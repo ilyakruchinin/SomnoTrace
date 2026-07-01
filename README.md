@@ -23,11 +23,16 @@ and uploads them to SMB and/or SleepHQ — no SD card required.
 
 ## Device
 
-- **Board:** Waveshare ESP32-S3-Touch-LCD-1.54
-  (touch variant preferred, but not required)
+<img src="https://www.waveshare.com/media/catalog/product/cache/1/image/560x560/9df78eab33525d08d6e5fb8d27136e95/e/s/esp32-s3-touch-lcd-1.54-1.jpg" alt="Waveshare ESP32-S3 Touch LCD 1.54 Front" width="300" align="right" />
+
+- **Board:** Waveshare ESP32-S3-Touch-LCD-1.54 (touch variant preferred, but not required)
 - **MCU:** ESP32-S3 (Wi-Fi + BLE 5) with 8 MB PSRAM
 - **Display:** 1.54" ST7789 LCD (optional CST816 capacitive touch)
 - **Source device:** ResMed AirSense 11 AutoSet
+
+<img src="https://www.waveshare.com/media/catalog/product/cache/1/image/560x560/9df78eab33525d08d6e5fb8d27136e95/e/s/esp32-s3-touch-lcd-1.54-2.jpg" alt="Waveshare ESP32-S3 Detail View" width="160" style="margin-top: 10px; margin-right: 10px;" /> <img src="https://www.waveshare.com/media/catalog/product/cache/1/image/560x560/9df78eab33525d08d6e5fb8d27136e95/e/s/esp32-s3-touch-lcd-1.54-4.jpg" alt="Waveshare ESP32-S3 Side View" width="160" style="margin-top: 10px;" /> <img src="https://www.waveshare.com/media/catalog/product/cache/1/image/560x560/9df78eab33525d08d6e5fb8d27136e95/e/s/esp32-s3-touch-lcd-1.54-3.jpg" alt="Waveshare ESP32-S3 Side View" width="160" style="margin-top: 10px;" /> <img src="https://www.waveshare.com/media/catalog/product/cache/1/image/560x560/9df78eab33525d08d6e5fb8d27136e95/e/s/esp32-s3-touch-lcd-1.54-5.jpg" alt="Waveshare ESP32-S3 Side View" width="160" style="margin-top: 10px;" />
+
+<br clear="right"/>
 
 ## How it works
 
