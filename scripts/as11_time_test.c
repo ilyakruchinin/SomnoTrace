@@ -294,6 +294,63 @@ int main(void)
                as11_time_offset_from_period_start(PS_MIDNIGHT_Z, &off) ? off : -999999, 43200);
     reset_offset();
 
+    printf("\n=== Scenario 12: Header Formatters ===\n");
+    /* The three formatters that write EDF header fields and the session prefix are
+     * reached by no host test: the edf suites build headers through their own
+     * fixtures. All three go through localtime_r(), so a fixed non-UTC zone is
+     * pinned and the expected strings come from Python datetime in that zone; in
+     * UTC a gmtime_r() swap would pass unnoticed. EST5 has no DST rule, so the
+     * result does not depend on the date's position in the year. */
+    set_tz("EST5");
+    char edf_date[9], edf_time[9], rec_id[128], prefix[24];
+
+    /* Scenario 7's evening session: 2026-08-07T21:38:33.027Z = 16:38:33 EST. */
+    as11_time_format_edf_datetime(1786138713027LL, edf_date, sizeof(edf_date),
+                                  edf_time, sizeof(edf_time));
+    expect_str("EDF startdate dd.mm.yy (local)", edf_date, "07.08.26");
+    expect_str("EDF starttime hh.mm.ss (local, ms dropped)", edf_time, "16.38.33");
+    as11_time_format_session_prefix(1786138713027LL, prefix, sizeof(prefix));
+    expect_str("session prefix yyyymmdd_hhmmss (local)", prefix, "20260807_163833");
+    as11_time_format_recording_id(rec_id, sizeof(rec_id), 1786138713027LL,
+                                  "23241234567", "AS11", "ResMed");
+    expect_str("recording id", rec_id,
+               "Startdate 07-AUG-2026 X X X SRN=23241234567 MID=AS11 VID=ResMed");
+
+    /* Last month of the year: the month-name table has twelve entries and DEC is
+     * the one an off-by-one index runs past. 2026-12-31T23:30:00Z = 18:30 EST. */
+    as11_time_format_edf_datetime(1798759800000LL, edf_date, sizeof(edf_date),
+                                  edf_time, sizeof(edf_time));
+    expect_str("EDF startdate on Dec 31", edf_date, "31.12.26");
+    expect_str("EDF starttime 18:30:00", edf_time, "18.30.00");
+    as11_time_format_recording_id(rec_id, sizeof(rec_id), 1798759800000LL, "1", "2", "3");
+    expect_str("recording id in DEC", rec_id, "Startdate 31-DEC-2026 X X X SRN=1 MID=2 VID=3");
+
+    /* Two-digit year: 2009 must print "09", not "9", and the century wrap in 2100
+     * must print "00". The 2100 epoch is 00:00Z, which the -5 h zone moves back to
+     * Feb 28, so the date and the year both come from the local conversion. */
+    as11_time_format_edf_datetime(1231156800000LL, edf_date, sizeof(edf_date),
+                                  edf_time, sizeof(edf_time));
+    expect_str("EDF startdate in 2009 keeps the leading zero", edf_date, "05.01.09");
+    as11_time_format_session_prefix(1231156800000LL, prefix, sizeof(prefix));
+    expect_str("session prefix in JAN 2009", prefix, "20090105_070000");
+    as11_time_format_edf_datetime(4107542400000LL, edf_date, sizeof(edf_date),
+                                  edf_time, sizeof(edf_time));
+    expect_str("EDF startdate 2100-03-01T00:00Z is 28.02.00 local", edf_date, "28.02.00");
+    as11_time_format_recording_id(rec_id, sizeof(rec_id), 4107542400000LL, "s", "m", "v");
+    expect_str("recording id in 2100 prints the four-digit year", rec_id,
+               "Startdate 28-FEB-2100 X X X SRN=s MID=m VID=v");
+
+    /* NULL identifiers print as empty fields rather than "(null)" or a crash; a
+     * NULL date or time output is skipped rather than written. */
+    as11_time_format_recording_id(rec_id, sizeof(rec_id), 1786138713027LL, NULL, NULL, NULL);
+    expect_str("recording id with NULL identifiers", rec_id,
+               "Startdate 07-AUG-2026 X X X SRN= MID= VID=");
+    strcpy(edf_time, "keep");
+    as11_time_format_edf_datetime(1786138713027LL, edf_date, sizeof(edf_date), NULL, 0);
+    expect_str("date written when time_out is NULL", edf_date, "07.08.26");
+    as11_time_format_edf_datetime(1786138713027LL, NULL, 0, edf_time, 0);
+    expect_str("time_len 0 leaves time_out untouched", edf_time, "keep");
+    reset_offset();
     printf("\n%s (%d failure%s)\n", fails ? "FAILURES" : "ALL PASS",
            fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
