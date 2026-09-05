@@ -893,7 +893,7 @@ static int build_str_mask_events(summary_ctx_t *ctx, int16_t *str_values,
             int dur_chk = (int)ctx->session_entries[i].duration_min;
             if (min_from_noon < 0 ||
                 min_from_noon + dur_chk > STR_MASK_MINUTES_MAX) {
-                ESP_LOGW(TAG, "STR.edf: %s session %d window %d..%d min is "
+                ESP_LOGI(TAG, "STR.edf: %s session %d window %d..%d min is "
                          "outside the day — entry skipped", day_label, i,
                          min_from_noon, min_from_noon + dur_chk);
                 continue;
@@ -1057,7 +1057,7 @@ static int collect_session_mask_pairs(const char *session_dir,
         /* Never emit a window outside the day this record declares — see
          * STR_MASK_MINUTES_MAX. */
         if (on < 0 || off > STR_MASK_MINUTES_MAX) {
-            ESP_LOGW(TAG, "STR.edf: %s window %d..%d min is outside the day "
+            ESP_LOGI(TAG, "STR.edf: %s window %d..%d min is outside the day "
                      "— entry skipped", session_id, on, off);
             continue;
         }
