@@ -1,0 +1,47 @@
+name: "Host tests"
+
+# Builds and runs the gcc host test suites via scripts/run_host_tests.sh.
+# No ESP-IDF: the suites compile main/*.c against the shims in
+# scripts/test_include and the system libcjson, and finish in seconds.
+#
+# The script prints "host tests: N run, M failed, K skipped" as its last line
+# and exits non-zero on a failure; a skipped suite does not fail it (a laptop
+# without libcjson still runs the rest), so this job fails on a skip itself.
+
+on:
+  push:
+    paths:
+      - "main/**"
+      - "scripts/**"
+      - ".github/workflows/host-tests.yml"
+  pull_request:
+    paths:
+      - "main/**"
+      - "scripts/**"
+      - ".github/workflows/host-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libcjson
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends libcjson-dev
+
+      - name: Run host tests
+        # The runner's default shell is `bash -e` without pipefail, so the
+        # script's exit status would be lost behind tee.  Both the status and
+        # the summary line are checked; a run that prints neither fails too.
+        run: |
+          set -o pipefail
+          bash scripts/run_host_tests.sh | tee host-tests.log
+          tail -1 host-tests.log | grep -qE '^host tests: [0-9]+ run, 0 failed, 0 skipped$' \
+            || { echo "::error::host tests failed or were skipped: $(tail -1 host-tests.log)"; exit 1; }
