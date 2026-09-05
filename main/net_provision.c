@@ -1849,6 +1849,51 @@ static esp_err_t upload_config_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ── Upload "Test connection" ─────────────────────────────────────────
+ * Probes one backend with the settings saved in NVS (not the form contents)
+ * and answers {"ok":bool,"message":"..."} — 409 while an upload is running.
+ * Blocks this worker for up to the backend's probe timeout (about 10 s). */
+static esp_err_t upload_test_send(httpd_req_t *req, const char *backend_id)
+{
+    bool ok = false;
+    char msg[192];
+    esp_err_t err = uploader_test_connection(backend_id, &ok, msg, sizeof(msg));
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "unknown backend");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    cJSON_AddBoolToObject(root, "ok", err == ESP_OK && ok);
+    cJSON_AddStringToObject(root, "message", msg);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    if (err == ESP_ERR_INVALID_STATE) httpd_resp_set_status(req, "409 Conflict");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    cJSON_free(json);
+    return ESP_OK;
+}
+
+static esp_err_t upload_test_smb_handler(httpd_req_t *req)
+{
+    return upload_test_send(req, "smb");
+}
+
+static esp_err_t upload_test_sleephq_handler(httpd_req_t *req)
+{
+    return upload_test_send(req, "sleephq");
+}
+
 /* ── Device settings endpoints ─────────────────────────────────────── */
 
 /* ── Therapy alert config endpoints ─────────────────────────────────── */
@@ -3064,6 +3109,12 @@ static esp_err_t start_webserver(void)
     httpd_register_uri_handler(s_httpd, &up_cfg_post);
     httpd_register_uri_handler(s_httpd, &up_prog_get);
     httpd_register_uri_handler(s_httpd, &up_state_get);
+
+    /* "Test connection" buttons: probe a backend with the saved settings */
+    httpd_uri_t up_test_smb = { .uri = "/api/uploads/test-smb", .method = HTTP_POST, .handler = upload_test_smb_handler };
+    httpd_uri_t up_test_shq = { .uri = "/api/uploads/test-sleephq", .method = HTTP_POST, .handler = upload_test_sleephq_handler };
+    httpd_register_uri_handler(s_httpd, &up_test_smb);
+    httpd_register_uri_handler(s_httpd, &up_test_shq);
 
     /* Device settings endpoints (brightness, LCD therapy mode) */
     httpd_uri_t settings_all = { .uri = "/api/settings/all", .method = HTTP_GET, .handler = settings_all_get_handler };

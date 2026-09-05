@@ -83,6 +83,10 @@ void upload_sched_request_reset(void);
 typedef bool (*upload_sched_busy_fn_t)(void);
 void upload_sched_set_busy_fn(upload_sched_busy_fn_t fn);
 
+/* True while any backend is inside a run (connected and transferring), so a
+ * "Test connection" probe does not open a second transport alongside it. */
+bool upload_sched_uploading(void);
+
 /* Compact progress for the Web UI.  Caller frees. */
 esp_err_t upload_sched_progress_json(char **out_json);
 

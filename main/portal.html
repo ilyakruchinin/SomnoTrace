@@ -588,6 +588,10 @@ Network Folder (SMB Share)
 <label style="font-size:.8rem;color:var(--text-muted)">Connection Preview</label>
 <div class="smb-preview" id="smb-uri-preview">smb://guest:@192.168.1.100/sleep/SomnoTrace</div>
 </div>
+<div style="margin-top:12px">
+<button type="button" class="btn btn-sm" id="smb-test-btn" onclick="testUploadConnection('smb')">Test connection</button>
+<span id="smb-test-status" class="status-msg" style="margin-left:8px;text-align:left"></span>
+</div>
 </div>
 
 <!-- SleepHQ Cloud -->
@@ -614,6 +618,10 @@ SleepHQ Cloud Upload
 <svg viewBox="0 0 24 24" class="eye-closed" style="display:none"><path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.83l2.92 2.92c1.51-1.26 2.7-2.89 3.43-4.75-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46A11.8 11.8 0 0 0 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78l3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/></svg>
 </button>
 </div>
+</div>
+<div style="margin-top:12px">
+<button type="button" class="btn btn-sm" id="shq-test-btn" onclick="testUploadConnection('shq')">Test connection</button>
+<span id="shq-test-status" class="status-msg" style="margin-left:8px;text-align:left"></span>
 </div>
 <div style="margin-top:14px;padding:10px 14px;border-radius:8px;background:rgba(167,139,250,.08);border:1px solid rgba(167,139,250,.25);font-size:.8rem;line-height:1.5;color:var(--text-muted)">
 <div style="margin-bottom:6px"><span style="font-weight:600;color:var(--accent,#a78bfa)">Requires SleepHQ Pro subscription.</span> The free SleepHQ tier does not include API access.</div>
@@ -2556,6 +2564,32 @@ function sendAlertTestPush() {
     if (r.ok) setTimeout(function(){ if (st) st.textContent = ''; }, 3000);
   }).catch(function() {
     if (st) { st.textContent = 'Network error'; st.style.color = 'var(--danger)'; }
+  });
+}
+
+/* ── Upload "Test connection" ──────────────────────────────────── */
+function testUploadConnection(id) {
+  var st = document.getElementById(id + '-test-status');
+  var btn = document.getElementById(id + '-test-btn');
+  var card = document.getElementById(id + '-card');
+  /* The device probes with what is saved in NVS, not what is typed here. */
+  if (card && card.querySelector('[data-dirty="true"]')) {
+    if (st) { st.textContent = 'Save settings first, then test'; st.style.color = 'var(--warning)'; }
+    return;
+  }
+  if (st) { st.textContent = 'Testing…'; st.style.color = 'var(--text-muted)'; }
+  if (btn) btn.disabled = true;
+  fetch('/api/uploads/test-' + (id === 'shq' ? 'sleephq' : id), { method: 'POST' }).then(function(r) {
+    return r.json();
+  }).then(function(d) {
+    if (st) {
+      st.textContent = d.message || (d.ok ? 'Connected' : 'Failed');
+      st.style.color = d.ok ? 'var(--success)' : 'var(--danger)';
+    }
+  }).catch(function() {
+    if (st) { st.textContent = 'Network error'; st.style.color = 'var(--danger)'; }
+  }).then(function() {
+    if (btn) btn.disabled = false;
   });
 }
 

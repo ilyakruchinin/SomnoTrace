@@ -357,18 +357,13 @@ static int shq_http_request(esp_tls_t *tls, const char *method,
 
 /* ── Authentication ─────────────────────────────────────────────────── */
 
-static esp_err_t shq_authenticate(esp_tls_t *tls, const uploader_config_t *cfg)
+/* One token request.  On success the token is copied into `token` and its
+ * lifetime into *expires_s.  On failure `err` (may be NULL) receives a
+ * one-line reason worded for the web UI. */
+static esp_err_t shq_request_token(esp_tls_t *tls, const uploader_config_t *cfg,
+                                   char *token, size_t token_cap, int *expires_s,
+                                   char *err, size_t err_len)
 {
-    if (s_token && s_token[0] && s_token_expires > 0) {
-        int64_t now_s = time(NULL);
-        int elapsed = (int)(now_s - s_token_time_s);
-        if (elapsed < s_token_expires - 60) {
-            return ESP_OK;
-        }
-    }
-
-    ESP_LOGI(TAG, "authenticating with SleepHQ...");
-
     char body[512];
     snprintf(body, sizeof(body),
              "grant_type=password&client_id=%s&client_secret=%s&scope=read+write",
@@ -381,6 +376,15 @@ static esp_err_t shq_authenticate(esp_tls_t *tls, const uploader_config_t *cfg)
                                   &resp_body, &resp_len);
     if (status < 200) {
         ESP_LOGE(TAG, "auth request failed (status=%d)", status);
+        if (err) snprintf(err, err_len, "No answer from %s", SHQ_HOST);
+        free(resp_body);
+        return ESP_FAIL;
+    }
+    if (status >= 300) {
+        /* 401 is what a wrong or revoked Client ID / Secret produces. */
+        if (err) snprintf(err, err_len, "SleepHQ rejected the API key (HTTP %d): "
+                          "check Client ID / Secret and that the account has API access",
+                          status);
         free(resp_body);
         return ESP_FAIL;
     }
@@ -390,27 +394,47 @@ static esp_err_t shq_authenticate(esp_tls_t *tls, const uploader_config_t *cfg)
 
     if (!root) {
         ESP_LOGE(TAG, "auth: failed to parse JSON");
+        if (err) snprintf(err, err_len, "Unexpected reply from %s", SHQ_HOST);
         return ESP_FAIL;
     }
 
-    cJSON *token = cJSON_GetObjectItem(root, "access_token");
+    cJSON *tok = cJSON_GetObjectItem(root, "access_token");
     cJSON *expires = cJSON_GetObjectItem(root, "expires_in");
 
-    if (!token || !cJSON_IsString(token)) {
+    if (!tok || !cJSON_IsString(tok)) {
         ESP_LOGE(TAG, "auth: no access_token in response");
+        if (err) snprintf(err, err_len, "SleepHQ did not issue a token");
         cJSON_Delete(root);
         return ESP_FAIL;
     }
 
-    if (!shq_token_ready()) {
-        cJSON_Delete(root);
-        return ESP_ERR_NO_MEM;
+    strlcpy(token, tok->valuestring, token_cap);
+    *expires_s = (expires && cJSON_IsNumber(expires)) ? expires->valueint : 7200;
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t shq_authenticate(esp_tls_t *tls, const uploader_config_t *cfg)
+{
+    if (s_token && s_token[0] && s_token_expires > 0) {
+        int64_t now_s = time(NULL);
+        int elapsed = (int)(now_s - s_token_time_s);
+        if (elapsed < s_token_expires - 60) {
+            return ESP_OK;
+        }
     }
-    strlcpy(s_token, token->valuestring, SHQ_TOKEN_MAX);
-    s_token_expires = (expires && cJSON_IsNumber(expires)) ? expires->valueint : 7200;
+
+    ESP_LOGI(TAG, "authenticating with SleepHQ...");
+
+    if (!shq_token_ready()) return ESP_ERR_NO_MEM;
+
+    int expires_s = 0;
+    esp_err_t rc = shq_request_token(tls, cfg, s_token, SHQ_TOKEN_MAX, &expires_s,
+                                     NULL, 0);
+    if (rc != ESP_OK) return rc;
+    s_token_expires = expires_s;
     s_token_time_s = time(NULL);
 
-    cJSON_Delete(root);
     ESP_LOGI(TAG, "authenticated, token expires in %d s", s_token_expires);
     return ESP_OK;
 }
@@ -819,6 +843,64 @@ static void shq_session_end(void)
     s_import_id[0] = '\0';
 }
 
+/* ── "Test connection" (web UI) ───────────────────────────────────────
+ *
+ * TLS connect plus one token request with the saved Client ID / Secret, on
+ * a private connection so it can run from the httpd task while the
+ * scheduler is idle.  The token is discarded rather than cached: the cache
+ * belongs to the scheduler task and a probe must not race it.  No import is
+ * opened, so nothing appears in the user's SleepHQ history. */
+#define SHQ_TEST_TIMEOUT_MS 10000
+
+static bool shq_test(char *msg, size_t msg_len)
+{
+    uploader_config_t cfg;
+    uploader_load_config(&cfg);
+    if (!cfg.shq_client_id[0] || !cfg.shq_client_secret[0]) {
+        snprintf(msg, msg_len, "Client ID and Client Secret are required");
+        return false;
+    }
+
+    esp_tls_cfg_t tls_cfg = {
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = SHQ_TEST_TIMEOUT_MS,
+    };
+    esp_tls_t *tls = esp_tls_init();
+    if (!tls) {
+        snprintf(msg, msg_len, "Out of memory");
+        return false;
+    }
+    if (esp_tls_conn_http_new_sync(SHQ_URL_BASE, &tls_cfg, tls) != 1) {
+        snprintf(msg, msg_len, "Cannot reach %s: check the internet connection", SHQ_HOST);
+        esp_tls_conn_destroy(tls);
+        return false;
+    }
+
+    char *token = heap_caps_malloc(SHQ_TOKEN_MAX, MALLOC_CAP_SPIRAM);
+    if (!token) token = malloc(SHQ_TOKEN_MAX);
+    if (!token) {
+        snprintf(msg, msg_len, "Out of memory");
+        esp_tls_conn_destroy(tls);
+        return false;
+    }
+
+    int expires_s = 0;
+    char err[128];
+    esp_err_t rc = shq_request_token(tls, &cfg, token, SHQ_TOKEN_MAX, &expires_s,
+                                     err, sizeof(err));
+    esp_tls_conn_destroy(tls);
+    memset(token, 0, SHQ_TOKEN_MAX);
+    free(token);
+
+    if (rc != ESP_OK) {
+        snprintf(msg, msg_len, "%s", err);
+        return false;
+    }
+    snprintf(msg, msg_len, "Signed in to SleepHQ, API key accepted (token valid for %d min)",
+             expires_s / 60);
+    return true;
+}
+
 static upload_result_t shq_day_begin(const char *day)
 {
     if (!s_tls) {
@@ -966,4 +1048,5 @@ const upload_backend_t sleephq_backend = {
     .put_bundle = shq_put_bundle,
     .day_end = shq_day_end,
     .session_end = shq_session_end,
+    .test = shq_test,
 };

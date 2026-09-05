@@ -529,3 +529,40 @@ void uploader_request_scan(void)
     if (!s_initialised) return;
     upload_sched_request_scan();
 }
+
+/* ── "Test connection" (web UI) ─────────────────────────────────────── */
+
+esp_err_t uploader_test_connection(const char *backend_id, bool *out_ok,
+                                   char *msg, size_t msg_len)
+{
+    if (!backend_id || !out_ok || !msg || msg_len == 0) return ESP_ERR_INVALID_ARG;
+    *out_ok = false;
+
+    const upload_backend_t *be = NULL;
+    for (int i = 0; i < s_n_backends; i++) {
+        if (s_backends[i] && strcmp(s_backends[i]->id, backend_id) == 0) {
+            be = s_backends[i];
+            break;
+        }
+    }
+    if (!be || !be->test) {
+        snprintf(msg, msg_len, "Unknown backend");
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (!s_initialised) {
+        snprintf(msg, msg_len, "Uploader is still starting up, try again in a moment");
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* Only one transport at a time: TLS and SMB buffers contend for memory
+     * (see the backend interface note), and a run may be mid-transfer. */
+    if (upload_sched_uploading()) {
+        snprintf(msg, msg_len, "An upload is in progress, try again when it has finished");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "%s: connection test requested", be->id);
+    *out_ok = be->test(msg, msg_len);
+    ESP_LOGI(TAG, "%s: connection test %s: %s", be->id,
+             *out_ok ? "passed" : "failed", msg);
+    return ESP_OK;
+}

@@ -291,6 +291,69 @@ static void smb_session_end(void)
     s_smb = NULL;
 }
 
+/* ── "Test connection" (web UI) ───────────────────────────────────────
+ *
+ * The same handshake as smb_session_begin() — negotiate, authenticate, open
+ * the share — on a private context so it can run from the httpd task while
+ * the scheduler is idle, followed by a stat of the configured folder: the
+ * uploader's mkdir calls do not create parents, so a remote path that does
+ * not exist on the share fails on the first upload rather than here.
+ * Nothing is created or written. */
+#define SMB_TEST_TIMEOUT_S 10
+
+static bool smb_test(char *msg, size_t msg_len)
+{
+    uploader_config_t cfg;
+    uploader_load_config(&cfg);
+    if (!cfg.smb_host[0] || !cfg.smb_share[0]) {
+        snprintf(msg, msg_len, "Host and share name are required");
+        return false;
+    }
+    const char *user = cfg.smb_user[0] ? cfg.smb_user : "Guest";
+
+    struct smb2_context *ctx = smb2_init_context();
+    if (!ctx) {
+        snprintf(msg, msg_len, "Out of memory");
+        return false;
+    }
+    smb2_set_security_mode(ctx, SMB2_NEGOTIATE_SIGNING_ENABLED);
+    smb2_set_timeout(ctx, SMB_TEST_TIMEOUT_S);
+    smb2_set_user(ctx, user);
+    if (cfg.smb_pass[0]) smb2_set_password(ctx, cfg.smb_pass);
+
+    ESP_LOGI(TAG, "test: connecting to %s/%s as %s", cfg.smb_host, cfg.smb_share, user);
+    if (smb2_connect_share(ctx, cfg.smb_host, cfg.smb_share, user) != 0) {
+        snprintf(msg, msg_len, "Cannot open //%s/%s as %s: %s",
+                 cfg.smb_host, cfg.smb_share, user, smb2_get_error(ctx));
+        smb2_destroy_context(ctx);
+        return false;
+    }
+
+    /* Relative to the share root, as in smb_session_begin(). */
+    const char *p = cfg.smb_path;
+    while (*p == '/' || *p == '\\') p++;
+
+    bool ok = true;
+    if (!*p) {
+        snprintf(msg, msg_len, "Connected to //%s/%s (share root)",
+                 cfg.smb_host, cfg.smb_share);
+    } else {
+        struct smb2_stat_64 st;
+        if (smb2_stat(ctx, p, &st) == 0) {
+            snprintf(msg, msg_len, "Connected to //%s/%s, folder '%s' found",
+                     cfg.smb_host, cfg.smb_share, p);
+        } else {
+            snprintf(msg, msg_len, "Connected to //%s/%s, but folder '%s' was not "
+                     "found on the share: create it or fix Remote Path",
+                     cfg.smb_host, cfg.smb_share, p);
+            ok = false;
+        }
+    }
+    smb2_disconnect_share(ctx);
+    smb2_destroy_context(ctx);
+    return ok;
+}
+
 static upload_result_t smb_day_begin(const char *day)
 {
     if (!s_smb) return UPLOAD_ERR_TRANSIENT;
@@ -399,4 +462,5 @@ const upload_backend_t smb_backend = {
     .put_bundle = smb_put_bundle,
     .day_end = smb_day_end,
     .session_end = smb_session_end,
+    .test = smb_test,
 };

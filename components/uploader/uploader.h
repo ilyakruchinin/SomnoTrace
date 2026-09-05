@@ -25,6 +25,7 @@
 
 #include "esp_err.h"
 #include <stdbool.h>
+#include <stddef.h>
 #include "upload_scan.h"
 #include "upload_ox.h"
 
@@ -110,6 +111,14 @@ typedef struct {
 
     /* Close the connection. Always called if session_begin() succeeded. */
     void (*session_end)(void);
+
+    /* Optional "Test connection" probe for the web UI: connect and
+     * authenticate with the saved configuration, then disconnect, without
+     * transferring anything.  Writes a one-line outcome for the user into
+     * msg and returns true when the backend is usable.  Must use its own
+     * connection object, never the one session_begin() owns — it runs on
+     * the httpd task, not the scheduler. */
+    bool (*test)(char *msg, size_t msg_len);
 } upload_backend_t;
 
 /* ── Configuration ──────────────────────────────────────────────────── */
@@ -246,3 +255,15 @@ esp_err_t uploader_save_config_json(const char *json_str);
  * config.max_days, so this cannot start an unbounded re-upload.
  * Asynchronous: the work happens on the scheduler task. */
 esp_err_t uploader_reset_state(void);
+
+/* "Test connection" for the web UI: probe one backend ("smb" | "sleephq")
+ * with the configuration currently saved in NVS, without uploading anything.
+ * msg receives a one-line outcome for the user in every case.
+ *   ESP_OK                 the probe ran; *out_ok says whether it passed
+ *   ESP_ERR_INVALID_STATE  an upload is in progress (one transport at a time,
+ *                          see the backend interface note) or the uploader
+ *                          has not finished initialising
+ *   ESP_ERR_NOT_FOUND      unknown backend id
+ * Blocks the caller for up to the backend's probe timeout (about 10 s). */
+esp_err_t uploader_test_connection(const char *backend_id, bool *out_ok,
+                                   char *msg, size_t msg_len);

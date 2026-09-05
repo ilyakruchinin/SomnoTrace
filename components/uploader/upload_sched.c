@@ -752,6 +752,14 @@ void upload_sched_request_reset(void)             { post(EV_RESET, 0); }
 
 void upload_sched_set_busy_fn(upload_sched_busy_fn_t fn) { s_busy_fn = fn; }
 
+bool upload_sched_uploading(void)
+{
+    for (int i = 0; i < s_n_rt; i++) {
+        if (s_rt[i].be && s_rt[i].state == SB_UPLOADING) return true;
+    }
+    return false;
+}
+
 /* ── Progress reporting ───────────────────────────────────────────── */
 
 static const char *state_name(sb_state_t s)
