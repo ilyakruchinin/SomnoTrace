@@ -142,14 +142,21 @@ cJSON *as11_ble_get_values(const char *const *keys, int n_keys);
  * Returns ESP_OK on success. */
 esp_err_t as11_ble_stop_therapy(void);
 
-/* Send EnterTherapy RPC to start therapy on the AS11.
- * Requires an active encrypted BLE session.
- * Returns ESP_OK on success. */
-esp_err_t as11_ble_start_therapy(void);
+/* Send EnterTherapy RPC to start therapy on the AS11. Requires an active
+ * encrypted BLE session. Returns ESP_OK on success and additionally reports
+ * whether the request may have reached the AS11. The outcome pointer is
+ * required so lifecycle-changing callers cannot silently ignore ambiguity.
+ * The flag remains true for indeterminate post-send failures/timeouts and is
+ * false before any accepted GATT write or after an explicit RPC rejection. */
+esp_err_t as11_ble_start_therapy_tracked(bool *may_have_started);
 
 /* Generic BLE JSON-RPC passthrough interface.
  * Transmits json_in over the encrypted BLE session, awaits the AS11 response,
- * and returns the decrypted response string in *json_out (malloc'd, caller frees).
- * Requires an active encrypted BLE session. */
-esp_err_t as11_ble_passthrough_rpc(const char *json_in, char **json_out, uint32_t timeout_ms);
-
+ * and returns the decrypted response string in *json_out (malloc'd, caller
+ * frees). Requires an active encrypted BLE session. may_have_run is required
+ * and distinguishes a definitely-unsent request from
+ * an indeterminate post-send failure. */
+esp_err_t as11_ble_passthrough_rpc_tracked(const char *json_in,
+                                           char **json_out,
+                                           uint32_t timeout_ms,
+                                           bool *may_have_run);

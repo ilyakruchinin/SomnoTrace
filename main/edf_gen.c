@@ -103,6 +103,31 @@ static bool day_metadata_fallback(const char *session_dir, const char *session_i
     return true;
 }
 
+/* A continuous ResMed EDF cannot represent gaps in an explicitly positioned
+ * source stream. Refuse before touching prior output; the raw SNT remains the
+ * source of truth until discontinuous export is supported. */
+static esp_err_t validate_positioned_sources(const char *dir, const char *id)
+{
+    static const char *const names[] = {"flow", "press", "sa2", "pld", "brp"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        char path[400];
+        int n = snprintf(path, sizeof(path), "%s/%s_%s.snt", dir, id, names[i]);
+        if (n < 0 || n >= (int)sizeof(path)) return ESP_ERR_INVALID_SIZE;
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            if (errno == ENOENT) continue;
+            return ESP_FAIL;
+        }
+        snt_header_t hdr;
+        esp_err_t ret = snt_read_header(f, &hdr) == 0 ? ESP_OK : ESP_FAIL;
+        if (fclose(f) != 0 && ret == ESP_OK) ret = ESP_FAIL;
+        if (ret != ESP_OK) return ret;
+        if (hdr.version >= 2 && (hdr.reserved & SNT_POSITION_GAP_FLAG))
+            return EDF_GEN_ERR_POSITION_GAPS;
+    }
+    return ESP_OK;
+}
+
 esp_err_t edf_gen_generate_ex(const char *out_root,
                               const char *session_dir, const char *session_id,
                               int64_t start_epoch_ms, int64_t end_epoch_ms,
@@ -128,6 +153,17 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                  (long long)start_epoch_ms, session_id);
         sd_storage_lease_release(SD_LEASE_EXPORT);
         return ESP_ERR_INVALID_ARG;
+    }
+    if (flags & EDF_GEN_PER_SESSION) {
+        esp_err_t valid = validate_positioned_sources(session_dir, session_id);
+        if (valid != ESP_OK) {
+            ESP_LOGE(TAG, "source preflight failed for %s (%s); retaining raw and prior export",
+                     session_id, valid == EDF_GEN_ERR_POSITION_GAPS
+                         ? "positioned_gaps_require_discontinuous_export"
+                         : esp_err_to_name(valid));
+            sd_storage_lease_release(SD_LEASE_EXPORT);
+            return valid;
+        }
     }
 
     ESP_LOGI(TAG, "=== EDF GENERATION START ===");

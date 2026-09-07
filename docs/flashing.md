@@ -9,7 +9,9 @@
 1. **Waveshare ESP32-S3-Touch-LCD-1.54** board (Touch variant with battery preferred — [Buy on Waveshare](https://www.waveshare.com/esp32-s3-lcd-1.54.htm?sku=33869)).
 2. **USB-C Data Cable** (make sure it is a *data* cable, not a charge-only cable).
 3. **Computer with a modern browser**: Google Chrome, Microsoft Edge, Brave, or Opera (these browsers support Web Serial).
-4. **MicroSD card** (formatted as FAT32 or exFAT, 8 GB to 32 GB recommended) inserted into the board's SD slot.
+4. **MicroSD card** (8 GB to 32 GB recommended), prepared as one FAT32 volume
+   using a Master Boot Record (MBR) partition scheme and inserted while the
+   board is powered off.
 
 ---
 
@@ -102,4 +104,7 @@ Once Wi-Fi is configured, the next step is to pair SomnoTrace with your CPAP ove
   - Try another USB-C cable (many cables included with phones/vapes are power-only and cannot transfer data).
   - Hold the **BOOT** button while plugging the board into your computer.
 - **SD Card Error on screen?**  
-  Ensure your MicroSD card is inserted securely into the slot before powering on, and that it is formatted as FAT32 or exFAT.
+  Power the board off, ensure the MicroSD card is seated securely, and then
+  restart it. The firmware detects and mounts the card only during boot. The
+  card must contain one FAT32 volume using a Master Boot Record (MBR) partition
+  scheme; exFAT and GUID Partition Map (GPT) cards will not mount.

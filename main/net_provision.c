@@ -52,6 +52,7 @@
 #include "bsp_power.h"
 #include "bsp_audio.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -74,6 +75,48 @@
 #include "mdns.h"
 
 static const char *TAG = "netprov";
+
+/* One global claim covers every firmware update and controlled restart.  Some
+ * owners continue in background tasks and can originate outside httpd, so the
+ * claim is public and atomically acquired before any worker is scheduled. */
+static portMUX_TYPE s_lifecycle_claim_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_lifecycle_claimed;
+static const char *s_lifecycle_claim_owner;
+
+
+
+
+bool netprov_lifecycle_try_claim(const char *owner)
+{
+    bool claimed = false;
+    portENTER_CRITICAL(&s_lifecycle_claim_lock);
+    if (!s_lifecycle_claimed) {
+        s_lifecycle_claimed = true;
+        s_lifecycle_claim_owner = owner;
+        claimed = true;
+    }
+    portEXIT_CRITICAL(&s_lifecycle_claim_lock);
+    return claimed;
+}
+
+
+void netprov_lifecycle_release(void)
+{
+    portENTER_CRITICAL(&s_lifecycle_claim_lock);
+    s_lifecycle_claimed = false;
+    s_lifecycle_claim_owner = NULL;
+    portEXIT_CRITICAL(&s_lifecycle_claim_lock);
+}
+
+
+static const char *lifecycle_claim_owner(void)
+{
+    const char *owner;
+    portENTER_CRITICAL(&s_lifecycle_claim_lock);
+    owner = s_lifecycle_claim_owner;
+    portEXIT_CRITICAL(&s_lifecycle_claim_lock);
+    return owner ? owner : "none";
+}
 
 #define NVS_NAMESPACE       "cfg"
 #define NVS_KEY_HOSTNAME    "hostname"
@@ -1416,19 +1459,94 @@ static esp_err_t ble_passthrough_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    int received = httpd_req_recv(req, body, total);
-    if (received < 0) {
-        free(body);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
-        return ESP_FAIL;
+    int received = 0;
+    while (received < total) {
+        int chunk = httpd_req_recv(req, body + received, total - received);
+        if (chunk <= 0) {
+            free(body);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv failed");
+            return ESP_FAIL;
+        }
+        received += chunk;
     }
     body[received] = '\0';
 
+    /* The passthrough endpoint can issue the same lifecycle-changing RPC as
+     * the local controls. Detect it from parsed JSON (including JSON-RPC batch
+     * form), then hold a therapy-start claim across the command response and
+     * local state publication so a restart cannot commit in between. */
+    bool starts_therapy = false;
+    bool batched_therapy_start = false;
+    cJSON *request_json = cJSON_Parse(body);
+    if (!request_json) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid JSON");
+        return ESP_FAIL;
+    }
+    if (cJSON_IsObject(request_json)) {
+        /* Scan every direct field so duplicate JSON keys cannot hide a later
+         * lifecycle-changing method from the gate. */
+        cJSON *field = NULL;
+        cJSON_ArrayForEach(field, request_json) {
+            if (field->string && strcmp(field->string, "method") == 0 &&
+                cJSON_IsString(field) &&
+                strcmp(field->valuestring, "EnterTherapy") == 0) {
+                starts_therapy = true;
+                break;
+            }
+        }
+    } else if (cJSON_IsArray(request_json)) {
+        cJSON *item = NULL;
+        cJSON_ArrayForEach(item, request_json) {
+            if (cJSON_IsObject(item)) {
+                cJSON *field = NULL;
+                cJSON_ArrayForEach(field, item) {
+                    if (field->string && strcmp(field->string, "method") == 0 &&
+                        cJSON_IsString(field) &&
+                        strcmp(field->valuestring, "EnterTherapy") == 0) {
+                        starts_therapy = true;
+                        batched_therapy_start = true;
+                        break;
+                    }
+                }
+            }
+            if (batched_therapy_start) break;
+        }
+    }
+    cJSON_Delete(request_json);
+
+    if (batched_therapy_start) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "batched EnterTherapy is not supported");
+        return ESP_FAIL;
+    }
+
+    if (starts_therapy && !bsp_display_reserve_therapy_start()) {
+        free(body);
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Connection", "close");
+        return httpd_resp_sendstr(
+            req, "{\"ok\":false,\"error\":\"restart already committed\"}");
+    }
+
     char *out_json = NULL;
-    esp_err_t err = as11_ble_passthrough_rpc(body, &out_json, 10000);
+    bool may_have_run = false;
+    esp_err_t err = as11_ble_passthrough_rpc_tracked(
+        body, &out_json, 10000, &may_have_run);
     free(body);
 
     if (err != ESP_OK || !out_json) {
+        if (starts_therapy) {
+            /* A post-send timeout/failure is indeterminate. Conservatively
+             * publish active before releasing the start claim so a real AS11
+             * start cannot lose to a restart while its event is in flight. */
+            if (may_have_run && bsp_display_set_therapy_active(true)) {
+                bsp_display_set_therapy_start_time(esp_timer_get_time());
+            }
+            bsp_display_release_therapy_start();
+        }
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_set_hdr(req, "Connection", "close");
@@ -1438,6 +1556,21 @@ static esp_err_t ble_passthrough_handler(httpd_req_t *req)
         snprintf(errbuf, sizeof(errbuf), "{\"ok\":false,\"error\":\"%s\"}", errmsg);
         httpd_resp_sendstr(req, errbuf);
         return ESP_FAIL;
+    }
+
+    if (starts_therapy) {
+        /* as11_ble_passthrough_rpc returns a syntactically valid serialized
+         * response. Only an explicit JSON-RPC error means EnterTherapy was
+         * rejected; on a local parse-allocation failure, conservatively mark
+         * therapy active so a real start can never lose to a restart. */
+        cJSON *response_json = cJSON_Parse(out_json);
+        bool accepted = !response_json ||
+                        !cJSON_GetObjectItemCaseSensitive(response_json, "error");
+        if (accepted && bsp_display_set_therapy_active(true)) {
+            bsp_display_set_therapy_start_time(esp_timer_get_time());
+        }
+        cJSON_Delete(response_json);
+        bsp_display_release_therapy_start();
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -1451,9 +1584,56 @@ static void reboot_task(void *arg)
 {
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(1500));
+
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active() ||
+        !bsp_display_try_reserve_therapy_safe_restart()) {
+        ESP_LOGW(TAG, "credential reboot deferred: therapy is active");
+        bsp_display_set_notice("Wi-Fi saved; restart deferred while recording");
+        netprov_lifecycle_release();
+        psram_task_delete(NULL);
+        return;
+    }
+
+    if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0)) {
+        bsp_display_cancel_therapy_safe_restart();
+        ESP_LOGW(TAG, "credential reboot deferred: SD operation active");
+        bsp_display_set_notice("Wi-Fi saved; restart deferred for microSD");
+        netprov_lifecycle_release();
+        psram_task_delete(NULL);
+        return;
+    }
+
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active() ||
+        !bsp_display_try_commit_therapy_safe_restart()) {
+        sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
+        bsp_display_cancel_therapy_safe_restart();
+        ESP_LOGW(TAG, "credential reboot deferred: therapy start won lifecycle gate");
+        bsp_display_set_notice("Wi-Fi saved; restart deferred while recording");
+        netprov_lifecycle_release();
+        psram_task_delete(NULL);
+        return;
+    }
+
     ESP_LOGI(TAG, "rebooting to apply credentials");
+    sd_storage_deinit();
     esp_restart();
 }
+
+static bool schedule_reboot(const char *name)
+{
+    if (!netprov_lifecycle_try_claim(name)) {
+        ESP_LOGW(TAG, "reboot deferred: lifecycle owned by %s", lifecycle_claim_owner());
+        return false;
+    }
+    if (!psram_task_create(reboot_task, name, 4096, NULL, 5,
+                           tskNO_AFFINITY, NULL, NULL)) {
+        netprov_lifecycle_release();
+        ESP_LOGE(TAG, "reboot worker allocation failed");
+        return false;
+    }
+    return true;
+}
+
 
 static esp_err_t heap_stats_handler(httpd_req_t *req)
 {
@@ -1507,7 +1687,7 @@ static esp_err_t reboot_post_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-    psram_task_create(reboot_task, "reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    schedule_reboot("reboot");
     return ESP_OK;
 }
 
@@ -1612,7 +1792,7 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     httpd_resp_sendstr(req,
         "<html><body style=\"font-family:sans-serif\">Saved. Rebooting to connect...</body></html>");
 
-    psram_task_create(reboot_task, "reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    schedule_reboot("reboot");
     return ESP_OK;
 }
 
@@ -2485,32 +2665,92 @@ static SemaphoreHandle_t s_format_mtx;  /* guards s_format_progress reads/writes
  * card in between.  The success path never returns (it reboots). */
 static void format_sd_task(void *arg)
 {
+    (void)arg;
     ESP_LOGW(TAG, "format_sd_task: starting destructive format");
 
-    if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 5000)) {
+    /* The lifecycle claim serializes this destructive operation with OTA and
+     * other restarts. Do not hold the therapy restart reservation across the
+     * long, blocking format: therapy publication must remain responsive. */
+    if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0)) {
         xSemaphoreTake(s_format_mtx, portMAX_DELAY);
         strlcpy(s_format_progress.error,
                 "SD busy — a recording, export or upload is using the card",
                 sizeof(s_format_progress.error));
         xSemaphoreGive(s_format_mtx);
+    } else if (bsp_display_is_therapy_active() ||
+               sd_storage_recording_active()) {
+        sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
+        xSemaphoreTake(s_format_mtx, portMAX_DELAY);
+        strlcpy(s_format_progress.error,
+                "therapy started before format could begin",
+                sizeof(s_format_progress.error));
+        xSemaphoreGive(s_format_mtx);
     } else {
-        /* No uploader_reset_state() here: on success the reboot re-inits the
-         * uploader against the now-empty state dir, and on failure the old
-         * state is still valid.  Calling it would also wake the upload
-         * scheduler to rescan the card mid-format. */
+        /* Do not reset uploader state before the result is known: that would
+         * wake its scheduler to rescan the card mid-format, and on failure the
+         * old state remains valid. */
         esp_err_t ret = sd_storage_format();
         if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "format_sd_task: formatted OK, rebooting for clean remount");
+            ESP_LOGI(TAG, "format_sd_task: formatted OK, preparing clean reboot");
             xSemaphoreTake(s_format_mtx, portMAX_DELAY);
             s_format_progress.ok = true;
             s_format_progress.done = true;
             s_format_progress.active = false;
             xSemaphoreGive(s_format_mtx);
+            /* Formatting is complete and the fresh volume is mounted. Let a
+             * therapy start record immediately during the browser grace
+             * period instead of retaining the destructive lease. */
+            sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
+            /* Keep the live process coherent if therapy defers reboot for a
+             * long time: clear stale upload tracking only after the fresh
+             * filesystem is mounted and the format lease is released. */
+            uploader_reset_state();
             /* Give the browser poll (2 s interval) time to read the result,
-             * then flush the fresh filesystem and reboot. */
+             * then atomically arbitrate the clean reboot with current/new
+             * therapy. The short reservation begins only after formatting. */
             vTaskDelay(pdMS_TO_TICKS(2500));
-            sd_storage_deinit();
-            esp_restart();
+            bool announced_defer = false;
+            for (;;) {
+                if (bsp_display_is_therapy_active() ||
+                    sd_storage_recording_active()) {
+                    if (!announced_defer) {
+                        ESP_LOGW(TAG, "format reboot deferred during therapy");
+                        bsp_display_set_notice(
+                            "Card formatted; restart deferred during therapy");
+                        announced_defer = true;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    continue;
+                }
+
+                if (!bsp_display_try_reserve_therapy_safe_restart()) {
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    continue;
+                }
+                if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0)) {
+                    bsp_display_cancel_therapy_safe_restart();
+                    if (!announced_defer) {
+                        ESP_LOGW(TAG, "format reboot deferred for storage");
+                        bsp_display_set_notice(
+                            "Card formatted; waiting for storage before restart");
+                        announced_defer = true;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    continue;
+                }
+                if (bsp_display_is_therapy_active() ||
+                    sd_storage_recording_active() ||
+                    !bsp_display_try_commit_therapy_safe_restart()) {
+                    sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
+                    /* Release storage before waking a therapy-start waiter. */
+                    bsp_display_cancel_therapy_safe_restart();
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    continue;
+                }
+
+                sd_storage_deinit();
+                esp_restart();
+            }
         }
         ESP_LOGE(TAG, "format_sd_task: failed: %s", esp_err_to_name(ret));
         xSemaphoreTake(s_format_mtx, portMAX_DELAY);
@@ -2524,6 +2764,7 @@ static void format_sd_task(void *arg)
     s_format_progress.done = true;
     s_format_progress.active = false;
     xSemaphoreGive(s_format_mtx);
+    netprov_lifecycle_release();
     psram_task_delete(NULL);
 }
 
@@ -2770,7 +3011,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     httpd_resp_sendstr(req, "{\"ok\":true}");
 
     /* Reboot after a short delay so the response is sent. */
-    psram_task_create(reboot_task, "ota_reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    schedule_reboot("ota_reboot");
     return ESP_OK;
 }
 
@@ -2864,7 +3105,7 @@ static void ota_url_task(void *arg)
     s_ota_progress.active = false;
     s_ota_progress.done = true;
     free(url);
-    psram_task_create(reboot_task, "ota_reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    schedule_reboot("ota_reboot");
     vTaskDelete(NULL);
     return;
 
@@ -3047,10 +3288,15 @@ static esp_err_t actions_handler(httpd_req_t *req)
             cJSON_Delete(root);
             return send_busy(req, "therapy recording in progress");
         }
+        if (!netprov_lifecycle_try_claim("format-sd")) {
+            cJSON_Delete(root);
+            return send_busy(req, "update or restart already in progress");
+        }
         xSemaphoreTake(s_format_mtx, portMAX_DELAY);
         if (s_format_progress.active) {
             xSemaphoreGive(s_format_mtx);
             cJSON_Delete(root);
+            netprov_lifecycle_release();
             return send_busy(req, "format already in progress");
         }
         ESP_LOGI(TAG, "action: format SD card (destructive)");
@@ -3060,6 +3306,7 @@ static esp_err_t actions_handler(httpd_req_t *req)
         xSemaphoreGive(s_format_mtx);
         TaskHandle_t h = psram_task_create(format_sd_task, "format_sd", 16384, NULL, 5, 1, NULL, NULL);
         if (!h) {
+            netprov_lifecycle_release();
             xSemaphoreTake(s_format_mtx, portMAX_DELAY);
             s_format_progress.active = false;
             xSemaphoreGive(s_format_mtx);

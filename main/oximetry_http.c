@@ -22,6 +22,7 @@
 
 #include "oximetry_http.h"
 #include "oximetry_canonical.h"
+#include "oximeter_store.h"
 #include "upload_ox.h"
 
 #include <stdio.h>
@@ -32,7 +33,6 @@
 
 #include "esp_log.h"
 
-char *ox_store_conversion_diagnostics_json(void);
 
 static const char *TAG = "ox_http";
 
@@ -57,29 +57,43 @@ static esp_err_t json_send(httpd_req_t *req, char *json)
 
 static esp_err_t oximetry_recordings_handler(httpd_req_t *req)
 {
+    if (!ox_store_begin_io(0)) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "Oximetry storage busy");
+    }
+
+    char *json = NULL;
     char date_str[16];
     if (query(req, "date", date_str, sizeof(date_str)) && strlen(date_str) == 8) {
         cJSON *arr = NULL;
         if (oximetry_canonical_list_ready_for_day(date_str, &arr) == ESP_OK && arr) {
-            char *s = cJSON_PrintUnformatted(arr);
+            json = cJSON_PrintUnformatted(arr);
             cJSON_Delete(arr);
-            return json_send(req, s);
         }
-        return json_send(req, strdup("[]"));
+        if (!json) json = strdup("[]");
+    } else {
+        json = oximetry_canonical_list_json();
     }
-    return json_send(req, oximetry_canonical_list_json());
+    ox_store_end_io();
+    return json_send(req, json);
 }
 
 static esp_err_t oximetry_days_handler(httpd_req_t *req)
 {
     (void)req;
-    cJSON *arr = NULL;
-    if (oximetry_canonical_list_days(&arr) == ESP_OK && arr) {
-        char *s = cJSON_PrintUnformatted(arr);
-        cJSON_Delete(arr);
-        return json_send(req, s);
+    if (!ox_store_begin_io(0)) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "Oximetry storage busy");
     }
-    return json_send(req, strdup("[]"));
+    cJSON *arr = NULL;
+    char *json = NULL;
+    if (oximetry_canonical_list_days(&arr) == ESP_OK && arr) {
+        json = cJSON_PrintUnformatted(arr);
+        cJSON_Delete(arr);
+    }
+    if (!json) json = strdup("[]");
+    ox_store_end_io();
+    return json_send(req, json);
 }
 
 static esp_err_t oximetry_recording_handler(httpd_req_t *req)
@@ -89,18 +103,30 @@ static esp_err_t oximetry_recording_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing id");
         return ESP_FAIL;
     }
-    return json_send(req, oximetry_canonical_manifest_json(id));
+    if (!ox_store_begin_io(0)) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "Oximetry storage busy");
+    }
+    char *json = oximetry_canonical_manifest_json(id);
+    ox_store_end_io();
+    return json_send(req, json);
 }
 
 static esp_err_t oximetry_uploads_handler(httpd_req_t *req)
 {
-    (void)req;
-    return json_send(req, upload_ox_status_json());
+    if (!ox_store_begin_io(0)) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "Oximetry storage busy");
+    }
+    char *json = upload_ox_status_json();
+    ox_store_end_io();
+    return json_send(req, json);
 }
 
 static esp_err_t oximetry_diagnostics_handler(httpd_req_t *req)
 {
     (void)req;
+    /* The store function owns a short export lease internally. */
     return json_send(req, ox_store_conversion_diagnostics_json());
 }
 
@@ -112,13 +138,19 @@ static esp_err_t oximetry_file_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing id or track");
         return ESP_FAIL;
     }
+    if (!ox_store_begin_io(0)) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(req, "Oximetry storage busy");
+    }
     char path[OXIMETRY_CANONICAL_MAX_PATH];
     if (oximetry_canonical_resolve_track(id, track, path, sizeof(path)) != ESP_OK) {
+        ox_store_end_io();
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "track not found");
         return ESP_FAIL;
     }
     FILE *f = fopen(path, "rb");
     if (!f) {
+        ox_store_end_io();
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "track not found");
         return ESP_FAIL;
     }
@@ -127,6 +159,7 @@ static esp_err_t oximetry_file_handler(httpd_req_t *req)
     fseek(f, 0, SEEK_SET);
     if (size < 0) {
         fclose(f);
+        ox_store_end_io();
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
@@ -147,7 +180,9 @@ static esp_err_t oximetry_file_handler(httpd_req_t *req)
             if (end >= size) end = size - 1;
             if (start > end || start >= size) {
                 fclose(f); httpd_resp_set_status(req, "416 Range Not Satisfiable");
-                return httpd_resp_send(req, NULL, 0);
+                esp_err_t response = httpd_resp_send(req, NULL, 0);
+                ox_store_end_io();
+                return response;
             }
             char content_range[64];
             snprintf(content_range, sizeof(content_range), "bytes %ld-%ld/%ld", start, end, size);
@@ -158,14 +193,22 @@ static esp_err_t oximetry_file_handler(httpd_req_t *req)
     if (req->method == HTTP_HEAD) {
         char len[24]; snprintf(len, sizeof(len), "%ld", end - start + 1);
         httpd_resp_set_hdr(req, "Content-Length", len);
-        fclose(f); return httpd_resp_send(req, NULL, 0);
+        fclose(f);
+        esp_err_t response = httpd_resp_send(req, NULL, 0);
+        ox_store_end_io();
+        return response;
     }
-    if (fseek(f, start, SEEK_SET) != 0) { fclose(f); return ESP_FAIL; }
+    if (fseek(f, start, SEEK_SET) != 0) {
+        fclose(f);
+        ox_store_end_io();
+        return ESP_FAIL;
+    }
     long remaining = end - start + 1;
     uint8_t *buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
     if (!buf) buf = malloc(4096);
     if (!buf) {
         fclose(f);
+        ox_store_end_io();
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
@@ -181,6 +224,7 @@ static esp_err_t oximetry_file_handler(httpd_req_t *req)
     if (e == ESP_OK) e = httpd_resp_send_chunk(req, NULL, 0);
     free(buf);
     fclose(f);
+    ox_store_end_io();
     if (e != ESP_OK) ESP_LOGW(TAG, "track send failed: %s", esp_err_to_name(e));
     return e;
 }

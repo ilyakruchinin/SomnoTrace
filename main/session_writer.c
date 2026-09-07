@@ -31,11 +31,11 @@
  *                 header update, fsync, close, manifest write, checkpoint.
  *                 Created once at init with a static command queue.
  *
- *   sw_post     — owns the post-stop pipeline: the stop-time GetDateTime
- *                 RPC, post-therapy spool collection, EDF generation and
- *                 the upload trigger.  Created once at init; no per-stop
- *                 task allocation (a failed allocation used to leave a
- *                 session that was never finalised).
+ *   sw_post     — owns the post-stop pipeline: post-therapy spool
+ *                 collection, EDF generation and the upload trigger.
+ *                 Storage finalisation happens first; this worker receives
+ *                 copied metadata and never owns live FILE pointers.
+ *                 Created once at init; no per-stop task allocation.
  *
  *  The BLE notification path performs NO filesystem I/O.  It appends
  *  samples to a producer-owned batch and enqueues:
@@ -93,6 +93,34 @@
 #include "psram_task.h"
 
 static const char *TAG = "session";
+
+/* The notification owner retains payloads; the writer owns admission intent. */
+static bool s_start_intent;
+static int64_t s_pending_start_us;
+static int64_t s_pending_start_epoch_ms;
+static bool s_transport_uncertain;
+static uint32_t s_stream_epoch;
+
+uint32_t session_writer_stream_epoch(void)
+{
+    return s_stream_epoch;
+}
+
+static void sw_start_intent_begin(void)
+{
+    if (s_start_intent) return;
+    sd_storage_recording_intent_begin();
+    s_start_intent = true;
+    s_pending_start_us = esp_timer_get_time();
+    s_pending_start_epoch_ms = (int64_t)time(NULL) * 1000;
+}
+
+static void sw_start_intent_end(void)
+{
+    if (!s_start_intent) return;
+    s_start_intent = false;
+    sd_storage_recording_intent_end();
+}
 
 /* ── Recovery journal (.ckpt) ─────────────────────────────────────────
  * Fixed-size binary journal with two alternating slots.  A checkpoint is
@@ -160,8 +188,14 @@ typedef struct __attribute__((packed)) {
 #define SW_START_DEBOUNCE_MS    15000
 
 #define SW_STORAGE_QUEUE_LEN    24
+#define SW_STORAGE_TERMINAL_RESERVE 1
 #define SW_POST_QUEUE_LEN        4
 #define MAX_SESSION_DIR_LEN    128
+
+/* A rapid stop/start sequence must not run BLE pulls or derived-file writes
+ * alongside the next raw recording.  Require storage to remain idle for this
+ * long before beginning each expensive post-stop phase. */
+#define SW_POST_QUIET_MS       5000
 
 /* ── Stream batch ─────────────────────────────────────────────────────
  * Immutable once handed to the storage worker.  Flow and pressure share
@@ -171,11 +205,18 @@ typedef struct {
     int16_t  brp_flow[BRP_CAP];
     int16_t  brp_press[BRP_CAP];
     uint32_t n_brp;
+    uint32_t brp_position[BRP_CAP];
+    uint32_t brp_end;
     int16_t  sa2_hr[SA2_CAP];
     int16_t  sa2_spo2[SA2_CAP];
     uint32_t n_sa2;
+    uint32_t sa2_position[SA2_CAP];
+    uint32_t sa2_end;
     int16_t  pld[PLD_CAP][12];
     uint32_t n_pld;
+    uint32_t pld_position[PLD_CAP];
+    uint32_t pld_end;
+    bool timing_uncertain;
     int64_t  elapsed_us;      /* monotonic span covered by this batch */
     int64_t  last_stream_us;
 } stream_batch_t;
@@ -186,6 +227,7 @@ typedef enum {
     SW_CMD_OPEN = 0,   /* create dir, open files, sync headers        */
     SW_CMD_BATCH,      /* write one detached batch                    */
     SW_CMD_EVENT,      /* write one pre-formatted JSON event line     */
+    SW_CMD_COMMIT,     /* FIFO durability barrier, ordered with events */
     SW_CMD_FINALIZE,   /* final commit, close, write manifest         */
 } sw_cmd_type_t;
 
@@ -201,16 +243,22 @@ typedef struct {
     const char       *drift_source;
     int64_t           drift_measured_at_ms;
     const char       *state;        /* static string                   */
-    bool              free_session; /* worker owns the struct (no sw_post) */
-    SemaphoreHandle_t done;
+    bool              queue_post;   /* dispatch immutable post work after close */
+    bool              allow_ble;
 } sw_cmd_t;
 
 /* ── Post-stop pipeline job ───────────────────────────────────────── */
 
 typedef struct {
-    session_writer_t *s;            /* freed by sw_post when done      */
+    char              session_dir[MAX_SESSION_DIR_LEN];
+    char              session_id[40];
+    int64_t           start_epoch_ms;
     int64_t           end_epoch_ms;
-    const char       *state;        /* "completed" | "timed_out" | ... */
+    int64_t           stop_boot_us;
+    int64_t           clock_drift_ms;
+    bool              drift_valid;
+    char              drift_source[24];
+    int64_t           drift_measured_at_ms;
     bool              allow_ble;    /* false when BLE is the reason    */
 } sw_post_job_t;
 
@@ -219,7 +267,8 @@ typedef struct {
 typedef struct {
     FILE    *f_l0;
     FILE    *f_l1;
-    uint32_t sample_count;   /* durable records written (per channel) */
+    uint32_t sample_count;   /* records written (per channel) */
+    bool position_gap;       /* header provenance durable before missing slots */
 } stream_files_t;
 
 struct session_writer {
@@ -233,24 +282,23 @@ struct session_writer {
 
     /* ── producer state ──────────────────────────────────────────── */
     volatile bool     active;
+    bool              finalize_requested;
+    /* Held from publication until the storage worker has closed every file
+     * and committed the terminal manifest.  `active` only describes whether
+     * producers may append; it is deliberately cleared earlier. */
+    bool              recording_claim_held;
     SemaphoreHandle_t fill_mutex;
     stream_batch_t   *fill;          /* current producer batch          */
     QueueHandle_t     batch_pool;    /* free stream_batch_t*            */
     stream_batch_t   *batches[SW_BATCH_POOL];
 
-    uint8_t  sa2_countdown;
-    uint8_t  pld_countdown;
-
-    /* missing-packet compensation / hold-last-value cache */
+    /* Source positions; no hold-last-value compensation. */
     int64_t  prev_stream_ms;
     bool     prev_stream_ms_valid;
-    int16_t  last_flow, last_press;
-    bool     last_brp_valid;
-    int16_t  last_hr, last_spo2;
-    bool     last_hr_valid, last_spo2_valid;
-    int16_t  last_pld[12];
-    bool     last_pld_valid;
-
+    uint64_t stream_elapsed_ms;
+    bool stream_position_valid;
+    uint32_t next_sa2_position;
+    uint32_t next_pld_position;
     /* ── stats (producer writes, worker reads at finalize) ────────── */
     uint32_t stream_notifications;
     uint32_t gap_events;
@@ -276,11 +324,15 @@ struct session_writer {
     FILE    *f_events;
     FILE    *f_ckpt;
     uint32_t flow_mm_count;
+    uint8_t flow_mm_fill;
+    int16_t flow_mm_min, flow_mm_max;
+    bool flow_mm_missing;
     uint32_t ckpt_seq;
     int64_t  committed_elapsed_us;
     int64_t  committed_last_stream_us;
     bool     files_open;
     bool     have_uncommitted;
+    bool     commit_queued;    /* storage-owned; producer fill lock protects enqueue */
 
     /* ── failure state (worker writes, anyone reads) ──────────────── */
     volatile bool storage_failed;
@@ -330,6 +382,28 @@ static char s_client_id[64] = {0};
 
 static void sw_request_finalize(session_writer_t *s, const char *state,
                                 int64_t end_epoch_ms, bool allow_ble);
+static void pending_export_mark(const char *day);
+
+/* OPEN is lifecycle work, but it also creates the next producer.  It may not
+ * consume the final free slot: that slot belongs to the new session's future
+ * FINALIZE.  The worker keeps draining while this bounded wait runs. */
+static bool storage_queue_send_open(const sw_cmd_t *cmd, uint32_t timeout_ms)
+{
+    TickType_t started = xTaskGetTickCount();
+    TickType_t wait = pdMS_TO_TICKS(timeout_ms);
+
+    do {
+        if (uxQueueSpacesAvailable(s_storage_q) >
+                SW_STORAGE_TERMINAL_RESERVE &&
+            xQueueSend(s_storage_q, cmd, 0) == pdTRUE) {
+            return true;
+        }
+        if (wait == 0 || (xTaskGetTickCount() - started) >= wait) break;
+        vTaskDelay(1);
+    } while (true);
+
+    return false;
+}
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -435,7 +509,7 @@ static void io_fail(session_writer_t *s, const char *what)
                  what, strerror(errno));
         ESP_LOGE(TAG, "STORAGE FAILURE (%s) — errno=%d (%s)",
                  what, errno, strerror(errno));
-        bsp_display_set_notice("SD write error");
+        bsp_display_set_critical_notice("microSD write error");
     } else {
         ESP_LOGW(TAG, "storage error #%u (%s)", (unsigned)s->io_errors, what);
     }
@@ -500,6 +574,8 @@ static void batch_reset(stream_batch_t *b)
     b->n_brp = 0;
     b->n_sa2 = 0;
     b->n_pld = 0;
+    b->brp_end = b->sa2_end = b->pld_end = 0;
+    b->timing_uncertain = false;
     b->elapsed_us = 0;
     b->last_stream_us = 0;
 }
@@ -545,6 +621,24 @@ static void batch_pool_destroy(session_writer_t *s)
     s->fill = NULL;
 }
 
+/* Dispose of a not-yet-published session start. The recording claim is kept
+ * through allocation teardown so destructive storage cannot enter while any
+ * session-owned buffer or queue still exists. */
+static void session_start_discard(session_writer_t *s)
+{
+    if (!s) return;
+    batch_pool_destroy(s);
+    if (s->fill_mutex) {
+        vSemaphoreDelete(s->fill_mutex);
+        s->fill_mutex = NULL;
+    }
+    if (s->recording_claim_held) {
+        s->recording_claim_held = false;
+        sd_storage_recording_end();
+    }
+    free(s);
+}
+
 /* Hand the current fill batch to the storage worker and take a fresh one.
  * Caller holds fill_mutex.  Returns false if the batch could not be handed
  * off (pool exhausted or queue full) — the caller keeps filling and the
@@ -552,7 +646,8 @@ static void batch_pool_destroy(session_writer_t *s)
 static bool swap_and_enqueue_locked(session_writer_t *s)
 {
     if (!s->fill || s->fill->n_brp == 0) {
-        if (!s->fill || (s->fill->n_sa2 == 0 && s->fill->n_pld == 0))
+        if (!s->fill || (s->fill->n_sa2 == 0 && s->fill->n_pld == 0 &&
+                         s->fill->brp_end == 0 && !s->fill->timing_uncertain))
             return true;   /* nothing to commit */
     }
 
@@ -567,7 +662,11 @@ static bool swap_and_enqueue_locked(session_writer_t *s)
     full->elapsed_us = esp_timer_get_time() - s->start_time_us;
 
     sw_cmd_t cmd = { .type = SW_CMD_BATCH, .s = s, .batch = full };
-    if (xQueueSend(s_storage_q, &cmd, 0) != pdTRUE) {
+    /* BATCH and EVENT producers are serialised by fill_mutex.  Keep one
+     * queue slot unavailable to regular work so STOP can always enqueue the
+     * terminal command without blocking the sole BLE notification consumer. */
+    if (uxQueueSpacesAvailable(s_storage_q) <= SW_STORAGE_TERMINAL_RESERVE ||
+        xQueueSend(s_storage_q, &cmd, 0) != pdTRUE) {
         /* Put the spare back; keep filling the current batch. */
         xQueueSend(s->batch_pool, &next, 0);
         s->batch_dropped++;
@@ -579,19 +678,11 @@ static bool swap_and_enqueue_locked(session_writer_t *s)
     return true;
 }
 
-static void producer_commit(session_writer_t *s)
-{
-    if (!s || !s->fill_mutex) return;
-    xSemaphoreTake(s->fill_mutex, portMAX_DELAY);
-    swap_and_enqueue_locked(s);
-    xSemaphoreGive(s->fill_mutex);
-}
-
 /* ── Checkpoint ───────────────────────────────────────────────────── */
 
 static void ckpt_write(session_writer_t *s)
 {
-    if (!s->f_ckpt) return;
+    if (!s->f_ckpt || s->storage_failed) return;
 
     snt_ckpt_t c = {
         .magic = CKPT_MAGIC,
@@ -741,60 +832,123 @@ static void storage_open(session_writer_t *s)
     ESP_LOGI(TAG, "dir: %s", s->dir);
 }
 
-/* Write one detached batch.  No locks held: the batch is immutable. */
+/* Persist provenance before writing a newly introduced gap. A crash cannot
+ * leave positioned missing slots behind an apparently gap-free header. */
+static bool storage_mark_position_gap(session_writer_t *s, stream_files_t *stream)
+{
+    if (stream->position_gap) return true;
+    long pos = ftell(stream->f_l0);
+    uint16_t flags = SNT_POSITION_GAP_FLAG;
+    if (pos < 0 || fseek(stream->f_l0, offsetof(snt_header_t, reserved), SEEK_SET) != 0 ||
+        !write_exact(s, stream->f_l0, &flags, sizeof(flags), "gap provenance") ||
+        fflush(stream->f_l0) != 0 || fsync(fileno(stream->f_l0)) != 0 ||
+        fseek(stream->f_l0, pos, SEEK_SET) != 0) {
+        io_fail(s, "gap provenance");
+        return false;
+    }
+    stream->position_gap = true;
+    return true;
+}
+
+static bool storage_write_brp_frame(session_writer_t *s, int16_t flow, int16_t press)
+{
+    if (flow == SNT_MISSING && !storage_mark_position_gap(s, &s->flow)) return false;
+    if (press == SNT_MISSING && !storage_mark_position_gap(s, &s->press)) return false;
+    if (!write_exact(s, s->flow.f_l0, &flow, sizeof(flow), "flow write") ||
+        !write_exact(s, s->press.f_l0, &press, sizeof(press), "press write")) return false;
+    s->flow.sample_count++;
+    s->press.sample_count++;
+    if (s->flow_mm_fill == 0) {
+        s->flow_mm_min = INT16_MAX;
+        s->flow_mm_max = INT16_MIN;
+        s->flow_mm_missing = false;
+    }
+    if (flow == SNT_MISSING) s->flow_mm_missing = true;
+    else {
+        if (flow < s->flow_mm_min) s->flow_mm_min = flow;
+        if (flow > s->flow_mm_max) s->flow_mm_max = flow;
+    }
+    if (++s->flow_mm_fill == 25) {
+        int16_t mm[2] = {s->flow_mm_min, s->flow_mm_max};
+        if (s->flow_mm_missing) mm[0] = mm[1] = SNT_MISSING;
+        if (s->flow.f_l1 && !write_exact(s, s->flow.f_l1, mm, sizeof(mm), "flow_mm write")) return false;
+        s->flow_mm_count++;
+        s->flow_mm_fill = 0;
+    }
+    return true;
+}
+
+static bool storage_fill_brp_until(session_writer_t *s, uint32_t position)
+{
+    if (s->flow.sample_count >= position) return true;
+    if (!storage_mark_position_gap(s, &s->flow) ||
+        !storage_mark_position_gap(s, &s->press)) return false;
+    while (s->flow.sample_count < position) {
+        if (!storage_write_brp_frame(s, SNT_MISSING, SNT_MISSING)) return false;
+        if ((s->flow.sample_count & 255U) == 0) vTaskDelay(1);
+    }
+    return true;
+}
+
+static bool storage_fill_stream_until(session_writer_t *s, stream_files_t *stream,
+                                      uint32_t position, unsigned channels)
+{
+    if (stream->sample_count >= position) return true;
+    if (!storage_mark_position_gap(s, stream)) return false;
+    int16_t missing[12];
+    for (unsigned i = 0; i < channels; i++) missing[i] = SNT_MISSING;
+    while (stream->sample_count < position) {
+        if (!write_exact(s, stream->f_l0, missing, channels * sizeof(int16_t), "missing write")) return false;
+        stream->sample_count++;
+        if ((stream->sample_count & 255U) == 0) vTaskDelay(1);
+    }
+    return true;
+}
+
+/* Immutable positions let the storage owner materialize gaps without using
+ * producer capacity or replaying held measurements. Ends also retain a clipped
+ * tail when STOP occurs before another valid sample can be queued. */
 static void storage_write_batch(session_writer_t *s, stream_batch_t *b)
 {
     if (!s->files_open) return;
-
-    /* flow (L0) + 1 Hz MinMax sidecar (L1) */
+    if (b->timing_uncertain &&
+        (!storage_mark_position_gap(s, &s->flow) ||
+         !storage_mark_position_gap(s, &s->press) ||
+         !storage_mark_position_gap(s, &s->sa2) ||
+         !storage_mark_position_gap(s, &s->pld_f))) return;
     for (uint32_t i = 0; i < b->n_brp; i++) {
-        if (!write_exact(s, s->flow.f_l0, &b->brp_flow[i], sizeof(int16_t),
-                         "flow write")) return;
+        if (b->brp_position[i] < s->flow.sample_count) continue;
+        if (!storage_fill_brp_until(s, b->brp_position[i]) ||
+            !storage_write_brp_frame(s, b->brp_flow[i], b->brp_press[i])) return;
     }
-    if (s->flow.f_l1) {
-        uint32_t n_sec = b->n_brp / 25;
-        for (uint32_t sec = 0; sec < n_sec; sec++) {
-            uint32_t base = sec * 25;
-            int16_t fmn = INT16_MAX, fmx = INT16_MIN;
-            for (int j = 0; j < 25; j++) {
-                int16_t fv = b->brp_flow[base + j];
-                if (fv != SNT_MISSING) {
-                    if (fv < fmn) fmn = fv;
-                    if (fv > fmx) fmx = fv;
-                }
-            }
-            if (fmn == INT16_MAX) { fmn = fmx = SNT_MISSING; }
-            int16_t mm[2] = { fmn, fmx };
-            if (!write_exact(s, s->flow.f_l1, mm, sizeof(mm), "flow_mm write"))
-                return;
-            s->flow_mm_count++;
-        }
-    }
-    /* pressure — same count as flow, by construction */
-    for (uint32_t i = 0; i < b->n_brp; i++) {
-        if (!write_exact(s, s->press.f_l0, &b->brp_press[i], sizeof(int16_t),
-                         "press write")) return;
-    }
-    s->flow.sample_count += b->n_brp;
-    s->press.sample_count += b->n_brp;
-
+    if (!storage_fill_brp_until(s, b->brp_end)) return;
     for (uint32_t i = 0; i < b->n_sa2; i++) {
-        int16_t pair[2] = { b->sa2_hr[i], b->sa2_spo2[i] };
+        if (b->sa2_position[i] < s->sa2.sample_count) continue;
+        if (!storage_fill_stream_until(s, &s->sa2, b->sa2_position[i], 2)) return;
+        int16_t pair[2] = {b->sa2_hr[i], b->sa2_spo2[i]};
+        if ((pair[0] == SNT_MISSING || pair[1] == SNT_MISSING) &&
+            !storage_mark_position_gap(s, &s->sa2)) return;
         if (!write_exact(s, s->sa2.f_l0, pair, sizeof(pair), "sa2 write")) return;
+        s->sa2.sample_count++;
     }
-    s->sa2.sample_count += b->n_sa2;
-
+    if (!storage_fill_stream_until(s, &s->sa2, b->sa2_end, 2)) return;
     for (uint32_t i = 0; i < b->n_pld; i++) {
-        if (!write_exact(s, s->pld_f.f_l0, b->pld[i], sizeof(int16_t) * 12,
-                         "pld write")) return;
+        if (b->pld_position[i] < s->pld_f.sample_count) continue;
+        if (!storage_fill_stream_until(s, &s->pld_f, b->pld_position[i], 12)) return;
+        for (unsigned ch = 0; ch < 12; ++ch)
+            if (b->pld[i][ch] == SNT_MISSING &&
+                !storage_mark_position_gap(s, &s->pld_f)) return;
+        if (!write_exact(s, s->pld_f.f_l0, b->pld[i], sizeof(b->pld[i]), "pld write")) return;
+        s->pld_f.sample_count++;
     }
-    s->pld_f.sample_count += b->n_pld;
-
-    if (b->elapsed_us > s->committed_elapsed_us)
-        s->committed_elapsed_us = b->elapsed_us;
-    if (b->last_stream_us > s->committed_last_stream_us)
-        s->committed_last_stream_us = b->last_stream_us;
-
+    if (!storage_fill_stream_until(s, &s->pld_f, b->pld_end, 12)) return;
+    if (b->elapsed_us > s->committed_elapsed_us) s->committed_elapsed_us = b->elapsed_us;
+    /* Replay may drain much faster than source time. Recovery must not use
+     * processing duration to truncate a correctly positioned raw stream. */
+    int64_t source_extent_us = (int64_t)s->flow.sample_count * 40000;
+    if (source_extent_us > s->committed_elapsed_us)
+        s->committed_elapsed_us = source_extent_us;
+    if (b->last_stream_us > s->committed_last_stream_us) s->committed_last_stream_us = b->last_stream_us;
     s->have_uncommitted = true;
 }
 
@@ -832,8 +986,10 @@ static void storage_commit(session_writer_t *s)
         if (fsync(fileno(s->f_events)) != 0) io_fail(s, "events fsync");
     }
 
-    /* Only now may the checkpoint claim these counts are durable. */
+    /* Failed payload/header/event sync must never advance the checkpoint. */
+    if (s->storage_failed) return;
     ckpt_write(s);
+    if (s->storage_failed) return;
     s->have_uncommitted = false;
 
     ESP_LOGI(TAG, "commit: flow=%u press=%u sa2=%u pld=%u seq=%u",
@@ -857,6 +1013,7 @@ static void write_manifest(session_writer_t *s, const char *state)
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 
     cJSON *root = cJSON_CreateObject();
+    if (!root) { errno = ENOMEM; io_fail(s, "manifest allocation"); return; }
     cJSON_AddStringToObject(root, "id", s->session_id);
     cJSON_AddNumberToObject(root, "start_epoch_ms", (double)s->start_epoch_ms);
     if (s->end_epoch_ms > 0)
@@ -877,6 +1034,7 @@ static void write_manifest(session_writer_t *s, const char *state)
 
     cJSON_AddStringToObject(root, "state", state);
     cJSON_AddNumberToObject(root, "fmt", 2);
+    cJSON_AddBoolToObject(root, "position_gaps", s->flow.position_gap || s->press.position_gap || s->sa2.position_gap || s->pld_f.position_gap);
 
     cJSON_AddNumberToObject(root, "brp_samples", (double)s->flow.sample_count);
     cJSON_AddNumberToObject(root, "brp_mm_samples", (double)s->flow_mm_count);
@@ -938,27 +1096,30 @@ static void write_manifest(session_writer_t *s, const char *state)
 
     char *json_str = cJSON_Print(root);
     cJSON_Delete(root);
-    if (!json_str) return;
+    if (!json_str) { errno = ENOMEM; io_fail(s, "manifest encoding"); return; }
 
     /* temp → checked write → fflush → fsync → rename.  A crash must never
      * leave a half-written manifest that recovery would trust. */
-    bool ok = false;
+    int first_error = 0;
     int64_t t_man = lat_begin();
     size_t len = strlen(json_str);
     FILE *f = fopen(tmp, "w");
-    if (f) {
-        ok = (fwrite(json_str, 1, len, f) == len);
-        if (ok && fflush(f) != 0) ok = false;
-        if (ok && fsync(fileno(f)) != 0) ok = false;
-        if (fclose(f) != 0) ok = false;
+    if (!f) first_error = errno ? errno : EIO;
+    else {
+        if (fwrite(json_str, 1, len, f) != len) first_error = errno ? errno : EIO;
+        if (!first_error && fflush(f) != 0) first_error = errno ? errno : EIO;
+        if (!first_error && fsync(fileno(f)) != 0) first_error = errno ? errno : EIO;
+        if (fclose(f) != 0 && !first_error) first_error = errno ? errno : EIO;
     }
-    if (ok) {
-        unlink(path);                       /* FATFS cannot rename-over */
-        if (rename(tmp, path) != 0) ok = false;
+    if (!first_error) {
+        if (unlink(path) != 0 && errno != ENOENT) first_error = errno;
+        if (!first_error && rename(tmp, path) != 0) first_error = errno;
     }
+    bool ok = first_error == 0;
     lat_end(SW_OP_MANIFEST, t_man);
     if (!ok) {
         unlink(tmp);
+        errno = first_error;
         io_fail(s, "manifest write");
         ESP_LOGE(TAG, "failed to write %s", path);
     } else {
@@ -967,24 +1128,47 @@ static void write_manifest(session_writer_t *s, const char *state)
     free(json_str);
 }
 
+static void close_session_file(session_writer_t *s, FILE **file,
+                               const char *label)
+{
+    if (!file || !*file) return;
+    FILE *owned = *file;
+    *file = NULL;
+    if (fclose(owned) != 0) io_fail(s, label);
+}
+
 static void storage_finalize(session_writer_t *s, const sw_cmd_t *cmd)
 {
     s->end_epoch_ms = cmd->end_epoch_ms;
-    s->end_time_us = esp_timer_get_time();
+    if (s->end_time_us <= 0) s->end_time_us = esp_timer_get_time();
     s->clock_drift_ms = cmd->clock_drift_ms;
     s->clock_drift_valid = cmd->drift_valid;
     s->clock_drift_source = cmd->drift_source;
     s->clock_drift_measured_at_ms = cmd->drift_measured_at_ms;
 
-    storage_commit(s);
+    /* The terminal fill deliberately bypasses the bounded regular-command
+     * path.  Producers are disabled, so the storage owner writes it after all
+     * older FIFO batches/events and before the durability commit. */
+    if (s->fill &&
+        (s->fill->n_brp > 0 || s->fill->n_sa2 > 0 || s->fill->n_pld > 0 ||
+         s->fill->brp_end > 0 || s->fill->timing_uncertain)) {
+        s->fill->last_stream_us = s->last_stream_us;
+        s->fill->elapsed_us = s->end_time_us - s->start_time_us;
+        storage_write_batch(s, s->fill);
+        batch_reset(s->fill);
+    }
 
-    if (s->flow.f_l0)  { fclose(s->flow.f_l0);  s->flow.f_l0 = NULL; }
-    if (s->flow.f_l1)  { fclose(s->flow.f_l1);  s->flow.f_l1 = NULL; }
-    if (s->press.f_l0) { fclose(s->press.f_l0); s->press.f_l0 = NULL; }
-    if (s->sa2.f_l0)   { fclose(s->sa2.f_l0);   s->sa2.f_l0 = NULL; }
-    if (s->pld_f.f_l0) { fclose(s->pld_f.f_l0); s->pld_f.f_l0 = NULL; }
-    if (s->f_events)   { fclose(s->f_events);   s->f_events = NULL; }
-    if (s->f_ckpt)     { fclose(s->f_ckpt);     s->f_ckpt = NULL; }
+    storage_commit(s);
+    int64_t positioned_end_ms = s->start_epoch_ms + s->committed_elapsed_us / 1000;
+    if (positioned_end_ms > s->end_epoch_ms) s->end_epoch_ms = positioned_end_ms;
+
+    close_session_file(s, &s->flow.f_l0,  "flow close");
+    close_session_file(s, &s->flow.f_l1,  "flow_mm close");
+    close_session_file(s, &s->press.f_l0, "pressure close");
+    close_session_file(s, &s->sa2.f_l0,   "sa2 close");
+    close_session_file(s, &s->pld_f.f_l0, "pld close");
+    close_session_file(s, &s->f_events,   "events close");
+    close_session_file(s, &s->f_ckpt,     "checkpoint close");
     s->files_open = false;
 
     /* Never claim "completed" when storage failed — that is the difference
@@ -992,6 +1176,15 @@ static void storage_finalize(session_writer_t *s, const sw_cmd_t *cmd)
     const char *state = cmd->state;
     if (s->storage_failed) state = "storage_failed";
     write_manifest(s, state);
+
+    /* A stopped producer is not yet safe for History to inspect: queued
+     * batches, open stdio descriptors and the terminal manifest all belong to
+     * the recording lifecycle.  Publish storage-idle only after those are
+     * complete, otherwise an immediate History refresh races FATFS finalise. */
+    if (s->recording_claim_held) {
+        s->recording_claim_held = false;
+        sd_storage_recording_end();
+    }
 
     ESP_LOGI(TAG, "=== SESSION STOPPED: %s (%s) ===", s->session_id, state);
     ESP_LOGI(TAG, "flow=%u press=%u sa2=%u pld=%u total samples",
@@ -1025,25 +1218,126 @@ static void storage_finalize(session_writer_t *s, const sw_cmd_t *cmd)
     if (s->fill_mutex) { vSemaphoreDelete(s->fill_mutex); s->fill_mutex = NULL; }
 }
 
+/* Raw files are closed on the storage worker before any slow BLE spool pull or
+ * EDF generation begins. The post queue owns copied metadata, never a live
+ * session or its seven FATFS descriptors. */
+static void storage_finish_and_dispatch(session_writer_t *s,
+                                        const sw_cmd_t *cmd)
+{
+    storage_finalize(s, cmd);
+
+    if (cmd->queue_post && !s->storage_failed) {
+        sw_post_job_t job = {
+            .start_epoch_ms = s->start_epoch_ms,
+            .end_epoch_ms = s->end_epoch_ms,
+            .stop_boot_us = s->end_time_us,
+            .clock_drift_ms = s->clock_drift_ms,
+            .drift_valid = s->clock_drift_valid,
+            .drift_measured_at_ms = s->clock_drift_measured_at_ms,
+            .allow_ble = cmd->allow_ble,
+        };
+        strlcpy(job.session_dir, s->dir, sizeof(job.session_dir));
+        strlcpy(job.session_id, s->session_id, sizeof(job.session_id));
+        strlcpy(job.drift_source,
+                s->clock_drift_source ? s->clock_drift_source : "none",
+                sizeof(job.drift_source));
+
+        if (xQueueSend(s_post_q, &job, 0) != pdTRUE) {
+            char day[16];
+            noon_day_folder_local((time_t)(s->start_epoch_ms / 1000),
+                                  day, sizeof(day));
+            ESP_LOGW(TAG, "post queue full — raw session %s is safe; "
+                          "deferring day %s export",
+                     s->session_id, day);
+            pending_export_mark(day);
+        }
+    } else if (s->storage_failed) {
+        ESP_LOGE(TAG, "post: storage failed for %s — skipping export",
+                 s->session_id);
+    }
+
+    free(s);
+}
+
 /* ── Storage worker task ──────────────────────────────────────────── */
+
+/* Pin the active session against finalisation while a producer touches it.
+ * Lock order is always active lifecycle -> fill.  Finalise takes the same
+ * order, clears publication, then waits for this lock before queueing the
+ * terminal command. */
+static session_writer_t *active_session_lock(void)
+{
+    session_writer_t *s = NULL;
+    xSemaphoreTake(s_active_mutex, portMAX_DELAY);
+    if (s_active && s_active->active && !s_active->finalize_requested &&
+        s_active->fill_mutex) {
+        s = s_active;
+        xSemaphoreTake(s->fill_mutex, portMAX_DELAY);
+    }
+    xSemaphoreGive(s_active_mutex);
+    return s;
+}
+
+/* Storage is the sole queue consumer, so it must never wait for the lifecycle
+ * gate: an external STOP may be holding that gate while waiting for queue
+ * capacity.  Failing the try-lock simply skips this periodic pass and lets the
+ * worker drain another command. */
+static session_writer_t *active_session_try_lock(bool *gate_acquired)
+{
+    session_writer_t *s = NULL;
+    if (gate_acquired) *gate_acquired = false;
+    if (xSemaphoreTake(s_active_mutex, 0) != pdTRUE) return NULL;
+    if (s_active && s_active->active && !s_active->finalize_requested &&
+        s_active->fill_mutex) {
+        if (xSemaphoreTake(s_active->fill_mutex, 0) != pdTRUE) {
+            xSemaphoreGive(s_active_mutex);
+            return NULL;
+        }
+        s = s_active;
+    }
+    if (gate_acquired) *gate_acquired = true;
+    xSemaphoreGive(s_active_mutex);
+    return s;
+}
+
+static void active_session_unlock(session_writer_t *s)
+{
+    if (s && s->fill_mutex) xSemaphoreGive(s->fill_mutex);
+}
 
 static void sw_storage_task(void *arg)
 {
     (void)arg;
+    /* session_writer_init() creates both persistent workers transactionally.
+     * Park before touching any shared queue so a later creation failure can
+     * delete this task and its queues without an SMP use-after-free. */
+    vTaskSuspend(NULL);
     ESP_LOGI(TAG, "storage worker started on core %d", xPortGetCoreID());
 
     int64_t last_commit_us = esp_timer_get_time();
+    session_writer_t *file_owner = NULL;
 
     while (1) {
         sw_cmd_t cmd;
         if (xQueueReceive(s_storage_q, &cmd, pdMS_TO_TICKS(500)) == pdTRUE) {
             switch (cmd.type) {
             case SW_CMD_OPEN:
+                if (file_owner != NULL) {
+                    ESP_LOGE(TAG, "lifecycle violation: duplicate/overlapping OPEN");
+                    break;
+                }
+                file_owner = cmd.s;
                 storage_open(cmd.s);
                 last_commit_us = esp_timer_get_time();
                 break;
 
             case SW_CMD_BATCH:
+                if (file_owner != cmd.s) {
+                    /* Never dereference a non-owner: if an invariant was
+                     * violated, FINALIZE may already have freed it. */
+                    ESP_LOGE(TAG, "lifecycle violation: BATCH owner mismatch");
+                    break;
+                }
                 storage_write_batch(cmd.s, cmd.batch);
                 /* Return the buffer to the producer pool immediately. */
                 if (cmd.s->batch_pool)
@@ -1051,7 +1345,10 @@ static void sw_storage_task(void *arg)
                 break;
 
             case SW_CMD_EVENT:
-                if (cmd.s->f_events && cmd.event_json) {
+                if (file_owner != cmd.s) {
+                    ESP_LOGE(TAG, "lifecycle violation: EVENT owner mismatch");
+                } else if (cmd.s->f_events && cmd.event_json) {
+                    cmd.s->have_uncommitted = true;
                     if (fputs(cmd.event_json, cmd.s->f_events) < 0 ||
                         fputc('\n', cmd.s->f_events) < 0) {
                         io_fail(cmd.s, "event write");
@@ -1060,14 +1357,24 @@ static void sw_storage_task(void *arg)
                 free(cmd.event_json);
                 break;
 
+            case SW_CMD_COMMIT:
+                if (file_owner != cmd.s) {
+                    ESP_LOGE(TAG, "lifecycle violation: COMMIT owner mismatch");
+                    break;
+                }
+                storage_commit(cmd.s);
+                cmd.s->commit_queued = false;
+                last_commit_us = esp_timer_get_time();
+                break;
+
             case SW_CMD_FINALIZE: {
-                session_writer_t *fs = cmd.s;
-                bool own = cmd.free_session;
-                storage_finalize(fs, &cmd);
-                if (cmd.done) xSemaphoreGive(cmd.done);
-                /* Normally sw_post owns the struct and frees it after the
-                 * export pipeline; only the fallback path hands it to us. */
-                if (own) free(fs);
+                session_writer_t *finished = cmd.s;
+                if (file_owner != finished) {
+                    ESP_LOGE(TAG, "lifecycle violation: FINALIZE owner mismatch");
+                    break;
+                }
+                storage_finish_and_dispatch(finished, &cmd);
+                file_owner = NULL;
                 break;
             }
             }
@@ -1076,37 +1383,44 @@ static void sw_storage_task(void *arg)
              * stale-session watchdog. */
         }
 
-        /* Periodic: bound uncommitted time, and close orphaned sessions. */
-        session_writer_t *s = s_active;
+        /* Periodic: bound uncommitted time, and close orphaned sessions.  Pin
+         * the writer while sampling producer state; storage itself owns the
+         * object and therefore may safely finish a queued batch after unlock. */
+        bool lifecycle_sampled = false;
+        session_writer_t *s = active_session_try_lock(&lifecycle_sampled);
         int64_t now = esp_timer_get_time();
 
-        if (s && s->active) {
-            if ((now - last_commit_us) / 1000 >= SW_COMMIT_INTERVAL_MS) {
-                producer_commit(s);          /* swap producer buffer  */
-                last_commit_us = now;
-                /* The batch lands on the queue; drain it before committing so
-                 * the checkpoint covers it. */
-                sw_cmd_t pending;
-                while (xQueuePeek(s_storage_q, &pending, 0) == pdTRUE &&
-                       pending.type == SW_CMD_BATCH) {
-                    if (xQueueReceive(s_storage_q, &pending, 0) != pdTRUE) break;
-                    storage_write_batch(pending.s, pending.batch);
-                    if (pending.s->batch_pool)
-                        xQueueSend(pending.s->batch_pool, &pending.batch, 0);
+        if (!lifecycle_sampled) continue;
+
+        if (s && s == file_owner) {
+            bool commit_due =
+                ((now - last_commit_us) / 1000 >= SW_COMMIT_INTERVAL_MS);
+            int64_t idle_ms = (now - s->last_stream_us) / 1000;
+            bool stale = s->last_stream_us > 0 &&
+                         idle_ms >= SW_STALE_TIMEOUT_MS;
+
+            if (commit_due && !s->commit_queued) {
+                /* Keep the terminal reserve. A failed enqueue leaves the
+                 * deadline due; the next pass retries after draining work. */
+                if (swap_and_enqueue_locked(s) &&
+                    uxQueueSpacesAvailable(s_storage_q) > SW_STORAGE_TERMINAL_RESERVE) {
+                    sw_cmd_t barrier = { .type = SW_CMD_COMMIT, .s = s };
+                    if (xQueueSend(s_storage_q, &barrier, 0) == pdTRUE)
+                        s->commit_queued = true;
                 }
-                storage_commit(s);
             }
+            active_session_unlock(s);
 
             /* Stale-session watchdog: monotonic, so a wall-clock step or an
              * AS11 time-of-day jump cannot defeat it. */
-            int64_t idle_ms = (now - s->last_stream_us) / 1000;
-            if (s->last_stream_us > 0 && idle_ms >= SW_STALE_TIMEOUT_MS) {
+            if (stale) {
                 ESP_LOGW(TAG, "no StreamData for %lld ms — closing orphaned session",
                          (long long)idle_ms);
                 sw_request_finalize(s, "timed_out",
                                     (int64_t)time(NULL) * 1000, false);
             }
-        } else if (s == NULL) {
+        } else {
+            active_session_unlock(s);
             last_commit_us = now;
         }
     }
@@ -1428,9 +1742,30 @@ esp_err_t session_writer_pending_export_json(char **out_json)
 
 /* ── Post-stop pipeline task ──────────────────────────────────────── */
 
+static void post_wait_for_storage_quiet(void)
+{
+    int64_t quiet_since_us = 0;
+
+    while (1) {
+        int64_t now_us = esp_timer_get_time();
+        if (sd_storage_recording_active()) {
+            quiet_since_us = 0;
+        } else if (quiet_since_us == 0) {
+            quiet_since_us = now_us;
+        } else if ((now_us - quiet_since_us) / 1000 >= SW_POST_QUIET_MS) {
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
+
+
 static void sw_post_task(void *arg)
 {
     (void)arg;
+    /* See sw_storage_task(): init resumes both workers only after every
+     * shared resource exists and s_ready has been published. */
+    vTaskSuspend(NULL);
     ESP_LOGI(TAG, "post worker started on core %d (idle; waiting for jobs)",
              xPortGetCoreID());
 
@@ -1444,115 +1779,56 @@ static void sw_post_task(void *arg)
             pending_export_service();
             continue;
         }
-        session_writer_t *s = job.s;
-        if (!s) continue;
+        /* Raw files and the terminal manifest are already closed.  A quiet
+         * window absorbs rapid UI start/stop cycles and keeps the next raw
+         * session ahead of optional BLE and EDF work. */
+        post_wait_for_storage_quiet();
+        ESP_LOGI(TAG, "post: processing closed session %s", job.session_id);
 
-        /* 1. Establish drift with honest provenance.
-         *
-         * The stop-time GetDateTime RPC is the authoritative source, but it
-         * is unavailable exactly when the link dropped — which is the common
-         * case for a timed-out session.  Never block on it there. */
-        int64_t drift_ms = 0;
-        bool drift_valid = false;
-        const char *drift_source = "none";
-        int64_t drift_at = job.end_epoch_ms;
-
-        if (job.allow_ble) {
-            int64_t as11_ms = 0;
-            if (as11_ble_get_datetime(&as11_ms) == ESP_OK) {
-                drift_ms = job.end_epoch_ms - as11_ms;
-                drift_valid = true;
-                drift_source = "measured_stop";
-                ESP_LOGI(TAG, "clock_drift_ms = %lld (stop-time)", (long long)drift_ms);
-            } else if (as11_ble_get_clock_drift(&drift_ms) == ESP_OK) {
-                drift_valid = true;
-                drift_source = "measured_prestream";
-                ESP_LOGI(TAG, "clock_drift_ms = %lld (pre-stream)", (long long)drift_ms);
-            }
-        }
-        if (!drift_valid) {
-            time_drift_snapshot_t snap;
-            if (time_sync_get_drift_snapshot(&snap) && snap.available) {
-                drift_ms = snap.drift_ms;
-                drift_at = snap.measured_at_ms;
-                drift_source = snap.source;   /* "nvs" | "sd" */
-                ESP_LOGW(TAG, "clock_drift_ms = %lld (estimate from %s)",
-                         (long long)drift_ms, drift_source);
-            } else {
-                ESP_LOGW(TAG, "clock_drift_ms unavailable");
-            }
-        }
-
-        /* 2. Hand the drift to the storage worker and wait for the files to
-         * be finalised, so the manifest is complete before anything reads it. */
-        SemaphoreHandle_t done = xSemaphoreCreateBinary();
-        sw_cmd_t fin = {
-            .type = SW_CMD_FINALIZE,
-            .s = s,
-            .end_epoch_ms = job.end_epoch_ms,
-            .clock_drift_ms = drift_ms,
-            .drift_valid = drift_valid,
-            .drift_source = drift_source,
-            .drift_measured_at_ms = drift_at,
-            .state = job.state,
-            .done = done,
-        };
-        xQueueSend(s_storage_q, &fin, portMAX_DELAY);
-        if (done) {
-            xSemaphoreTake(done, pdMS_TO_TICKS(60000));
-            vSemaphoreDelete(done);
-        }
-
-        /* 3. Persist drift only when the clock was NTP-authoritative, else a
+        /* Persist drift only when the clock was NTP-authoritative, else a
          * degraded-mode session would feed its own estimate back in. */
-        if (drift_valid && time_source_get() == TIME_SRC_NTP) {
-            time_sync_save_drift(drift_ms, job.end_epoch_ms);
-        }
-
-        char session_dir[MAX_SESSION_DIR_LEN];
-        char session_id[40];
-        strlcpy(session_dir, s->dir, sizeof(session_dir));
-        strlcpy(session_id, s->session_id, sizeof(session_id));
-        int64_t start_epoch_ms = s->start_epoch_ms;
-        int64_t end_epoch_ms = s->end_epoch_ms;
-        int64_t stop_boot_us = s->end_time_us;
-        bool storage_failed = s->storage_failed;
-
-        free(s);
-        s = NULL;
-
-        if (storage_failed) {
-            ESP_LOGE(TAG, "post: storage failed for %s — skipping export",
-                     session_id);
-            continue;
+        if (job.drift_valid && time_source_get() == TIME_SRC_NTP) {
+            time_sync_save_drift(job.clock_drift_ms,
+                                 job.drift_measured_at_ms > 0
+                                     ? job.drift_measured_at_ms
+                                     : job.end_epoch_ms);
         }
 
         /* 4. Post-therapy collection (BLE spool pulls + Get RPC). */
         bool spool_current = false;
         if (job.allow_ble) {
             ESP_LOGI(TAG, "post: starting post-therapy collection");
-            post_therapy_collect(session_dir, session_id, start_epoch_ms,
-                                 drift_ms, end_epoch_ms, &spool_current);
+            post_therapy_collect(job.session_dir, job.session_id,
+                                 job.start_epoch_ms, job.clock_drift_ms,
+                                 job.end_epoch_ms, &spool_current);
             if (!spool_current) {
                 ESP_LOGI(TAG, "post: waiting for Summary spool to become current");
-                bool fresh = post_therapy_wait_spool_current(end_epoch_ms, drift_ms);
-                int64_t elapsed_ms = (esp_timer_get_time() - stop_boot_us) / 1000;
+                bool fresh = post_therapy_wait_spool_current(job.end_epoch_ms,
+                                                              job.clock_drift_ms);
+                int64_t elapsed_ms =
+                    (esp_timer_get_time() - job.stop_boot_us) / 1000;
                 ESP_LOGI(TAG, "post: spool %s after %lld ms from stop",
                          fresh ? "CURRENT" : "STALE (timeout)",
                          (long long)elapsed_ms);
             }
         } else {
             ESP_LOGW(TAG, "post: BLE unavailable, skipping spool collection for %s",
-                     session_id);
+                     job.session_id);
         }
+
+        /* A new recording may have begun during a BLE RPC.  Wait it out before
+         * opening the much heavier EDF generation pass. */
+        if (sd_storage_recording_active()) post_wait_for_storage_quiet();
 
         /* 5. EDF generation + upload trigger.  Runs here rather than in a
          * per-stop task: one persistent worker means no allocation can fail
          * at the exact moment a session needs exporting. */
-        esp_err_t ret = edf_gen_generate(session_dir, session_id,
-                                        start_epoch_ms, end_epoch_ms, drift_ms);
+        esp_err_t ret = edf_gen_generate(job.session_dir, job.session_id,
+                                         job.start_epoch_ms, job.end_epoch_ms,
+                                         job.clock_drift_ms);
         char day_folder[32];
-        as11_time_noon_day(start_epoch_ms - drift_ms, day_folder, sizeof(day_folder));
+        as11_time_noon_day(job.start_epoch_ms - job.clock_drift_ms,
+                           day_folder, sizeof(day_folder));
         if (ret == ESP_OK) {
             uploader_on_export_complete(day_folder);
         } else if (ret == ESP_ERR_TIMEOUT) {
@@ -1586,6 +1862,45 @@ static void sw_post_task(void *arg)
 
 /* ── Public API ───────────────────────────────────────────────────── */
 
+/* A newly-created worker self-suspends before reading module state. Observing
+ * eSuspended is therefore a real startup join (rather than remotely suspending
+ * a possibly-running task) and makes partial-init teardown safe on SMP. */
+static void sw_wait_startup_parked(TaskHandle_t task)
+{
+    while (task && eTaskGetState(task) != eSuspended) {
+        vTaskDelay(1);
+    }
+}
+
+static void session_writer_init_unwind(void)
+{
+    s_ready = false;
+    s_active = NULL;
+
+    /* Init waits for each created worker to self-park before proceeding, so
+     * neither task can still reference a queue when it is deleted here. */
+    if (s_post_task) {
+        psram_task_delete(s_post_task);
+        s_post_task = NULL;
+    }
+    if (s_storage_task) {
+        psram_task_delete(s_storage_task);
+        s_storage_task = NULL;
+    }
+    if (s_post_q) {
+        vQueueDelete(s_post_q);
+        s_post_q = NULL;
+    }
+    if (s_storage_q) {
+        vQueueDelete(s_storage_q);
+        s_storage_q = NULL;
+    }
+    if (s_active_mutex) {
+        vSemaphoreDelete(s_active_mutex);
+        s_active_mutex = NULL;
+    }
+}
+
 esp_err_t session_writer_init(void)
 {
     if (s_ready) return ESP_OK;
@@ -1597,7 +1912,7 @@ esp_err_t session_writer_init(void)
     s_post_q = xQueueCreate(SW_POST_QUEUE_LEN, sizeof(sw_post_job_t));
     if (!s_storage_q || !s_post_q) {
         ESP_LOGE(TAG, "session writer queue alloc failed");
-        return ESP_ERR_NO_MEM;
+        goto no_mem;
     }
 
     /* Persistent workers, created once.  If either cannot be created the
@@ -1607,74 +1922,89 @@ esp_err_t session_writer_init(void)
                                        NULL, 8, tskNO_AFFINITY, NULL, NULL);
     if (!s_storage_task) {
         ESP_LOGE(TAG, "storage worker creation failed");
-        return ESP_ERR_NO_MEM;
+        goto no_mem;
     }
+    sw_wait_startup_parked(s_storage_task);
     s_post_task = psram_task_create(sw_post_task, "sw_post", 16384,
                                     NULL, 5, 1, NULL, NULL);
     if (!s_post_task) {
         ESP_LOGE(TAG, "post worker creation failed");
-        return ESP_ERR_NO_MEM;
+        goto no_mem;
     }
+    sw_wait_startup_parked(s_post_task);
 
     s_ready = true;
+    vTaskResume(s_storage_task);
+    vTaskResume(s_post_task);
     ESP_LOGI(TAG, "session writer initialised (commit interval %d ms, "
              "stale timeout %d ms)", SW_COMMIT_INTERVAL_MS, SW_STALE_TIMEOUT_MS);
     return ESP_OK;
+
+no_mem:
+    session_writer_init_unwind();
+    return ESP_ERR_NO_MEM;
 }
 
 session_writer_t *session_writer_start(void)
 {
+    bool first_attempt = !s_start_intent;
+    sw_start_intent_begin();
     if (!s_ready) {
-        ESP_LOGE(TAG, "cannot start session: writer not initialised");
+        if (first_attempt) ESP_LOGE(TAG, "cannot start session: writer not initialised");
         return NULL;
     }
     if (!sd_storage_is_ready()) {
-        ESP_LOGE(TAG, "cannot start session: SD not ready");
+        if (first_attempt) ESP_LOGE(TAG, "cannot start session: SD not ready");
         return NULL;
     }
-    if (!sd_storage_reserve_for_recording()) {
-        ESP_LOGE(TAG, "cannot start session: insufficient free space");
+    if (!sd_storage_reserve_for_recording_cached()) {
+        if (first_attempt) ESP_LOGE(TAG, "cannot start session: insufficient free space");
         return NULL;
     }
 
-    /* Rotate any previous session through the normal stop pipeline. */
+    /* Rotate any previous session through the normal stop pipeline.  Do not
+     * pre-clear s_active: the finalise helper owns that state transition and
+     * orders FINALIZE on the storage queue before this START can enqueue OPEN. */
     xSemaphoreTake(s_active_mutex, portMAX_DELAY);
     session_writer_t *prev = s_active;
-    s_active = NULL;
     xSemaphoreGive(s_active_mutex);
     if (prev) {
         ESP_LOGW(TAG, "session already active, rotating");
-        prev->active = false;
         sw_request_finalize(prev, "rotated", (int64_t)time(NULL) * 1000, true);
+    }
+
+    /* Admit the storage owner before allocating the session and its large
+     * PSRAM batch pool. This is the atomic admission boundary against
+     * History/upload/format; every failed start below releases the claim. */
+    if (!sd_storage_recording_try_begin()) {
+        if (first_attempt) ESP_LOGW(TAG, "cannot start session: microSD reader or maintenance active");
+        return NULL;
     }
 
     session_writer_t *s = heap_caps_calloc(1, sizeof(session_writer_t), MALLOC_CAP_SPIRAM);
     if (!s) s = calloc(1, sizeof(session_writer_t));
-    if (!s) return NULL;
+    if (!s) {
+        sd_storage_recording_end();
+        return NULL;
+    }
+    s->recording_claim_held = true;
 
     s->fill_mutex = xSemaphoreCreateMutex();
-    if (!s->fill_mutex) { free(s); return NULL; }
+    if (!s->fill_mutex) {
+        session_start_discard(s);
+        return NULL;
+    }
     if (!batch_pool_create(s)) {
-        batch_pool_destroy(s);
-        vSemaphoreDelete(s->fill_mutex);
-        free(s);
+        session_start_discard(s);
         return NULL;
     }
 
-    s->pld_countdown = 1;
-    s->sa2_countdown = 1;
     s->clock_drift_source = "none";
-    s->start_time_us = esp_timer_get_time();
-    s->start_epoch_ms = (int64_t)time(NULL) * 1000;
+    s->start_time_us = s_pending_start_us;
+    s->start_epoch_ms = s_pending_start_epoch_ms;
     s->last_stream_us = s->start_time_us;
 
     make_session_id(s->session_id, sizeof(s->session_id));
-    /* Leave a breadcrumb in RTC memory: if the firmware dies mid-session, the
-     * next boot can name the session that was recording even when no core
-     * dump could be written. */
-    crash_diag_note_session(s->session_id);
-    crash_diag_note_activity("session_open");
-
     int64_t drift_ms = 0;
     as11_ble_get_clock_drift(&drift_ms);
 
@@ -1682,33 +2012,39 @@ session_writer_t *session_writer_start(void)
     as11_time_noon_day(s->start_epoch_ms - drift_ms, noon_day, sizeof(noon_day));
     snprintf(s->dir, sizeof(s->dir), "%s/%s", SD_STREAMS_DIR, noon_day);
 
-    s->active = true;
-    /* Declare the recording so destructive maintenance actions are refused
-     * for its duration (raw capture outranks derived output). */
-    sd_storage_recording_begin();
-
-    /* Publish before the files exist on purpose.  The producer can start
-     * filling immediately while the worker creates and syncs the headers,
-     * so the notifications that arrive during file setup are buffered
-     * rather than dropped — mid-therapy auto-start is detected from the
-     * very first StreamData notification. */
+    /* Queue OPEN before publishing the pointer.  Once published, producers
+     * can start filling while the worker creates the files, but FIFO ordering
+     * guarantees no BATCH or FINALIZE can overtake OPEN.  Holding the active
+     * mutex also orders this OPEN after a preceding session's FINALIZE. */
     xSemaphoreTake(s_active_mutex, portMAX_DELAY);
-    s_active = s;
-    xSemaphoreGive(s_active_mutex);
-
-    sw_cmd_t cmd = { .type = SW_CMD_OPEN, .s = s };
-    if (xQueueSend(s_storage_q, &cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
-        ESP_LOGE(TAG, "failed to enqueue session open");
-        xSemaphoreTake(s_active_mutex, portMAX_DELAY);
-        if (s_active == s) s_active = NULL;
+    if (s_active && s_active->active) {
+        /* A concurrent duplicate start won the race while this session was
+         * being allocated.  Keep that healthy session instead of replacing
+         * it with a second set of seven files. */
+        session_writer_t *existing = s_active;
         xSemaphoreGive(s_active_mutex);
+        session_start_discard(s);
+        sw_start_intent_end();
+        return existing;
+    }
+
+    s->active = true;
+    /* Leave a breadcrumb only after duplicate arbitration has selected this
+     * start. If OPEN cannot be queued, clear it with the rest of the start. */
+    crash_diag_note_session(s->session_id);
+    crash_diag_note_activity("session_open");
+    sw_cmd_t cmd = { .type = SW_CMD_OPEN, .s = s };
+    if (!storage_queue_send_open(&cmd, 0)) {
+        ESP_LOGE(TAG, "failed to enqueue session open");
         s->active = false;
-        sd_storage_recording_end();
-        batch_pool_destroy(s);
-        vSemaphoreDelete(s->fill_mutex);
-        free(s);
+        xSemaphoreGive(s_active_mutex);
+        crash_diag_note_session(NULL);
+        session_start_discard(s);
         return NULL;
     }
+    s_active = s;
+    xSemaphoreGive(s_active_mutex);
+    sw_start_intent_end();
 
     return s;
 }
@@ -1721,54 +2057,95 @@ static void sw_request_finalize(session_writer_t *s, const char *state,
 {
     if (!s) return;
 
-    /* Clear s_active first so a TherapyStart arriving during the stop
-     * pipeline creates a fresh session instead of writing into this one. */
-    xSemaphoreTake(s_active_mutex, portMAX_DELAY);
-    bool was_active = s->active;
+    /* The active mutex is also the lifecycle queue-order gate.  START holds it
+     * from OPEN enqueue through publication, while STOP holds it from detach
+     * through FINALIZE enqueue.  A later OPEN therefore cannot overtake this
+     * close even when UI and BLE callbacks arrive on different tasks. */
+    bool on_storage_worker =
+        (xTaskGetCurrentTaskHandle() == s_storage_task);
+    if (xSemaphoreTake(s_active_mutex, on_storage_worker ? 0 : portMAX_DELAY) !=
+        pdTRUE) {
+        /* The queue owner must remain able to drain capacity for an external
+         * STOP that is holding this gate.  Its watchdog will retry later. */
+        return;
+    }
+    /* Pointer comparison is safe even if the caller held an obsolete handle;
+     * do not dereference it unless it is still the published active owner. */
+    if (s_active != s) {
+        xSemaphoreGive(s_active_mutex);
+        return;
+    }
+    if (s->finalize_requested) {
+        xSemaphoreGive(s_active_mutex);
+        return;
+    }
+
+    s->finalize_requested = true;
     s->active = false;
     if (s_active == s) s_active = NULL;
-    xSemaphoreGive(s_active_mutex);
-    if (was_active) sd_storage_recording_end();
+    s->end_time_us = esp_timer_get_time();
 
-    crash_diag_note_activity(state ? state : "finalize");
-    crash_diag_note_session(NULL);
+    /* Wait behind any producer that already passed its active check.  Once
+     * this barrier completes, the terminal fill batch is immutable; the
+     * storage worker writes it directly after all older queued commands. */
+    if (s->fill_mutex) {
+        xSemaphoreTake(s->fill_mutex, portMAX_DELAY);
+        xSemaphoreGive(s->fill_mutex);
+    }
 
-    /* Hand off whatever the producer still holds, before FINALIZE is queued;
-     * the queue is FIFO, so the batch is written first. */
-    producer_commit(s);
-
-    sw_post_job_t job = {
-        .s = s,
-        .end_epoch_ms = end_epoch_ms,
-        .state = state,
-        .allow_ble = allow_ble,
-    };
-    if (xQueueSend(s_post_q, &job, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        /* Post queue full: finalise the files anyway so the raw data is never
-         * left unfinished, and let the day rebuild handle the export. */
-        ESP_LOGE(TAG, "post queue full — finalising files without export");
-        sw_cmd_t fin = {
-            .type = SW_CMD_FINALIZE, .s = s,
-            .end_epoch_ms = end_epoch_ms,
-            .drift_source = "none",
-            .state = state,
-            .free_session = true,   /* nobody downstream owns it now */
-        };
-        /* The stale-session watchdog runs ON the storage worker.  Queueing to
-         * our own queue with portMAX_DELAY would self-deadlock if it were
-         * full, so finalise inline when we are already that task. */
-        if (xTaskGetCurrentTaskHandle() == s_storage_task) {
-            storage_finalize(s, &fin);
-            free(s);
-        } else if (xQueueSend(s_storage_q, &fin, pdMS_TO_TICKS(5000)) != pdTRUE) {
-            ESP_LOGE(TAG, "storage queue full — session %s left unfinalised "
-                     "(recovery will repair it on next boot)", s->session_id);
+    int64_t drift_ms = 0;
+    bool drift_valid = false;
+    const char *drift_source = "none";
+    int64_t drift_at = end_epoch_ms;
+    if (allow_ble && as11_ble_get_clock_drift(&drift_ms) == ESP_OK) {
+        drift_valid = true;
+        drift_source = "measured_prestream";
+    } else {
+        time_drift_snapshot_t snap;
+        if (time_sync_peek_drift_snapshot(&snap) && snap.available) {
+            drift_ms = snap.drift_ms;
+            drift_source = snap.source;
+            drift_at = snap.measured_at_ms;
         }
     }
+
+    sw_cmd_t fin = {
+        .type = SW_CMD_FINALIZE,
+        .s = s,
+        .end_epoch_ms = end_epoch_ms,
+        .clock_drift_ms = drift_ms,
+        .drift_valid = drift_valid,
+        .drift_source = drift_source,
+        .drift_measured_at_ms = drift_at,
+        .state = state,
+        .queue_post = true,
+        .allow_ble = allow_ble,
+    };
+
+    /* Regular BATCH/EVENT admission always preserves this terminal slot.
+     * A STOP therefore never stalls the BLE notification consumer, while the
+     * active mutex still orders this FINALIZE ahead of a later OPEN. */
+    BaseType_t queued = xQueueSend(s_storage_q, &fin, 0);
+
+    if (queued != pdTRUE) {
+        s->finalize_requested = false;
+        s->active = true;
+        s_active = s;
+        xSemaphoreGive(s_active_mutex);
+        ESP_LOGW(TAG, "storage queue busy — deferring finalise of %s",
+                 s->session_id);
+        return;
+    }
+
+    xSemaphoreGive(s_active_mutex);
+    crash_diag_note_activity(state ? state : "finalize");
+    crash_diag_note_session(NULL);
 }
 
 esp_err_t session_writer_stop(session_writer_t *s)
 {
+    s_stream_epoch++;
+    sw_start_intent_end();
     if (!s) return ESP_OK;
     sw_request_finalize(s, "completed", (int64_t)time(NULL) * 1000, true);
     return ESP_OK;
@@ -1804,7 +2181,8 @@ static void queue_event_json(session_writer_t *s, char *json_str)
 {
     if (!s || !json_str) { free(json_str); return; }
     sw_cmd_t cmd = { .type = SW_CMD_EVENT, .s = s, .event_json = json_str };
-    if (xQueueSend(s_storage_q, &cmd, 0) != pdTRUE) {
+    if (uxQueueSpacesAvailable(s_storage_q) <= SW_STORAGE_TERMINAL_RESERVE ||
+        xQueueSend(s_storage_q, &cmd, 0) != pdTRUE) {
         s->event_dropped++;
         free(json_str);
     }
@@ -1980,19 +2358,47 @@ static int match_key(const char *key, int klen)
 
 static int64_t parse_starttime_ms(const char *s, int len)
 {
-    if (len < 24) return -1;
-    if (s[11] < '0' || s[11] > '9') return -1;
+    if (len < 23 || s[13] != ':' || s[16] != ':' || s[19] != '.') return -1;
+    static const uint8_t digits[] = {11,12,14,15,17,18,20,21,22};
+    for (unsigned i = 0; i < sizeof(digits); ++i)
+        if (s[digits[i]] < '0' || s[digits[i]] > '9') return -1;
     int h   = (s[11] - '0') * 10 + (s[12] - '0');
     int m   = (s[14] - '0') * 10 + (s[15] - '0');
     int sec = (s[17] - '0') * 10 + (s[18] - '0');
     int ms  = (s[20] - '0') * 100 + (s[21] - '0') * 10 + (s[22] - '0');
+    if (h >= 24 || m >= 60 || sec >= 60) return -1;
     return (int64_t)h * 3600000 + m * 60000 + sec * 1000 + ms;
 }
 
-void session_writer_on_stream_data_raw(const char *json, int len)
+static void publish_live_stream(const int16_t *flow_vals, int flow_n,
+                                const int16_t *pld_vals, const bool *pld_found)
 {
-    session_writer_t *s = session_writer_get_active();
+    /* PatientFlow is encoded as hundredths of a litre per second.  The
+     * display API uses litres per minute, so convert at this boundary:
+     *
+     *     raw / 100 L/s * 60 s/min = raw * 0.6 L/min
+     *
+     * Keeping the display-side unit explicit matters on the 7-inch UI: it
+     * stores tenths of L/min. Passing L/s made ordinary breathing values
+     * smaller than a single chart pixel and rendered an apparent flat line. */
+    for (int j = 0; j < flow_n; j++) {
+        /* Missingness occupies time on the live trace without becoming a measurement. */
+        bsp_display_push_flow(flow_vals[j] == SNT_MISSING ? NAN : flow_vals[j] * 0.6f);
+    }
 
+    /* Push leak rate to display for info panel mode.
+     * PLD channel 3 = Leak, stored as value*100 in L/s (same raw format
+     * as .snt files).  Convert to L/min: dig * 0.6f, matching
+     * pld_leak_phys() in session_graph.c. */
+    if (pld_found[3] && pld_vals[3] >= 0)
+        bsp_display_push_leak(pld_vals[3] * 0.6f);
+
+}
+
+
+bool session_writer_try_stream_data_raw(const char *json, int len)
+{
+    if (!json || len <= 0) return true;
     static bool s_first_logged = false;
     if (!s_first_logged) {
         s_first_logged = true;
@@ -2072,19 +2478,14 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         }
     }
 
-    /* PatientFlow: push to display, detect active flow */
     bool has_active_flow = false;
     for (int j = 0; j < flow_n; j++) {
-        bsp_display_push_flow(flow_vals[j] / 100.0f);
+        /* null samples are retained as gaps in the recording below, but are
+         * not measurements and must neither move the live trace nor trigger
+         * the mid-therapy recovery heuristic. */
+        if (flow_vals[j] == SNT_MISSING) continue;
         if (abs(flow_vals[j]) > 50) has_active_flow = true;
     }
-
-    /* Push leak rate to display for info panel mode.
-     * PLD channel 3 = Leak, stored as value*100 in L/s (same raw format
-     * as .snt files).  Convert to L/min: dig * 0.6f, matching
-     * pld_leak_phys() in session_graph.c. */
-    if (pld_found[3] && pld_vals[3] >= 0)
-        bsp_display_push_leak(pld_vals[3] * 0.6f);
 
     bool has_therapy_pressure = false;
     for (int j = 0; j < press_n; j++) {
@@ -2095,182 +2496,131 @@ void session_writer_on_stream_data_raw(const char *json, int len)
      * therapy (reboot mid-therapy, or ESP powered on after the AS11).
      * Gated against Mask Fit and Cooldown/Drying mode so non-therapeutic
      * blower air never opens a phantom therapy session (issue #149). */
-    if ((!s || !session_writer_is_active(s)) && !s_therapy_stopped
+    session_writer_t *s = active_session_lock();
+
+    if (!s && !s_therapy_stopped
         && !s_in_mask_fit && !s_in_cooldown
-        && has_active_flow && has_therapy_pressure) {
-        ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
-        bsp_display_set_therapy_active(true);
-        bsp_display_set_therapy_start_time(esp_timer_get_time());
-        s = session_writer_start();
-        if (s) {
-            s_started_from_event = false;
+        && (s_start_intent || (has_active_flow && has_therapy_pressure))) {
+        bool first_attempt = !s_start_intent;
+        if (first_attempt) ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
+        if (!bsp_display_set_therapy_active(true)) {
+            ESP_LOGW(TAG, "therapy recovery ignored: restart already committed");
         } else {
-            ESP_LOGW(TAG, "session_writer_start() failed — "
-                     "graph active but NOT recording to SD");
+            if (first_attempt) bsp_display_set_therapy_start_time(esp_timer_get_time());
+            session_writer_t *started = session_writer_start();
+            if (started) {
+                s_started_from_event = false;
+                s = active_session_lock();
+            } else if (first_attempt) {
+                ESP_LOGW(TAG, "session_writer_start() failed — "
+                         "graph active but NOT recording to SD");
+            }
         }
     }
 
-    if (!s || !session_writer_is_active(s)) return;
+    if (!s && s_start_intent) return false;
+    if (!s) {
+    publish_live_stream(flow_vals, flow_n, pld_vals, pld_found);
+        return true;
+    }
 
     s->last_stream_us = esp_timer_get_time();
-
-    xSemaphoreTake(s->fill_mutex, portMAX_DELAY);
 
     s->stream_notifications++;
     stream_batch_t *b = s->fill;
 
-    /* ── Missing-packet compensation ───────────────────────────────
-     * Short gaps hold the previous value (visually indistinguishable and
-     * matching AS11 conventions).  Long gaps are NOT padded: minutes of
-     * fabricated data would be worse than an honest boundary, so they are
-     * counted and — beyond SW_SPLIT_GAP_MS — the session is split. */
+    /* Source spacing, not task scheduling, determines fixed-rate positions.
+     * Only a real midnight wrap is treated as a wrap; other backward clock
+     * changes start a new span instead of manufacturing nearly 24 hours. */
+    int64_t delta_ms = 200;
     bool want_split = false;
     if (cur_stream_ms >= 0 && s->prev_stream_ms_valid) {
-        int64_t gap = cur_stream_ms - s->prev_stream_ms;
-        if (gap < 0) gap += 86400000;
-        if (gap > 280) {
-            int missing = (int)((gap - 100) / 200);
-            if (missing > 0 && missing < 50) {
-                ESP_LOGW(TAG, "StreamData gap: %lldms (%d missing notifications), "
-                         "inserting compensation", (long long)gap, missing);
-                s->gap_events++;
-                s->gap_missing_total += missing;
-
-                for (int m = 0; m < missing; m++) {
-                    uint32_t base = b->n_brp;
-                    if (base + 5 <= BRP_CAP && s->last_brp_valid) {
-                        for (int j = 0; j < 5; j++) {
-                            b->brp_flow[base + j] = s->last_flow;
-                            b->brp_press[base + j] = s->last_press;
-                        }
-                        b->n_brp = base + 5;
-                    } else if (s->last_brp_valid) {
-                        s->brp_dropped += 5;
-                    }
-                }
-                for (int m = 0; m < missing; m++) {
-                    if (s->sa2_countdown <= 1) {
-                        s->sa2_countdown = 5;
-                        if (b->n_sa2 < SA2_CAP) {
-                            b->sa2_hr[b->n_sa2] = s->last_hr_valid ? s->last_hr : SNT_MISSING;
-                            b->sa2_spo2[b->n_sa2] = s->last_spo2_valid ? s->last_spo2 : SNT_MISSING;
-                            b->n_sa2++;
-                        } else {
-                            s->sa2_dropped++;
-                        }
-                    } else {
-                        s->sa2_countdown--;
-                    }
-                }
-                for (int m = 0; m < missing; m++) {
-                    if (s->pld_countdown <= 1) {
-                        s->pld_countdown = 10;
-                        if (s->last_pld_valid && b->n_pld < PLD_CAP) {
-                            for (int k = 0; k < 12; k++)
-                                b->pld[b->n_pld][k] = s->last_pld[k];
-                            b->n_pld++;
-                        } else if (s->last_pld_valid) {
-                            s->pld_dropped++;
-                        }
-                    } else {
-                        s->pld_countdown--;
-                    }
-                }
-            } else if (missing >= 50) {
-                /* Uncompensated discontinuity — record it honestly. */
-                int64_t offset_ms = s->start_epoch_ms > 0
-                    ? (esp_timer_get_time() - s->start_time_us) / 1000 : 0;
+        delta_ms = cur_stream_ms - s->prev_stream_ms;
+        if (delta_ms < 0 && s->prev_stream_ms >= 23 * 3600000LL &&
+            cur_stream_ms < 3600000LL) delta_ms += 86400000LL;
+        if (delta_ms == 0) { active_session_unlock(s); return true; }
+        /* Ordered intake can still contain an old source packet. Do not
+         * publish it twice or rotate a fresh session for a small regression.
+         * A sustained/large clock reset is handled as a separate span below. */
+        if (delta_ms < 0 && delta_ms > -SW_SPLIT_GAP_MS) {
+            b->timing_uncertain = true;
+            active_session_unlock(s);
+            return true;
+        }
+        want_split = delta_ms < 0 || delta_ms >= SW_SPLIT_GAP_MS;
+        if (delta_ms > 280) {
+            s->gap_events++;
+            s->gap_missing_total += (uint32_t)((delta_ms - 100) / 200);
+            if (delta_ms >= 10200) {
                 s->gap_long_events++;
-                s->gap_long_ms_total += (uint64_t)gap;
-                if (s->gap_long_first_ms == 0) s->gap_long_first_ms = offset_ms;
-                s->gap_long_last_ms = offset_ms;
-                ESP_LOGW(TAG, "long StreamData gap: %lld ms (%d notifications) — "
-                         "not compensated", (long long)gap, missing);
-                if (gap >= SW_SPLIT_GAP_MS) want_split = true;
+                s->gap_long_ms_total += (uint64_t)delta_ms;
+                if (!s->gap_long_first_ms) s->gap_long_first_ms = s->stream_elapsed_ms;
+                s->gap_long_last_ms = s->stream_elapsed_ms + delta_ms;
             }
         }
     }
-
-    if (cur_stream_ms >= 0) {
-        s->prev_stream_ms = cur_stream_ms;
-        s->prev_stream_ms_valid = true;
-    }
-
     if (want_split) {
-        /* Split rather than emit a continuous-looking timeline across a
-         * multi-minute hole.  .snt assumes uniform sampling, so a gap this
-         * large cannot be represented honestly inside one session. */
-        xSemaphoreGive(s->fill_mutex);
-        ESP_LOGW(TAG, "splitting session at long gap");
+        active_session_unlock(s);
         sw_request_finalize(s, "split", (int64_t)time(NULL) * 1000, true);
-        s = session_writer_start();
-        if (!s) return;
-        xSemaphoreTake(s->fill_mutex, portMAX_DELAY);
+        if (!session_writer_start()) return false;
+        s = active_session_lock();
+        if (!s) return false;
         b = s->fill;
-        s->prev_stream_ms = cur_stream_ms;
-        s->prev_stream_ms_valid = true;
     }
-
-    /* BRP: flow + pressure appended in lockstep at the same buffer index. */
-    {
-        uint32_t base = b->n_brp;
-        int n_pairs = flow_n > press_n ? flow_n : press_n;
-        int room = (int)(BRP_CAP - base);
-        int added = n_pairs;
-        if (added > room) {
-            s->brp_dropped += (uint32_t)(added - room);
-            added = room;
-        }
-        for (int j = 0; j < added; j++) {
-            b->brp_flow[base + j]  = (j < flow_n)  ? flow_vals[j]  : SNT_MISSING;
-            b->brp_press[base + j] = (j < press_n) ? press_vals[j] : SNT_MISSING;
-        }
-        b->n_brp = base + (uint32_t)added;
-        if (added > 0) {
-            s->last_flow = b->brp_flow[b->n_brp - 1];
-            s->last_press = b->brp_press[b->n_brp - 1];
-            s->last_brp_valid = true;
-        }
+    if (s->stream_position_valid && delta_ms > 200) {
+        uint32_t missing = (uint32_t)((delta_ms - 200 + 20) / 40);
+        bsp_display_push_flow_gap(missing);
     }
+    publish_live_stream(flow_vals, flow_n, pld_vals, pld_found);
 
-    /* SA2: 1 Hz, decimated from the 5 Hz report. */
-    if (--s->sa2_countdown == 0) {
-        s->sa2_countdown = 5;
+    if (s->stream_position_valid) s->stream_elapsed_ms += (uint64_t)delta_ms;
+    else s->stream_position_valid = true;
+    s->prev_stream_ms = cur_stream_ms;
+    s->prev_stream_ms_valid = cur_stream_ms >= 0;
+    b->timing_uncertain |= cur_stream_ms < 0 || s_transport_uncertain;
+    s_transport_uncertain = false;
+    uint32_t position = (uint32_t)((s->stream_elapsed_ms + 20) / 40);
+
+    uint32_t base = b->n_brp;
+    int n_pairs = flow_n > press_n ? flow_n : press_n;
+    int added = n_pairs;
+    if (added > (int)(BRP_CAP - base)) {
+        added = (int)(BRP_CAP - base);
+        s->brp_dropped += (uint32_t)(n_pairs - added);
+    }
+    for (int j = 0; j < added; j++) {
+        b->brp_position[base + j] = position + (uint32_t)j;
+        b->brp_flow[base + j] = j < flow_n ? flow_vals[j] : SNT_MISSING;
+        b->brp_press[base + j] = j < press_n ? press_vals[j] : SNT_MISSING;
+    }
+    b->n_brp += (uint32_t)added;
+    b->brp_end = position + (uint32_t)(n_pairs > 5 ? n_pairs : 5);
+
+    uint32_t sa2_position = position / 25;
+    if (sa2_position >= s->next_sa2_position) {
+        s->next_sa2_position = sa2_position + 1;
         if (b->n_sa2 < SA2_CAP) {
-            b->sa2_hr[b->n_sa2] = hr_found ? hr_val : SNT_MISSING;
-            b->sa2_spo2[b->n_sa2] = spo2_found ? spo2_val : SNT_MISSING;
-            b->n_sa2++;
-        } else {
-            s->sa2_dropped++;
-        }
-        if (hr_found) { s->last_hr = hr_val; s->last_hr_valid = true; }
-        if (spo2_found) { s->last_spo2 = spo2_val; s->last_spo2_valid = true; }
-    } else if (spo2_found && b->n_sa2 > 0) {
+            uint32_t i = b->n_sa2++;
+            b->sa2_position[i] = sa2_position;
+            b->sa2_hr[i] = hr_found ? hr_val : SNT_MISSING;
+            b->sa2_spo2[i] = spo2_found ? spo2_val : SNT_MISSING;
+        } else s->sa2_dropped++;
+    } else if (spo2_found && b->n_sa2 &&
+               b->sa2_position[b->n_sa2 - 1] == sa2_position) {
         b->sa2_spo2[b->n_sa2 - 1] = spo2_val;
-        s->last_spo2 = spo2_val;
-        s->last_spo2_valid = true;
     }
+    b->sa2_end = sa2_position + 1;
 
-    /* PLD: 12 channels at 0.5 Hz, decimated from the 5 Hz report. */
-    if (--s->pld_countdown == 0) {
-        s->pld_countdown = 10;
-        bool any_found = false;
-        for (int k = 0; k < 12; k++) {
-            if (pld_found[k]) { any_found = true; break; }
-        }
-        if (any_found) {
-            if (b->n_pld < PLD_CAP) {
-                for (int k = 0; k < 12; k++)
-                    b->pld[b->n_pld][k] = pld_found[k] ? pld_vals[k] : SNT_MISSING;
-                b->n_pld++;
-                for (int k = 0; k < 12; k++)
-                    s->last_pld[k] = b->pld[b->n_pld - 1][k];
-                s->last_pld_valid = true;
-            } else {
-                s->pld_dropped++;
-            }
-        }
+    uint32_t pld_position = position / 50;
+    if (pld_position >= s->next_pld_position) {
+        s->next_pld_position = pld_position + 1;
+        if (b->n_pld < PLD_CAP) {
+            uint32_t i = b->n_pld++;
+            b->pld_position[i] = pld_position;
+            for (int k = 0; k < 12; k++) b->pld[i][k] = pld_found[k] ? pld_vals[k] : SNT_MISSING;
+        } else s->pld_dropped++;
     }
+    b->pld_end = pld_position + 1;
 
     /* Hand off to the storage worker before anything can be clipped.  No
      * file I/O happens here — only a pointer swap. */
@@ -2280,7 +2630,25 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         swap_and_enqueue_locked(s);
     }
 
-    xSemaphoreGive(s->fill_mutex);
+    active_session_unlock(s);
+    return true;
+}
+
+void session_writer_on_stream_data_raw(const char *json, int len)
+{
+    (void)session_writer_try_stream_data_raw(json, len);
+}
+
+void session_writer_on_transport_loss(void)
+{
+    s_stream_epoch++;
+    sw_start_intent_end();
+    s_transport_uncertain = true;
+    session_writer_t *s = active_session_lock();
+    if (s) {
+        s->fill->timing_uncertain = true;
+        active_session_unlock(s);
+    }
 }
 
 /* ── Notification dispatch ────────────────────────────────────────── */
@@ -2293,6 +2661,17 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
     const char *method_str = method ? method->valuestring : NULL;
     if (!method_str) return;
 
+    /* Do not trust a bare pointer captured by the caller.  Reacquire under
+     * the lifecycle lock so the storage worker cannot destroy this session
+     * while the notification is inspecting or queueing data for it. */
+    (void)s;
+    s = active_session_lock();
+    bool session_locked = (s != NULL);
+#define NOTIFY_RETURN() do {                         \
+        if (session_locked) active_session_unlock(s); \
+        return;                                       \
+    } while (0)
+
     ESP_LOGD(TAG, "notification: %s", method_str);
 
     if (strcmp(method_str, "EventNotification") == 0) {
@@ -2300,42 +2679,53 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         as11_event_t ev_type = check_event_notification(msg, &report);
 
         if (ev_type == AS11_EV_THERAPY_STOP) {
+            s_stream_epoch++;
             ESP_LOGI(TAG, ">>> THERAPY STOP detected");
             crash_diag_note_activity("therapy_stop");
             s_therapy_stopped = true;
+            sw_start_intent_end();
             s_in_mask_fit = false;
             bsp_display_set_therapy_active(false);
             therapy_alert_on_therapy_stop();
-            if (s && s->active) {
+            if (s) {
                 write_event(s, msg);
+                active_session_unlock(s);
+                session_locked = false;
                 sw_request_finalize(s, "completed",
                                     (int64_t)time(NULL) * 1000, true);
                 s = NULL;
             }
-            return;
+            NOTIFY_RETURN();
         }
         if (ev_type == AS11_EV_THERAPY_START) {
             ESP_LOGI(TAG, ">>> THERAPY START detected");
+            if (!bsp_display_set_therapy_active(true)) {
+                ESP_LOGW(TAG, "TherapyStart ignored: restart already committed");
+                NOTIFY_RETURN();
+            }
             crash_diag_note_activity("therapy_start");
             s_therapy_stopped = false;
             s_in_mask_fit = false;
             s_in_cooldown = false;
             therapy_alert_on_therapy_start();
-            bsp_display_set_therapy_active(true);
             bsp_display_set_therapy_start_time(esp_timer_get_time());
 
             int64_t now_us = esp_timer_get_time();
             bool duplicate = false;
             if (report && report[0] && strcmp(report, s_last_start_report) == 0) {
                 duplicate = true;
-            } else if (s && s->active &&
+            } else if (s &&
                        (now_us - s->start_time_us) / 1000 < SW_START_DEBOUNCE_MS) {
                 duplicate = true;
             }
             if (report && report[0])
                 strlcpy(s_last_start_report, report, sizeof(s_last_start_report));
 
-            if (s && s->active && !duplicate) {
+            if (!duplicate) {
+                s_stream_epoch++;
+                sw_start_intent_end();
+            }
+            if (s && !duplicate) {
                 /* A genuine TherapyStart while a session is still open means
                  * the TherapyStop was missed (BLE dropout across the end of
                  * therapy).  Rotate: without this the sessions glue together,
@@ -2343,15 +2733,20 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                  * therapy's StreamData keeps resetting it. */
                 ESP_LOGW(TAG, "TherapyStart while session active — "
                          "missed TherapyStop, rotating session");
+                active_session_unlock(s);
+                session_locked = false;
                 sw_request_finalize(s, "rotated",
                                     (int64_t)time(NULL) * 1000, true);
                 s = NULL;
-            } else if (duplicate && s && s->active) {
+            } else if (duplicate && s) {
                 ESP_LOGI(TAG, "duplicate TherapyStart ignored (echo)");
             }
 
-            if (!s || !s->active) {
-                s = session_writer_start();
+            if (!s) {
+                if (session_writer_start()) {
+                    s = active_session_lock();
+                    session_locked = (s != NULL);
+                }
             }
             if (s) {
                 s_started_from_event = true;
@@ -2360,66 +2755,79 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                 ESP_LOGW(TAG, "session_writer_start() failed — "
                          "graph active but NOT recording to SD");
             }
-            return;
+            NOTIFY_RETURN();
         }
         if (ev_type == AS11_EV_MASK_FIT_START) {
+            s_stream_epoch++;
             ESP_LOGI(TAG, ">>> MASK FIT / DIAGNOSTIC START detected (suppressing therapy)");
             s_in_mask_fit = true;
+            sw_start_intent_end();
             bsp_display_set_therapy_active(false);
             /* If a session was started by flow heuristic within the last 15 seconds
              * before the MaskFit event arrived, abort the false session. */
-            if (s && s->active && !s_started_from_event) {
+            if (s && !s_started_from_event) {
                 int64_t dur_ms = (esp_timer_get_time() - s->start_time_us) / 1000;
                 if (dur_ms < 15000) {
                     ESP_LOGW(TAG, "aborting false session opened by Mask Fit airflow (%lld ms)",
                              (long long)dur_ms);
+                    active_session_unlock(s);
+                    session_locked = false;
                     sw_request_finalize(s, "aborted_mask_fit",
                                         (int64_t)time(NULL) * 1000, false);
                     s = NULL;
                 }
             }
-            return;
+            NOTIFY_RETURN();
         }
         if (ev_type == AS11_EV_MASK_FIT_STOP) {
             ESP_LOGI(TAG, ">>> MASK FIT / DIAGNOSTIC STOP detected");
             s_in_mask_fit = false;
-            return;
+            NOTIFY_RETURN();
         }
         if (ev_type == AS11_EV_COOLDOWN_START) {
+            s_stream_epoch++;
             ESP_LOGI(TAG, ">>> COOLDOWN (tube drying) STARTED");
             s_in_cooldown = true;
             s_therapy_stopped = true;
+            sw_start_intent_end();
             bsp_display_set_therapy_active(false);
             therapy_alert_on_therapy_stop();
-            if (s && s->active) {
+            if (s) {
                 ESP_LOGI(TAG, "finalizing therapy session on CooldownStarted");
                 write_event(s, msg);
+                active_session_unlock(s);
+                session_locked = false;
                 sw_request_finalize(s, "completed",
                                     (int64_t)time(NULL) * 1000, true);
                 s = NULL;
             }
-            return;
+            NOTIFY_RETURN();
         }
         if (ev_type == AS11_EV_COOLDOWN_STOP) {
             ESP_LOGI(TAG, ">>> COOLDOWN (tube drying) STOPPED");
             s_in_cooldown = false;
-            return;
+            NOTIFY_RETURN();
         }
         if (ev_type == AS11_EV_STANDBY_START) {
+            s_stream_epoch++;
+            sw_start_intent_end();
+            s_therapy_stopped = true;
             ESP_LOGD(TAG, ">>> STANDBY STARTED");
-            if (s && s->active) {
+            if (s) {
                 ESP_LOGI(TAG, "finalizing therapy session on StandbyStarted");
                 s_therapy_stopped = true;
                 bsp_display_set_therapy_active(false);
                 therapy_alert_on_therapy_stop();
                 write_event(s, msg);
+                active_session_unlock(s);
+                session_locked = false;
                 sw_request_finalize(s, "completed",
                                     (int64_t)time(NULL) * 1000, true);
                 s = NULL;
             }
-            return;
+            NOTIFY_RETURN();
         }
-        if (ev_type != AS11_EV_NONE) return;
+        if (ev_type != AS11_EV_NONE) NOTIFY_RETURN();
 
         cJSON *params = cJSON_GetObjectItem(msg, "params");
         if (params) {
@@ -2439,7 +2847,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                         }
                     }
                 }
-                return;
+                NOTIFY_RETURN();
             }
             /* _ZLE ValueChange — the AS11 omits reportTime here, so capture
              * the NTP time at receipt and inject it.  The pair (AS11 event +
@@ -2457,7 +2865,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                             zle_val = (int)val->valuedouble;
                     }
                 }
-                if (s && s->active) {
+                if (s) {
                     cJSON *zle_copy = cJSON_Duplicate(msg, 1);
                     if (zle_copy) {
                         cJSON *zp = cJSON_GetObjectItem(zle_copy, "params");
@@ -2478,15 +2886,17 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                 }
                 ESP_LOGI(TAG, ">>> _ZLE ValueChange: %d (%s)",
                          zle_val, zle_val == 1 ? "rising edge" : "falling edge");
-                return;
+                NOTIFY_RETURN();
             }
         }
 
-        if (s && s->active) write_event(s, msg);
-        return;
+        if (s) write_event(s, msg);
+        NOTIFY_RETURN();
     }
 
-    if (s && s->active) write_event(s, msg);
+    if (s) write_event(s, msg);
+    NOTIFY_RETURN();
+#undef NOTIFY_RETURN
 }
 
 /* ════════════════════════════════════════════════════════════════════

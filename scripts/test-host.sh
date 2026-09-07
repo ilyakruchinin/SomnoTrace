@@ -9,3 +9,13 @@ python3 scripts/idf_async_allocation_test.py
 python3 scripts/oximetry_forget_tombstone_contract_test.py
 python3 scripts/psram_task_lifecycle_contract_test.py
 python3 scripts/backend_runtime_test.py
+python3 scripts/session_storage_behavior_test.py
+python3 scripts/session_checkpoint_barrier_test.py
+python3 scripts/rapid_session_lifecycle_contract_test.py
+python3 scripts/session_writer_start_resilience_contract_test.py
+python3 scripts/sd_recording_arbitration_contract_test.py
+python3 scripts/oximetry_sd_lease_contract_test.py
+python3 scripts/sd_mount_fallback_contract_test.py
+python3 scripts/backend_recording_test.py
+python3 scripts/therapy_lifecycle_race_contract_test.py
+python3 scripts/therapy_gate_behavior_test.py

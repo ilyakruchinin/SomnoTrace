@@ -42,6 +42,10 @@ extern "C" {
 #define SNT_TIER_RAW       0            /* L0 raw sample stream */
 #define SNT_TIER_MINMAX    1            /* L1 MinMax stream */
 
+/* header.reserved bit: the source contains positioned missing-data gaps.
+ * Continuous EDF export must retain these streams as raw SNT. */
+#define SNT_POSITION_GAP_FLAG 0x0001U
+
 /* Authoritative 28-byte packed SNT header */
 typedef struct __attribute__((packed)) {
     uint32_t magic;            /* 0x534E5442 "SNTB"                  */
