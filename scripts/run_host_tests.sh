@@ -108,6 +108,12 @@ run_test first_run_setup_test -I"$SHIM" -I"$MAIN_DIR" \
     scripts/first_run_setup_test.c "$MAIN_DIR/first_run_setup_model.c"
 run_test timezone_catalog_test -DTIMEZONE_CATALOG_HOST_TEST -I"$SHIM" -I"$MAIN_DIR" \
     scripts/timezone_catalog_test.c "$MAIN_DIR/timezone_catalog.c"
+run_test history_cache_test -DHISTORY_CACHE_HOST_TEST -I"$SHIM" -I"$MAIN_DIR" \
+    scripts/history_cache_test.c "$MAIN_DIR/history_cache.c" -lpthread
+run_test history_flow_cache_test -D_DARWIN_C_SOURCE -D_POSIX_C_SOURCE=200809L \
+    -I"$SHIM" -I"$MAIN_DIR" scripts/history_flow_cache_test.c "$MAIN_DIR/history_flow_cache.c"
+run_test touch_history_model_test -DTOUCH_HISTORY_MODEL_TEST -I"$SHIM" -I"$MAIN_DIR" \
+    scripts/touch_history_model_test.c "$MAIN_DIR/touch_history.c" -lm
 
 # edf_gen_test #includes the real edf_gen.c and needs a real cJSON.
 # Include order matters: the real cJSON.h must shadow the shim in $SHIM.

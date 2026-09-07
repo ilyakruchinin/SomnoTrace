@@ -65,4 +65,21 @@ python3 scripts/timezone_catalog_contract_test.py
 
 python3 scripts/netprov_scan_contract_test.py
 
+
+python3 scripts/history_storage_lifecycle_contract_test.py
+
+python3 scripts/history_trace_channels_contract_test.py
+
+python3 scripts/touch_history_service_contract_test.py
+
+python3 scripts/history_generation_test.py
+
+python3 scripts/history_probe_cancellation_test.py
+
+python3 scripts/history_flow_io_test.py
+
+python3 scripts/history_service_cache_test.py
+
+python3 scripts/history_flow_envelope_contract_test.py
+
 echo "All synthetic host tests passed"

@@ -661,3 +661,6 @@ void sd_storage_deinit(void)
     s_card = NULL;
     bsp_display_set_sd_ready(false);
 }
+
+/* FTP source mutations invalidate retained History data. */
+void ftp_storage_changed(void) { sd_storage_content_changed(); }

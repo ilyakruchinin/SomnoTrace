@@ -58,6 +58,7 @@
  * ──────────────────────────────────────────────────────────────────── */
 
 #include "session_writer.h"
+#include "history_flow_cache.h"
 #include "sd_storage.h"
 #include "as11_ble.h"
 #include "bsp_display.h"
@@ -1963,6 +1964,12 @@ static void post_wait_for_storage_quiet(void)
 /* Optional derived IO yields to a new recording, just like History reads. */
 
 
+static bool post_flow_cache_cancel(void *context)
+{
+    (void)context;
+    return sd_storage_recording_pending() || sd_storage_recording_active();
+}
+
 static void sw_post_task(void *arg)
 {
     (void)arg;
@@ -2046,6 +2053,20 @@ static void sw_post_task(void *arg)
                 pending_update(marker, day, 1, pending_error_is_permanent(ret), ret);
                 sd_storage_lease_release(SD_LEASE_EXPORT);
             }
+        }
+
+        /* Raw files and post-stop metadata are terminal. A skipped build is
+         * backfilled after browsing this night. Reader arbitration lets a new
+         * recording cancel derived IO; no raw file is modified here. */
+        if (sd_storage_lease_acquire(SD_LEASE_UPLOAD, 0)) {
+            char source[384];
+            int n = snprintf(source, sizeof(source), "%s/%s_flow_mm.snt",
+                             job.session_dir, job.session_id);
+            if (n > 0 && n < (int)sizeof(source)) {
+                int cached = history_flow_cache_build(source, post_flow_cache_cancel, NULL);
+                if (cached) ESP_LOGI(TAG, "post: Flow cache deferred for %s", job.session_id);
+            }
+            sd_storage_lease_release(SD_LEASE_UPLOAD);
         }
 
         UBaseType_t free_bytes = uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t);
