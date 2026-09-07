@@ -327,3 +327,9 @@ Any redistributed or derivative works must remain licensed under GPLv3 and prese
 SomnoTrace is an independent open-source project and is **not affiliated with, endorsed by, or associated with** ResMed, Wellue / Viatom, or SleepHQ. It is intended strictly for personal data portability and interoperability research. SomnoTrace is **not a medical device** and must not be used for clinical diagnosis, treatment decisions, or life-critical monitoring. Use entirely at your own risk.
 
 ![GitHub Downloads (all assets, latest release)](https://img.shields.io/github/downloads/ilyakruchinin/somnotrace/latest/total)
+
+### Waveshare 7B display
+
+The physical 1024×600 Waveshare ESP32-S3-Touch-LCD-7B is selected with
+`scripts/build-7b.sh`. See [wiring and display behavior](docs/hardware/waveshare-7b.md).
+The original 240×240 board remains the default build.

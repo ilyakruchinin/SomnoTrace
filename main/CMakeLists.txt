@@ -1,14 +1,21 @@
-idf_component_register(SRCS "main.c" "bsp_power.c" "bsp_display.c" "net_provision.c" "as11_ble.c"
+set(SOMNOTRACE_BSP_SRCS "bsp_power.c" "bsp_display.c" "bsp_audio.c" "bsp_i2c.c" "bsp_touch.c")
+set(SOMNOTRACE_DISPLAY_REQUIRES)
+if(CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B)
+    set(SOMNOTRACE_BSP_SRCS "board_waveshare_7b.c" "bsp_power_7b.c" "bsp_display_7b.c" "bsp_audio_7b.c" "touch_observation.c" "controller_diagnostics.c")
+    set(SOMNOTRACE_DISPLAY_REQUIRES lvgl esp_lcd_touch_gt911)
+endif()
+
+idf_component_register(SRCS "main.c" ${SOMNOTRACE_BSP_SRCS} "net_provision.c" "as11_ble.c"
                            "sd_storage.c" "session_writer.c" "time_sync.c"
                            "post_therapy.c" "edf_gen.c" "edf_header.c" "edf_waveform.c" "edf_annotations.c" "edf_summary.c" "log_stream.c" "device_settings.c"
-                           "psram_task.c" "bsp_audio.c" "bsp_i2c.c" "bsp_touch.c" "session_graph.c" "nvs_writer.c"
+                           "psram_task.c" "session_graph.c" "nvs_writer.c"
                            "as11_time.c"
                            "crash_diag.c"
                            "oximeter.c" "oximeter_oxyii.c" "oximeter_legacy.c" "oximeter_store.c" "oximetry_vld3.c" "oximetry_canonical.c" "oximetry_http.c"
                        INCLUDE_DIRS "."
                        REQUIRES esp_lcd driver esp_wifi esp_netif esp_event nvs_flash esp_http_server json esp_app_format
                                 bt mbedtls esp_rom fatfs sdmmc esp-idf-ftpServer uploader esp_http_client
-                                esp_driver_i2c esp_driver_i2s esp_adc app_update espcoredump esp_https_ota therapy_alert esp_coex)
+                                esp_driver_i2c esp_driver_i2s esp_adc app_update espcoredump esp_https_ota therapy_alert esp_coex ${SOMNOTRACE_DISPLAY_REQUIRES})
 
 # Download zones.json (IANA-to-POSIX timezone database) if not present.
 # Source: https://github.com/nayarsystems/posix_tz_db (MIT License)

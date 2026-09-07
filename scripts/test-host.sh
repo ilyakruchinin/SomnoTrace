@@ -27,3 +27,5 @@ python3 scripts/upload_invalidation_behavior_test.py
 python3 scripts/backend_realtime_test.py
 python3 scripts/uploader_ox_lease_contract_test.py
 python3 scripts/fork_backend_reconciliation_test.py
+
+./scripts/test-platform4.sh

@@ -1,0 +1,15 @@
+menu "SomnoTrace hardware"
+
+choice SOMNOTRACE_BOARD
+    prompt "Target board"
+    default SOMNOTRACE_BOARD_WAVESHARE_154
+
+config SOMNOTRACE_BOARD_WAVESHARE_154
+    bool "Waveshare ESP32-S3-Touch-LCD-1.54"
+
+config SOMNOTRACE_BOARD_WAVESHARE_7B
+    bool "Waveshare ESP32-S3-Touch-LCD-7B (1024x600)"
+
+endchoice
+
+endmenu

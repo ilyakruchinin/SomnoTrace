@@ -597,9 +597,8 @@ static void lcd_flush(void)
 {
     if (!s_panel || !s_fb) return;
 
-    if (!s_strip[0] || !s_flush_done) {
-        /* Fallback (e.g. strip alloc failed): single direct draw. */
-        esp_lcd_panel_draw_bitmap(s_panel, 0, 0, LCD_H_RES, LCD_V_RES, s_fb);
+    if (!s_strip[0] || !s_strip[1] || !s_flush_done) {
+        ESP_LOGE(TAG, "LCD strip transport unavailable; frame skipped");
         return;
     }
 
@@ -911,8 +910,58 @@ static void display_supervisor_cb(void *arg)
     }
 }
 
+static void display_buffers_free(void)
+{
+    heap_caps_free(s_fb);
+    s_fb = NULL;
+    heap_caps_free(s_flow_buf);
+    s_flow_buf = NULL;
+    heap_caps_free(s_flow_local);
+    s_flow_local = NULL;
+    heap_caps_free(s_flow_yf);
+    s_flow_yf = NULL;
+    if (s_state_mutex) vSemaphoreDelete(s_state_mutex);
+    s_state_mutex = NULL;
+    for (int i = 0; i < LCD_STRIP_BUFS; ++i) {
+        heap_caps_free(s_strip[i]);
+        s_strip[i] = NULL;
+    }
+    if (s_flush_done) vSemaphoreDelete(s_flush_done);
+    s_flush_done = NULL;
+}
+static esp_err_t display_buffers_init(void)
+{
+    s_fb = heap_caps_malloc(LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    if (!s_fb)
+        s_fb = heap_caps_malloc(LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_DMA);
+    if (!s_fb) goto no_mem;
+
+    s_flow_buf = heap_caps_calloc(FLOW_BUF_SIZE, sizeof(float), MALLOC_CAP_SPIRAM);
+    s_flow_local = heap_caps_malloc(FLOW_BUF_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
+    s_flow_yf = heap_caps_malloc(LCD_H_RES * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (!s_flow_buf || !s_flow_local || !s_flow_yf) goto no_mem;
+
+    for (int i = 0; i < LCD_STRIP_BUFS; ++i) {
+        s_strip[i] = heap_caps_malloc(LCD_H_RES * LCD_STRIP_ROWS * sizeof(uint16_t),
+                                      MALLOC_CAP_DMA);
+        if (!s_strip[i]) goto no_mem;
+    }
+    s_flush_done = xSemaphoreCreateCounting(LCD_STRIP_BUFS, 0);
+    if (!s_flush_done) goto no_mem;
+    s_state_mutex = xSemaphoreCreateMutex();
+    if (!s_state_mutex) goto no_mem;
+    return ESP_OK;
+
+no_mem:
+    display_buffers_free();
+    ESP_LOGE(TAG, "display buffer/semaphore allocation failed");
+    return ESP_ERR_NO_MEM;
+}
+
 esp_err_t bsp_display_init(void)
 {
+    esp_err_t err = display_buffers_init();
+    if (err != ESP_OK) return err;
     /* The project's default log level is DEBUG; spi_master emits several DEBUG
      * lines per DMA transaction. At the LCD's transfer rate that is a real CPU
      * and I/O drain, so quiet it down to WARN regardless of the global level. */
@@ -940,8 +989,6 @@ esp_err_t bsp_display_init(void)
     ESP_ERROR_CHECK(ledc_channel_config(&bl_ch));
     s_backlight_on = true;
     s_brightness = 100;
-
-    s_flush_done = xSemaphoreCreateCounting(LCD_STRIP_BUFS, 0);
 
     spi_bus_config_t bus_cfg = {
         .sclk_io_num = LCD_PIN_SCLK,
@@ -981,44 +1028,19 @@ esp_err_t bsp_display_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, 0, 0));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
-    /* Allocate the framebuffer from PSRAM. The ESP32-S3 GDMA can stream SPI
-     * pixel data directly from external RAM, so the ~115 KB framebuffer does
-     * not need scarce internal DMA-capable RAM (which Wi-Fi SoftAP beacon and
-     * SDMMC buffers require). Fall back to internal DMA RAM if PSRAM is absent. */
-    s_fb = heap_caps_malloc(LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-    if (!s_fb) {
-        s_fb = heap_caps_malloc(LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_DMA);
-    }
-    if (!s_fb) {
-        ESP_LOGE(TAG, "framebuffer alloc failed");
-        return ESP_ERR_NO_MEM;
-    }
-
-    s_flow_buf = heap_caps_calloc(FLOW_BUF_SIZE, sizeof(float), MALLOC_CAP_SPIRAM);
-    s_flow_local = heap_caps_malloc(FLOW_BUF_SIZE * sizeof(float), MALLOC_CAP_SPIRAM);
-    s_flow_yf = heap_caps_malloc(LCD_H_RES * sizeof(float), MALLOC_CAP_SPIRAM);
-    if (!s_flow_buf || !s_flow_local || !s_flow_yf) {
-        ESP_LOGE(TAG, "flow graph buffer alloc failed");
-        return ESP_ERR_NO_MEM;
-    }
-
-    /* Permanently allocate the internal DMA-capable strip buffers up front,
-     * while internal RAM is still free. */
-    for (int i = 0; i < LCD_STRIP_BUFS; i++) {
-        s_strip[i] = heap_caps_malloc(LCD_H_RES * LCD_STRIP_ROWS * sizeof(uint16_t),
-                                      MALLOC_CAP_DMA);
-        if (!s_strip[i]) {
-            ESP_LOGW(TAG, "strip buffer %d alloc failed; using direct flush", i);
-        }
-    }
-
-    /* Create the state mutex and start the single-owner render task. Only this
+    /* Start the single-owner render task after every resource exists. Only this
      * task ever touches the framebuffer or the LCD panel. */
-    s_state_mutex = xSemaphoreCreateMutex();
-    if (s_state_mutex) {
-        s_display_task = psram_task_create(display_task, "display", DISPLAY_TASK_STACK, NULL, 4, tskNO_AFFINITY, NULL, NULL);
-    } else {
-        ESP_LOGE(TAG, "state mutex alloc failed, display task not started");
+    s_display_task = psram_task_create(display_task, "display", DISPLAY_TASK_STACK, NULL, 4, tskNO_AFFINITY, NULL, NULL);
+    if (!s_display_task) {
+        esp_lcd_panel_del(s_panel);
+        s_panel = NULL;
+        esp_lcd_panel_io_del(s_io);
+        s_io = NULL;
+        spi_bus_free(LCD_SPI_HOST);
+        ledc_stop(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, 0);
+        display_buffers_free();
+        ESP_LOGE(TAG, "display task allocation failed");
+        return ESP_ERR_NO_MEM;
     }
 
     /* Start non-intrusive display supervisor timer to monitor display responsiveness */

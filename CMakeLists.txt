@@ -116,3 +116,17 @@ add_compile_definitions(SNT_UPSTREAM_REPO="${UPSTREAM_REPO}")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 project(somnotrace)
+
+# The 7-inch UI creates a much larger LVGL object tree than the original
+# display. Scope its allocator to PSRAM first so small widgets and copied text
+# do not consume the internal heap needed by Wi-Fi, BLE and RTOS stacks.
+if(CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B)
+    idf_component_get_property(_somnotrace_lvgl_lib lvgl__lvgl COMPONENT_LIB)
+    target_include_directories(${_somnotrace_lvgl_lib} PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/main")
+    target_compile_definitions(${_somnotrace_lvgl_lib} PRIVATE
+        LV_MEM_CUSTOM_INCLUDE="somnotrace_lvgl_psram.h"
+        LV_MEM_CUSTOM_ALLOC=somnotrace_lvgl_alloc
+        LV_MEM_CUSTOM_FREE=somnotrace_lvgl_free
+        LV_MEM_CUSTOM_REALLOC=somnotrace_lvgl_realloc)
+endif()
