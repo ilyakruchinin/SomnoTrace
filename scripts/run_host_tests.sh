@@ -120,6 +120,9 @@ run_test manage_config_behavior_test -Dtime=config_test_time -I"$SHIM" -I"$MAIN_
     components/therapy_alert/alert_history.c
 run_test upload_probe_behavior_test -I"$SHIM" -Icomponents/uploader \
     scripts/upload_probe_behavior_test.c components/uploader/upload_probe_smb.c
+run_test maintenance_model_test -DMAINTENANCE_HOST_TEST -D_POSIX_C_SOURCE=200809L \
+    -I"$SHIM" -I"$MAIN_DIR" scripts/maintenance_model_test.c \
+    "$MAIN_DIR/maintenance_model.c" "$MAIN_DIR/maintenance_fs.c"
 
 # edf_gen_test #includes the real edf_gen.c and needs a real cJSON.
 # Include order matters: the real cJSON.h must shadow the shim in $SHIM.
@@ -131,6 +134,7 @@ else
     CJ_INC=""
     skip_test edf_gen_test "no cJSON (apt install libcjson-dev, or set CJSON_DIR=<dir with cJSON.c/.h>)"
     skip_test edf_properties_test "no cJSON"
+    skip_test maintenance_release_test "no cJSON"
 fi
 if [ -n "$CJ_INC" ]; then
     run_test edf_gen_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
@@ -138,6 +142,10 @@ if [ -n "$CJ_INC" ]; then
     # upstream's EDF pipeline property suite (54ae598)
     run_test edf_properties_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
         scripts/edf_properties_test.c "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
+    run_test maintenance_release_test -DMAINTENANCE_HOST_TEST -D_POSIX_C_SOURCE=200809L \
+        $CJ_INC -I"$SHIM" -I"$MAIN_DIR" scripts/maintenance_release_test.c \
+        "$MAIN_DIR/maintenance_release.c" "$MAIN_DIR/maintenance_model.c" \
+        $CJ_SRC $CJ_LIB -lm
 fi
 
 # Roster check: a test file that exists but is not wired in here would never

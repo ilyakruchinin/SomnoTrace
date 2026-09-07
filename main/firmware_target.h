@@ -9,3 +9,4 @@ typedef struct {
     char board[16];
 } somnotrace_firmware_target_t;
 extern const somnotrace_firmware_target_t somnotrace_firmware_target;
+bool somnotrace_firmware_target_matches(const void *prefix, size_t size);

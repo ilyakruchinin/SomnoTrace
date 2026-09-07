@@ -2161,3 +2161,9 @@ void bsp_display_set_setup_callback(void (*callback)(void))
     s_setup_callback = callback;
     (void)s_setup_callback;
 }
+
+bool bsp_display_get_wake_snapshot(bsp_display_wake_snapshot_t *out)
+{
+    (void)out;
+    return false;
+}

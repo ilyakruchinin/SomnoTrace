@@ -4,7 +4,7 @@
 
 > A plug-and-play wireless bridge that pulls CPAP therapy and pulse oximetry data over Bluetooth, automatically saves standard European Data Format (EDF) files, and uploads them to your home network (NAS/SMB) or SleepHQ — **no SD card swapping or Wi-Fi SD cards required**.
 
-Created and architected by **Ilya Kruchinin** ([@ilyakruchinin](https://github.com/ilyakruchinin)).  
+Created and architected by **Ilya Kruchinin** ([@ilyakruchinin](https://github.com/ilyakruchinin)).
 Spiritual successor to [CPAP-AutoSync](https://github.com/ilyakruchinin/CPAP-AutoSync), transitioning from software-only sync to a dedicated, standalone hardware device.
 
 ---
@@ -13,13 +13,13 @@ Spiritual successor to [CPAP-AutoSync](https://github.com/ilyakruchinin/CPAP-Aut
 
 SomnoTrace is the **first and only** open-source project that delivers:
 
-- 📡 **Wireless Therapy Data via BLE — No SD Card or WiFi SD Card Needed:**  
+- 📡 **Wireless Therapy Data via BLE — No SD Card or WiFi SD Card Needed:**
   SomnoTrace pulls detailed sleep therapy data directly from ResMed Series 11 machines (AirSense 11 / AirCurve 11) over Bluetooth Low Energy (BLE) — **no SD card required in the CPAP machine at all**. This replaces both the daily ritual of physically swapping SD cards and the need for WiFi SD card adapters (such as EZShare). Your therapy data is captured wirelessly as you sleep.
-- ⏱️ **Zero Clock Drift (Perfect Pulse Oximeter Sync):**  
+- ⏱️ **Zero Clock Drift (Perfect Pulse Oximeter Sync):**
   The AirSense 11's built-in clock drifts over time (often by minutes), causing your CPAP graphs and pulse oximeter graphs to be misaligned in OSCAR and SleepHQ. SomnoTrace continuously aligns therapy records to exact internet time (NTP), delivering sample-accurate synchronization with your oximetry data (such as the Wellue O2 Ring).
-- 🚨 **Interrupted Therapy Alerts (Insurance Compliance & Safety):**  
-  If your mask slips off or therapy stops unexpectedly during the night, SomnoTrace alerts you immediately. It sends a push notification to your phone, smartwatch (Apple Watch, Garmin, WearOS), or smart bed shaker via [ntfy](https://ntfy.sh). If unacknowledged, an escalating audible alarm sounds on the device speaker, helping you preserve required insurance compliance hours and prevent unmanaged apnea.
-- ⚡ **ResMed BLE → Wi-Fi Bridge & Smart Home Automations:**  
+- 🚨 **Interrupted Therapy Alerts:**
+  Configurable interruption alerts appear on screen and can request a push through [ntfy](https://ntfy.sh). The original compact board also supports an escalating speaker alarm; the 7B uses visual and push alerts and has no speaker. Service acceptance does not confirm delivery to a phone or acknowledgement by the user.
+- ⚡ **ResMed BLE → Wi-Fi Bridge & Smart Home Automations:**
   SomnoTrace bridges the machine's encrypted Bluetooth link to your local Wi-Fi network. You can query machine settings, start/stop therapy remotely, or build rich [Home Assistant automations](docs/automations.md) (e.g. automatically turn off bedroom lights when you start therapy).
 
 ---
@@ -40,7 +40,7 @@ SomnoTrace is the **first and only** open-source project that delivers:
 
 SomnoTrace runs on a compact, affordable, all-in-one development board:
 
-- **Hardware Board:** **[Waveshare ESP32-S3-Touch-LCD-1.54](https://www.waveshare.com/esp32-s3-lcd-1.54.htm?sku=33869)**  
+- **Hardware Board:** **[Waveshare ESP32-S3-Touch-LCD-1.54](https://www.waveshare.com/esp32-s3-lcd-1.54.htm?sku=33869)**
   *(The **touch variant with battery** is strongly recommended for portable bedside use).*
 - **Display:** 1.54" round-corner color screen with touch control.
 - **Storage:** MicroSD card slot for saving high-resolution sleep data and EDF files.
@@ -61,7 +61,7 @@ SomnoTrace runs on a compact, affordable, all-in-one development board:
   - ResMed AirSense 11 (AutoSet / Elite)
   - ResMed AirCurve 11 (VAuto / ASV)
 - **Supported Pulse Oximeters:**
-  - **O2 Ring S (Gen2)** — Viatom model PO2B (S8-AW). Also sold as: 
+  - **O2 Ring S (Gen2)** — Viatom model PO2B (S8-AW). Also sold as:
     - Wellue O2Ring S
     - SleepHQ O2 Ring Pro.
   - **O2 Ring (Gen1, experimental)** — Viatom model PO2 (S9). Also sold as:
@@ -276,9 +276,9 @@ OSCAR takes a session's extent from the recording files themselves, not from the
 | **SMB / NAS Network Upload** | ✅ Implemented | Direct file transfer to Windows, macOS, and Linux/Samba shared folders. |
 | **SleepHQ Cloud Upload** | ✅ Implemented | Direct HTTPS upload to SleepHQ with fast retry handling. |
 | **Web Dashboard & Mobile UI** | ✅ Implemented | Interactive sleep charts, AHI breakdown, status telemetry, and easy setup. |
-| **LCD & Audio Alert System** | ✅ Implemented | Bedside color screen, live flow graph, and speaker alert sounds. |
+| **LCD & Audio Alert System** | ✅ Implemented | Bedside color screen and live flow graph; speaker alerts on the compact board, visual/push alerts on 7B. |
 | **Sub-Second NTP Clock Sync** | ✅ Implemented | Internet time sync eliminating AirSense 11 clock drift for pulse oximeter alignment. |
-| **Therapy Interruption Alarm** | ✅ Implemented | Push notifications via ntfy (phone/smartwatch/bed shaker) and escalating audio buzzer. |
+| **Therapy Interruption Alarm** | ✅ Implemented | Push notifications via ntfy (phone/smartwatch/bed shaker), with escalating speaker audio on the compact board. |
 | **BLE → Wi-Fi RPC Proxy** | ✅ Implemented | Local HTTP endpoint for remote machine queries and smart home control. |
 | **FTP File Server** | ✅ Implemented | Download EDF and session files directly from the MicroSD card using any FTP client (e.g., FileZilla). |
 | **O2 Ring Bluetooth Sync** | ✅ Implemented | Downloads stored oximetry recordings from Viatom O2 Ring (Gen1 & Gen2) over Bluetooth, with automatic upload to SMB and SleepHQ. |
@@ -317,7 +317,7 @@ SomnoTrace is free software released under the **GNU General Public License v3.0
 - Full license text: [`LICENSE`](LICENSE)
 - Copyright & Section 7(b) Attribution Terms: [`NOTICE`](NOTICE)
 
-Any redistributed or derivative works must remain licensed under GPLv3 and preserve the author attribution notice:  
+Any redistributed or derivative works must remain licensed under GPLv3 and preserve the author attribution notice:
 > *"Based on SomnoTrace, originally created by Ilya Kruchinin (https://github.com/ilyakruchinin)."*
 
 ---
@@ -339,9 +339,13 @@ The original 240×240 board remains the default build.
 Build and run either display profile with `scripts/build-qemu.sh --board 7b|154`
 and `scripts/run-qemu-ui.sh --board 7b|154`. See [QEMU validation and captures](docs/qemu-ui.md).
 
-The 7B native Home screen adds bedside typography, live flow and fresh scalar
-metrics, status details, and Screen off with wake-only touch. Display timeout
-settings are available through the existing web portal.
+The 7B native interface includes resumable first-run Setup, Home with live flow
+and current metrics, progressive History, and Manage controls for Devices,
+Connectivity, Alerts, Uploads, Storage, System, Logs and Advanced maintenance.
+Screen off uses a wake-only first touch; display preferences live under System.
+See the [native interface contract](spec/0013-touch-ui-rev-c.md),
+[History behavior](docs/history-progressive.md), and
+[validation boundaries](docs/rev-c-validation.md).
 
 On first boot, tap **Start setup** on the touchscreen. The checklist walks
 through Wi-Fi, time and clock, AirSense, microSD, alerts, and uploads. Enable

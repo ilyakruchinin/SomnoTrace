@@ -26,7 +26,21 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
+
+/* Command/consumer observations only; no optical measurement of the panel. */
+typedef struct {
+    bool requested_on;
+    bool last_applied_on;
+    bool applied_known;
+    bool gesture_blocked;
+    uint32_t write_errors;
+    int64_t last_service_us;
+} bsp_display_wake_snapshot_t;
+
+/* Nonblocking snapshot. False means this display has no wake observations yet. */
+bool bsp_display_get_wake_snapshot(bsp_display_wake_snapshot_t *out);
 
 esp_err_t bsp_display_init(void);
 void bsp_display_show_number(uint32_t value);

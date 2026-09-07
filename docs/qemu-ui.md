@@ -1,18 +1,18 @@
 # QEMU display previews
 
-Use `scripts/build-qemu.sh --board 7b` for the 1024×600 status display or `--board 154` for the original 240×240 renderer. Run `scripts/run-qemu-ui.sh --board 7b|154` after building. The default profile is 7b.
+Use `scripts/build-qemu.sh --board 7b` for the 1024×600 native interface or `--board 154` for the original 240×240 renderer. Run `scripts/run-qemu-ui.sh --board 7b|154` after building. The default profile is 7b.
 
 `scripts/test-qemu-ui.sh --board 7b|154` retains a boot receipt with source provenance, firmware hashes, QEMU identity, UART output and a framebuffer. A stale, mismatched or foreign checkout build is rejected. `scripts/test-qemu-worktree.py` checks launcher ownership and duplicate refusal.
 
-The compact profile uses its actual renderer and a virtual panel adapter. UART `0`/`1`/`2`/`3` select status, flow, info and notice scenes; `r` rotates and `b` switches the backlight. `scripts/test-qemu-154.py` captures those states and verifies the guest identity. `scripts/capture-qemu-ui.py` captures the minimal 7B status display through QMP.
+The compact profile uses its actual renderer and a virtual panel adapter. UART `0`/`1`/`2`/`3` select status, flow, info and notice scenes; `r` rotates and `b` switches the backlight. `scripts/test-qemu-154.py` captures those states and verifies the guest identity. `scripts/capture-qemu-ui.py` captures the 7B interface through QMP.
 
 Linked checkouts mount their absolute Git common directory read-only in the toolchain container. Firmware outputs stay local to each worktree. `scripts/test-platform5.sh` tests both profiles and artifact rejection without a firmware build.
 
-All preview data is simulated. QEMU cannot validate physical BLE, storage, touch-controller recovery, RGB timing, panel tearing or backlight electronics. Each topic requires fresh captures after its own build; integration screenshots do not validate an extracted topic.
+All preview data is simulated. QEMU cannot validate physical BLE, storage, touch-controller recovery, RGB timing, panel tearing or backlight electronics. Capture and test the exact checkout under review.
 
-Home arrives with the native shell and elapsed-time flow presentation. Capture
-active Home with `scripts/capture-qemu-ui.py --screen home`, stopped therapy
-with `--screen home-idle`, or the status tray with `--screen status`.
+Capture active Home with `scripts/capture-qemu-ui.py --screen home`, or add
+`--representative` for stopped therapy. Capture a selected History night with
+`--screen history --representative`.
 `scripts/test-qemu-touch.py` checks Screen off, the black framebuffer and a
 wake press directly over the Screen off control, rejecting a leaked second action.
 These commands retain the selected build identity with the resulting images.
@@ -31,16 +31,27 @@ QEMU save and disconnect fixtures do not establish physical card persistence.
 Tap the QEMU clock or capture `--interaction-state setup-wifi` to open a fresh
 simulated setup run. Normal emulator boot seeds finished setup so ordinary
 captures remain deterministic. Setup owns its worker, durable state and native
-screen independently of the later Manage configuration and maintenance views.
+screen independently of Manage configuration and maintenance views.
 The host runner generates `main/zones.json` before timezone catalogue tests.
 
 ## Manage configuration and Devices
 
-Manage now exposes Devices, Connectivity, Alerts, Uploads and Logs. Run
+Manage exposes Devices, Connectivity, Alerts, Uploads, Storage, System, Logs
+and Advanced. Run
 `python3 scripts/test-qemu-rev-c.py` against the current build to exercise native
-configuration, redaction and disabled controls; this stage does not expose
-Storage, System or Advanced. Capture individual screens through
-`--interaction-state devices`, `connectivity`, `alerts` or `uploads`.
+configuration, redaction, disabled controls and maintenance navigation. Capture individual screens through
+`--interaction-state devices`, `connectivity-overview`, `alerts-overview` or
+`uploads-overview`.
 Host validation runs production configuration and SMB-probe adapters with
 controlled dependencies. Simulated receipts do not verify physical pairing or
 external delivery.
+
+## Maintenance and OTA
+
+Run
+`python3 scripts/test-qemu-manage-lifecycle.py` after building this source to
+exercise view retirement during asynchronous reads, and use
+`--interaction-state storage-overview`, `system-overview` or
+`advanced-overview` for captures. Release
+metadata, card writes and OTA installation use injected fixtures in host/QEMU
+checks; physical flashing and card durability require separate acceptance.

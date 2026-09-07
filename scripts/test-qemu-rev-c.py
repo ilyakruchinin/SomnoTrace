@@ -135,8 +135,31 @@ with tempfile.TemporaryDirectory(prefix="run-", dir=ROOT / "build-qemu") as temp
         restored_frame("connectivity-restored", overview, (260, 145, 988, 383),
                        "network priority/list changed during cancelled edits")
 
-        print("Native password input/masking/cancel, secret teardown, and forget cancellation passed")
-
+        # Stop only simulated therapy via the public Home input before opening
+        # the destructive hold prompt. Do not press or hold its action control.
+        tap(330, 563)
+        tap(858, 458)
+        wait(3.4)
+        tap(694, 563)
+        advanced_offset = capture.log_character_offset(uart)
+        tap(110, 462)
+        capture.wait_for_log(process, uart, "QEMU maintenance frame view=advanced", 3,
+                             start_offset=advanced_offset)
+        advanced = shot("advanced-before")
+        hold_offset = capture.log_character_offset(uart)
+        tap(550, 348)
+        capture.wait_for_log(process, uart, "QEMU maintenance frame view=hold", 3,
+                             start_offset=hold_offset)
+        hold = shot("advanced-delete-confirmation")
+        assert region(hold, form) != region(advanced, form), "destructive action has no confirmation view"
+        cancel_offset = capture.log_character_offset(uart)
+        tap(875, 362)  # Cancel, never the hold target.
+        capture.wait_for_log(process, uart, "QEMU maintenance frame view=advanced", 3,
+                             start_offset=cancel_offset)
+        restored_frame("advanced-cancelled", advanced, form,
+                       "maintenance Cancel did not restore Advanced")
+        wait(1.0)
+        print("Rev C native password input/masking/cancel, secret teardown, forget cancellation, and destructive-prompt cancellation passed")
     finally:
         if client is not None:
             client.close()

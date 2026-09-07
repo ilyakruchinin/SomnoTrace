@@ -18,6 +18,11 @@ CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y
 # task starts. Keep explicit headroom for that one-time construction path.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=14336
 
+# OTA slots are only useful at the bedside if a bad image can recover without
+# a USB cable. The application marks a pending image valid after its bounded
+# display, storage/writer, and AirSense BLE health gate completes.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
 # Native 1024x600 UI (LVGL 8).
 CONFIG_LV_COLOR_DEPTH_16=y
 # Read touch at 100 Hz and schedule invalidated UI work at 60 Hz. The RGB

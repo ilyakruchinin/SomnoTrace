@@ -35,7 +35,7 @@ with tempfile.TemporaryDirectory() as tmp:
     subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-I',str(ROOT/'scripts/test_include'),'-I',str(ROOT/'main'),str(p/'test.c'),'-o',str(p/'test')],check=True)
     subprocess.run([str(p/'test')],check=True)
 net=(ROOT/'main/net_provision.c').read_text()
-a=net.index('static void status_cache_refresh_sd(');b=net.index('\n}',a)
-assert 'sd_storage_get_cached_free(' in net[a:b]
-assert '== ESP_OK' not in net[a:b], 'bool capacity success must not be inverted'
+a=net.index('cJSON *netprov_build_status_json(');b=net.index('\n}',a)
+assert 'if (sd_storage_get_cached_free(&sd_free, &sd_total)) {' in net[a:b], 'bool capacity success must not be inverted'
+assert 'sd_storage_get_free(' not in net[a:b], 'status must not issue card IO'
 print('Production capacity public API and bool success/failure convention passed')

@@ -18,3 +18,11 @@ const somnotrace_firmware_target_t somnotrace_firmware_target
         .board = "waveshare-154",
 #endif
 };
+bool somnotrace_firmware_target_matches(const void *prefix, size_t size)
+{
+    const size_t offset =
+        sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t);
+    return prefix && size >= offset + sizeof(somnotrace_firmware_target) &&
+           memcmp((const uint8_t *)prefix + offset, &somnotrace_firmware_target,
+                  sizeof(somnotrace_firmware_target)) == 0;
+}

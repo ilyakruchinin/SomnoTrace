@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-TEST_DIR="$(mktemp -d /tmp/somnotrace-feature-host.XXXXXX)"
-trap 'rm -rf "${TEST_DIR}"' EXIT
 cd "$(dirname "$0")/.."
 python3 scripts/therapy_alert_ack_contract_test.py
 python3 scripts/clock_snapshot_contract_test.py
@@ -97,6 +95,17 @@ python3 scripts/touch_history_controller_contract_test.py
 
 python3 scripts/touch_history_integration_contract_test.py
 
+python3 scripts/maintenance_ota_race_test.py
+python3 scripts/maintenance_diagnostics_test.py
+python3 scripts/maintenance_navigation_test.py
+python3 scripts/download_lifecycle_test.py
+python3 scripts/storage_notice_contract_test.py
+python3 scripts/status_sd_cache_contract_test.py
+python3 scripts/manage_detail_lifecycle_contract_test.py
+python3 scripts/recording_priority_contract_test.py
+python3 scripts/ota_memory_safety_contract_test.py
+python3 scripts/ota_rollback_contract_test.py
+python3 scripts/oximetry_contract_test.py
 
 python3 scripts/uploader_config_persistence_test.py
 

@@ -19,16 +19,34 @@ def function_body(source: str, name: str) -> str:
     )
     if not match:
         raise AssertionError(f"missing function: {name}")
-    # Conditional physical/QEMU arms share closing braces; select the next
-    # unindented function terminator rather than counting both inactive arms.
-    end = source.find("\n}", match.end())
-    if end < 0:
+    depth = 1
+    cursor = match.end()
+    while cursor < len(source) and depth:
+        if source[cursor] == "{":
+            depth += 1
+        elif source[cursor] == "}":
+            depth -= 1
+        cursor += 1
+    if depth:
         raise AssertionError(f"unterminated function: {name}")
-    return source[match.end():end]
+    return source[match.end(): cursor - 1]
 
 
-start = function_body(DISPLAY, "start_storage_refresh")
-worker = function_body(DISPLAY, "storage_status_task")
+start_match = re.search(
+    r"static void start_storage_refresh\(void\).*?"
+    r"(?=static void alert_config_task)",
+    DISPLAY,
+    re.DOTALL,
+)
+worker_match = re.search(
+    r"static void storage_status_task\(void \*arg\).*?"
+    r"(?=static void start_storage_refresh)",
+    DISPLAY,
+    re.DOTALL,
+)
+assert start_match and worker_match, "missing storage refresh functions"
+start = start_match.group(0)
+worker = worker_match.group(0)
 summary = function_body(SCHED, "upload_sched_summary")
 
 # The physical UI worker is created once at boot with its stack in PSRAM.

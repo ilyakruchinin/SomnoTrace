@@ -170,10 +170,11 @@ def sleep_from_header_then_wake_over(
     )
     wake_end = log_character_offset(log_path)
     wake_log = log_path.read_text(errors="replace")[wake_offset:wake_end]
-    leaked_selection = "backlight off"
+    leaked_selection = f"emulated touch selected page {destination_page}"
     if leaked_selection in wake_log:
         raise AssertionError(
-            "first touch after shared-header screen-off activated Screen off a second time"
+            "first touch after shared-header screen-off selected page "
+            f"{destination_page} instead of only waking the display"
         )
     return backlight_off, backlight_on
 
@@ -232,10 +233,138 @@ def main():
             json.loads(stream.readline())
             qmp_command(stream, "qmp_capabilities")
 
-            time.sleep(3.5)
+            # Centre of the History pill in the custom three-screen navigation.
+            x = round(512 * 32767 / 1023)
+            y = round(563 * 32767 / 599)
+            click_started = time.monotonic()
+            qmp_command(stream, "input-send-event", {"events": [
+                {"type": "abs", "data": {"axis": "x", "value": x}},
+                {"type": "abs", "data": {"axis": "y", "value": y}},
+                {"type": "btn", "data": {"button": "left", "down": True}},
+            ]})
+            # Read only the position register here. Reading the adjacent
+            # status register would itself consume the emulator's one-shot
+            # short-click latch before the guest gets a chance to poll it.
+            pressed_position = qmp_command(stream, "human-monitor-command", {
+                "command-line": "xp /1wx 0x2100001c",
+            })
+            print(f"Touch position while pressed: {pressed_position.strip()}")
+            qmp_command(stream, "input-send-event", {"events": [
+                {"type": "btn", "data": {"button": "left", "down": False}},
+            ]})
+            observed = wait_for_log(process, serial_log, "emulated touch at", 3)
+            selected = wait_for_log(
+                process, serial_log, "emulated touch selected page 1", 3
+            )
+            registers = qmp_command(stream, "human-monitor-command", {
+                "command-line": "xp /2wx 0x2100001c",
+            })
+            print(f"Touch registers after synthetic click: {registers.strip()}")
+            # The guest must sample the release before the next scripted tap;
+            # a navigation redraw can delay that poll on slower hosts.
+            time.sleep(0.08)
+            click_latency = time.monotonic() - click_started
+            if click_latency > 1.5:
+                raise AssertionError(
+                    f"QEMU navigation click took {click_latency:.2f}s"
+                )
+
+            # The startup simulation notice intentionally covers the header.
+            # Wait for its three-second lifetime, then exercise the one shared
+            # Screen off control from every primary page. Each wake press is
+            # aimed at a different destination so any input leak is observable.
+            time.sleep(3.2)
+            history_off, history_on = sleep_from_header_then_wake_over(
+                process, serial_log, stream, "history", (330, 563), 0
+            )
+            _, home_offset = tap(process, serial_log, stream, 330, 563)
+            home_selected = wait_for_log(
+                process, serial_log, "emulated touch selected page 0", 3,
+                start_offset=home_offset,
+            )
             home_off, home_on = sleep_from_header_then_wake_over(
-                process, serial_log, stream, "home", (566, 35), 0)
-            print(f"Home screen-off/wake passed: {home_off}; {home_on}")
+                process, serial_log, stream, "home", (694, 563), 2
+            )
+            _, manage_offset = tap(process, serial_log, stream, 694, 563)
+            manage_selected = wait_for_log(
+                process, serial_log, "emulated touch selected page 2", 3,
+                start_offset=manage_offset,
+            )
+            # Manage lazily builds its first detail pane in the pressed-event
+            # callback. Let LVGL sample the release after that bounded build
+            # before injecting the header command's next press edge.
+            time.sleep(0.35)
+            manage_off, manage_on = sleep_from_header_then_wake_over(
+                process, serial_log, stream, "manage", (512, 563), 1
+            )
+
+            # The Rev C System overview has a Display detail route. Keep
+            # its native Off now and wake-only acceptance in addition to the
+            # shared header check; never target the old B3 inline control.
+            tap(process, serial_log, stream, 330, 563)
+            tap(process, serial_log, stream, 858, 458)  # Stop simulated therapy.
+            time.sleep(3.5)
+            tap(process, serial_log, stream, 694, 563)
+            _, system_offset = tap(process, serial_log, stream, 130, 368)
+            wait_for_log(process, serial_log, "QEMU maintenance frame view=system", 3,
+                         start_offset=system_offset)
+            time.sleep(2.0)
+            scroll_offset = log_character_offset(serial_log)
+            drag(process, serial_log, stream, (980, 440), (980, 160),
+                 steps=19, step_seconds=0.16)
+            wait_for_log(process, serial_log,
+                         "QEMU maintenance frame view=system scroll=232", 3,
+                         start_offset=scroll_offset)
+            _, display_offset = tap(process, serial_log, stream, 590, 445)
+            wait_for_log(process, serial_log, "QEMU maintenance frame view=display", 3,
+                         start_offset=display_offset)
+            time.sleep(0.35)
+            _, settings_off_offset = tap(
+                process, serial_log, stream, 793, 95  # Native Off now
+            )
+            settings_off = wait_for_log(
+                process, serial_log, "backlight off", 3,
+                start_offset=settings_off_offset,
+            )
+            assert_emulated_backlight_frame(
+                stream, serial_log.parent / "settings-off.ppm", True
+            )
+            _, settings_wake_offset = tap(
+                process, serial_log, stream, 512, 563
+            )
+            settings_on = wait_for_log(
+                process, serial_log, "backlight on", 3,
+                start_offset=settings_wake_offset,
+            )
+            time.sleep(0.25)
+            assert_emulated_backlight_frame(
+                stream, serial_log.parent / "settings-awake.ppm", False
+            )
+            settings_wake_end = log_character_offset(serial_log)
+            settings_wake_log = serial_log.read_text(errors="replace")[
+                settings_wake_offset:settings_wake_end
+            ]
+            if "emulated touch selected page 1" in settings_wake_log:
+                raise AssertionError(
+                    "first touch after Settings Off now leaked into History"
+                )
+
+            _, second_history_offset = tap(
+                process, serial_log, stream, 512, 563
+            )
+            history_after_wake = wait_for_log(
+                process, serial_log, "emulated touch selected page 1", 3,
+                start_offset=second_history_offset,
+            )
+            print(
+                f"QEMU touch smoke test passed: {observed}; {selected}; "
+                f"{registers.strip()}; {click_latency:.2f}s; "
+                f"History {history_off}; {history_on}; {home_selected}; "
+                f"Home {home_off}; {home_on}; {manage_selected}; "
+                f"Manage {manage_off}; {manage_on}; wake-only first touches; "
+                f"Settings {settings_off}; {settings_on}; "
+                f"{history_after_wake}"
+            )
         finally:
             if stream is not None:
                 try:

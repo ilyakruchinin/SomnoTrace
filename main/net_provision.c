@@ -38,7 +38,6 @@
 #include "log_stream.h"
 #include "device_settings.h"
 #include "session_graph.h"
-#include "session_writer.h"
 #include "oximetry_http.h"
 #if CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B
 #include "board_waveshare_7b.h"
@@ -78,51 +77,18 @@
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
+#include "maintenance_ota.h"
+#include "touch_maintenance.h"
+#include "maintenance_model.h"
+#include "maintenance_fs.h"
+#include "firmware_target.h"
 #include "mdns.h"
 
 static const char *TAG = "netprov";
 
 /* OTA and ordinary restart requests share the public lifecycle claim declared
  * in net_provision.h.  The response helper is defined with the OTA handlers. */
-
-static portMUX_TYPE s_lifecycle_claim_lock = portMUX_INITIALIZER_UNLOCKED;
-static bool s_lifecycle_claimed;
-static const char *s_lifecycle_claim_owner;
-
-
-
-
-bool netprov_lifecycle_try_claim(const char *owner)
-{
-    bool claimed = false;
-    portENTER_CRITICAL(&s_lifecycle_claim_lock);
-    if (!s_lifecycle_claimed) {
-        s_lifecycle_claimed = true;
-        s_lifecycle_claim_owner = owner;
-        claimed = true;
-    }
-    portEXIT_CRITICAL(&s_lifecycle_claim_lock);
-    return claimed;
-}
-
-
-void netprov_lifecycle_release(void)
-{
-    portENTER_CRITICAL(&s_lifecycle_claim_lock);
-    s_lifecycle_claimed = false;
-    s_lifecycle_claim_owner = NULL;
-    portEXIT_CRITICAL(&s_lifecycle_claim_lock);
-}
-
-
-static const char *lifecycle_claim_owner(void)
-{
-    const char *owner;
-    portENTER_CRITICAL(&s_lifecycle_claim_lock);
-    owner = s_lifecycle_claim_owner;
-    portEXIT_CRITICAL(&s_lifecycle_claim_lock);
-    return owner ? owner : "none";
-}
+static esp_err_t ota_send_busy(httpd_req_t *req);
 
 #define NVS_NAMESPACE       "cfg"
 #define NVS_KEY_HOSTNAME    "hostname"
@@ -997,19 +963,13 @@ static esp_err_t favicon_get_handler(httpd_req_t *req)
 }
 
 /* ── Cached status data ────────────────────────────────────────────
- * These values rarely change but are expensive to query (SD I/O for
- * f_getfree, flash I/O for NVS).  Caching avoids contending with large
- * file downloads on the shared SD bus during 3-second status polls. */
+ * Flash-backed configuration changes rarely. SD capacity has its own
+ * producer-maintained cache in sd_storage; this frequently-polled endpoint
+ * must never turn a missing/stale sample into synchronous card I/O. */
 
-#define STATUS_CACHE_SD_MS    600000  /* refresh SD free space every 10 min */
 #define STATUS_CACHE_NVS_MS   120000  /* refresh NVS-backed settings every 2 min */
 
 static struct {
-    /* SD card */
-    uint64_t sd_total;
-    uint64_t sd_free;
-    bool     sd_valid;
-    TickType_t sd_tick;
     /* NVS config */
     struct netprov_config cfg;
     bool     cfg_valid;
@@ -1019,33 +979,6 @@ static struct {
     char     ntp_srv[64];
     TickType_t tz_tick;
 } s_status_cache;
-static volatile bool s_sd_refreshing = false;
-
-static void sd_refresh_task(void *arg)
-{
-    (void)arg;
-    if (sd_storage_is_ready() &&
-        sd_storage_get_free(NULL, NULL) == ESP_OK) {
-        s_status_cache.sd_tick = xTaskGetTickCount();
-    }
-    s_sd_refreshing = false;
-    vTaskDelete(NULL);
-}
-
-static void trigger_sd_refresh(void)
-{
-    if (s_sd_refreshing || !sd_storage_is_ready()) return;
-    s_sd_refreshing = true;
-    if (xTaskCreate(sd_refresh_task, "sd_refresh", 3072, NULL, 1, NULL) != pdPASS) {
-        s_sd_refreshing = false;
-    }
-}
-
-static void status_cache_refresh_sd(void)
-{
-    s_status_cache.sd_valid = sd_storage_get_cached_free(
-        &s_status_cache.sd_free, &s_status_cache.sd_total);
-}
 
 static void status_cache_refresh_nvs(void)
 {
@@ -1059,14 +992,6 @@ cJSON *netprov_build_status_json(void)
 {
     TickType_t now = xTaskGetTickCount();
     uint32_t ms = portTICK_PERIOD_MS;
-
-    /* Refresh free space asynchronously, then copy its coherent cached
-     * snapshot into this request's status cache. */
-    if (!s_status_cache.sd_valid ||
-        (uint32_t)((now - s_status_cache.sd_tick) * ms) >= STATUS_CACHE_SD_MS) {
-        trigger_sd_refresh();
-    }
-    status_cache_refresh_sd();
 
     /* Refresh NVS-backed settings at most once per STATUS_CACHE_NVS_MS */
     if (!s_status_cache.cfg_valid ||
@@ -1090,6 +1015,12 @@ cJSON *netprov_build_status_json(void)
 #ifdef SNT_UPSTREAM_REPO
     cJSON_AddStringToObject(resp, "upstream_repo", SNT_UPSTREAM_REPO);
 #endif
+    if (app_desc) {
+        char elf_sha256[65];
+        for (size_t i = 0; i < sizeof(app_desc->app_elf_sha256); ++i)
+            snprintf(elf_sha256 + i * 2, 3, "%02x", app_desc->app_elf_sha256[i]);
+        cJSON_AddStringToObject(resp, "fw_elf_sha256", elf_sha256);
+    }
 
     if (!s_portal_mode) {
         /* Live link state: SSID, IP, RSSI — all derived from the event-driven
@@ -1167,6 +1098,56 @@ cJSON *netprov_build_status_json(void)
     /* Uptime */
     uint32_t uptime_s = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS / 1000);
     cJSON_AddNumberToObject(resp, "uptime", uptime_s);
+    cJSON_AddNumberToObject(resp, "reset_reason", esp_reset_reason());
+#if CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B
+    /* Timestamped controller observations; these do not measure emitted light. */
+    touch_observation_t touch;
+    waveshare_7b_touch_snapshot(&touch);
+    cJSON *input = cJSON_AddObjectToObject(resp, "touch");
+    if (input) {
+        int64_t now_us = esp_timer_get_time();
+        cJSON_AddBoolToObject(input, "healthy", touch_observation_healthy(&touch, now_us));
+        cJSON_AddBoolToObject(input, "recovering", touch.recovering);
+        cJSON_AddBoolToObject(input, "preventive_recovery",
+                              touch.preventive_recovery);
+        cJSON_AddNumberToObject(input, "read_errors", touch.errors);
+        cJSON_AddNumberToObject(input, "consecutive_errors", touch.consecutive_errors);
+        cJSON_AddNumberToObject(input, "recovery_attempts", touch.recovery_attempts);
+        cJSON_AddNumberToObject(input, "preventive_recovery_requests",
+                                touch.preventive_recovery_requests);
+        cJSON_AddNumberToObject(input, "preventive_recovery_attempts",
+                                touch.preventive_recovery_attempts);
+        cJSON_AddNumberToObject(input, "visibility_requests", touch.visibility_requests);
+        cJSON_AddBoolToObject(input, "frame_valid", touch.valid);
+        cJSON_AddBoolToObject(input, "pressed", touch_observation_pressed(&touch, now_us));
+        cJSON_AddNumberToObject(input, "continuity", touch.continuity);
+        cJSON_AddNumberToObject(input, "last_error", touch.last_error);
+        if (touch.frame_us > 0 && now_us >= touch.frame_us)
+            cJSON_AddNumberToObject(input, "frame_age_ms", (now_us - touch.frame_us) / 1000);
+        else cJSON_AddNullToObject(input, "frame_age_ms");
+        if (touch.observed && now_us >= touch.observed_us)
+            cJSON_AddNumberToObject(input, "observation_age_ms", (now_us - touch.observed_us) / 1000);
+        else cJSON_AddNullToObject(input, "observation_age_ms");
+    }
+    bsp_display_wake_snapshot_t wake;
+    cJSON *display = cJSON_AddObjectToObject(resp, "display");
+    if (display) {
+        bool observed = bsp_display_get_wake_snapshot(&wake);
+        cJSON_AddBoolToObject(display, "observed", observed);
+        if (observed) {
+            int64_t now_us = esp_timer_get_time();
+            cJSON_AddBoolToObject(display, "requested_on", wake.requested_on);
+            cJSON_AddBoolToObject(display, "last_applied_on", wake.last_applied_on);
+            cJSON_AddBoolToObject(display, "applied_known", wake.applied_known);
+            cJSON_AddBoolToObject(display, "gesture_blocked", wake.gesture_blocked);
+            cJSON_AddNumberToObject(display, "write_errors", wake.write_errors);
+            if (now_us >= wake.last_service_us)
+                cJSON_AddNumberToObject(display, "service_age_ms",
+                                       (now_us - wake.last_service_us) / 1000);
+            else cJSON_AddNullToObject(display, "service_age_ms");
+        }
+    }
+#endif
 
     /* BLE status (only in connected mode) */
     if (!s_portal_mode) {
@@ -1216,16 +1197,6 @@ cJSON *netprov_build_status_json(void)
     cJSON *alert = cJSON_AddObjectToObject(resp, "alert");
     cJSON_AddStringToObject(alert, "state", therapy_alert_state_str(therapy_alert_get_state()));
 
-    {
-        char *pending = NULL;
-        if (session_writer_pending_export_json(&pending) == ESP_OK && pending) {
-            cJSON *parsed = cJSON_Parse(pending);
-            if (parsed) {
-                cJSON_AddItemToObject(resp, "pending_export", parsed);
-            }
-            free(pending);
-        }
-    }
     cJSON_AddNumberToObject(resp, "ih_min", (double)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(resp, "ih_lfb", (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(resp, "ps_free", (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -1233,10 +1204,12 @@ cJSON *netprov_build_status_json(void)
     cJSON_AddNumberToObject(resp, "ps_lfb", (double)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     cJSON_AddNumberToObject(resp, "tasks", (double)uxTaskGetNumberOfTasks());
 
-    /* SD card free space (from cache — no SD I/O on every poll) */
-    if (s_status_cache.sd_valid) {
-        cJSON_AddNumberToObject(resp, "sd_total", (double)s_status_cache.sd_total);
-        cJSON_AddNumberToObject(resp, "sd_free", (double)s_status_cache.sd_free);
+    /* A producer-owned snapshot: this call is bounded RAM access only. */
+    uint64_t sd_total = 0;
+    uint64_t sd_free = 0;
+    if (sd_storage_get_cached_free(&sd_free, &sd_total)) {
+        cJSON_AddNumberToObject(resp, "sd_total", (double)sd_total);
+        cJSON_AddNumberToObject(resp, "sd_free", (double)sd_free);
     }
 
     return resp;
@@ -1920,22 +1893,6 @@ static void reboot_task(void *arg)
     esp_restart();
 }
 
-static bool schedule_reboot(const char *name)
-{
-    if (!netprov_lifecycle_try_claim(name)) {
-        ESP_LOGW(TAG, "reboot deferred: lifecycle owned by %s", lifecycle_claim_owner());
-        return false;
-    }
-    if (!psram_task_create(reboot_task, name, 4096, NULL, 5,
-                           tskNO_AFFINITY, NULL, NULL)) {
-        netprov_lifecycle_release();
-        ESP_LOGE(TAG, "reboot worker allocation failed");
-        return false;
-    }
-    return true;
-}
-
-
 static esp_err_t heap_stats_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
@@ -1986,10 +1943,20 @@ static esp_err_t heap_stats_handler(httpd_req_t *req)
 
 static esp_err_t reboot_post_handler(httpd_req_t *req)
 {
+    if (!netprov_lifecycle_try_claim("reboot")) {
+        return ota_send_busy(req);
+    }
+    TaskHandle_t task = psram_task_create(reboot_task, "reboot", 4096, NULL, 5,
+                                          tskNO_AFFINITY, NULL, NULL);
+    if (!task) {
+        netprov_lifecycle_release();
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(
+            req, "{\"ok\":false,\"error\":\"unable to schedule restart\"}");
+    }
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-    schedule_reboot("reboot");
-    return ESP_OK;
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t save_post_handler(httpd_req_t *req)
@@ -2246,54 +2213,148 @@ static esp_err_t dir_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t download_get_handler(httpd_req_t *req)
+static bool s_download_active;
+static bool s_download_closing;
+static int64_t s_download_deadline_us;
+
+static bool download_cancelled(void)
 {
+    return __atomic_load_n(&s_download_closing, __ATOMIC_ACQUIRE) ||
+           sd_storage_recording_pending() || sd_storage_recording_active() ||
+           esp_timer_get_time() >= s_download_deadline_us;
+}
+
+/* HTTP's send-all loop can call us repeatedly after positive partial writes.
+ * Check cancellation on every call, with a bounded nonblocking socket wait. */
+static int download_send(httpd_handle_t server, int socket, const char *bytes,
+                          size_t size, int flags)
+{
+    (void)server;
+    int64_t deadline = esp_timer_get_time() + 200000;
+    for (;;) {
+        if (download_cancelled() || esp_timer_get_time() >= deadline)
+            return HTTPD_SOCK_ERR_TIMEOUT;
+        int sent = send(socket, bytes, size, flags | MSG_DONTWAIT);
+        if (sent >= 0) return sent;
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return HTTPD_SOCK_ERR_FAIL;
+        fd_set writable;
+        FD_ZERO(&writable);
+        FD_SET(socket, &writable);
+        struct timeval pause = { .tv_usec = 20000 };
+        int ready = select(socket + 1, NULL, &writable, NULL, &pause);
+        if (ready < 0 && errno != EINTR) return HTTPD_SOCK_ERR_FAIL;
+    }
+}
+
+static bool download_cancel_and_wait(void)
+{
+    __atomic_store_n(&s_download_closing, true, __ATOMIC_RELEASE);
+    int64_t deadline = esp_timer_get_time() + 5000000;
+    while (__atomic_load_n(&s_download_active, __ATOMIC_ACQUIRE)) {
+        if (esp_timer_get_time() >= deadline) return false;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return true;
+}
+
+static void download_finish(httpd_req_t *req)
+{
+    /* shutdown does not recycle the descriptor. Do it while the SDK still
+     * excludes this session from reuse, then let HTTP retire it after EOF. */
+    shutdown(httpd_req_to_sockfd(req), SHUT_RDWR);
+    httpd_req_async_handler_complete(req);
+    __atomic_store_n(&s_download_active, false, __ATOMIC_RELEASE);
+}
+
+static esp_err_t download_file(httpd_req_t *req)
+{
+    s_download_deadline_us = esp_timer_get_time() + 300000000LL;
+    if (httpd_sess_set_send_override(req->handle, httpd_req_to_sockfd(req), download_send) != ESP_OK)
+        return ESP_FAIL;
     char file_path[256];
-    if (!get_query_param(req, "path", file_path, sizeof(file_path))) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing path");
+    if (!get_query_param(req, "path", file_path, sizeof(file_path)) || !path_is_safe(file_path)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing or invalid path");
         return ESP_FAIL;
     }
-
-    if (!path_is_safe(file_path)) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad path");
+    if (!sd_storage_lease_acquire(SD_LEASE_UPLOAD, 0)) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "card busy; retry later");
         return ESP_FAIL;
     }
-
-    FILE *f = fopen(file_path, "rb");
-    if (!f) {
+    esp_err_t result = ESP_FAIL;
+    FILE *file = fopen(file_path, "rb");
+    char *buffer = NULL;
+    if (!file) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "file not found");
-        return ESP_FAIL;
+        goto done;
     }
-
-    struct stat st;
-    if (stat(file_path, &st) == 0) {
-        char len_str[16];
-        snprintf(len_str, sizeof(len_str), "%ld", (long)st.st_size);
-        httpd_resp_set_hdr(req, "Content-Length", len_str);
+    buffer = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
+    if (!buffer) {
+        httpd_resp_send_500(req);
+        goto done;
     }
-
     httpd_resp_set_type(req, "application/octet-stream");
     httpd_resp_set_hdr(req, "Connection", "close");
-
-    /* Heap-allocate to avoid stack overflow */
-    char *buf = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
-    if (!buf) buf = malloc(2048);
-    if (!buf) {
-        fclose(f);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    size_t n;
-    while ((n = fread(buf, 1, 2048, f)) > 0) {
-        if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) {
-            free(buf);
-            fclose(f);
-            return ESP_FAIL;
+    result = ESP_OK;
+    for (;;) {
+        if (download_cancelled()) {
+            result = ESP_ERR_TIMEOUT;
+            break;
+        }
+        size_t count = fread(buffer, 1, 2048, file);
+        if (!count) {
+            if (ferror(file)) result = ESP_FAIL;
+            break;
+        }
+        if (httpd_resp_send_chunk(req, buffer, count) != ESP_OK) {
+            result = ESP_FAIL;
+            break;
         }
     }
-    free(buf);
-    fclose(f);
-    httpd_resp_send_chunk(req, NULL, 0);
+    if (result == ESP_OK) result = httpd_resp_send_chunk(req, NULL, 0);
+done:
+    free(buffer);
+    if (file && fclose(file) != 0) result = ESP_FAIL;
+    sd_storage_lease_release(SD_LEASE_UPLOAD);
+    return result;
+}
+
+static void download_task(void *argument)
+{
+    httpd_req_t *req = argument;
+    (void)download_file(req);
+    download_finish(req);
+    psram_task_delete(NULL);
+}
+
+static esp_err_t download_get_handler(httpd_req_t *req)
+{
+    bool expected = false;
+    if (!__atomic_compare_exchange_n(&s_download_active, &expected, true, false,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "download in progress; retry later");
+        return ESP_OK;
+    }
+    if (__atomic_load_n(&s_download_closing, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&s_download_active, false, __ATOMIC_RELEASE);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_sendstr(req, "server restarting; retry later");
+        return ESP_OK;
+    }
+    httpd_req_t *async = NULL;
+    esp_err_t result = httpd_req_async_handler_begin(req, &async);
+    if (result != ESP_OK) {
+        __atomic_store_n(&s_download_active, false, __ATOMIC_RELEASE);
+        httpd_resp_send_500(req);
+        return result;
+    }
+    if (!psram_task_create(download_task, "file_download", 8192, async, 3,
+                           tskNO_AFFINITY, NULL, NULL)) {
+        httpd_resp_send_500(async);
+        download_finish(async);
+    }
     return ESP_OK;
 }
 
@@ -2759,243 +2820,12 @@ static void uploader_lease_release(void)
     sd_storage_lease_release(SD_LEASE_UPLOAD);
 }
 
-
 static bool uploader_recording_requested(void)
 {
     return sd_storage_recording_pending() || sd_storage_recording_active();
 }
 
-/* Recursively delete a directory and all its contents. */
-static void recursive_delete(const char *path)
-{
-    DIR *d = opendir(path);
-    if (!d) {
-        remove(path);
-        return;
-    }
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-            continue;
-        char child[512];
-        snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
-        if (ent->d_type == DT_DIR) {
-            recursive_delete(child);
-        } else {
-            remove(child);
-        }
-    }
-    closedir(d);
-    rmdir(path);
-}
-
-/* Background task for recreate EDFs (long-running, needs large stack). */
-typedef struct {
-    char session_dir[256];
-    char session_id[32];
-    int64_t start_epoch_ms;
-    int64_t end_epoch_ms;
-    int64_t clock_drift_ms;
-} recreate_session_t;
-
-static void recreate_edfs_task(void *arg)
-{
-    ESP_LOGI(TAG, "recreate_edfs_task: starting");
-
-    int max_days = uploader_max_days();
-    ESP_LOGI(TAG, "recreate_edfs_task: upload window = %d days (newest first)", max_days);
-
-    /* 1. Per-day deletion happens inline during generation (below) so that
-     * days outside the upload window are left untouched.  The shared root
-     * artifacts (STR.edf, Identification.json, SETTINGS/) are overwritten
-     * by edf_gen_generate via atomic rename — no pre-deletion needed. */
-
-    /* 2. First pass: count total _session.json files so we can allocate the
-     * exact-sized array (no arbitrary cap). */
-    int total_sessions = 0;
-    DIR *d = opendir(SD_STREAMS_DIR);
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL) {
-            if (ent->d_type != DT_DIR) continue;
-            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-                continue;
-            char day_dir[300];
-            snprintf(day_dir, sizeof(day_dir), "%s/%s", SD_STREAMS_DIR, ent->d_name);
-            DIR *dd = opendir(day_dir);
-            if (!dd) continue;
-            struct dirent *fent;
-            while ((fent = readdir(dd)) != NULL) {
-                if (fent->d_type != DT_REG) continue;
-                const char *suffix = "_session.json";
-                int slen = strlen(suffix);
-                int flen = strlen(fent->d_name);
-                if (flen <= slen || strcmp(fent->d_name + flen - slen, suffix) != 0)
-                    continue;
-                total_sessions++;
-            }
-            closedir(dd);
-        }
-        closedir(d);
-    }
-
-    if (total_sessions == 0) {
-        ESP_LOGI(TAG, "recreate_edfs_task: no sessions found");
-        psram_task_delete(NULL);
-        return;
-    }
-
-    /* 3. Allocate sessions array in PSRAM (each entry is ~312 bytes;
-     * with many sessions this can exceed internal RAM free space). */
-    recreate_session_t *sessions = heap_caps_calloc(total_sessions,
-            sizeof(recreate_session_t), MALLOC_CAP_SPIRAM);
-    if (!sessions) {
-        ESP_LOGE(TAG, "recreate_edfs_task: failed to allocate %d sessions", total_sessions);
-        psram_task_delete(NULL);
-        return;
-    }
-    int n_sessions = 0;
-
-    /* 4. Second pass: collect all sessions. */
-    d = opendir(SD_STREAMS_DIR);
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL) {
-            if (ent->d_type != DT_DIR) continue;
-            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-                continue;
-            char day_dir[300];
-            snprintf(day_dir, sizeof(day_dir), "%s/%s", SD_STREAMS_DIR, ent->d_name);
-            DIR *dd = opendir(day_dir);
-            if (!dd) continue;
-            struct dirent *fent;
-            while ((fent = readdir(dd)) != NULL) {
-                if (fent->d_type != DT_REG) continue;
-                const char *suffix = "_session.json";
-                int slen = strlen(suffix);
-                int flen = strlen(fent->d_name);
-                if (flen <= slen || strcmp(fent->d_name + flen - slen, suffix) != 0)
-                    continue;
-                char session_id[32];
-                int prefix_len = flen - slen;
-                if (prefix_len <= 0 || prefix_len >= (int)sizeof(session_id)) continue;
-                memcpy(session_id, fent->d_name, prefix_len);
-                session_id[prefix_len] = '\0';
-                char json_path[600];
-                snprintf(json_path, sizeof(json_path), "%s/%s", day_dir, fent->d_name);
-                FILE *f = fopen(json_path, "r");
-                if (!f) continue;
-                fseek(f, 0, SEEK_END);
-                long fsize = ftell(f);
-                fseek(f, 0, SEEK_SET);
-                if (fsize <= 0 || fsize > 4096) { fclose(f); continue; }
-                char *buf = heap_caps_malloc((size_t)fsize + 1, MALLOC_CAP_SPIRAM);
-                if (!buf) buf = malloc((size_t)fsize + 1);
-                if (!buf) { fclose(f); continue; }
-                fread(buf, 1, fsize, f);
-                buf[fsize] = '\0';
-                fclose(f);
-                cJSON *j = cJSON_Parse(buf);
-                free(buf);
-                if (!j) continue;
-                cJSON *j_start = cJSON_GetObjectItem(j, "start_epoch_ms");
-                cJSON *j_end = cJSON_GetObjectItem(j, "end_epoch_ms");
-                cJSON *j_drift = cJSON_GetObjectItem(j, "clock_drift_ms");
-                if (j_start && cJSON_IsNumber(j_start)) {
-                    int64_t epoch = (int64_t)j_start->valuedouble;
-                    if (epoch < 946684800000LL) {
-                        ESP_LOGW(TAG, "recreate_edfs: skipping %s (invalid start_epoch_ms=%lld)",
-                                 session_id, (long long)epoch);
-                        cJSON_Delete(j);
-                        continue;
-                    }
-                    recreate_session_t *s = &sessions[n_sessions++];
-                    strlcpy(s->session_dir, day_dir, sizeof(s->session_dir));
-                    strlcpy(s->session_id, session_id, sizeof(s->session_id));
-                    s->start_epoch_ms = (int64_t)j_start->valuedouble;
-                    s->end_epoch_ms = (j_end && cJSON_IsNumber(j_end)) ? (int64_t)j_end->valuedouble : 0;
-                    s->clock_drift_ms = (j_drift && cJSON_IsNumber(j_drift)) ? (int64_t)j_drift->valuedouble : 0;
-                }
-                cJSON_Delete(j);
-            }
-            closedir(dd);
-        }
-        closedir(d);
-    }
-
-    ESP_LOGI(TAG, "recreate_edfs_task: found %d sessions", n_sessions);
-
-    /* 5. Sort sessions by start_epoch_ms descending (newest first). */
-    for (int i = 1; i < n_sessions; i++) {
-        recreate_session_t tmp = sessions[i];
-        int j = i - 1;
-        while (j >= 0 && sessions[j].start_epoch_ms < tmp.start_epoch_ms) {
-            sessions[j + 1] = sessions[j];
-            j--;
-        }
-        sessions[j + 1] = tmp;
-    }
-
-    /* 6. Walk newest-first, generating EDFs only for sessions within the
-     * first max_days unique day folders.  Sessions are sorted descending so
-     * once max_days distinct days have been seen, all remaining sessions are
-     * older and outside the upload window. */
-    char (*queued_days)[16] = heap_caps_calloc(max_days + 1,
-            sizeof(*queued_days), MALLOC_CAP_SPIRAM);
-    if (!queued_days) {
-        ESP_LOGE(TAG, "recreate_edfs_task: failed to allocate queued_days");
-        free(sessions);
-        psram_task_delete(NULL);
-        return;
-    }
-    int n_queued_days = 0;
-    int n_processed = 0;
-
-    for (int i = 0; i < n_sessions; i++) {
-        char day_folder[32];
-        as11_time_noon_day(sessions[i].start_epoch_ms - sessions[i].clock_drift_ms,
-                           day_folder, sizeof(day_folder));
-
-        bool dup = false;
-        for (int j = 0; j < n_queued_days; j++) {
-            if (strcmp(queued_days[j], day_folder) == 0) { dup = true; break; }
-        }
-        if (!dup) {
-            if (n_queued_days >= max_days) {
-                /* Exceeded the upload window — all remaining sessions are
-                 * older; stop processing. */
-                break;
-            }
-            /* Delete just this day's existing EDF folder before recreating
-             * it, so stale files from a previous export don't survive. */
-            char old_day_dir[300];
-            snprintf(old_day_dir, sizeof(old_day_dir), "%s/%s",
-                     SD_SDCARD_DATALOG, day_folder);
-            recursive_delete(old_day_dir);
-            strlcpy(queued_days[n_queued_days++], day_folder, sizeof(queued_days[0]));
-        }
-
-        n_processed++;
-        ESP_LOGI(TAG, "recreate_edfs_task: generating EDFs for session %d: %s",
-                 n_processed, sessions[i].session_id);
-        edf_gen_generate(sessions[i].session_dir, sessions[i].session_id,
-                         sessions[i].start_epoch_ms, sessions[i].end_epoch_ms,
-                         sessions[i].clock_drift_ms);
-    }
-
-    /* 7. Queue unique day folders for upload. */
-    for (int j = 0; j < n_queued_days; j++) {
-        uploader_on_day_invalidated(queued_days[j]);
-    }
-
-    ESP_LOGI(TAG, "recreate_edfs_task: done (%d/%d sessions processed, %d unique days queued)",
-             n_processed, n_sessions, n_queued_days);
-    free(queued_days);
-    free(sessions);
-    psram_task_delete(NULL);
-}
-
-/* Scoped single-day rebuild.  Unlike recreate_edfs_task() this deletes
+/* Scoped single-day rebuild.  This deletes
  * nothing up front: edf_gen_rebuild_day() stages the day and publishes it
  * only on full success, and the day is queued for upload only then. */
 static void rebuild_day_task(void *arg)
@@ -3031,9 +2861,9 @@ static format_progress_t s_format_progress;
 static SemaphoreHandle_t s_format_mtx;  /* guards s_format_progress reads/writes across tasks */
 
 /* Background task for the destructive SD format.  PSRAM-backed because the
- * format is slow and must not block the HTTP handler.  Holds the destructive
- * lease for the whole operation, including the reboot, so nothing writes to the
- * card in between.  The success path never returns (it reboots). */
+ * format is slow and must not block the HTTP handler.  The format lease is
+ * released as soon as the fresh volume is remounted; any later clean reboot
+ * reacquires it under the short therapy lifecycle reservation. */
 static void format_sd_task(void *arg)
 {
     (void)arg;
@@ -3169,56 +2999,530 @@ static esp_err_t format_progress_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+esp_err_t maintenance_format_start(void)
+{
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    return ESP_ERR_NOT_SUPPORTED; /* Never format host data in the preview. */
+#endif
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active() ||
+        !netprov_lifecycle_try_claim("format")) return ESP_ERR_INVALID_STATE;
+    if (!s_format_mtx) s_format_mtx = xSemaphoreCreateMutex();
+    if (!s_format_mtx) { netprov_lifecycle_release(); return ESP_ERR_NO_MEM; }
+    xSemaphoreTake(s_format_mtx, portMAX_DELAY);
+    memset(&s_format_progress, 0, sizeof(s_format_progress));
+    s_format_progress.active = true;
+    xSemaphoreGive(s_format_mtx);
+    if (!psram_task_create(format_sd_task, "format_sd", 16384, NULL, 5, 1, NULL, NULL)) {
+        xSemaphoreTake(s_format_mtx, portMAX_DELAY);
+        s_format_progress.active = false;
+        xSemaphoreGive(s_format_mtx);
+        netprov_lifecycle_release();
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+void maintenance_format_snapshot(bool *active, bool *done, bool *ok, char *error, size_t cap)
+{
+    *active = *done = *ok = false;
+    if (cap) error[0] = 0;
+    if (!s_format_mtx) return;
+    xSemaphoreTake(s_format_mtx, portMAX_DELAY);
+    *active=s_format_progress.active; *done=s_format_progress.done; *ok=s_format_progress.ok;
+    if (cap) strlcpy(error,s_format_progress.error,cap);
+    xSemaphoreGive(s_format_mtx);
+}
+
+static bool factory_reset_cancelled(void *unused)
+{
+    (void)unused;
+    return bsp_display_therapy_safe_maintenance_should_abort() ||
+           sd_storage_recording_pending();
+}
+
+/* Internal stack: final NVS erasure and restart disable the flash cache. The
+ * global NVS lock is deliberately held until restart so settings cannot be
+ * repopulated between factory erasure and booting first-run setup. */
+static void factory_reset_task(void *arg)
+{
+    (void)arg;
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    bool leased = false, maintenance = false, reserved = false;
+    maintenance_fs_totals_t totals = {0};
+    maintenance = bsp_display_try_begin_therapy_safe_maintenance();
+    if (!maintenance) goto out;
+    leased = sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0);
+    if (!leased) goto out;
+    const char *roots[] = { SD_SDCARD_DIR, SD_APP_DIR };
+    for (size_t i=0; i<2; i++) {
+        int error = maintenance_fs_walk(roots[i], MAINT_FS_DELETE_TREE, false,
+                                         &totals, factory_reset_cancelled, NULL);
+        if (error) { result = ESP_FAIL; goto out; }
+    }
+    sd_storage_lease_release(SD_LEASE_DESTRUCTIVE); leased = false;
+    bsp_display_end_therapy_safe_maintenance(); maintenance = false;
+    /* Yield to any therapy start which arrived during the card wipe. It may
+     * leave a partial factory reset, which is reported as such; settings have
+     * not yet been erased. No long therapy restart reservation covers I/O. */
+    reserved = bsp_display_try_reserve_therapy_safe_restart();
+    if (!reserved) goto out;
+    leased = sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0);
+    if (!leased || bsp_display_is_therapy_active() || sd_storage_recording_active() ||
+        !bsp_display_try_commit_therapy_safe_restart()) goto out;
+    nvs_writer_lock();
+    result = nvs_flash_deinit();
+    if (result == ESP_OK || result == ESP_ERR_NVS_NOT_INITIALIZED)
+        result = nvs_flash_erase();
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Factory settings erase failed: %s; restarting for recovery", esp_err_to_name(result));
+        bsp_display_set_notice("Settings erase failed; restarting for recovery");
+    }
+    /* Commit is one-way. Even an NVS failure must complete the owned restart,
+     * never return with therapy publication permanently fenced. */
+    sd_storage_deinit();
+    esp_restart();
+out:
+    if (leased) sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
+    if (maintenance) bsp_display_end_therapy_safe_maintenance();
+    if (reserved) bsp_display_cancel_therapy_safe_restart();
+    xSemaphoreTake(s_format_mtx, portMAX_DELAY);
+    s_format_progress.active = false;
+    s_format_progress.done = true;
+    s_format_progress.ok = false;
+    snprintf(s_format_progress.error, sizeof(s_format_progress.error),
+             "Reset incomplete; %llu files removed (%s)",
+             (unsigned long long)totals.files, esp_err_to_name(result));
+    xSemaphoreGive(s_format_mtx);
+    netprov_lifecycle_release();
+    vTaskDelete(NULL);
+}
+
+esp_err_t maintenance_factory_reset_start(void)
+{
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active() ||
+        !sd_storage_is_ready() || !netprov_lifecycle_try_claim("factory-reset"))
+        return ESP_ERR_INVALID_STATE;
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 49152 ||
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 17408) {
+        netprov_lifecycle_release(); return ESP_ERR_NO_MEM;
+    }
+    if (!s_format_mtx) s_format_mtx = xSemaphoreCreateMutex();
+    if (!s_format_mtx) { netprov_lifecycle_release(); return ESP_ERR_NO_MEM; }
+    xSemaphoreTake(s_format_mtx, portMAX_DELAY);
+    memset(&s_format_progress, 0, sizeof(s_format_progress));
+    s_format_progress.active = true;
+    xSemaphoreGive(s_format_mtx);
+    if (xTaskCreate(factory_reset_task, "factory_reset", 16384, NULL, 5, NULL) != pdPASS) {
+        xSemaphoreTake(s_format_mtx, portMAX_DELAY);
+        s_format_progress.active = false;
+        xSemaphoreGive(s_format_mtx);
+        netprov_lifecycle_release(); return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 /* ── OTA firmware upload ─────────────────────────────────────────── */
 
 #define OTA_CHUNK_SIZE   4096
 #define OTA_MAX_SIZE     (0x400000)  /* 4 MB — partition size */
 #define OTA_BUF_SIZE     (OTA_CHUNK_SIZE * 2)  /* stream buffer: 8 KB */
+#define OTA_BUF_STORAGE_SIZE (OTA_BUF_SIZE + 1) /* static streams reserve one byte */
 
-/* OTA flash task context — passed from httpd handler to the internal-stack task. */
+/* Flash/NVS code must run from an internal-RAM task stack.  Keep a measured
+ * reserve after creating that task for its TCB, flash/cache-off helpers, and
+ * the Wi-Fi DMA path which is still serving the request.  The largest-block
+ * guard catches fragmentation that a total-free check alone cannot see. */
+#define OTA_UPLOAD_TASK_STACK_BYTES 8192U
+#define OTA_URL_TASK_STACK_BYTES    12288U
+#define OTA_INTERNAL_RUNTIME_RESERVE_BYTES (16U * 1024U)
+#define OTA_INTERNAL_CONTROL_HEADROOM_BYTES 1024U
+#define OTA_UPLOAD_MIN_INTERNAL_FREE \
+    (OTA_UPLOAD_TASK_STACK_BYTES + OTA_INTERNAL_RUNTIME_RESERVE_BYTES + \
+     OTA_INTERNAL_CONTROL_HEADROOM_BYTES)
+#define OTA_URL_MIN_INTERNAL_FREE \
+    (OTA_URL_TASK_STACK_BYTES + OTA_INTERNAL_RUNTIME_RESERVE_BYTES + \
+     OTA_INTERNAL_CONTROL_HEADROOM_BYTES)
+#define OTA_UPLOAD_MIN_INTERNAL_LARGEST \
+    (OTA_UPLOAD_TASK_STACK_BYTES + OTA_INTERNAL_CONTROL_HEADROOM_BYTES)
+#define OTA_URL_MIN_INTERNAL_LARGEST \
+    (OTA_URL_TASK_STACK_BYTES + OTA_INTERNAL_CONTROL_HEADROOM_BYTES)
+#define OTA_INTERNAL_CAPS (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+#define OTA_REBOOT_FALLBACK_TIMEOUT_MS 5000U
+
 typedef struct {
-    StreamBufferHandle_t sbuf;       /* data channel: httpd → flash task */
-    int total_size;                  /* expected image size (0 = unknown/chunked) */
-    volatile bool eof;               /* download side finished sending data */
-    esp_err_t result;                /* result from flash task */
-    bool done;                       /* flash task finished */
+    size_t free_bytes;
+    size_t minimum_free_bytes;
+    size_t largest_block_bytes;
+} ota_heap_snapshot_t;
+
+/* One global claim covers every firmware update and controlled restart.  Some
+ * owners continue in background tasks and can originate outside httpd, so the
+ * claim is public and atomically acquired before any worker is scheduled. */
+static portMUX_TYPE s_lifecycle_claim_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_lifecycle_claimed;
+static const char *s_lifecycle_claim_owner;
+
+static ota_heap_snapshot_t ota_heap_snapshot(void)
+{
+    ota_heap_snapshot_t snapshot = {
+        .free_bytes = heap_caps_get_free_size(OTA_INTERNAL_CAPS),
+        .minimum_free_bytes = heap_caps_get_minimum_free_size(OTA_INTERNAL_CAPS),
+        .largest_block_bytes = heap_caps_get_largest_free_block(OTA_INTERNAL_CAPS),
+    };
+    return snapshot;
+}
+
+bool netprov_lifecycle_try_claim(const char *owner)
+{
+    bool claimed = false;
+    portENTER_CRITICAL(&s_lifecycle_claim_lock);
+    if (!s_lifecycle_claimed) {
+        s_lifecycle_claimed = true;
+        s_lifecycle_claim_owner = owner;
+        claimed = true;
+    }
+    portEXIT_CRITICAL(&s_lifecycle_claim_lock);
+    return claimed;
+}
+
+void netprov_lifecycle_release(void)
+{
+    portENTER_CRITICAL(&s_lifecycle_claim_lock);
+    s_lifecycle_claimed = false;
+    s_lifecycle_claim_owner = NULL;
+    portEXIT_CRITICAL(&s_lifecycle_claim_lock);
+}
+
+static const char *lifecycle_claim_owner(void)
+{
+    const char *owner;
+    portENTER_CRITICAL(&s_lifecycle_claim_lock);
+    owner = s_lifecycle_claim_owner;
+    portEXIT_CRITICAL(&s_lifecycle_claim_lock);
+    return owner ? owner : "none";
+}
+
+static bool ota_heap_admit(const char *mode,
+                           size_t required_free,
+                           size_t required_largest,
+                           ota_heap_snapshot_t *out)
+{
+    ota_heap_snapshot_t snapshot = ota_heap_snapshot();
+    ESP_LOGI(TAG,
+             "OTA %s admission: internal8 free=%u min=%u largest=%u "
+             "required_free=%u required_largest=%u PSRAM=%u",
+             mode,
+             (unsigned)snapshot.free_bytes,
+             (unsigned)snapshot.minimum_free_bytes,
+             (unsigned)snapshot.largest_block_bytes,
+             (unsigned)required_free,
+             (unsigned)required_largest,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    if (out) {
+        *out = snapshot;
+    }
+    return snapshot.free_bytes >= required_free &&
+           snapshot.largest_block_bytes >= required_largest;
+}
+
+static esp_err_t ota_send_busy(httpd_req_t *req)
+{
+    char body[112];
+    snprintf(body, sizeof(body),
+             "{\"ok\":false,\"error\":\"update or restart already active\",\"mode\":\"%s\"}",
+             lifecycle_claim_owner());
+    httpd_resp_set_status(req, "409 Conflict");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t ota_send_resource_error(httpd_req_t *req,
+                                         const char *error,
+                                         const ota_heap_snapshot_t *snapshot,
+                                         size_t required_free,
+                                         size_t required_largest)
+{
+    char body[256];
+    ota_heap_snapshot_t current = snapshot ? *snapshot : ota_heap_snapshot();
+    snprintf(body, sizeof(body),
+             "{\"ok\":false,\"error\":\"%s\","
+             "\"internal_free\":%u,\"internal_largest\":%u,"
+             "\"required_free\":%u,\"required_largest\":%u}",
+             error,
+             (unsigned)current.free_bytes,
+             (unsigned)current.largest_block_bytes,
+             (unsigned)required_free,
+             (unsigned)required_largest);
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Retry-After", "5");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t ota_send_storage_busy(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "409 Conflict");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Retry-After", "5");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    return httpd_resp_sendstr(
+        req,
+        "{\"ok\":false,\"error\":\"therapy or storage operation active\"}");
+}
+
+/* Verify that OTA starts only from an idle therapy/storage boundary.  The
+ * lease is intentionally a probe, not a minutes-long reservation: retaining
+ * it throughout a network download could prevent an unexpectedly-started
+ * therapy session from recording.  The OTA-specific reboot worker performs
+ * the same checks again and takes the destructive lease before unmounting. */
+static bool ota_storage_preflight(void)
+{
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active()) {
+        return false;
+    }
+    if (!bsp_display_try_reserve_therapy_safe_restart()) {
+        return false;
+    }
+    if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0)) {
+        bsp_display_cancel_therapy_safe_restart();
+        return false;
+    }
+    bool idle = !bsp_display_is_therapy_active() &&
+                !sd_storage_recording_active();
+    sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
+    /* Release the storage lease before waking any therapy-start waiter. */
+    bsp_display_cancel_therapy_safe_restart();
+    return idle;
+}
+
+/* A firmware marked bootable must have an owned path to restart.  This worker
+ * keeps the OTA claim while therapy or card I/O is active, then atomically
+ * excludes new recording/card work, flushes FATFS, and restarts. */
+static bool ota_wait_for_safe_reboot(uint32_t timeout_ms)
+{
+    bool announced_defer = false;
+    bool wait_forever = timeout_ms == UINT32_MAX;
+    TickType_t started = xTaskGetTickCount();
+    TickType_t timeout_ticks = wait_forever
+                                   ? portMAX_DELAY
+                                   : pdMS_TO_TICKS(timeout_ms);
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    for (;;) {
+        if (!wait_forever &&
+            (TickType_t)(xTaskGetTickCount() - started) >= timeout_ticks) {
+            return false;
+        }
+        if (bsp_display_is_therapy_active() || sd_storage_recording_active()) {
+            if (!announced_defer) {
+                ESP_LOGW(TAG, "OTA reboot deferred until therapy ends");
+                bsp_display_set_notice("Update ready; restart deferred during therapy");
+                announced_defer = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
+        /* Reserve the therapy lifecycle before waiting for the SD lease. A
+         * concurrent start records itself as a waiter and cannot publish (or
+         * attempt recording) until this owner releases SD and cancels. */
+        if (!bsp_display_try_reserve_therapy_safe_restart()) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0)) {
+            bsp_display_cancel_therapy_safe_restart();
+            if (!announced_defer) {
+                ESP_LOGW(TAG, "OTA reboot deferred for active storage operation");
+                bsp_display_set_notice("Update ready; waiting for storage");
+                announced_defer = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        /* Therapy state is external to the storage arbiter, so close the
+         * final check/acquire window before unmounting. */
+        if (bsp_display_is_therapy_active() || sd_storage_recording_active()) {
+            sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
+            bsp_display_cancel_therapy_safe_restart();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        /* Promote the reservation only when no therapy start arrived while SD
+         * was acquired. On contention, release SD before waking the waiter so
+         * its recording claim cannot lose to a restart that then defers. */
+        if (!bsp_display_try_commit_therapy_safe_restart()) {
+            sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
+            bsp_display_cancel_therapy_safe_restart();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "OTA reboot: storage idle, flushing and restarting");
+        sd_storage_deinit();
+        /* ESP-IDF 5.5's ESP32-S3 esp_restart_noos() detects an external SP
+         * and switches to an internal emergency stack before cache disable.
+         * All FATFS work above completes while cache is enabled, so keeping
+         * this tiny wait worker in PSRAM is supported and preserves the
+         * contiguous internal block needed by URL OTA. */
+        esp_restart();
+    }
+}
+
+static void ota_reboot_task(void *arg)
+{
+    (void)arg;
+    if (!ota_wait_for_safe_reboot(UINT32_MAX)) {
+        ESP_LOGE(TAG, "OTA reboot worker stopped unexpectedly");
+        netprov_lifecycle_release();
+    }
+    psram_task_delete(NULL);
+}
+
+static bool ota_schedule_reboot(void)
+{
+    TaskHandle_t task = psram_task_create(ota_reboot_task, "ota_reboot", 4096,
+                                          NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    if (!task) {
+        ESP_LOGE(TAG, "OTA reboot task allocation failed; using caller fallback");
+        return false;
+    }
+    return true;
+}
+
+#define OTA_INPUT_DONE_BIT BIT0
+#define OTA_INPUT_ABORT_BIT BIT1
+#define OTA_FLASH_DONE_BIT BIT2
+
+/* Heap-owned context shared by the HTTP and flash tasks.  Its control blocks
+ * are internal, while bulk buffers live explicitly in PSRAM.  The handler
+ * frees it only after OTA_FLASH_DONE_BIT, so a failed receive cannot leave the
+ * flash task dereferencing a returned handler stack or deleted stream. */
+typedef struct {
+    StreamBufferHandle_t sbuf;
+    EventGroupHandle_t events;
+    StaticStreamBuffer_t sbuf_control;
+    StaticEventGroup_t event_control;
+    uint8_t *sbuf_storage;
+    uint8_t *flash_buf;
+    int total_size;
+    esp_err_t result;
+    bool aborted_by_input;
+    bool aborted_by_therapy;
 } ota_ctx_t;
+
+static ota_ctx_t *ota_upload_context_create(int total_size)
+{
+    ota_ctx_t *ctx = heap_caps_calloc(1, sizeof(*ctx), OTA_INTERNAL_CAPS);
+    if (!ctx) {
+        return NULL;
+    }
+    ctx->total_size = total_size;
+    ctx->result = ESP_FAIL;
+    ctx->sbuf_storage = heap_caps_malloc(OTA_BUF_STORAGE_SIZE,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ctx->flash_buf = heap_caps_malloc(OTA_CHUNK_SIZE,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ctx->sbuf_storage || !ctx->flash_buf) {
+        free(ctx->flash_buf);
+        free(ctx->sbuf_storage);
+        free(ctx);
+        return NULL;
+    }
+    ctx->events = xEventGroupCreateStatic(&ctx->event_control);
+    ctx->sbuf = xStreamBufferCreateStatic(OTA_BUF_STORAGE_SIZE, 1,
+                                           ctx->sbuf_storage,
+                                           &ctx->sbuf_control);
+    if (!ctx->events || !ctx->sbuf) {
+        if (ctx->events) {
+            vEventGroupDelete(ctx->events);
+        }
+        if (ctx->sbuf) {
+            vStreamBufferDelete(ctx->sbuf);
+        }
+        free(ctx->flash_buf);
+        free(ctx->sbuf_storage);
+        free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+static void ota_upload_context_destroy(ota_ctx_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    vStreamBufferDelete(ctx->sbuf);
+    vEventGroupDelete(ctx->events);
+    free(ctx->flash_buf);
+    free(ctx->sbuf_storage);
+    free(ctx);
+}
 
 /* OTA flash task — runs on an INTERNAL RAM stack because esp_ota_* functions
  * freeze the SPI cache, which asserts the task stack is not in PSRAM. */
 static void ota_flash_task(void *arg)
 {
     ota_ctx_t *ctx = (ota_ctx_t *)arg;
+    esp_err_t result = ESP_FAIL;
+    esp_ota_handle_t ota_hdl = 0;
+    bool ota_started = false;
+    int written = 0;
+
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (!part) {
         ESP_LOGE(TAG, "OTA: no update partition");
-        ctx->result = ESP_FAIL;
-        ctx->done = true;
-        vTaskDelete(NULL);
-        return;
+        goto finished;
     }
 
-    esp_ota_handle_t ota_hdl = 0;
-    esp_err_t err = esp_ota_begin(part, ctx->total_size, &ota_hdl);
+    /* Erase only the sectors immediately needed by each sequential write.
+     * A whole-slot erase can block long enough to fill the 8 KiB producer
+     * stream and make an otherwise healthy upload time out. */
+    esp_err_t err = esp_ota_begin(part, OTA_WITH_SEQUENTIAL_WRITES, &ota_hdl);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "OTA: begin failed: %s", esp_err_to_name(err));
-        ctx->result = err;
-        ctx->done = true;
-        vTaskDelete(NULL);
-        return;
+        result = err;
+        goto finished;
     }
+    ota_started = true;
 
-    uint8_t *buf = malloc(OTA_CHUNK_SIZE);
-    if (!buf) {
-        esp_ota_abort(ota_hdl);
-        ctx->result = ESP_ERR_NO_MEM;
-        ctx->done = true;
-        vTaskDelete(NULL);
-        return;
-    }
+    while (true) {
+        if (bsp_display_therapy_safe_maintenance_should_abort()) {
+            ESP_LOGW(TAG, "OTA: therapy start arrived; abandoning update");
+            ctx->aborted_by_therapy = true;
+            result = ESP_ERR_INVALID_STATE;
+            goto finished;
+        }
+        EventBits_t bits = xEventGroupGetBits(ctx->events);
+        size_t available = xStreamBufferBytesAvailable(ctx->sbuf);
+        if (bits & OTA_INPUT_ABORT_BIT) {
+            ESP_LOGE(TAG, "OTA: input aborted at %d bytes", written);
+            ctx->aborted_by_input = true;
+            result = ESP_ERR_INVALID_STATE;
+            goto finished;
+        }
+        if (ctx->total_size > 0) {
+            if (written >= ctx->total_size) {
+                break;
+            }
+            if ((bits & OTA_INPUT_DONE_BIT) && available == 0) {
+                ESP_LOGE(TAG, "OTA: short upload at %d/%d bytes",
+                         written, ctx->total_size);
+                result = ESP_ERR_INVALID_SIZE;
+                goto finished;
+            }
+        } else if ((bits & OTA_INPUT_DONE_BIT) && available == 0) {
+            break;
+        }
 
-    int written = 0;
-    while (ctx->total_size > 0 ? (written < ctx->total_size) : !ctx->eof || xStreamBufferBytesAvailable(ctx->sbuf) > 0) {
         size_t want;
         if (ctx->total_size > 0) {
             want = ctx->total_size - written;
@@ -3226,57 +3530,59 @@ static void ota_flash_task(void *arg)
             want = OTA_CHUNK_SIZE;
         }
         if (want > OTA_CHUNK_SIZE) want = OTA_CHUNK_SIZE;
-        /* When total_size is unknown, use a short timeout so we can re-check eof */
-        size_t got = xStreamBufferReceive(ctx->sbuf, buf, want, pdMS_TO_TICKS(ctx->total_size > 0 ? 10000 : 500));
+        /* A short wait lets producer completion/abort become visible without
+         * ever destroying a stream under this task. */
+        size_t got = xStreamBufferReceive(ctx->sbuf, ctx->flash_buf, want,
+                                          pdMS_TO_TICKS(250));
         if (got == 0) {
-            if (ctx->total_size > 0) {
-                ESP_LOGE(TAG, "OTA: stream buffer timeout at %d/%d", written, ctx->total_size);
-                esp_ota_abort(ota_hdl);
-                free(buf);
-                ctx->result = ESP_ERR_TIMEOUT;
-                ctx->done = true;
-                vTaskDelete(NULL);
-                return;
-            }
-            /* chunked mode: no data yet, but not EOF — keep waiting */
             continue;
         }
-        err = esp_ota_write(ota_hdl, buf, got);
+        err = esp_ota_write(ota_hdl, ctx->flash_buf, got);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "OTA: write failed: %s", esp_err_to_name(err));
-            esp_ota_abort(ota_hdl);
-            free(buf);
-            ctx->result = err;
-            ctx->done = true;
-            vTaskDelete(NULL);
-            return;
+            result = err;
+            goto finished;
         }
         written += got;
     }
-    free(buf);
 
     err = esp_ota_end(ota_hdl);
+    ota_started = false; /* esp_ota_end consumes the handle, including errors */
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "OTA: end failed: %s", esp_err_to_name(err));
-        ctx->result = err;
-        ctx->done = true;
-        vTaskDelete(NULL);
-        return;
+        result = err;
+        goto finished;
     }
 
     err = esp_ota_set_boot_partition(part);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "OTA: set_boot_partition failed: %s", esp_err_to_name(err));
-        ctx->result = err;
-        ctx->done = true;
-        vTaskDelete(NULL);
-        return;
+        result = err;
+        goto finished;
     }
 
     ESP_LOGI(TAG, "OTA: flash complete (%d bytes)", written);
-    ctx->result = ESP_OK;
-    ctx->done = true;
-    vTaskDelete(NULL);
+    result = ESP_OK;
+
+finished:
+    if (ota_started) {
+        esp_ota_abort(ota_hdl);
+    }
+    ota_heap_snapshot_t heap = ota_heap_snapshot();
+    ESP_LOGI(TAG, "OTA upload finish: result=%s internal8 free=%u largest=%u",
+             esp_err_to_name(result),
+             (unsigned)heap.free_bytes,
+             (unsigned)heap.largest_block_bytes);
+    ctx->result = result;
+    xEventGroupSetBits(ctx->events, OTA_FLASH_DONE_BIT);
+
+    /* The completion bit wakes the handler, but it is not itself a task join:
+     * on SMP the handler can run before xEventGroupSetBits() has returned on
+     * this core.  Park without touching ctx again and let the handler delete
+     * this task before it destroys the static event group embedded in ctx. */
+    for (;;) {
+        vTaskSuspend(NULL); /* deleted by ota_upload_handler; never resumed */
+    }
 }
 
 static esp_err_t ota_upload_handler(httpd_req_t *req)
@@ -3289,101 +3595,213 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    if (!netprov_lifecycle_try_claim("upload")) {
+        return ota_send_busy(req);
+    }
+
+    if (!ota_storage_preflight()) {
+        netprov_lifecycle_release();
+        return ota_send_storage_busy(req);
+    }
+
+    ota_heap_snapshot_t admission;
+    if (!ota_heap_admit("upload",
+                        OTA_UPLOAD_MIN_INTERNAL_FREE,
+                        OTA_UPLOAD_MIN_INTERNAL_LARGEST,
+                        &admission)) {
+        netprov_lifecycle_release();
+        return ota_send_resource_error(req,
+                                       "insufficient internal RAM for OTA upload",
+                                       &admission,
+                                       OTA_UPLOAD_MIN_INTERNAL_FREE,
+                                       OTA_UPLOAD_MIN_INTERNAL_LARGEST);
+    }
+
     if (chunked) {
         ESP_LOGI(TAG, "OTA: receiving chunked stream");
     } else {
         ESP_LOGI(TAG, "OTA: receiving %d bytes", total);
     }
 
-    /* Set up stream buffer and context for the flash task. */
-    ota_ctx_t ctx = {
-        .sbuf = xStreamBufferCreate(OTA_BUF_SIZE, 1),
-        .total_size = total,
-        .eof = false,
-        .result = ESP_FAIL,
-        .done = false,
-    };
-    if (!ctx.sbuf) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom (stream buffer)");
-        return ESP_FAIL;
+    /* Allocate every shared object before the task starts.  A later receive
+     * failure can therefore only signal the task; it never tears resources
+     * out from underneath it. */
+    ota_ctx_t *ctx = ota_upload_context_create(total);
+    uint8_t *recv_buf = heap_caps_malloc(OTA_CHUNK_SIZE,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ctx || !recv_buf) {
+        free(recv_buf);
+        ota_upload_context_destroy(ctx);
+        ota_heap_snapshot_t failed = ota_heap_snapshot();
+        netprov_lifecycle_release();
+        return ota_send_resource_error(req,
+                                       "unable to allocate OTA streaming buffers",
+                                       &failed,
+                                       OTA_UPLOAD_MIN_INTERNAL_FREE,
+                                       OTA_UPLOAD_MIN_INTERNAL_LARGEST);
+    }
+
+    /* OTA maintenance never blocks therapy publication. A local, physical,
+     * or flow-detected start changes the guard to abort; the flash worker
+     * abandons the partial image before its next sector write. */
+    if (!bsp_display_try_begin_therapy_safe_maintenance()) {
+        free(recv_buf);
+        ota_upload_context_destroy(ctx);
+        netprov_lifecycle_release();
+        return ota_send_storage_busy(req);
     }
 
     /* Launch flash task on an INTERNAL RAM stack (not PSRAM) — required for
      * cache-freeze safety during esp_ota_write. */
     TaskHandle_t flash_task = NULL;
-    BaseType_t tr = xTaskCreate(ota_flash_task, "ota_flash", 8192, &ctx, 5, &flash_task);
+    BaseType_t tr = xTaskCreate(ota_flash_task, "ota_flash",
+                                OTA_UPLOAD_TASK_STACK_BYTES, ctx, 5, &flash_task);
     if (tr != pdPASS) {
-        vStreamBufferDelete(ctx.sbuf);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom (flash task)");
-        return ESP_FAIL;
+        bsp_display_end_therapy_safe_maintenance();
+        free(recv_buf);
+        ota_upload_context_destroy(ctx);
+        ota_heap_snapshot_t failed = ota_heap_snapshot();
+        netprov_lifecycle_release();
+        return ota_send_resource_error(req,
+                                       "unable to allocate internal OTA task",
+                                       &failed,
+                                       OTA_UPLOAD_MIN_INTERNAL_FREE,
+                                       OTA_UPLOAD_MIN_INTERNAL_LARGEST);
     }
 
     /* Feed data from the HTTP socket to the stream buffer. */
-    uint8_t *recv_buf = heap_caps_malloc(OTA_CHUNK_SIZE, MALLOC_CAP_SPIRAM);
-    if (!recv_buf) {
-        ctx.eof = true;
-        vStreamBufferDelete(ctx.sbuf);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        return ESP_FAIL;
-    }
-
     int received = 0;
+    const char *input_error = NULL;
+    const char *input_status = "400 Bad Request";
     while (chunked || received < total) {
+        if (xEventGroupGetBits(ctx->events) & OTA_FLASH_DONE_BIT) {
+            break;
+        }
         int want = chunked ? OTA_CHUNK_SIZE : (total - received);
         if (want > OTA_CHUNK_SIZE) want = OTA_CHUNK_SIZE;
         int r = httpd_req_recv(req, (char *)recv_buf, want);
         if (r < 0) {
             ESP_LOGE(TAG, "OTA: recv error at %d bytes", received);
+            input_error = "firmware receive failed";
+            input_status = "408 Request Timeout";
             break;
         }
         if (r == 0) {
-            /* chunked mode: end of stream */
+            if (!chunked && received < total) {
+                input_error = "firmware upload ended early";
+            }
             break;
         }
         if (chunked && received + r > OTA_MAX_SIZE) {
             ESP_LOGE(TAG, "OTA: chunked stream exceeded max size (%d)", OTA_MAX_SIZE);
+            input_error = "image too large";
+            input_status = "413 Content Too Large";
             break;
         }
-        /* Wait for space in the stream buffer (flash task may be slow). */
-        size_t sent = xStreamBufferSend(ctx.sbuf, recv_buf, r, pdMS_TO_TICKS(10000));
+        /* Bound each wait so an early flash failure is reported as that failure
+         * instead of filling the stream and masquerading as producer stall. */
+        size_t sent = 0;
+        TickType_t send_started = xTaskGetTickCount();
+        while (sent < (size_t)r &&
+               !(xEventGroupGetBits(ctx->events) & OTA_FLASH_DONE_BIT)) {
+            sent += xStreamBufferSend(ctx->sbuf, recv_buf + sent,
+                                      (size_t)r - sent, pdMS_TO_TICKS(250));
+            if ((TickType_t)(xTaskGetTickCount() - send_started) >=
+                pdMS_TO_TICKS(10000)) {
+                break;
+            }
+        }
         if (sent != (size_t)r) {
+            if (xEventGroupGetBits(ctx->events) & OTA_FLASH_DONE_BIT) {
+                break;
+            }
             ESP_LOGE(TAG, "OTA: stream buffer full at %d bytes", received);
+            input_error = "firmware stream stalled";
+            input_status = "503 Service Unavailable";
             break;
         }
         received += r;
     }
     free(recv_buf);
-    ctx.eof = true;  /* signal flash task that no more data is coming */
 
-    /* Wait for the flash task to finish.  Use a longer timeout for chunked
-     * mode since the data arrives over a potentially slow stream. */
-    int wait_ms = 0;
-    while (!ctx.done && wait_ms < 120000) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        wait_ms += 100;
+    xEventGroupSetBits(ctx->events,
+                       input_error ? OTA_INPUT_ABORT_BIT : OTA_INPUT_DONE_BIT);
+    /* Never free ctx or its stream on a timeout while ota_flash_task can still
+     * use them.  All task-side waits are bounded and producer completion is
+     * explicit, so this wait has a guaranteed software termination path. */
+    xEventGroupWaitBits(ctx->events, OTA_FLASH_DONE_BIT,
+                        pdFALSE, pdTRUE, portMAX_DELAY);
+    /* xEventGroupSetBits() may still be unwinding on the other core after the
+     * wait returns, and SMP vTaskDelete() only requests a remote-core yield.
+     * Observing eSuspended proves the worker has returned from the event-group
+     * call and reached the park loop, after which it never touches ctx again. */
+    while (eTaskGetState(flash_task) != eSuspended) {
+        vTaskDelay(1);
+    }
+    vTaskDelete(flash_task);
+    esp_err_t flash_result = ctx->result;
+    bool aborted_by_input = ctx->aborted_by_input;
+    bool aborted_by_therapy = ctx->aborted_by_therapy;
+    ota_upload_context_destroy(ctx);
+
+    if (aborted_by_therapy) {
+        bsp_display_end_therapy_safe_maintenance();
+        netprov_lifecycle_release();
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Retry-After", "5");
+        return httpd_resp_sendstr(
+            req, "{\"ok\":false,\"error\":\"therapy started; update cancelled\"}");
     }
 
-    if (!ctx.done) {
-        ESP_LOGE(TAG, "OTA: flash task timed out");
-        vStreamBufferDelete(ctx.sbuf);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "flash task timeout");
+    if (flash_result != ESP_OK && !aborted_by_input) {
+        bsp_display_end_therapy_safe_maintenance();
+        netprov_lifecycle_release();
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            esp_err_to_name(flash_result));
         return ESP_FAIL;
     }
 
-    vStreamBufferDelete(ctx.sbuf);
+    if (input_error) {
+        bsp_display_end_therapy_safe_maintenance();
+        netprov_lifecycle_release();
+        httpd_resp_set_status(req, input_status);
+        httpd_resp_set_type(req, "application/json");
+        char error_body[112];
+        snprintf(error_body, sizeof(error_body),
+                 "{\"ok\":false,\"error\":\"%s\"}", input_error);
+        return httpd_resp_send(req, error_body, HTTPD_RESP_USE_STRLEN);
+    }
 
-    if (ctx.result != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(ctx.result));
+    if (flash_result != ESP_OK) {
+        bsp_display_end_therapy_safe_maintenance();
+        netprov_lifecycle_release();
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            esp_err_to_name(flash_result));
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "OTA: upload complete (%d bytes), rebooting", received);
+    ESP_LOGI(TAG, "OTA: upload complete (%d bytes), scheduling reboot", received);
+    bsp_display_end_therapy_safe_maintenance();
+
+    /* The normal path moves deferral off the sole httpd worker. If task
+     * creation fails, keep the handler for at most five seconds while trying
+     * the same safe restart directly. Beyond that, report the installed-but-
+     * pending image and release the claim instead of wedging HTTP forever. */
+    if (!ota_schedule_reboot()) {
+        if (!ota_wait_for_safe_reboot(OTA_REBOOT_FALLBACK_TIMEOUT_MS)) {
+            ESP_LOGE(TAG, "OTA installed but automatic reboot is unavailable");
+            bsp_display_set_notice("Update ready; restart device manually");
+            netprov_lifecycle_release();
+            httpd_resp_set_status(req, "503 Service Unavailable");
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(
+                req,
+                "{\"ok\":false,\"error\":\"firmware installed; restart manually\"}");
+        }
+    }
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"ok\":true}");
-
-    /* Reboot after a short delay so the response is sent. */
-    schedule_reboot("ota_reboot");
-    return ESP_OK;
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
 /* ── OTA firmware download from URL ─────────────────────────────────── */
@@ -3392,15 +3810,163 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
 
 /* Progress tracking for URL-based OTA (polled by browser via /api/ota-progress). */
 typedef struct {
-    volatile int total;       /* total bytes to download (0 = unknown) */
-    volatile int downloaded;  /* bytes downloaded so far */
-    volatile int flashed;     /* bytes flashed so far */
-    volatile bool active;     /* download in progress */
-    volatile bool done;       /* finished (check result) */
-    volatile bool ok;         /* true if flash succeeded */
-    char error[64];           /* error message if failed */
+    int total;       /* total bytes to download (0 = unknown) */
+    int downloaded;  /* bytes downloaded so far */
+    int flashed;     /* bytes flashed so far */
+    bool active;     /* download in progress */
+    bool done;       /* finished (check result) */
+    bool ok;         /* true if flash succeeded */
+    char error[96];           /* error message if failed */
+    bool cancel_requested, cancellable, boot_selected;
+    maintenance_ota_stage_t stage, failed_stage;
+    int64_t started_us;
 } ota_progress_t;
 static ota_progress_t s_ota_progress;
+static portMUX_TYPE s_ota_progress_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void ota_progress_start(void)
+{
+    portENTER_CRITICAL(&s_ota_progress_lock);
+    memset(&s_ota_progress, 0, sizeof(s_ota_progress));
+    s_ota_progress.active = true;
+    s_ota_progress.cancellable = true;
+    s_ota_progress.stage = MAINT_OTA_TRANSFER;
+    s_ota_progress.started_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&s_ota_progress_lock);
+}
+
+static void ota_progress_set_error(const char *error)
+{
+    portENTER_CRITICAL(&s_ota_progress_lock);
+    strlcpy(s_ota_progress.error, error ? error : "",
+            sizeof(s_ota_progress.error));
+    portEXIT_CRITICAL(&s_ota_progress_lock);
+}
+
+static void ota_progress_set_total(int total)
+{
+    portENTER_CRITICAL(&s_ota_progress_lock);
+    s_ota_progress.total = total;
+    portEXIT_CRITICAL(&s_ota_progress_lock);
+}
+
+static void ota_progress_set_transfer(int bytes)
+{
+    portENTER_CRITICAL(&s_ota_progress_lock);
+    s_ota_progress.downloaded = bytes;
+    s_ota_progress.flashed = bytes;
+    portEXIT_CRITICAL(&s_ota_progress_lock);
+}
+
+static void ota_progress_set_active(bool active)
+{
+    portENTER_CRITICAL(&s_ota_progress_lock);
+    s_ota_progress.active = active;
+    portEXIT_CRITICAL(&s_ota_progress_lock);
+}
+
+static void ota_progress_finish(bool ok, const char *error)
+{
+    portENTER_CRITICAL(&s_ota_progress_lock);
+    s_ota_progress.active = false;
+    s_ota_progress.done = true;
+    s_ota_progress.ok = ok;
+    s_ota_progress.cancellable = false;
+    if (!ok) {
+        s_ota_progress.failed_stage = s_ota_progress.stage;
+        s_ota_progress.stage = s_ota_progress.cancel_requested ? MAINT_OTA_CANCELLED : MAINT_OTA_FAILED;
+    }
+    if (error) {
+        strlcpy(s_ota_progress.error, error, sizeof(s_ota_progress.error));
+    }
+    portEXIT_CRITICAL(&s_ota_progress_lock);
+}
+
+static ota_progress_t ota_progress_snapshot(void)
+{
+    ota_progress_t snapshot;
+    portENTER_CRITICAL(&s_ota_progress_lock);
+    snapshot = s_ota_progress;
+    portEXIT_CRITICAL(&s_ota_progress_lock);
+    return snapshot;
+}
+
+/* Cancel and the boot-selection commit are serialized under one lock. A
+ * successful cancel acknowledgement guarantees no subsequent boot selection. */
+bool maintenance_ota_cancel(void)
+{
+    portENTER_CRITICAL(&s_ota_progress_lock);
+    bool accepted = s_ota_progress.active && s_ota_progress.cancellable;
+    if (accepted) s_ota_progress.cancel_requested = true;
+    portEXIT_CRITICAL(&s_ota_progress_lock);
+    return accepted;
+}
+
+static bool ota_native_should_abort(void)
+{
+    ota_progress_t p = ota_progress_snapshot();
+    return p.cancel_requested || bsp_display_therapy_safe_maintenance_should_abort();
+}
+
+static void ota_native_stage(maintenance_ota_stage_t stage)
+{
+    portENTER_CRITICAL(&s_ota_progress_lock);
+    s_ota_progress.stage = stage;
+    portEXIT_CRITICAL(&s_ota_progress_lock);
+}
+
+static bool ota_native_commit_begin(void)
+{
+    if (!bsp_display_try_reserve_maintenance_commit()) return false;
+    portENTER_CRITICAL(&s_ota_progress_lock);
+    bool allowed = !s_ota_progress.cancel_requested;
+    if (allowed) {
+        s_ota_progress.cancellable = false;
+        s_ota_progress.stage = MAINT_OTA_COMMIT;
+    }
+    portEXIT_CRITICAL(&s_ota_progress_lock);
+    if (!allowed) bsp_display_cancel_therapy_safe_restart();
+    return allowed;
+}
+
+static void ota_native_boot_selected(void)
+{
+    portENTER_CRITICAL(&s_ota_progress_lock);
+    s_ota_progress.boot_selected = true;
+    s_ota_progress.stage = MAINT_OTA_RESTART;
+    portEXIT_CRITICAL(&s_ota_progress_lock);
+}
+
+void maintenance_ota_snapshot(maintenance_ota_snapshot_t *out)
+{
+    if (!out) return;
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    /* Explicit deterministic service simulation. No network, flash or reboot. */
+    portENTER_CRITICAL(&s_ota_progress_lock);
+    if (s_ota_progress.active) {
+        int seconds = (int)((esp_timer_get_time() - s_ota_progress.started_us) / 1000000);
+        s_ota_progress.total = 2097152;
+        s_ota_progress.downloaded = seconds < 8 ? seconds * 262144 : 2097152;
+        if (s_ota_progress.cancel_requested || seconds >= 8) {
+            s_ota_progress.active = false;
+            s_ota_progress.done = true;
+            s_ota_progress.cancellable = false;
+            s_ota_progress.failed_stage = s_ota_progress.cancel_requested
+                ? s_ota_progress.stage : MAINT_OTA_VERIFY;
+            s_ota_progress.stage = s_ota_progress.cancel_requested ? MAINT_OTA_CANCELLED : MAINT_OTA_FAILED;
+            strlcpy(s_ota_progress.error, s_ota_progress.cancel_requested ?
+                "Simulation: cancelled before boot selection" : "Simulation: image verification rejected", sizeof(s_ota_progress.error));
+        }
+    }
+    portEXIT_CRITICAL(&s_ota_progress_lock);
+#endif
+    ota_progress_t p = ota_progress_snapshot();
+    *out = (maintenance_ota_snapshot_t){ .active=p.active, .done=p.done,
+        .ok=p.ok, .cancellable=p.cancellable, .boot_selected=p.boot_selected,
+        .total=p.total, .transferred=p.downloaded, .stage=p.stage,
+        .failed_stage=p.failed_stage, .started_us=p.started_us };
+    strlcpy(out->error, p.error, sizeof(out->error));
+}
 
 /* OTA URL download task — uses ESP-IDF's esp_https_ota, which handles
  * redirects, chunked/content-length bodies, and all esp_ota_* flashing
@@ -3409,10 +3975,12 @@ static void ota_url_task(void *arg)
 {
     char *url = (char *)arg;
 
-    ESP_LOGI(TAG, "OTA URL: downloading %s", url);
-
-    memset((void *)&s_ota_progress, 0, sizeof(s_ota_progress));
-    s_ota_progress.active = true;
+    ESP_LOGI(TAG, "OTA URL: downloading firmware");
+    ota_heap_snapshot_t start_heap = ota_heap_snapshot();
+    ESP_LOGI(TAG, "OTA URL start: internal8 free=%u largest=%u PSRAM=%u",
+             (unsigned)start_heap.free_bytes,
+             (unsigned)start_heap.largest_block_bytes,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     esp_http_client_config_t http_cfg = {
         .url = url,
@@ -3427,64 +3995,265 @@ static void ota_url_task(void *arg)
 
     esp_https_ota_config_t ota_cfg = {
         .http_config = &http_cfg,
+        /* esp_flash_write safely bounces non-DRAM input before disabling the
+         * cache. Keep the 4 KiB OTA buffer out of scarce internal RAM; the
+         * task stack itself remains internal. */
+        .buffer_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
     };
 
     esp_https_ota_handle_t handle = NULL;
     esp_err_t err = esp_https_ota_begin(&ota_cfg, &handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "OTA URL: begin failed: %s", esp_err_to_name(err));
-        strlcpy(s_ota_progress.error, esp_err_to_name(err), sizeof(s_ota_progress.error));
+        ota_progress_set_error(esp_err_to_name(err));
         goto out;
     }
 
-    s_ota_progress.total = esp_https_ota_get_image_size(handle);
-    ESP_LOGI(TAG, "OTA URL: image size %d bytes", s_ota_progress.total);
+    int image_size = esp_https_ota_get_image_size(handle);
+    ota_progress_set_total(image_size);
+    ESP_LOGI(TAG, "OTA URL: image size %d bytes", image_size);
 
     /* Pump the download/flash loop, updating progress as we go. */
     while (1) {
+        if (ota_native_should_abort()) {
+            ESP_LOGW(TAG, "OTA URL: therapy start arrived; abandoning update");
+            ota_progress_set_error("cancelled before boot selection (request or therapy)");
+            esp_https_ota_abort(handle);
+            handle = NULL;
+            goto out;
+        }
         err = esp_https_ota_perform(handle);
         if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) break;
 
         int read = esp_https_ota_get_image_len_read(handle);
-        s_ota_progress.downloaded = read;
-        s_ota_progress.flashed = read;
+        ota_progress_set_transfer(read);
+    }
+
+    /* esp_https_ota_perform() may complete the final network read and flash
+     * in one call. Recheck before validating or selecting that image. */
+    if (ota_native_should_abort()) {
+        ESP_LOGW(TAG, "OTA URL: therapy start arrived at completion boundary");
+        ota_progress_set_error("cancelled before boot selection (request or therapy)");
+        esp_https_ota_abort(handle);
+        handle = NULL;
+        goto out;
     }
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "OTA URL: perform failed: %s", esp_err_to_name(err));
-        strlcpy(s_ota_progress.error, esp_err_to_name(err), sizeof(s_ota_progress.error));
+        ota_progress_set_error(esp_err_to_name(err));
         esp_https_ota_abort(handle);
         goto out;
     }
 
     if (!esp_https_ota_is_complete_data_received(handle)) {
         ESP_LOGE(TAG, "OTA URL: incomplete image received");
-        strlcpy(s_ota_progress.error, "incomplete image", sizeof(s_ota_progress.error));
+        ota_progress_set_error("incomplete image");
         esp_https_ota_abort(handle);
         goto out;
     }
 
+    ota_progress_set_transfer(esp_https_ota_get_image_len_read(handle));
+    ota_native_stage(MAINT_OTA_VERIFY);
+    /* The transport validates the chip/image; the board descriptor additionally
+     * excludes firmware for other ESP32-S3 displays and unmarked legacy images. */
+    const esp_partition_t *candidate = esp_ota_get_next_update_partition(NULL);
+    uint8_t prefix[384];
+    if (!candidate || esp_partition_read(candidate, 0, prefix, sizeof(prefix)) != ESP_OK ||
+        !somnotrace_firmware_target_matches(prefix, sizeof(prefix))) {
+        ota_progress_set_error("missing or incompatible SomnoTrace board identity");
+        esp_https_ota_abort(handle);
+        goto out;
+    }
+    /* esp_https_ota_finish validates and selects the boot slot in one SDK call.
+     * The UI therefore names this indivisible stage and disables Cancel first. */
+    if (!ota_native_commit_begin()) {
+        ota_progress_set_error("cancelled before boot selection (request or therapy)");
+        esp_https_ota_abort(handle);
+        goto out;
+    }
     err = esp_https_ota_finish(handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "OTA URL: finish failed: %s", esp_err_to_name(err));
-        strlcpy(s_ota_progress.error, esp_err_to_name(err), sizeof(s_ota_progress.error));
+        ota_progress_set_error(esp_err_to_name(err));
         goto out;
     }
 
-    ESP_LOGI(TAG, "OTA URL: flash complete, rebooting");
-    s_ota_progress.ok = true;
-    s_ota_progress.active = false;
-    s_ota_progress.done = true;
+    ota_native_boot_selected();
+    ESP_LOGI(TAG, "OTA URL: flash complete, scheduling reboot");
+    bsp_display_cancel_therapy_safe_restart();
+    bsp_display_end_therapy_safe_maintenance();
+    ota_progress_set_active(false);
+    ota_heap_snapshot_t finish_heap = ota_heap_snapshot();
+    ESP_LOGI(TAG, "OTA URL finish: internal8 free=%u largest=%u",
+             (unsigned)finish_heap.free_bytes,
+             (unsigned)finish_heap.largest_block_bytes);
     free(url);
-    schedule_reboot("ota_reboot");
+    if (!ota_schedule_reboot()) {
+        if (!ota_wait_for_safe_reboot(OTA_REBOOT_FALLBACK_TIMEOUT_MS)) {
+            ESP_LOGE(TAG, "OTA URL installed but automatic reboot is unavailable");
+            ota_progress_finish(false, "firmware installed; restart manually");
+            bsp_display_set_notice("Update ready; restart device manually");
+            netprov_lifecycle_release();
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+    ota_progress_finish(true, NULL);
     vTaskDelete(NULL);
     return;
 
 out:
-    s_ota_progress.active = false;
-    s_ota_progress.done = true;
+    bsp_display_cancel_therapy_safe_restart();
+    bsp_display_end_therapy_safe_maintenance();
+    ota_progress_finish(false, NULL);
+    ota_heap_snapshot_t failed_heap = ota_heap_snapshot();
+    ESP_LOGE(TAG, "OTA URL stopped: internal8 free=%u largest=%u",
+             (unsigned)failed_heap.free_bytes,
+             (unsigned)failed_heap.largest_block_bytes);
+    netprov_lifecycle_release();
     free(url);
     vTaskDelete(NULL);
+}
+
+esp_err_t maintenance_ota_start_url(const char *url)
+{
+    if (!url || strlen(url) >= OTA_URL_MAX_LEN || strncmp(url, "https://", 8))
+        return ESP_ERR_INVALID_ARG;
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    if (ota_progress_snapshot().active) return ESP_ERR_INVALID_STATE;
+    ota_progress_start();
+    return ESP_OK;
+#endif
+    if (!netprov_is_link_up() || !netprov_lifecycle_try_claim("native-url"))
+        return ESP_ERR_INVALID_STATE;
+    if (!ota_storage_preflight()) { netprov_lifecycle_release(); return ESP_ERR_INVALID_STATE; }
+    if (!ota_heap_admit("native URL", OTA_URL_MIN_INTERNAL_FREE,
+                         OTA_URL_MIN_INTERNAL_LARGEST, NULL)) {
+        netprov_lifecycle_release(); return ESP_ERR_NO_MEM;
+    }
+    char *copy = heap_caps_malloc(strlen(url)+1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!copy) { netprov_lifecycle_release(); return ESP_ERR_NO_MEM; }
+    strcpy(copy, url);
+    if (!bsp_display_try_begin_therapy_safe_maintenance()) {
+        free(copy); netprov_lifecycle_release(); return ESP_ERR_INVALID_STATE;
+    }
+    ota_progress_start();
+    if (xTaskCreate(ota_url_task, "ota_url", OTA_URL_TASK_STACK_BYTES, copy, 5, NULL) != pdPASS) {
+        bsp_display_end_therapy_safe_maintenance();
+        free(copy); netprov_lifecycle_release();
+        ota_progress_finish(false, "internal task allocation failed");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+static void ota_sd_task(void *arg)
+{
+    char *name = arg;
+    char path[sizeof(SD_MOUNT_POINT) + MAINTENANCE_NAME_MAX + 2];
+    snprintf(path, sizeof(path), "%s/%s", SD_MOUNT_POINT, name);
+    free(name);
+    esp_err_t result = ESP_FAIL;
+    esp_ota_handle_t handle = 0;
+    bool begun = false, leased = false;
+    FILE *file = NULL;
+    uint8_t *buffer = heap_caps_malloc(OTA_CHUNK_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
+    if (!buffer || !partition) { ota_progress_set_error("update resources unavailable"); goto out; }
+    leased = sd_storage_lease_acquire(SD_LEASE_UPLOAD, 0);
+    if (!leased || ota_native_should_abort()) { ota_progress_set_error("card busy or therapy starting"); goto out; }
+    file = fopen(path, "rb");
+    if (!file || fseek(file, 0, SEEK_END)) { ota_progress_set_error("cannot read SD image"); goto out; }
+    long size = ftell(file);
+    if (size <= 384 || size > OTA_MAX_SIZE || size > partition->size || fseek(file, 0, SEEK_SET)) {
+        ota_progress_set_error("image size outside inactive slot bounds"); goto out;
+    }
+    ota_progress_set_total((int)size);
+    size_t n = fread(buffer, 1, OTA_CHUNK_SIZE, file);
+    if (!somnotrace_firmware_target_matches(buffer, n)) {
+        ota_progress_set_error("missing or incompatible SomnoTrace board identity"); goto out;
+    }
+    /* esp_ota_write validates image magic/chip; esp_ota_end verifies the complete
+     * image. No whole image allocation and no flash call from an external stack. */
+    result = esp_ota_begin(partition, OTA_WITH_SEQUENTIAL_WRITES, &handle);
+    if (result != ESP_OK) goto failed;
+    begun = true;
+    int transferred = 0;
+    while (n) {
+        if (ota_native_should_abort() || sd_storage_recording_pending()) {
+            ota_progress_set_error("cancelled before boot selection (request or therapy)"); goto out;
+        }
+        result = esp_ota_write(handle, buffer, n);
+        if (result != ESP_OK) goto failed;
+        transferred += (int)n;
+        ota_progress_set_transfer(transferred);
+        n = fread(buffer, 1, OTA_CHUNK_SIZE, file);
+    }
+    if (ferror(file) || transferred != size) { ota_progress_set_error("truncated SD image"); goto out; }
+    fclose(file); file = NULL;
+    sd_storage_lease_release(SD_LEASE_UPLOAD); leased = false;
+    ota_native_stage(MAINT_OTA_VERIFY);
+    if (ota_native_should_abort()) { ota_progress_set_error("cancelled before verification"); goto out; }
+    result = esp_ota_end(handle); begun = false;
+    if (result != ESP_OK) goto failed;
+    if (!ota_native_commit_begin()) { ota_progress_set_error("cancelled before boot selection"); goto out; }
+    result = esp_ota_set_boot_partition(partition);
+    if (result != ESP_OK) goto failed;
+    ota_native_boot_selected();
+    free(buffer);
+    bsp_display_cancel_therapy_safe_restart();
+    bsp_display_end_therapy_safe_maintenance();
+    ota_progress_finish(true, NULL);
+    if (!ota_schedule_reboot() && !ota_wait_for_safe_reboot(OTA_REBOOT_FALLBACK_TIMEOUT_MS)) {
+        ota_progress_finish(false, "firmware selected; restart manually");
+        netprov_lifecycle_release();
+    }
+    vTaskDelete(NULL);
+    return;
+failed:
+    ota_progress_set_error(esp_err_to_name(result));
+out:
+    if (begun) esp_ota_abort(handle);
+    if (file) fclose(file);
+    if (leased) sd_storage_lease_release(SD_LEASE_UPLOAD);
+    free(buffer);
+    bsp_display_cancel_therapy_safe_restart();
+    bsp_display_end_therapy_safe_maintenance();
+    ota_progress_finish(false, NULL);
+    netprov_lifecycle_release();
+    vTaskDelete(NULL);
+}
+
+esp_err_t maintenance_ota_start_sd(const char *root_filename)
+{
+    if (!maintenance_sd_image_name_valid(root_filename)) return ESP_ERR_INVALID_ARG;
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    if (ota_progress_snapshot().active) return ESP_ERR_INVALID_STATE;
+    ota_progress_start();
+    return ESP_OK;
+#endif
+    if (!sd_storage_is_ready() || !netprov_lifecycle_try_claim("native-sd"))
+        return ESP_ERR_INVALID_STATE;
+    if (!ota_storage_preflight()) { netprov_lifecycle_release(); return ESP_ERR_INVALID_STATE; }
+    if (!ota_heap_admit("SD", OTA_UPLOAD_MIN_INTERNAL_FREE,
+                         OTA_UPLOAD_MIN_INTERNAL_LARGEST, NULL)) {
+        netprov_lifecycle_release(); return ESP_ERR_NO_MEM;
+    }
+    char *copy = heap_caps_malloc(strlen(root_filename)+1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!copy) { netprov_lifecycle_release(); return ESP_ERR_NO_MEM; }
+    strcpy(copy, root_filename);
+    if (!bsp_display_try_begin_therapy_safe_maintenance()) {
+        free(copy); netprov_lifecycle_release(); return ESP_ERR_INVALID_STATE;
+    }
+    ota_progress_start();
+    if (xTaskCreate(ota_sd_task, "ota_sd", OTA_UPLOAD_TASK_STACK_BYTES, copy, 5, NULL) != pdPASS) {
+        bsp_display_end_therapy_safe_maintenance();
+        free(copy); netprov_lifecycle_release();
+        ota_progress_finish(false, "internal task allocation failed");
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 /* HTTP handler: POST /api/ota-url with JSON body {"url":"https://..."}.
@@ -3520,29 +4289,89 @@ static esp_err_t ota_url_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    /* Check URL starts with http:// or https:// */
+    /* HTTPS is mandatory in production. Plain HTTP is accepted only in an
+     * explicitly insecure build where ESP-IDF's OTA transport allows it. */
     const char *url = url_item->valuestring;
-    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+    bool allowed_scheme = strncmp(url, "https://", 8) == 0;
+#if CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP
+    allowed_scheme = allowed_scheme || strncmp(url, "http://", 7) == 0;
+#endif
+    if (!allowed_scheme) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "URL must start with http:// or https://");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "URL must start with https://");
         return ESP_FAIL;
     }
 
-    /* Copy URL for the background task (it frees it). */
-    char *url_copy = strdup(url);
+    if (!netprov_lifecycle_try_claim("url")) {
+        cJSON_Delete(root);
+        return ota_send_busy(req);
+    }
+
+    if (!ota_storage_preflight()) {
+        cJSON_Delete(root);
+        netprov_lifecycle_release();
+        return ota_send_storage_busy(req);
+    }
+
+    ota_heap_snapshot_t admission;
+    if (!ota_heap_admit("URL",
+                        OTA_URL_MIN_INTERNAL_FREE,
+                        OTA_URL_MIN_INTERNAL_LARGEST,
+                        &admission)) {
+        cJSON_Delete(root);
+        netprov_lifecycle_release();
+        return ota_send_resource_error(req,
+                                       "insufficient internal RAM for URL OTA",
+                                       &admission,
+                                       OTA_URL_MIN_INTERNAL_FREE,
+                                       OTA_URL_MIN_INTERNAL_LARGEST);
+    }
+
+    /* Copy the URL to PSRAM for the background task (it frees it). */
+    size_t url_len = strlen(url) + 1;
+    char *url_copy = heap_caps_malloc(url_len,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (url_copy) {
+        memcpy(url_copy, url, url_len);
+    }
     cJSON_Delete(root);
     if (!url_copy) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
-        return ESP_FAIL;
+        ota_heap_snapshot_t failed = ota_heap_snapshot();
+        netprov_lifecycle_release();
+        return ota_send_resource_error(req,
+                                       "unable to allocate OTA URL",
+                                       &failed,
+                                       OTA_URL_MIN_INTERNAL_FREE,
+                                       OTA_URL_MIN_INTERNAL_LARGEST);
     }
+
+    /* The background updater owns a cancellable maintenance gate. It does not
+     * delay therapy publication; the next perform iteration observes the
+     * start and abandons the partial image. */
+    if (!bsp_display_try_begin_therapy_safe_maintenance()) {
+        free(url_copy);
+        netprov_lifecycle_release();
+        return ota_send_storage_busy(req);
+    }
+
+    ota_progress_start();
 
     /* Launch the download+flash task on an internal RAM stack. */
     TaskHandle_t task = NULL;
-    BaseType_t tr = xTaskCreate(ota_url_task, "ota_url", 12288, url_copy, 5, &task);
+    BaseType_t tr = xTaskCreate(ota_url_task, "ota_url",
+                                OTA_URL_TASK_STACK_BYTES, url_copy, 5, &task);
     if (tr != pdPASS) {
+        bsp_display_end_therapy_safe_maintenance();
         free(url_copy);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM (task)");
-        return ESP_FAIL;
+        ota_progress_finish(false, "internal task allocation failed");
+        ota_heap_snapshot_t failed = ota_heap_snapshot();
+        netprov_lifecycle_release();
+        return ota_send_resource_error(req,
+                                       "unable to allocate internal OTA task",
+                                       &failed,
+                                       OTA_URL_MIN_INTERNAL_FREE,
+                                       OTA_URL_MIN_INTERNAL_LARGEST);
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -3554,14 +4383,29 @@ static esp_err_t ota_url_handler(httpd_req_t *req)
 static esp_err_t ota_progress_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
-    char resp[192];
+    char resp[512];
+    ota_heap_snapshot_t heap = ota_heap_snapshot();
+    ota_progress_t progress = ota_progress_snapshot();
     snprintf(resp, sizeof(resp),
-             "{\"active\":%s,\"done\":%s,\"ok\":%s,\"total\":%d,\"downloaded\":%d,\"flashed\":%d,\"error\":\"%s\"}",
-             s_ota_progress.active ? "true" : "false",
-             s_ota_progress.done ? "true" : "false",
-             s_ota_progress.ok ? "true" : "false",
-             s_ota_progress.total, s_ota_progress.downloaded, s_ota_progress.flashed,
-             s_ota_progress.error);
+             "{\"active\":%s,\"done\":%s,\"ok\":%s,\"mode\":\"%s\","
+             "\"total\":%d,\"downloaded\":%d,\"flashed\":%d,\"error\":\"%s\","
+             "\"internal_free\":%u,\"internal_minimum\":%u,"
+             "\"internal_largest\":%u,\"upload_required_free\":%u,"
+             "\"upload_required_largest\":%u,\"url_required_free\":%u,"
+             "\"url_required_largest\":%u}",
+             progress.active ? "true" : "false",
+             progress.done ? "true" : "false",
+             progress.ok ? "true" : "false",
+             lifecycle_claim_owner(),
+             progress.total, progress.downloaded, progress.flashed,
+             progress.error,
+             (unsigned)heap.free_bytes,
+             (unsigned)heap.minimum_free_bytes,
+             (unsigned)heap.largest_block_bytes,
+             (unsigned)OTA_UPLOAD_MIN_INTERNAL_FREE,
+             (unsigned)OTA_UPLOAD_MIN_INTERNAL_LARGEST,
+             (unsigned)OTA_URL_MIN_INTERNAL_FREE,
+             (unsigned)OTA_URL_MIN_INTERNAL_LARGEST);
     httpd_resp_sendstr(req, resp);
     return ESP_OK;
 }
@@ -3597,41 +4441,15 @@ static esp_err_t actions_handler(httpd_req_t *req)
 
     esp_err_t err = ESP_OK;
     if (strcmp(action, "reset-state") == 0) {
-        /* Clears tracking and re-uploads, bounded by the configured upload
-         * window; the scheduler does the work asynchronously. */
-        ESP_LOGI(TAG, "action: reset upload state");
-        uploader_reset_state();
+        err = touch_maintenance_request(MAINT_RESET_UPLOAD, NULL);
     } else if (strcmp(action, "delete-edfs") == 0) {
-        /* Destructive: refused while recording, exporting or uploading. */
-        if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0)) {
-            cJSON_Delete(root);
-            return send_busy(req, "recording, export or upload in progress");
-        }
-        ESP_LOGI(TAG, "action: delete all EDF files");
-        recursive_delete(SD_SDCARD_DIR);
-        sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
+        err = touch_maintenance_request(MAINT_DELETE_EDF, NULL);
     } else if (strcmp(action, "reset-all") == 0) {
-        if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0)) {
-            cJSON_Delete(root);
-            return send_busy(req, "recording, export or upload in progress");
-        }
-        ESP_LOGI(TAG, "action: reset all (state + SDCARD + .somnotrace)");
-        uploader_reset_state();
-        recursive_delete(SD_SDCARD_DIR);
-        recursive_delete(SD_SESSIONS_DIR);
-        sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
+        err = touch_maintenance_request(MAINT_RESET_RECORDINGS, NULL);
     } else if (strcmp(action, "recreate-edfs") == 0) {
-        /* Explicitly destructive maintenance: deletes the whole export before
-         * rebuilding.  Prefer "rebuild-day" for recovering a single night. */
-        if (sd_storage_recording_active()) {
-            cJSON_Delete(root);
-            return send_busy(req, "therapy recording in progress");
-        }
-        ESP_LOGW(TAG, "action: recreate ALL EDFs (destructive)");
-        TaskHandle_t h = psram_task_create(recreate_edfs_task, "recreate_edfs", 16384, NULL, 5, 1, NULL, NULL);
-        if (!h) {
-            err = ESP_ERR_NO_MEM;
-        }
+        err = touch_maintenance_request(MAINT_RECREATE_EDF, NULL);
+    } else if (strcmp(action, "factory-reset") == 0) {
+        err = touch_maintenance_request(MAINT_FACTORY_RESET, NULL);
     } else if (strcmp(action, "rebuild-day") == 0) {
         /* Scoped, success-gated recovery: rebuilds one noon-day as a
          * transaction and queues it for upload only if it fully succeeded. */
@@ -3655,19 +4473,19 @@ static esp_err_t actions_handler(httpd_req_t *req)
             }
         }
     } else if (strcmp(action, "format-sd") == 0) {
-        if (sd_storage_recording_active()) {
+        if (bsp_display_is_therapy_active() || sd_storage_recording_active()) {
             cJSON_Delete(root);
             return send_busy(req, "therapy recording in progress");
         }
-        if (!netprov_lifecycle_try_claim("format-sd")) {
+        if (!netprov_lifecycle_try_claim("format")) {
             cJSON_Delete(root);
-            return send_busy(req, "update or restart already in progress");
+            return ota_send_busy(req);
         }
         xSemaphoreTake(s_format_mtx, portMAX_DELAY);
         if (s_format_progress.active) {
             xSemaphoreGive(s_format_mtx);
-            cJSON_Delete(root);
             netprov_lifecycle_release();
+            cJSON_Delete(root);
             return send_busy(req, "format already in progress");
         }
         ESP_LOGI(TAG, "action: format SD card (destructive)");
@@ -3677,12 +4495,47 @@ static esp_err_t actions_handler(httpd_req_t *req)
         xSemaphoreGive(s_format_mtx);
         TaskHandle_t h = psram_task_create(format_sd_task, "format_sd", 16384, NULL, 5, 1, NULL, NULL);
         if (!h) {
-            netprov_lifecycle_release();
             xSemaphoreTake(s_format_mtx, portMAX_DELAY);
             s_format_progress.active = false;
             xSemaphoreGive(s_format_mtx);
+            netprov_lifecycle_release();
             err = ESP_ERR_NO_MEM;
         }
+#if CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B
+    } else if (strcmp(action, "display-pclk") == 0) {
+        /* Temporary, non-persistent A/B diagnostic. Reusing /api/actions
+         * avoids consuming a 61st URI slot on the memory-constrained 7B. */
+        cJSON *hz_item = cJSON_GetObjectItem(root, "hz");
+        if (!cJSON_IsNumber(hz_item) ||
+            (hz_item->valuedouble != 18000000.0 &&
+             hz_item->valuedouble != 30850000.0)) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "hz must be 18000000 or 30850000");
+            return ESP_FAIL;
+        }
+
+        uint32_t hz = (uint32_t)hz_item->valuedouble;
+        err = waveshare_7b_set_panel_pclk(hz);
+        cJSON_Delete(root);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "display PCLK diagnostic failed: %s",
+                     esp_err_to_name(err));
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                                esp_err_to_name(err));
+            return ESP_FAIL;
+        }
+
+        /* Current porch totals are 1386 x 661 pixels per frame. */
+        double frame_hz = (double)hz / (1386.0 * 661.0);
+        char response[160];
+        snprintf(response, sizeof(response),
+                 "{\"ok\":true,\"pclk_hz\":%" PRIu32
+                 ",\"nominal_frame_hz\":%.4f,\"boot_default_hz\":30850000}",
+                 hz, frame_hz);
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+#endif
     } else {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown action");
@@ -3694,7 +4547,7 @@ static esp_err_t actions_handler(httpd_req_t *req)
     if (err == ESP_OK) {
         httpd_resp_sendstr(req, "{\"ok\":true}");
     } else {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -3715,6 +4568,9 @@ static inline esp_err_t reg_uri(httpd_handle_t handle, const httpd_uri_t *uri_ha
 static esp_err_t start_webserver(void)
 {
     if (s_httpd) {
+        /* An async clone still references the server and session. Refuse to
+         * free either while its owner is running, even after the deadline. */
+        if (!download_cancel_and_wait()) return ESP_ERR_TIMEOUT;
         ESP_LOGI(TAG, "stopping existing webserver");
         httpd_stop(s_httpd);
         s_httpd = NULL;
@@ -3762,6 +4618,7 @@ static esp_err_t start_webserver(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     esp_err_t herr = httpd_start(&s_httpd, &config);
+    if (herr == ESP_OK) __atomic_store_n(&s_download_closing, false, __ATOMIC_RELEASE);
     if (herr != ESP_OK) {
         ESP_LOGE(TAG, "failed to start httpd: %s (internal free=%u)",
                  esp_err_to_name(herr),

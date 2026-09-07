@@ -51,6 +51,8 @@
 #include "touch_history_controller.h"
 #include "touch_history_ui.h"
 #include "touch_logs_controller.h"
+#include "touch_maintenance_ui.h"
+#include "touch_maintenance.h"
 #include "uploader.h"
 
 #define FLOW_POINTS 300
@@ -59,7 +61,6 @@
 #define FLOW_RESYNC_THRESHOLD 25
 #define UI_UPDATE_MS 50
 #define DEVICE_RESULT_MAX 8
-#define SCREEN_TIMEOUT_OPTION_COUNT 6
 #define POLICY_PEEK_TIMEOUT_S 60
 #define TOUCH_FAILURE_THRESHOLD 3
 #define BACKLIGHT_RETRY_US 250000
@@ -301,6 +302,7 @@ static uint32_t s_touch_read_errors;
 static uint8_t s_touch_consecutive_errors;
 static uint32_t s_backlight_write_errors;
 static int64_t s_backlight_retry_after_us;
+static int64_t s_last_display_service_us;
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
 static bool s_qemu_first_frame_published;
 static bool s_qemu_setup_preview_requested;
@@ -372,6 +374,10 @@ static lv_obj_t *s_alert_label;
 static lv_obj_t *s_alert_subtitle;
 static lv_obj_t *s_alert_mark;
 static lv_obj_t *s_alert_ack_button;
+static lv_obj_t *s_alert_test_button;
+static lv_obj_t *s_reboot_button;
+static lv_obj_t *s_wifi_save_button;
+static lv_obj_t *s_wifi_hotspot_button;
 static lv_obj_t *s_therapy_button_label;
 static lv_obj_t *s_therapy_button;
 static lv_obj_t *s_chart;
@@ -409,6 +415,44 @@ static lv_obj_t *s_ox_dropdown;
 static lv_obj_t *s_device_change_row;
 static lv_obj_t *s_device_change_title;
 static lv_obj_t *s_device_change_detail;
+static lv_obj_t *s_network_status;
+static lv_obj_t *s_wifi_ssid;
+static lv_obj_t *s_wifi_password;
+static lv_obj_t *s_connectivity_rows[5];
+static lv_obj_t *s_wifi_scan_button;
+static lv_obj_t *s_wifi_scan_button_label;
+static lv_obj_t *s_wifi_scan_row;
+static lv_obj_t *s_wifi_scan_status;
+static lv_obj_t *s_wifi_scan_dropdown;
+static lv_obj_t *s_wifi_scan_use_button;
+static bool s_wifi_scan_requested;
+static bool s_wifi_scan_open_selected;
+static bool s_wifi_force_clear_password;
+static uint32_t s_wifi_scan_seen_generation = UINT32_MAX;
+static netprov_scan_state_t s_wifi_scan_seen_state = NETPROV_SCAN_IDLE;
+static lv_obj_t *s_wifi_password_helper;
+static lv_obj_t *s_wifi_password_reveal;
+static lv_obj_t *s_wifi_password_reveal_label;
+static bool s_wifi_password_revealed;
+static lv_obj_t *s_wifi_restart_detail;
+static lv_obj_t *s_alert_status;
+static lv_obj_t *s_storage_status;
+static lv_obj_t *s_storage_estimate;
+static lv_obj_t *s_storage_meter;
+static lv_obj_t *s_storage_refresh_button;
+static lv_obj_t *s_upload_rows[UPLOADER_PROGRESS_MAX_BACKENDS];
+static lv_obj_t *s_upload_dots[UPLOADER_PROGRESS_MAX_BACKENDS];
+static lv_obj_t *s_upload_titles[UPLOADER_PROGRESS_MAX_BACKENDS];
+static lv_obj_t *s_upload_details[UPLOADER_PROGRESS_MAX_BACKENDS];
+static lv_obj_t *s_upload_states[UPLOADER_PROGRESS_MAX_BACKENDS];
+static lv_obj_t *s_upload_meters[UPLOADER_PROGRESS_MAX_BACKENDS];
+static lv_obj_t *s_upload_browser_row;
+static lv_obj_t *s_storage_browser_row;
+static lv_obj_t *s_system_health_title;
+static lv_obj_t *s_system_health_dot;
+static lv_obj_t *s_system_details;
+static lv_obj_t *s_system_firmware;
+static lv_obj_t *s_system_restart_detail;
 static lv_obj_t *s_device_section_subtitle;
 static lv_obj_t *s_connectivity_section_subtitle;
 static lv_obj_t *s_system_section_subtitle;
@@ -438,7 +482,10 @@ static unsigned s_seen_ox_version;
 #if !CONFIG_SOMNOTRACE_BOARD_QEMU
 static TaskHandle_t s_storage_worker_task;
 #endif
+static bool s_connectivity_settings_synced;
+static char s_saved_wifi_ssid[NETPROV_SSID_MAXLEN + 1];
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
+static int64_t s_qemu_wifi_scan_started_us;
 static uint8_t s_qemu_requested_tab = UINT8_MAX;
 #endif
 
@@ -585,6 +632,7 @@ static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
     /* Hardware has positively retired the previous framebuffer at this point. */
     if (lv_disp_flush_is_last(drv)) s_flush_count++;
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
+    touch_maintenance_ui_frame_published();
     if (lv_disp_flush_is_last(drv) && !s_qemu_first_frame_published) {
         s_qemu_first_frame_published = true;
         ESP_LOGI(TAG, "QEMU UI first frame published");
@@ -648,7 +696,8 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     if (cancel_gesture) s_wake_gesture_pending = true;
     if (healthy && touch.valid && !touch.pressed)
         s_wake_gesture_pending = false;
-    /* Physical wake is admitted by the board's ordered visibility demand. */
+    /* Physical wake is admitted by the board's ordered visibility demand.
+     * An old down frame must not bypass a newer OFF through the overlay. */
     bool allow_press = s_backlight_requested && !s_wake_gesture_pending;
     portEXIT_CRITICAL(&s_state_lock);
     /* An ordinary RELEASED sample generates CLICKED in LVGL. Cancel the
@@ -1056,7 +1105,6 @@ static lv_obj_t *make_value_card(lv_obj_t *parent, int x, int y,
     return card;
 }
 
-
 static void manage_dropdown_list_ready_cb(lv_event_t *event)
 {
     lv_obj_t *list = lv_dropdown_get_list(lv_event_get_target(event));
@@ -1195,6 +1243,48 @@ static unsigned estimated_airsense_nights(uint64_t free_bytes)
     return (unsigned)raw;
 }
 
+static void set_storage_night_estimate(lv_obj_t *label, uint64_t free_bytes)
+{
+    if (!label) return;
+    unsigned nights = estimated_airsense_nights(free_bytes);
+    if (nights == 0) {
+        lv_label_set_text(label,
+                          "Less than one AirSense-only night · O2 uses more");
+    } else {
+        lv_label_set_text_fmt(label,
+                              "About %u AirSense-only nights · fewer with O2",
+                              nights);
+    }
+}
+
+static void alert_config_task(void *arg)
+{
+    (void)arg;
+    therapy_alert_config_t config = ALERT_DEFAULTS;
+    esp_err_t result = therapy_alert_load_config(&config);
+    portENTER_CRITICAL(&s_state_lock);
+    s_services.alert_config = config;
+    s_services.alert_config_result = result;
+    s_services.alert_config_busy = false;
+    s_services.alert_config_version++;
+    portEXIT_CRITICAL(&s_state_lock);
+    vTaskDelete(NULL);
+}
+
+static void __attribute__((unused)) start_alert_config_refresh(void)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    bool busy = s_services.alert_config_busy;
+    if (!busy) s_services.alert_config_busy = true;
+    portEXIT_CRITICAL(&s_state_lock);
+    if (!busy && xTaskCreate(alert_config_task, "ui_alert_cfg", 4096,
+                             NULL, 2, NULL) != pdPASS) {
+        portENTER_CRITICAL(&s_state_lock);
+        s_services.alert_config_busy = false;
+        portEXIT_CRITICAL(&s_state_lock);
+        bsp_display_set_notice("Unable to read alert settings");
+    }
+}
 
 static void device_scan_task(void *arg)
 {
@@ -1489,6 +1579,67 @@ static void forget_prompt_cb(lv_event_t *event)
     lv_obj_center(dialog);
 }
 
+static void layout_connectivity_rows(void)
+{
+    if (!s_connectivity_rows[0]) return;
+    set_hidden(s_wifi_scan_row,
+               !s_wifi_scan_requested || s_keyboard_target != NULL);
+    /* The keyboard owns the active field's temporary y=0 geometry.  The
+     * periodic scan refresh must not move it back into the scrolled layout. */
+    if (s_keyboard_target == s_wifi_ssid ||
+        s_keyboard_target == s_wifi_password)
+        return;
+    int offset = s_wifi_scan_requested ? 120 : 0;
+    if (s_wifi_scan_row) lv_obj_set_pos(s_wifi_scan_row, 0, 94);
+    lv_obj_set_pos(s_connectivity_rows[1], 0, 94 + offset);
+    lv_obj_set_pos(s_connectivity_rows[2], 0, 214 + offset);
+    lv_obj_set_pos(s_connectivity_rows[3], 0, 334 + offset);
+    lv_obj_set_pos(s_connectivity_rows[4], 0, 424 + offset);
+}
+
+static void set_connectivity_editing(lv_obj_t *target, bool editing)
+{
+    bool network_field = target == s_wifi_ssid || target == s_wifi_password;
+    if (!network_field || !s_connectivity_rows[0]) return;
+
+    lv_obj_t *active_row = target == s_wifi_ssid
+                               ? s_connectivity_rows[1]
+                               : s_connectivity_rows[2];
+    for (int i = 0; i < 5; ++i) {
+        if (editing && s_connectivity_rows[i] != active_row)
+            lv_obj_add_flag(s_connectivity_rows[i], LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_clear_flag(s_connectivity_rows[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_wifi_scan_row)
+        set_hidden(s_wifi_scan_row, editing || !s_wifi_scan_requested);
+
+    if (editing) {
+        lv_obj_set_pos(active_row, 0, 0);
+        lv_obj_set_size(active_row, UI_MANAGE_ROW_FULL_W, 124);
+        lv_obj_set_pos(target, 0, 42);
+        lv_obj_set_size(target, 708, 60);
+        if (target == s_wifi_password) {
+            lv_obj_add_flag(s_wifi_password_helper, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_pos(s_wifi_password_reveal, 580, 46);
+            lv_obj_move_foreground(s_wifi_password_reveal);
+        }
+        lv_obj_scroll_to_y(s_manage_scrolls[MANAGE_CONNECTIVITY], 0,
+                           LV_ANIM_OFF);
+        return;
+    }
+
+    layout_connectivity_rows();
+    lv_obj_set_size(s_connectivity_rows[1], UI_MANAGE_ROW_W, 112);
+    lv_obj_set_pos(s_wifi_ssid, 190, 0);
+    lv_obj_set_size(s_wifi_ssid, 504, 60);
+    lv_obj_set_size(s_connectivity_rows[2], UI_MANAGE_ROW_W, 112);
+    lv_obj_set_pos(s_wifi_password, 190, 0);
+    lv_obj_set_size(s_wifi_password, 504, 60);
+    lv_obj_set_pos(s_wifi_password_reveal, 574, 4);
+    lv_obj_clear_flag(s_wifi_password_helper, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_scroll_to_y(s_manage_scrolls[MANAGE_CONNECTIVITY], 0, LV_ANIM_OFF);
+}
 
 static void close_keyboard_sheet(bool restore)
 {
@@ -1499,6 +1650,12 @@ static void close_keyboard_sheet(bool restore)
      * layout_connectivity_rows() can put the optional scan row and fields
      * back in their steady-state positions in this same frame. */
     s_keyboard_target = NULL;
+    set_connectivity_editing(target, false);
+    if (target && target == s_wifi_password) {
+        s_wifi_password_revealed = false;
+        lv_textarea_set_password_mode(s_wifi_password, true);
+        lv_label_set_text(s_wifi_password_reveal_label, "Reveal");
+    }
     if (target) lv_obj_clear_state(target, LV_STATE_FOCUSED);
     lv_obj_add_flag(s_keyboard_sheet, LV_OBJ_FLAG_HIDDEN);
     lv_keyboard_set_textarea(s_keyboard, NULL);
@@ -1512,6 +1669,13 @@ static void open_keyboard_sheet(lv_obj_t *target, lv_keyboard_mode_t mode,
     strlcpy(s_keyboard_initial, lv_textarea_get_text(target),
             sizeof(s_keyboard_initial));
     lv_label_set_text(s_keyboard_title, title);
+    if (target == s_wifi_ssid)
+        lv_label_set_text(s_connectivity_section_subtitle,
+                          "Editing network name");
+    else if (target == s_wifi_password)
+        lv_label_set_text(s_connectivity_section_subtitle,
+                          "Editing network password");
+    set_connectivity_editing(target, true);
     lv_keyboard_set_mode(s_keyboard, mode);
     lv_keyboard_set_textarea(s_keyboard, target);
     lv_obj_set_y(s_keyboard_sheet, top);
@@ -1529,6 +1693,155 @@ static void passkey_focus_cb(lv_event_t *event)
                             LV_KEYBOARD_MODE_NUMBER, "Pairing code", 356);
 }
 
+static void text_focus_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_FOCUSED) return;
+    lv_obj_t *target = lv_event_get_target(event);
+    open_keyboard_sheet(target, LV_KEYBOARD_MODE_TEXT_LOWER,
+                        target == s_wifi_ssid ? "Network name"
+                                              : "Network password",
+                        314);
+}
+
+static void wifi_field_changed_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_VALUE_CHANGED) return;
+    s_wifi_force_clear_password = false;
+    s_wifi_scan_open_selected = false;
+    portENTER_CRITICAL(&s_state_lock);
+    s_wifi_restart_pending = false;
+    portEXIT_CRITICAL(&s_state_lock);
+}
+
+static void wifi_password_reveal_cb(lv_event_t *event)
+{
+    (void)event;
+    s_wifi_password_revealed = !s_wifi_password_revealed;
+    lv_textarea_set_password_mode(s_wifi_password, !s_wifi_password_revealed);
+    lv_obj_scroll_to_y(s_wifi_password, 0, LV_ANIM_OFF);
+    lv_label_set_text(s_wifi_password_reveal_label,
+                      s_wifi_password_revealed ? "Mask" : "Reveal");
+}
+
+static void wifi_scan_snapshot(netprov_scan_snapshot_t *snapshot)
+{
+    memset(snapshot, 0, sizeof(*snapshot));
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    if (!s_wifi_scan_requested) {
+        snapshot->state = NETPROV_SCAN_IDLE;
+        snapshot->result = ESP_OK;
+        return;
+    }
+    snapshot->generation = 1;
+    if (s_qemu_wifi_scan_started_us > 0 &&
+        esp_timer_get_time() - s_qemu_wifi_scan_started_us < 650000) {
+        snapshot->state = NETPROV_SCAN_RUNNING;
+        snapshot->result = ESP_OK;
+        return;
+    }
+    static const netprov_scan_ap_t fixture[] = {
+        { .ssid = "Hearthstone", .rssi = -42, .secure = true },
+        { .ssid = "Bedroom mesh", .rssi = -61, .secure = true },
+        { .ssid = "Guest open", .rssi = -74, .secure = false },
+    };
+    snapshot->state = NETPROV_SCAN_READY;
+    snapshot->result = ESP_OK;
+    snapshot->count = sizeof(fixture) / sizeof(fixture[0]);
+    memcpy(snapshot->aps, fixture, sizeof(fixture));
+#else
+    netprov_scan_get_snapshot(snapshot);
+#endif
+}
+
+static const char *wifi_scan_interaction_reason(bool scan_running)
+{
+    if (!s_touch_services_ready) return "Network service is still starting";
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active())
+        return "Stop therapy to scan for Wi-Fi";
+    if (s_keyboard_target) return "Finish editing before scanning";
+    portENTER_CRITICAL(&s_state_lock);
+    bool save_busy = s_wifi_save_busy;
+    bool reboot_busy = s_reboot_busy;
+    bool restart_pending = s_wifi_restart_pending;
+    portEXIT_CRITICAL(&s_state_lock);
+    if (save_busy) return "Wait for Wi-Fi settings to finish saving";
+    if (reboot_busy) return "Restart is already in progress";
+    if (restart_pending) return "Restart saved Wi-Fi changes before scanning";
+    if (scan_running) return "Wi-Fi scan is already running";
+    return NULL;
+}
+
+static void wifi_scan_request_cb(lv_event_t *event)
+{
+    (void)event;
+    netprov_scan_snapshot_t snapshot;
+    wifi_scan_snapshot(&snapshot);
+    const char *blocked = wifi_scan_interaction_reason(
+        snapshot.state == NETPROV_SCAN_RUNNING);
+    if (blocked) {
+        bsp_display_set_notice(blocked);
+        return;
+    }
+
+    s_wifi_scan_requested = true;
+    s_wifi_scan_open_selected = false;
+    s_wifi_scan_seen_generation = UINT32_MAX;
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    s_qemu_wifi_scan_started_us = esp_timer_get_time();
+    bsp_display_set_notice("Scanning nearby Wi-Fi · simulated preview");
+#else
+    esp_err_t result = netprov_scan_request();
+    if (result == ESP_OK)
+        bsp_display_set_notice("Scanning nearby Wi-Fi networks...");
+    else {
+        wifi_scan_snapshot(&snapshot);
+        if (snapshot.blocked_by == NETPROV_SCAN_BLOCK_RECORDING)
+            bsp_display_set_notice("Stop therapy to scan for Wi-Fi");
+        else if (snapshot.blocked_by == NETPROV_SCAN_BLOCK_RADIO_BUSY)
+            bsp_display_set_notice("Wi-Fi is reconnecting · try again shortly");
+        else
+            bsp_display_set_notice("Unable to start Wi-Fi scan");
+    }
+#endif
+}
+
+static void wifi_scan_selection_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_VALUE_CHANGED) return;
+    s_wifi_scan_open_selected = false;
+}
+
+static void wifi_scan_use_cb(lv_event_t *event)
+{
+    (void)event;
+    netprov_scan_snapshot_t snapshot;
+    wifi_scan_snapshot(&snapshot);
+    const char *blocked = wifi_scan_interaction_reason(
+        snapshot.state == NETPROV_SCAN_RUNNING);
+    if (blocked) {
+        bsp_display_set_notice(blocked);
+        return;
+    }
+    if (snapshot.state != NETPROV_SCAN_READY || snapshot.count == 0) {
+        bsp_display_set_notice("Choose an available Wi-Fi network first");
+        return;
+    }
+    uint16_t selected = lv_dropdown_get_selected(s_wifi_scan_dropdown);
+    if (selected >= snapshot.count) selected = 0;
+    const netprov_scan_ap_t *network = &snapshot.aps[selected];
+    lv_textarea_set_text(s_wifi_ssid, network->ssid);
+    lv_textarea_set_text(s_wifi_password, "");
+    s_wifi_force_clear_password = !network->secure;
+    s_wifi_scan_open_selected = !network->secure;
+    if (network->secure) {
+        lv_obj_add_state(s_wifi_password, LV_STATE_FOCUSED);
+        open_keyboard_sheet(s_wifi_password, LV_KEYBOARD_MODE_TEXT_LOWER,
+                            "Network password", 314);
+        bsp_display_set_notice("Secure network selected · enter its password");
+    } else {
+        bsp_display_set_notice("Open network selected · no password required");
+    }
+}
 
 static void keyboard_cb(lv_event_t *event)
 {
@@ -1564,6 +1877,106 @@ static void keyboard_sheet_action_cb(lv_event_t *event)
     close_keyboard_sheet(cancel);
 }
 
+static void reboot_task(void *arg)
+{
+    bool from_wifi_save = (intptr_t)arg == 1;
+    vTaskDelay(pdMS_TO_TICKS(500));
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active() ||
+        !bsp_display_try_reserve_therapy_safe_restart()) {
+        bsp_display_set_notice("Restart cancelled: therapy recording is active");
+        portENTER_CRITICAL(&s_state_lock);
+        s_reboot_busy = false;
+        if (from_wifi_save) s_wifi_save_busy = false;
+        portEXIT_CRITICAL(&s_state_lock);
+        netprov_lifecycle_release();
+        vTaskDelete(NULL);
+        return;
+    }
+    if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0)) {
+        bsp_display_cancel_therapy_safe_restart();
+        bsp_display_set_notice("Restart cancelled: microSD is busy");
+        portENTER_CRITICAL(&s_state_lock);
+        s_reboot_busy = false;
+        if (from_wifi_save) s_wifi_save_busy = false;
+        portEXIT_CRITICAL(&s_state_lock);
+        netprov_lifecycle_release();
+        vTaskDelete(NULL);
+        return;
+    }
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active() ||
+        !bsp_display_try_commit_therapy_safe_restart()) {
+        sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
+        bsp_display_cancel_therapy_safe_restart();
+        bsp_display_set_notice("Restart cancelled: therapy recording started");
+        portENTER_CRITICAL(&s_state_lock);
+        s_reboot_busy = false;
+        if (from_wifi_save) s_wifi_save_busy = false;
+        portEXIT_CRITICAL(&s_state_lock);
+        netprov_lifecycle_release();
+        vTaskDelete(NULL);
+        return;
+    }
+    sd_storage_deinit();
+    esp_restart();
+}
+
+static void reboot_cb(lv_event_t *event)
+{
+    (void)event;
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active()) {
+        bsp_display_set_notice("Stop therapy before restarting");
+        return;
+    }
+    portENTER_CRITICAL(&s_state_lock);
+    bool busy = s_reboot_busy || s_wifi_save_busy;
+    if (!busy) s_reboot_busy = true;
+    portEXIT_CRITICAL(&s_state_lock);
+    if (busy) return;
+    if (!netprov_lifecycle_try_claim("ui-reboot")) {
+        portENTER_CRITICAL(&s_state_lock);
+        s_reboot_busy = false;
+        portEXIT_CRITICAL(&s_state_lock);
+        bsp_display_set_notice("Restart deferred: update or restart in progress");
+        return;
+    }
+    bsp_display_set_notice("Restarting SomnoTrace...");
+    if (xTaskCreate(reboot_task, "ui_reboot", 2048, NULL, 5, NULL) != pdPASS) {
+        netprov_lifecycle_release();
+        portENTER_CRITICAL(&s_state_lock);
+        s_reboot_busy = false;
+        portEXIT_CRITICAL(&s_state_lock);
+        bsp_display_set_notice("Unable to start restart task");
+    }
+}
+
+static void reboot_dialog_cb(lv_event_t *event)
+{
+    lv_obj_t *dialog = lv_event_get_current_target(event);
+    const char *button = lv_msgbox_get_active_btn_text(dialog);
+    if (!button) return;
+    if (!strcmp(button, "Restart")) reboot_cb(NULL);
+    lv_msgbox_close(dialog);
+}
+
+static void reboot_prompt_cb(lv_event_t *event)
+{
+    (void)event;
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active()) {
+        bsp_display_set_notice("Stop therapy before restarting");
+        return;
+    }
+    static const char *buttons[] = { "Cancel", "Restart", "" };
+    lv_obj_t *dialog = lv_msgbox_create(
+        NULL, "Restart SomnoTrace?",
+        "The display, Bluetooth, and network services will be unavailable while the device restarts. Recorded nights are kept.",
+        buttons, true);
+    lv_obj_set_width(dialog, 620);
+    lv_obj_set_style_bg_color(dialog, lv_color_hex(0x172640), 0);
+    lv_obj_set_style_text_color(dialog, lv_color_hex(0xe7edf7), 0);
+    lv_obj_add_event_cb(dialog, reboot_dialog_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    track_manage_dialog(dialog);
+    lv_obj_center(dialog);
+}
 
 typedef struct {
     char ssid[NETPROV_SSID_MAXLEN + 1];
@@ -1571,6 +1984,82 @@ typedef struct {
     bool keep_password;
 } wifi_job_t;
 
+static void wifi_save_task(void *arg)
+{
+    wifi_job_t *job = arg;
+    struct netprov_config cfg = {0};
+    netprov_load_config(&cfg);
+    strlcpy(cfg.wifi[0].ssid, job->ssid, sizeof(cfg.wifi[0].ssid));
+    if (!job->keep_password)
+        strlcpy(cfg.wifi[0].pass, job->password, sizeof(cfg.wifi[0].pass));
+    esp_err_t result = netprov_save_config(&cfg);
+    free(job);
+    if (result == ESP_OK) {
+        portENTER_CRITICAL(&s_state_lock);
+        s_wifi_save_busy = false;
+        s_wifi_restart_pending = true;
+        portEXIT_CRITICAL(&s_state_lock);
+        if (bsp_display_is_therapy_active() || sd_storage_recording_active())
+            bsp_display_set_notice("Wi-Fi saved; restart deferred while recording");
+        else
+            bsp_display_set_notice("Wi-Fi saved; restart required");
+        vTaskDelete(NULL);
+        return;
+    }
+    portENTER_CRITICAL(&s_state_lock);
+    s_wifi_save_busy = false;
+    portEXIT_CRITICAL(&s_state_lock);
+    bsp_display_set_notice("Could not save Wi-Fi settings");
+    vTaskDelete(NULL);
+}
+
+static void wifi_save_cb(lv_event_t *event)
+{
+    (void)event;
+    if (!s_touch_services_ready) {
+        bsp_display_set_notice("Network service is still starting");
+        return;
+    }
+    portENTER_CRITICAL(&s_state_lock);
+    bool restart_pending = s_wifi_restart_pending;
+    bool busy = s_wifi_save_busy || s_reboot_busy;
+    if (!busy && !restart_pending) s_wifi_save_busy = true;
+    portEXIT_CRITICAL(&s_state_lock);
+    if (busy) return;
+    if (restart_pending) {
+        reboot_prompt_cb(NULL);
+        return;
+    }
+    const char *ssid = lv_textarea_get_text(s_wifi_ssid);
+    const char *password = lv_textarea_get_text(s_wifi_password);
+    if (!ssid || !ssid[0]) {
+        portENTER_CRITICAL(&s_state_lock);
+        s_wifi_save_busy = false;
+        portEXIT_CRITICAL(&s_state_lock);
+        bsp_display_set_notice("Enter a Wi-Fi network name");
+        return;
+    }
+    wifi_job_t *job = calloc(1, sizeof(*job));
+    if (!job) {
+        portENTER_CRITICAL(&s_state_lock);
+        s_wifi_save_busy = false;
+        portEXIT_CRITICAL(&s_state_lock);
+        bsp_display_set_notice("Unable to prepare Wi-Fi settings");
+        return;
+    }
+    strlcpy(job->ssid, ssid, sizeof(job->ssid));
+    strlcpy(job->password, password ? password : "", sizeof(job->password));
+    job->keep_password = !s_wifi_force_clear_password && !job->password[0] &&
+                         !strcmp(job->ssid, s_saved_wifi_ssid);
+    close_keyboard_sheet(false);
+    if (xTaskCreate(wifi_save_task, "ui_wifi_save", 4096, job, 4, NULL) != pdPASS) {
+        free(job);
+        portENTER_CRITICAL(&s_state_lock);
+        s_wifi_save_busy = false;
+        portEXIT_CRITICAL(&s_state_lock);
+        bsp_display_set_notice("Unable to save Wi-Fi settings");
+    }
+}
 
 static void set_active_page(int page)
 {
@@ -1638,7 +2127,7 @@ static void nav_cb(lv_event_t *event)
 
 static void set_manage_section(int section)
 {
-    if (!(section == MANAGE_DEVICES || section == MANAGE_CONNECTIVITY || section == MANAGE_ALERTS || section == MANAGE_UPLOADS || section == MANAGE_LOGS)) return;
+    if (section < 0 || section >= MANAGE_SECTION_COUNT) return;
     if (section == s_active_manage_section) return;
 
     /* Teardown must precede changing the selected index so callbacks and
@@ -1661,6 +2150,11 @@ static void manage_section_cb(lv_event_t *event)
     set_manage_section((int)(intptr_t)lv_event_get_user_data(event));
 }
 
+static void storage_refresh_cb(lv_event_t *event)
+{
+    (void)event;
+    start_storage_refresh();
+}
 
 static void status_tray_close_cb(lv_event_t *event)
 {
@@ -1696,6 +2190,12 @@ static void history_controller_changed(void *context)
     __atomic_store_n(&s_history_apply_scheduled, true, __ATOMIC_RELEASE);
 }
 
+static void history_route_card(void *context)
+{
+    (void)context;
+    set_manage_section(MANAGE_STORAGE);
+    set_active_page(2);
+}
 
 static void apply_history_controller_if_needed(void)
 {
@@ -1714,6 +2214,35 @@ static void apply_history_controller_if_needed(void)
     }
 }
 
+static void alert_test_task(void *arg)
+{
+    (void)arg;
+    esp_err_t result = therapy_alert_send_test_push(NULL);
+    portENTER_CRITICAL(&s_state_lock);
+    s_alert_test_busy = false;
+    portEXIT_CRITICAL(&s_state_lock);
+    bsp_display_set_notice(result == ESP_OK ? "Test alert sent"
+                                            : "Test alert could not be sent");
+    vTaskDelete(NULL);
+}
+
+static void alert_test_cb(lv_event_t *event)
+{
+    (void)event;
+    portENTER_CRITICAL(&s_state_lock);
+    bool busy = s_alert_test_busy;
+    if (!busy) s_alert_test_busy = true;
+    portEXIT_CRITICAL(&s_state_lock);
+    if (busy) return;
+    bsp_display_set_notice("Sending test alert...");
+    if (xTaskCreate(alert_test_task, "ui_alert_test", 4096,
+                    NULL, 3, NULL) != pdPASS) {
+        portENTER_CRITICAL(&s_state_lock);
+        s_alert_test_busy = false;
+        portEXIT_CRITICAL(&s_state_lock);
+        bsp_display_set_notice("Unable to start alert test");
+    }
+}
 
 #if !CONFIG_SOMNOTRACE_BOARD_QEMU
 static esp_err_t start_therapy_with_lifecycle_gate(void)
@@ -1844,6 +2373,52 @@ static void wake_overlay_cb(lv_event_t *event)
     }
 }
 
+static void diagnostics_cb(lv_event_t *event)
+{
+    (void)event;
+    ui_state_t state;
+    portENTER_CRITICAL(&s_state_lock);
+    state = s_state;
+    portEXIT_CRITICAL(&s_state_lock);
+
+    const esp_app_desc_t *app = esp_app_get_description();
+    UBaseType_t stack_free = s_lvgl_task ? uxTaskGetStackHighWaterMark(s_lvgl_task) : 0;
+    char details[640];
+    snprintf(details, sizeof(details),
+             "Board        " UI_BOARD_NAME "\n"
+             "Display      1024 x 600 RGB565\n"
+             "Touch        %s (this tap was received)\n"
+             "SD storage   %s\n"
+             "Wi-Fi        %s\n"
+             "AirSense 11  %s\n"
+             "PSRAM free   %u KiB\n"
+             "Internal RAM %u KiB\n"
+             "UI stack min %u bytes free\n"
+             "RGB frames   %lu (%lu sync timeouts)\n"
+             "Touch errors %lu\n"
+             "Backlight I2C errors %lu\n"
+             "Firmware     %s",
+             UI_TOUCH_STATUS,
+             state.sd_ready ? "ready" : "not ready",
+             state.wifi ? "connected" : "offline",
+             state.paired ? "paired" : "not paired",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)stack_free,
+             (unsigned long)s_flush_count,
+             (unsigned long)s_flush_timeouts,
+             (unsigned long)s_touch_read_errors,
+             (unsigned long)s_backlight_write_errors,
+             app ? app->version : "unknown");
+
+    lv_obj_t *message = lv_msgbox_create(NULL, "Hardware diagnostics",
+                                         details, NULL, true);
+    lv_obj_set_width(message, 720);
+    lv_obj_set_style_bg_color(message, lv_color_hex(0x121d32), 0);
+    lv_obj_set_style_text_color(message, lv_color_hex(0xe7edf7), 0);
+    track_manage_dialog(message);
+    lv_obj_center(message);
+}
 
 static lv_obj_t *make_plain_container(lv_obj_t *parent, int x, int y, int w, int h)
 {
@@ -2368,6 +2943,223 @@ static void build_devices_section(lv_obj_t *section)
     lv_obj_add_flag(s_device_change_row, LV_OBJ_FLAG_HIDDEN);
 }
 
+static void __attribute__((unused)) build_connectivity_section(lv_obj_t *section)
+{
+    lv_obj_t *scroll = make_manage_section(section, MANAGE_CONNECTIVITY, "Connectivity",
+                                            "Wi-Fi and local dashboard access");
+    s_wifi_scan_button = make_touch_button(section, 616, 14, 134, 48,
+                                            "Scan", COLOR_CONTROL,
+                                            wifi_scan_request_cb, 0);
+    lv_obj_set_style_radius(s_wifi_scan_button, 24, 0);
+    s_wifi_scan_button_label = lv_obj_get_child(s_wifi_scan_button, 0);
+    lv_obj_set_style_text_font(s_wifi_scan_button_label, FONT_BUTTON_COMPACT, 0);
+
+    s_connectivity_rows[0] = make_manage_row(scroll, 0, 86);
+    make_label(s_connectivity_rows[0], "Current network", 0, 0, 190,
+               FONT_ROW_TITLE, COLOR_TEXT);
+    s_network_status = make_label(s_connectivity_rows[0], "Checking network...", 200, 0, 492,
+                                  FONT_BODY_SMALL, COLOR_SECONDARY);
+
+    s_wifi_scan_row = make_manage_row(scroll, 94, 112);
+    make_label(s_wifi_scan_row, "Nearby networks", 0, 0, 180,
+               FONT_ROW_TITLE, COLOR_TEXT);
+    s_wifi_scan_status = make_label(s_wifi_scan_row, "Preparing scan...", 0, 28, 180,
+                                    FONT_BODY_SMALL, COLOR_SECONDARY);
+    s_wifi_scan_dropdown = lv_dropdown_create(s_wifi_scan_row);
+    lv_dropdown_set_options(s_wifi_scan_dropdown, "Scanning nearby networks...");
+    lv_dropdown_set_symbol(s_wifi_scan_dropdown, NULL);
+    lv_obj_set_pos(s_wifi_scan_dropdown, 190, 0);
+    lv_obj_set_size(s_wifi_scan_dropdown, 354, 56);
+    lv_obj_set_style_text_font(s_wifi_scan_dropdown, FONT_BODY_SMALL, 0);
+    style_manage_field(s_wifi_scan_dropdown);
+    make_manage_field_chevron(s_wifi_scan_dropdown);
+    lv_obj_add_event_cb(s_wifi_scan_dropdown, manage_dropdown_list_ready_cb,
+                        LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(s_wifi_scan_dropdown, wifi_scan_selection_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+    s_wifi_scan_use_button = make_touch_button(s_wifi_scan_row, 556, 0, 138, 56,
+                                                "Use", COLOR_INVERSE,
+                                                wifi_scan_use_cb, 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(s_wifi_scan_use_button, 0),
+                                lv_color_hex(COLOR_BASE), 0);
+    lv_obj_add_flag(s_wifi_scan_row, LV_OBJ_FLAG_HIDDEN);
+
+    s_connectivity_rows[1] = make_manage_row(scroll, 94, 112);
+    make_label(s_connectivity_rows[1], "Network name", 0, 0, 180,
+               FONT_ROW_TITLE, COLOR_TEXT);
+    s_wifi_ssid = lv_textarea_create(s_connectivity_rows[1]);
+    lv_textarea_set_one_line(s_wifi_ssid, true);
+    lv_textarea_set_max_length(s_wifi_ssid, NETPROV_SSID_MAXLEN);
+    lv_textarea_set_placeholder_text(s_wifi_ssid, "Wi-Fi name (SSID)");
+    lv_obj_set_pos(s_wifi_ssid, 190, 0);
+    lv_obj_set_size(s_wifi_ssid, 504, 60);
+    lv_obj_set_style_text_font(s_wifi_ssid, FONT_BODY, 0);
+    style_manage_textarea(s_wifi_ssid);
+    lv_obj_add_event_cb(s_wifi_ssid, text_focus_cb, LV_EVENT_FOCUSED, NULL);
+    lv_obj_add_event_cb(s_wifi_ssid, wifi_field_changed_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+
+    s_connectivity_rows[2] = make_manage_row(scroll, 214, 112);
+    make_label(s_connectivity_rows[2], "Password", 0, 0, 180,
+               FONT_ROW_TITLE, COLOR_TEXT);
+    s_wifi_password_helper = make_label(s_connectivity_rows[2],
+                                        "Blank keeps the saved password",
+                                        0, 28, 180, FONT_BODY_SMALL,
+                                        COLOR_TERTIARY);
+    s_wifi_password = lv_textarea_create(s_connectivity_rows[2]);
+    lv_textarea_set_one_line(s_wifi_password, true);
+    lv_textarea_set_password_mode(s_wifi_password, true);
+    lv_textarea_set_max_length(s_wifi_password, NETPROV_PASS_MAXLEN);
+    lv_textarea_set_placeholder_text(s_wifi_password, "Enter a new password");
+    lv_obj_set_pos(s_wifi_password, 190, 0);
+    lv_obj_set_size(s_wifi_password, 504, 60);
+    lv_obj_set_style_text_font(s_wifi_password, FONT_BODY, 0);
+    style_manage_textarea(s_wifi_password);
+    lv_obj_set_style_pad_right(s_wifi_password, 128, 0);
+    lv_obj_add_event_cb(s_wifi_password, text_focus_cb, LV_EVENT_FOCUSED, NULL);
+    lv_obj_add_event_cb(s_wifi_password, wifi_field_changed_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+    s_wifi_password_reveal = make_touch_button(
+        s_connectivity_rows[2], 574, 4, 112, 52, "Reveal",
+        COLOR_CONTROL, wifi_password_reveal_cb, 0);
+    lv_obj_set_style_radius(s_wifi_password_reveal, 26, 0);
+    s_wifi_password_reveal_label = lv_obj_get_child(s_wifi_password_reveal, 0);
+    lv_obj_set_style_text_font(s_wifi_password_reveal_label,
+                               FONT_BUTTON_COMPACT, 0);
+
+    s_connectivity_rows[3] = make_manage_row(scroll, 334, 82);
+    make_label(s_connectivity_rows[3], "Setup hotspot", 0, 0, 360,
+               FONT_ROW_TITLE, COLOR_TEXT);
+    make_label(s_connectivity_rows[3], "Configure Wi-Fi from a phone", 0, 27, 390,
+               FONT_BODY_SMALL, COLOR_SECONDARY);
+    s_wifi_hotspot_button = make_touch_button(s_connectivity_rows[3], 528, -3, 166, 56,
+                                               "Start", COLOR_CONTROL,
+                                               action_cb, 3);
+
+    s_connectivity_rows[4] = make_manage_row(scroll, 424, 82);
+    make_label(s_connectivity_rows[4], "Apply network changes", 0, 0, 390,
+               FONT_ROW_TITLE, COLOR_TEXT);
+    s_wifi_restart_detail = make_label(
+        s_connectivity_rows[4], "Save now; restart is requested separately.", 0, 27, 440,
+        FONT_BODY_SMALL, COLOR_SECONDARY);
+    s_wifi_save_button = make_touch_button(s_connectivity_rows[4], 494, -3, 200, 56,
+                                            "Save changes", COLOR_INVERSE,
+                                            wifi_save_cb, 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(s_wifi_save_button, 0),
+                                lv_color_hex(COLOR_BASE), 0);
+}
+
+static void __attribute__((unused)) build_alerts_section(lv_obj_t *section)
+{
+    lv_obj_t *scroll = make_manage_section(section, MANAGE_ALERTS, "Alerts",
+                                            "If therapy stops unexpectedly overnight");
+    lv_obj_t *status = make_manage_row(scroll, 0, 114);
+    make_label(status, "Push alerts", 0, 0, 190,
+               FONT_ROW_TITLE, COLOR_TEXT);
+    s_alert_status = make_label(status, "Reading alert settings...", 200, 0, 494,
+                                FONT_BODY_SMALL, COLOR_SECONDARY);
+    make_label(status,
+               "This 7-inch board has no onboard speaker; persistent on-screen alerts still wake the display.",
+               0, 48, 672, FONT_BODY_SMALL, COLOR_SECONDARY);
+
+    lv_obj_t *test = make_manage_row(scroll, 122, 82);
+    make_label(test, "Test alert", 0, 0, 390,
+               FONT_ROW_TITLE, COLOR_TEXT);
+    make_label(test, "Sends one real test push notification", 0, 27, 430,
+               FONT_BODY_SMALL, COLOR_SECONDARY);
+    s_alert_test_button = make_touch_button(test, 494, -3, 200, 56,
+                                             "Send test push", COLOR_INVERSE,
+                                             alert_test_cb, 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(s_alert_test_button, 0),
+                                lv_color_hex(COLOR_BASE), 0);
+
+    lv_obj_t *browser = make_manage_row(scroll, 212, 92);
+    make_label(browser, "Alert schedule and delivery", 0, 0, 390,
+               FONT_ROW_TITLE, COLOR_TEXT);
+    make_label(browser,
+               "Notification server, schedule, and escalation settings are configured in the browser dashboard.",
+               0, 29, 470, FONT_BODY_SMALL, COLOR_SECONDARY);
+    make_label(browser, "Browser dashboard only", 522, 20, 172,
+               FONT_BODY_SMALL, COLOR_TERTIARY);
+}
+
+static void __attribute__((unused)) build_uploads_section(lv_obj_t *section)
+{
+    lv_obj_t *scroll = make_manage_section(section, MANAGE_UPLOADS, "Uploads",
+                                            "Destination status and retry progress");
+
+    for (int i = 0; i < UPLOADER_PROGRESS_MAX_BACKENDS; ++i) {
+        lv_obj_t *row = make_manage_row(scroll, i * 100, 92);
+        s_upload_rows[i] = row;
+        s_upload_dots[i] = make_status_dot(row, 0, 7, 12);
+        s_upload_titles[i] = make_label(row, "Upload destination", 28, 0, 330,
+                                        FONT_ROW_TITLE, COLOR_TEXT);
+        s_upload_states[i] = make_label(row, "Checking", 542, 1, 152,
+                                        FONT_BODY, COLOR_TERTIARY);
+        lv_obj_set_style_text_align(s_upload_states[i], LV_TEXT_ALIGN_RIGHT, 0);
+        s_upload_details[i] = make_label(row, "Reading upload status...", 28, 29,
+                                         642, FONT_BODY_SMALL, COLOR_SECONDARY);
+        s_upload_meters[i] = lv_bar_create(row);
+        lv_obj_set_pos(s_upload_meters[i], 28, 54);
+        lv_obj_set_size(s_upload_meters[i], 642, 8);
+        lv_bar_set_range(s_upload_meters[i], 0, 100);
+        lv_bar_set_value(s_upload_meters[i], 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(s_upload_meters[i], lv_color_hex(COLOR_CONTROL),
+                                  LV_PART_MAIN);
+        lv_obj_set_style_bg_color(s_upload_meters[i], lv_color_hex(COLOR_LIVE),
+                                  LV_PART_INDICATOR);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    s_upload_browser_row = make_manage_row(scroll, 0, 96);
+    make_label(s_upload_browser_row, "Upload configuration", 0, 0, 270,
+               FONT_ROW_TITLE, COLOR_TEXT);
+    make_label(s_upload_browser_row,
+               "Credentials, FTP access, formatting, and bulk upload controls stay in the browser dashboard.",
+               0, 29, 470, FONT_BODY_SMALL, COLOR_SECONDARY);
+    make_label(s_upload_browser_row, "Browser dashboard only", 522, 22, 172,
+               FONT_BODY_SMALL, COLOR_TERTIARY);
+}
+
+static void maintenance_navigate(maintenance_ui_navigation_t destination)
+{
+    static const int sections[] = { MANAGE_DEVICES, MANAGE_CONNECTIVITY,
+                                    MANAGE_UPLOADS, MANAGE_LOGS };
+    if ((unsigned)destination < sizeof(sections)/sizeof(sections[0]))
+        set_manage_section(sections[destination]);
+}
+
+static void maintenance_restart(void) { reboot_prompt_cb(NULL); }
+static void maintenance_screen_off(void)
+{
+    if (!screen_wake_input_available()) {
+        bsp_display_set_notice("Touch is unavailable - screen kept on");
+        return;
+    }
+    bsp_display_set_backlight(false);
+}
+
+static void build_maintenance_section(lv_obj_t *section,
+                                      maintenance_ui_destination_t destination)
+{
+    const maintenance_ui_hooks_t hooks = {
+        .navigate = maintenance_navigate, .restart = maintenance_restart,
+        .screen_off = maintenance_screen_off, .wake_available = screen_wake_input_available,
+    };
+    esp_err_t result = touch_maintenance_ui_show(section, destination, &hooks);
+    if (result == ESP_OK)
+        touch_maintenance_ui_refresh(s_touch_services_ready);
+    else
+        make_label(section, "Maintenance pane unavailable: insufficient memory",
+                   16, 24, 700, FONT_BODY, COLOR_FAULT);
+}
+
+static void build_storage_section(lv_obj_t *section)
+{ build_maintenance_section(section, MAINT_UI_STORAGE); }
+static void build_system_section(lv_obj_t *section)
+{ build_maintenance_section(section, MAINT_UI_SYSTEM); }
+static void build_advanced_section(lv_obj_t *section)
+{ build_maintenance_section(section, MAINT_UI_ADVANCED); }
 
 static void clear_manage_section_pointers(int section)
 {
@@ -2402,7 +3194,61 @@ static void clear_manage_section_pointers(int section)
         s_seen_as11_version = UINT_MAX;
         s_seen_ox_version = UINT_MAX;
         break;
-    default: break;
+    case MANAGE_CONNECTIVITY:
+        s_network_status = NULL;
+        s_wifi_ssid = NULL;
+        s_wifi_password = NULL;
+        memset(s_connectivity_rows, 0, sizeof(s_connectivity_rows));
+        s_wifi_scan_button = NULL;
+        s_wifi_scan_button_label = NULL;
+        s_wifi_scan_row = NULL;
+        s_wifi_scan_status = NULL;
+        s_wifi_scan_dropdown = NULL;
+        s_wifi_scan_use_button = NULL;
+        s_wifi_password_helper = NULL;
+        s_wifi_password_reveal = NULL;
+        s_wifi_password_reveal_label = NULL;
+        s_wifi_restart_detail = NULL;
+        s_wifi_save_button = NULL;
+        s_wifi_hotspot_button = NULL;
+        s_connectivity_section_subtitle = NULL;
+        s_wifi_password_revealed = false;
+        s_wifi_scan_seen_generation = UINT32_MAX;
+        s_wifi_scan_seen_state = NETPROV_SCAN_IDLE;
+        s_connectivity_settings_synced = false;
+        break;
+    case MANAGE_ALERTS:
+        s_alert_status = NULL;
+        s_alert_test_button = NULL;
+        break;
+    case MANAGE_UPLOADS:
+        memset(s_upload_rows, 0, sizeof(s_upload_rows));
+        memset(s_upload_dots, 0, sizeof(s_upload_dots));
+        memset(s_upload_titles, 0, sizeof(s_upload_titles));
+        memset(s_upload_details, 0, sizeof(s_upload_details));
+        memset(s_upload_states, 0, sizeof(s_upload_states));
+        memset(s_upload_meters, 0, sizeof(s_upload_meters));
+        s_upload_browser_row = NULL;
+        break;
+    case MANAGE_STORAGE:
+        s_storage_status = NULL;
+        s_storage_estimate = NULL;
+        s_storage_meter = NULL;
+        s_storage_refresh_button = NULL;
+        s_storage_browser_row = NULL;
+        break;
+    case MANAGE_SYSTEM:
+        s_system_health_title = NULL;
+        s_system_health_dot = NULL;
+        s_system_details = NULL;
+        s_system_firmware = NULL;
+        s_system_restart_detail = NULL;
+        s_reboot_button = NULL;
+        s_system_section_subtitle = NULL;
+        break;
+    case MANAGE_LOGS:
+    case MANAGE_ADVANCED:
+        break;
     }
 }
 
@@ -2439,7 +3285,6 @@ static void log_manage_ownership(const char *action)
 static void update_manage_rail_selection(int section)
 {
     for (int i = 0; i < MANAGE_SECTION_COUNT; ++i) {
-        if (!s_manage_buttons[i]) continue;
         bool selected = i == section;
         set_destination_surface(s_manage_buttons[i],
                                 selected ? COLOR_INVERSE : COLOR_PANEL,
@@ -2488,6 +3333,8 @@ static void teardown_rendered_manage_destination(void)
     if (section == MANAGE_CONNECTIVITY || section == MANAGE_ALERTS || section == MANAGE_UPLOADS)
         touch_manage_config_hide();
 
+    if (section == MANAGE_STORAGE || section == MANAGE_SYSTEM ||
+        section == MANAGE_ADVANCED) touch_maintenance_ui_destroy();
     clear_manage_section_pointers(section); /* invalidate before lv_obj_del */
     if (section == MANAGE_LOGS &&
         touch_logs_controller_destroy() == ESP_ERR_INVALID_STATE) {
@@ -2522,7 +3369,6 @@ static void build_manage_destination(int section)
     s_manage_sections[section] = destination;
     s_rendered_manage_section = section;
     switch ((manage_section_t)section) {
-    default: break;
     case MANAGE_DEVICES:
         build_devices_section(destination);
         break;
@@ -2534,6 +3380,12 @@ static void build_manage_destination(int section)
         break;
     case MANAGE_UPLOADS:
         touch_manage_config_show(destination, MC_UPLOADS);
+        break;
+    case MANAGE_STORAGE:
+        build_storage_section(destination);
+        break;
+    case MANAGE_SYSTEM:
+        build_system_section(destination);
         break;
     case MANAGE_LOGS: {
         s_manage_scrolls[MANAGE_LOGS] = destination;
@@ -2551,6 +3403,9 @@ static void build_manage_destination(int section)
 #endif
         break;
     }
+    case MANAGE_ADVANCED:
+        build_advanced_section(destination);
+        break;
     }
     s_manage_transition_generation++;
     log_manage_ownership("build");
@@ -2569,16 +3424,17 @@ static void ensure_manage_destination(void)
 
 static void build_manage_page(lv_obj_t *manage)
 {
-    static const int section_ids[] = { MANAGE_DEVICES, MANAGE_CONNECTIVITY, MANAGE_ALERTS, MANAGE_UPLOADS, MANAGE_LOGS };
-    static const char *section_names[] = { "Devices", "Connectivity", "Alerts", "Uploads", "Logs" };
+    static const char *section_names[] = {
+        "Devices", "Connectivity", "Alerts", "Uploads",
+        "Storage", "System", "Logs", "Advanced"
+    };
     lv_obj_t *rail = make_card(manage, UI_PANEL_X, UI_PANEL_Y,
                                UI_MANAGE_RAIL_W, UI_PANEL_H);
     lv_obj_set_style_radius(rail, 28, 0);
     lv_obj_set_style_pad_all(rail, 8, 0);
-    for (unsigned row = 0; row < sizeof(section_ids) / sizeof(section_ids[0]); ++row) {
-        int i = section_ids[row];
+    for (int i = 0; i < MANAGE_SECTION_COUNT; ++i) {
         s_manage_buttons[i] = make_destination_button(
-            rail, 0, i * 52, 196, 46, section_names[row], COLOR_PANEL,
+            rail, 0, i * 52, 196, 46, section_names[i], COLOR_PANEL,
             manage_section_cb, i);
         lv_obj_set_style_radius(s_manage_buttons[i], 20, 0);
         s_manage_labels[i] = lv_obj_get_child(s_manage_buttons[i], 0);
@@ -2810,7 +3666,10 @@ static void build_ui(void)
     static const char *tray_actions[] = {
         "Pair", "Manage", "Manage", "", "Pair"
     };
-    static const int tray_sections[] = { MANAGE_DEVICES, -1, MANAGE_CONNECTIVITY, MANAGE_UPLOADS, MANAGE_DEVICES };
+    static const int tray_sections[] = {
+        MANAGE_DEVICES, MANAGE_STORAGE, MANAGE_CONNECTIVITY,
+        MANAGE_UPLOADS, MANAGE_DEVICES
+    };
     lv_obj_t **details[] = {
         &s_status_tray_as11, &s_status_tray_sd, &s_status_tray_wifi,
         &s_status_tray_upload, &s_status_tray_ox
@@ -2822,7 +3681,6 @@ static void build_ui(void)
                    FONT_BODY_SMALL, COLOR_TEXT);
         *details[i] = make_label(row, "Checking...", 42, 34, 320,
                                  FONT_BODY_SMALL, COLOR_SECONDARY);
-        if (tray_sections[i] < 0) continue;
         s_status_tray_actions[i] = make_destination_button(
             row, 370, 11, 82, 44, tray_actions[i], COLOR_CONTROL,
             status_tray_route_cb, tray_sections[i]);
@@ -3045,6 +3903,247 @@ static int pairing_step(const char *status, bool scanning)
     return -1;
 }
 
+static const char *friendly_alert_state(alert_state_t state)
+{
+    switch (state) {
+        case ALERT_ARMED: return "Push ready";
+        case ALERT_PENDING: return "Therapy stop detected";
+        case ALERT_PUSH_SENT: return "Push service accepted";
+        case ALERT_SCREEN_ONLY: return "Screen alert only";
+        case ALERT_PUSH_FAILED: return "Push failed; screen alert active";
+        case ALERT_BUZZING: return "Escalated screen alert";
+        case ALERT_ACKED: return "Acknowledged";
+        case ALERT_DISARMED:
+        default: return "Push unavailable";
+    }
+}
+
+static void format_upload_day(const char *day, char *out, size_t out_len)
+{
+    static const char *months[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    if (day && strlen(day) == 8) {
+        int month = (day[4] - '0') * 10 + day[5] - '0';
+        int date = (day[6] - '0') * 10 + day[7] - '0';
+        if (month >= 1 && month <= 12 && date >= 1 && date <= 31) {
+            snprintf(out, out_len, "%d %s", date, months[month - 1]);
+            return;
+        }
+    }
+    strlcpy(out, "current night", out_len);
+}
+
+static void format_upload_success(const uploader_backend_progress_t *backend,
+                                  char *out, size_t out_len)
+{
+    if (!backend->last_success_valid) {
+        strlcpy(out, "No successful upload recorded yet", out_len);
+        return;
+    }
+    time_t epoch = (time_t)backend->last_success_epoch_s;
+    struct tm local;
+    if (localtime_r(&epoch, &local)) {
+        char stamp[32];
+        strftime(stamp, sizeof(stamp), "%e %b %H:%M", &local);
+        snprintf(out, out_len, "Last success %s", stamp);
+    } else {
+        strlcpy(out, "Last success recorded", out_len);
+    }
+}
+
+static void refresh_upload_destinations(const ui_service_state_t *services)
+{
+    const uploader_progress_snapshot_t *progress = &services->upload_progress;
+    size_t count = services->upload_progress_result == ESP_OK
+                       ? progress->backend_count : 0;
+    if (count > UPLOADER_PROGRESS_MAX_BACKENDS)
+        count = UPLOADER_PROGRESS_MAX_BACKENDS;
+
+    if (services->storage_busy || count == 0) {
+        count = 1;
+        lv_label_set_text(s_upload_titles[0], "Upload destinations");
+        lv_label_set_text(s_upload_states[0],
+                          services->storage_busy ? "Checking" : "Unavailable");
+        lv_label_set_text(s_upload_details[0],
+                          services->storage_busy
+                              ? "Reading synchronized upload status..."
+                              : "Upload service status is not available yet");
+        set_dot_tone(s_upload_dots[0], COLOR_DISABLED, false);
+        lv_obj_add_flag(s_upload_meters[0], LV_OBJ_FLAG_HIDDEN);
+    } else {
+        for (size_t i = 0; i < count; ++i) {
+            const uploader_backend_progress_t *backend = &progress->backends[i];
+            char detail[160];
+            uint32_t tone = COLOR_LIVE;
+            const char *state_text = "Enabled";
+            bool show_meter = false;
+            int meter = 0;
+
+            lv_label_set_text(s_upload_titles[i], backend->label[0]
+                                                      ? backend->label
+                                                      : backend->id);
+            if (!backend->configured ||
+                backend->state == UPLOADER_BACKEND_DISABLED) {
+                state_text = "Disabled";
+                tone = COLOR_DISABLED;
+                strlcpy(detail,
+                        "Not configured or disabled · configure in the browser dashboard",
+                        sizeof(detail));
+            } else if (backend->state == UPLOADER_BACKEND_UPLOADING) {
+                state_text = "Uploading";
+                char day[24];
+                format_upload_day(backend->current_day, day, sizeof(day));
+                if (backend->current_valid && backend->current_units > 0) {
+                    snprintf(detail, sizeof(detail),
+                             "%s · %d of %d parts complete · %d of %d nights",
+                             day, backend->current_unit, backend->current_units,
+                             backend->days_done, backend->days_total);
+                    meter = backend->current_unit * 100 / backend->current_units;
+                } else {
+                    snprintf(detail, sizeof(detail), "%d of %d nights uploaded",
+                             backend->days_done, backend->days_total);
+                }
+                show_meter = true;
+            } else if (backend->state == UPLOADER_BACKEND_COOLDOWN) {
+                state_text = backend->error_permanent ? "Needs setup" : "Retrying";
+                tone = backend->error_permanent ? COLOR_FAULT : COLOR_AMBER;
+                if (backend->retry_in_s >= 120) {
+                    snprintf(detail, sizeof(detail), "Retry in %lu min%s%s",
+                             (unsigned long)((backend->retry_in_s + 59) / 60),
+                             backend->error_valid ? " · " : "",
+                             backend->error_valid ? backend->error : "");
+                } else {
+                    snprintf(detail, sizeof(detail), "Retry in %lu s%s%s",
+                             (unsigned long)backend->retry_in_s,
+                             backend->error_valid ? " · " : "",
+                             backend->error_valid ? backend->error : "");
+                }
+                show_meter = backend->days_total > 0;
+            } else {
+                char last_success[64];
+                format_upload_success(backend, last_success, sizeof(last_success));
+                state_text = backend->days_total > 0 &&
+                                     backend->days_done >= backend->days_total
+                                 ? "Up to date" : "Enabled";
+                snprintf(detail, sizeof(detail), "%d of %d nights uploaded · %s",
+                         backend->days_done, backend->days_total, last_success);
+                show_meter = backend->days_total > 0;
+            }
+
+            if (show_meter && backend->state != UPLOADER_BACKEND_UPLOADING &&
+                backend->days_total > 0)
+                meter = backend->days_done * 100 / backend->days_total;
+            if (meter < 0) meter = 0;
+            if (meter > 100) meter = 100;
+            lv_label_set_text(s_upload_states[i], state_text);
+            lv_obj_set_style_text_color(s_upload_states[i], lv_color_hex(tone), 0);
+            lv_label_set_text(s_upload_details[i], detail);
+            set_dot_tone(s_upload_dots[i], tone, tone != COLOR_DISABLED);
+            lv_bar_set_value(s_upload_meters[i], meter, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(s_upload_meters[i], lv_color_hex(tone),
+                                      LV_PART_INDICATOR);
+            set_hidden(s_upload_meters[i], !show_meter);
+        }
+    }
+
+    for (size_t i = 0; i < UPLOADER_PROGRESS_MAX_BACKENDS; ++i)
+        set_hidden(s_upload_rows[i], i >= count);
+    lv_obj_set_y(s_upload_browser_row, (int)count * 100);
+}
+
+static void set_control_disabled(lv_obj_t *control, bool disabled)
+{
+    if (disabled) lv_obj_add_state(control, LV_STATE_DISABLED);
+    else lv_obj_clear_state(control, LV_STATE_DISABLED);
+}
+
+static void __attribute__((unused)) refresh_wifi_scan_controls(void)
+{
+    netprov_scan_snapshot_t snapshot;
+    wifi_scan_snapshot(&snapshot);
+    bool running = snapshot.state == NETPROV_SCAN_RUNNING;
+    const char *blocked = wifi_scan_interaction_reason(running);
+
+    set_control_disabled(s_wifi_scan_button, blocked != NULL);
+    if (!s_touch_services_ready)
+        lv_label_set_text(s_wifi_scan_button_label, "Starting...");
+    else if (bsp_display_is_therapy_active() || sd_storage_recording_active())
+        lv_label_set_text(s_wifi_scan_button_label, "Stop therapy");
+    else if (s_keyboard_target)
+        lv_label_set_text(s_wifi_scan_button_label, "Editing");
+    else if (running)
+        lv_label_set_text(s_wifi_scan_button_label, "Scanning...");
+    else {
+        portENTER_CRITICAL(&s_state_lock);
+        bool save_busy = s_wifi_save_busy;
+        bool reboot_busy = s_reboot_busy;
+        bool restart_pending = s_wifi_restart_pending;
+        portEXIT_CRITICAL(&s_state_lock);
+        lv_label_set_text(s_wifi_scan_button_label,
+                          save_busy ? "Saving..." :
+                          reboot_busy ? "Restarting" :
+                          restart_pending ? "Restart first" : "Scan");
+    }
+
+    layout_connectivity_rows();
+    if (!s_wifi_scan_requested) return;
+
+    bool ready = snapshot.state == NETPROV_SCAN_READY && snapshot.count > 0;
+    set_control_disabled(s_wifi_scan_dropdown, !ready || blocked != NULL);
+    set_control_disabled(s_wifi_scan_use_button, !ready || blocked != NULL);
+
+    if (snapshot.generation != s_wifi_scan_seen_generation ||
+        snapshot.state != s_wifi_scan_seen_state) {
+        char options[NETPROV_SCAN_MAX_APS * (NETPROV_SSID_MAXLEN + 24)] = {0};
+        if (ready) {
+            for (size_t i = 0; i < snapshot.count; ++i) {
+                size_t used = strlen(options);
+                snprintf(options + used, sizeof(options) - used,
+                         "%s%s · %d dBm · %s",
+                         i ? "\n" : "", snapshot.aps[i].ssid,
+                         snapshot.aps[i].rssi,
+                         snapshot.aps[i].secure ? "secured" : "open");
+            }
+        } else if (snapshot.state == NETPROV_SCAN_RUNNING) {
+            strlcpy(options, "Scanning nearby networks...", sizeof(options));
+        } else if (snapshot.state == NETPROV_SCAN_BLOCKED) {
+            strlcpy(options, "Scan unavailable", sizeof(options));
+        } else if (snapshot.state == NETPROV_SCAN_ERROR) {
+            strlcpy(options, "Scan failed", sizeof(options));
+        } else {
+            strlcpy(options, "No networks found", sizeof(options));
+        }
+        lv_dropdown_set_options(s_wifi_scan_dropdown, options);
+        s_wifi_scan_seen_generation = snapshot.generation;
+        s_wifi_scan_seen_state = snapshot.state;
+    }
+
+    if (snapshot.state == NETPROV_SCAN_RUNNING) {
+        lv_label_set_text(s_wifi_scan_status, "Scanning · please wait");
+    } else if (snapshot.state == NETPROV_SCAN_READY && snapshot.count > 0) {
+        if (s_wifi_scan_open_selected)
+            lv_label_set_text(s_wifi_scan_status,
+                              "Open selected · no password");
+        else
+            lv_label_set_text_fmt(s_wifi_scan_status, "%u found · choose one",
+                                  (unsigned)snapshot.count);
+    } else if (snapshot.state == NETPROV_SCAN_READY) {
+        lv_label_set_text(s_wifi_scan_status, "No networks found · scan again");
+    } else if (snapshot.state == NETPROV_SCAN_BLOCKED) {
+        if (snapshot.blocked_by == NETPROV_SCAN_BLOCK_RECORDING)
+            lv_label_set_text(s_wifi_scan_status, "Stop therapy to scan");
+        else if (snapshot.blocked_by == NETPROV_SCAN_BLOCK_NOT_INITIALIZED)
+            lv_label_set_text(s_wifi_scan_status, "Network service is starting");
+        else
+            lv_label_set_text(s_wifi_scan_status, "Wi-Fi is reconnecting");
+    } else if (snapshot.state == NETPROV_SCAN_ERROR) {
+        lv_label_set_text(s_wifi_scan_status, "Scan failed · try again");
+    } else {
+        lv_label_set_text(s_wifi_scan_status, "Tap Scan to search");
+    }
+}
 
 /* Persistent rail state must update before any lazy detail returns. Read only
  * bounded RAM observations here: no NVS, filesystem traversal or service I/O. */
@@ -3118,7 +4217,6 @@ static void refresh_manage_rail(const ui_state_t *state)
         (touch_logs_controller_is_paused() ? COLOR_AMBER : COLOR_LIVE) :
         s_touch_services_ready ? COLOR_FAULT : COLOR_TERTIARY;
     for (size_t i = 0; i < MANAGE_SECTION_COUNT; ++i) {
-        if (!s_manage_buttons[i]) continue;
         set_dot_tone(s_manage_dots[i], dots[i], dots[i] != COLOR_TERTIARY);
         set_hidden(s_manage_badges[i], badges[i] == 0);
         if (badges[i]) set_label_text_fmt_if_changed(s_manage_badges[i], "%u", badges[i]);
@@ -3177,6 +4275,11 @@ static void refresh_secondary_pages(const ui_state_t *state, int active_tab)
     if (section < 0 || section >= MANAGE_SECTION_COUNT ||
         section != s_active_manage_section || !s_manage_sections[section])
         return;
+    if (section == MANAGE_STORAGE || section == MANAGE_SYSTEM ||
+        section == MANAGE_ADVANCED) {
+        touch_maintenance_ui_refresh(s_touch_services_ready);
+        return;
+    }
     lv_obj_t *active_scroll = s_manage_scrolls[section];
     if (active_scroll && lv_obj_is_scrolling(active_scroll)) {
         /* Static state catches up on the next 500 ms pass. Deferring it while
@@ -3777,9 +4880,10 @@ static void update_ui(void)
         false,
         !ring_paired,
     };
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < 5; ++i) {
         if (s_status_tray_actions[i])
             set_hidden(s_status_tray_actions[i], !tray_action_visible[i]);
+    }
 
     bool recording;
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
@@ -4231,6 +5335,7 @@ esp_err_t bsp_display_init(void)
     s_backlight_write_errors = 0;
     s_backlight_retry_after_us = 0;
     s_last_off_request_us = 0;
+    s_last_display_service_us = 0;
     portEXIT_CRITICAL(&s_state_lock);
     s_render_services = heap_caps_calloc(1, sizeof(*s_render_services),
                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -4324,7 +5429,7 @@ esp_err_t bsp_display_init(void)
     ESP_RETURN_ON_FALSE(s_lvgl_lock, ESP_ERR_NO_MEM, TAG, "create LVGL mutex");
     const touch_history_controller_config_t history_config = {
         .changed = history_controller_changed,
-        .route_card = NULL,
+        .route_card = history_route_card,
         .context = NULL,
         .usage_target_minutes = 240,
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
@@ -4399,6 +5504,7 @@ void bsp_display_set_setup_callback(void (*callback)(void))
 
 void bsp_display_enable_touch_services(bool as11_ready, bool oximeter_ready)
 {
+    touch_maintenance_service_readiness(as11_ready, oximeter_ready);
     portENTER_CRITICAL(&s_state_lock);
     s_touch_services_ready = true;
     s_as11_service_ready = as11_ready;
@@ -4827,6 +5933,22 @@ void bsp_display_set_brightness(uint8_t tenth_percent)
     }
 }
 
+bool bsp_display_get_wake_snapshot(bsp_display_wake_snapshot_t *out)
+{
+    if (!out) return false;
+    portENTER_CRITICAL(&s_state_lock);
+    *out = (bsp_display_wake_snapshot_t) {
+        .requested_on = s_backlight_requested,
+        .last_applied_on = s_backlight,
+        .applied_known = s_backlight_known,
+        .gesture_blocked = s_wake_gesture_pending,
+        .write_errors = s_backlight_write_errors,
+        .last_service_us = s_last_display_service_us,
+    };
+    portEXIT_CRITICAL(&s_state_lock);
+    return out->last_service_us != 0;
+}
+
 void bsp_display_set_backlight(bool on)
 {
     portENTER_CRITICAL(&s_state_lock);
@@ -4859,6 +5981,7 @@ static void apply_pending_backlight_locked(void)
     waveshare_7b_touch_snapshot(&touch);
 #endif
     portENTER_CRITICAL(&s_state_lock);
+    s_last_display_service_us = now_us;
 #if !CONFIG_SOMNOTRACE_BOARD_QEMU
     if (touch.visibility_requests != s_touch_seen_visibility) {
         s_touch_seen_visibility = touch.visibility_requests;

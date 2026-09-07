@@ -18,7 +18,7 @@ SCREEN_SCENARIOS = {
     "history": (1, (512, 563)),
     "manage": (2, (694, 563)),
 }
-INTERACTION_SCENARIOS = ('history-calendar', 'history-calendar-selection', 'setup-wifi', 'devices', 'logs', 'logs-paused', 'logs-debug', 'logs-search-keyboard', 'logs-filtered', 'logs-empty', 'logs-disconnected', 'logs-recovered', 'logs-save-progress', 'logs-save-complete', 'logs-clear-confirm', 'logs-levels-none', 'logs-keyboard-edits', 'connectivity-overview', 'connectivity-network', 'connectivity-ipv4', 'connectivity-time', 'connectivity-forget-confirm', 'alerts-overview', 'alerts-topic', 'uploads-overview', 'uploads-smb', 'connectivity-password-keyboard', 'connectivity-password-revealed', 'connectivity-password-remasked')
+INTERACTION_SCENARIOS = ('history-calendar', 'history-calendar-selection', 'setup-wifi', 'devices', 'system-display-controls', 'system-display-timeout-open', 'logs', 'logs-paused', 'logs-debug', 'logs-search-keyboard', 'logs-filtered', 'logs-empty', 'logs-disconnected', 'logs-recovered', 'logs-save-progress', 'logs-save-complete', 'logs-clear-confirm', 'logs-levels-none', 'logs-keyboard-edits', 'connectivity-overview', 'connectivity-network', 'connectivity-ipv4', 'connectivity-time', 'connectivity-forget-confirm', 'alerts-overview', 'alerts-topic', 'uploads-overview', 'uploads-smb', 'storage-overview', 'system-overview', 'advanced-overview', 'advanced-delete-confirm', 'connectivity-password-keyboard', 'connectivity-password-revealed', 'connectivity-password-remasked')
 FATAL_MARKERS = (
     "Guru Meditation Error",
     "assert failed",
@@ -466,7 +466,10 @@ def validate_persistent_shell(name, payload, representative, interaction):
         "system-display-timeout-open", "logs",
     ) or name.startswith(("logs-", "connectivity-", "alerts-", "uploads-",
                           "storage-", "system-", "advanced-")):
-        for index, label in ((0, 'Devices'), (1, 'Connectivity'), (2, 'Alerts'), (3, 'Uploads'), (6, 'Logs')):
+        for index, label in enumerate((
+            "Devices", "Connectivity", "Alerts", "Uploads",
+            "Storage", "System", "Logs", "Advanced",
+        )):
             y1 = 84 + index * 52
             if bright_samples(payload, (35, y1, 225, y1 + 48)) < 20:
                 raise AssertionError(f"Manage rail entry {label} is absent")

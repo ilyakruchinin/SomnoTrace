@@ -74,8 +74,9 @@ update = function("update_ui")
 require(update, r"active_tab\s*==\s*1.*?"
               r"apply_history_controller_if_needed", "LVGL task applies revisions")
 
-# Storage management is introduced in PR12; no unavailable route is exposed.
-assert ".route_card = NULL" in DISPLAY
+route = function("history_route_card")
+require(route, r"set_manage_section\(MANAGE_STORAGE\).*?set_active_page\(2\)",
+        "card error route to Manage Storage")
 therapy = function("bsp_display_set_therapy_active")
 require(therapy, r"therapy_finished.*?touch_history_controller_refresh",
         "therapy stop invalidates/reloads History")

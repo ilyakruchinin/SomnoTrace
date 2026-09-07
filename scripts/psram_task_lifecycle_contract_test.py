@@ -53,6 +53,7 @@ assert "vTaskDeleteWithCaps(NULL)" not in HELPER_C
 assert "xQueueSend(s_reaper_queue, &current, portMAX_DELAY)" in delete
 assert "vTaskSuspend(NULL)" in delete
 assert "psram_task_init" in (MAIN / "main.c").read_text(encoding="utf-8")
+assert "psram_task_init" in (MAIN / "main_qemu.c").read_text(encoding="utf-8")
 assert "psram_task_delete(TaskHandle_t task)" in HELPER_H
 
 # Audit every concrete helper call. A WithCaps task must not use plain
@@ -89,6 +90,8 @@ self_deleting = {
     ("bsp_power.c", "battery_monitor_task"),
     ("log_stream.c", "ws_forwarder_task"),
     ("net_provision.c", "wifi_scan_task"),
+    ("net_provision.c", "reboot_task"),
+    ("touch_maintenance.c", "worker"),
     ("net_provision.c", "rebuild_day_task"),
     ("net_provision.c", "format_sd_task"),
     ("net_provision.c", "netprov_dns_task"),
@@ -121,6 +124,13 @@ for filename, task_name in sorted(self_deleting):
 ota_url = function_body(sources["net_provision.c"], "ota_url_task")
 assert "vTaskDelete(NULL)" in ota_url
 assert "psram_task_delete" not in ota_url
+
+ota_flash = function_body(sources["net_provision.c"], "ota_flash_task")
+ota_upload = function_body(sources["net_provision.c"], "ota_upload_handler")
+assert "vTaskSuspend(NULL)" in ota_flash
+assert "vTaskDelete(NULL)" not in ota_flash
+assert "vTaskDelete(flash_task)" in ota_upload
+assert "psram_task_delete" not in ota_flash
 
 assert "psram_task_lifecycle_contract_test.py" in HOST_TEST
 

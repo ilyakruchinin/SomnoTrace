@@ -8,6 +8,7 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = (ROOT / "main/bsp_display.h").read_text(encoding="utf-8")
 SMALL = (ROOT / "main/bsp_display.c").read_text(encoding="utf-8")
+TOUCH = (ROOT / "main/bsp_display_7b.c").read_text(encoding="utf-8")
 AS11 = (ROOT / "main/as11_ble.c").read_text(encoding="utf-8")
 NET = (ROOT / "main/net_provision.c").read_text(encoding="utf-8")
 
@@ -44,7 +45,7 @@ for declaration in (
 
 # A restart cannot reserve or commit while a raw notification is waiting for
 # decryption/dispatch. This closes the pre-JSON queue gap for TherapyStart.
-for display in (SMALL,):
+for display in (SMALL, TOUCH):
     reserve = function_body(display, "bsp_display_try_reserve_therapy_safe_restart")
     commit = function_body(display, "bsp_display_try_commit_therapy_safe_restart")
     queued = function_body(display, "bsp_display_note_as11_notification_queued")
@@ -76,14 +77,40 @@ worker = function_body(AS11, "notif_proc_task")
 assert worker.index("handle_notify(item.data, item.len)") \
        < worker.index("bsp_display_note_as11_notification_processed()")
 
+# OTA uses a separate cancellable maintenance gate. It never makes the live
+# therapy publisher wait, and both upload modes check it between flash steps.
+upload = function_body(NET, "ota_upload_handler")
+flash = function_body(NET, "ota_flash_task")
+url_handler = function_body(NET, "ota_url_handler")
+url_task = function_body(NET, "ota_url_task")
+assert upload.index("bsp_display_try_begin_therapy_safe_maintenance()") \
+       < upload.index("xTaskCreate(ota_flash_task")
+assert flash.index("bsp_display_therapy_safe_maintenance_should_abort()") \
+       < flash.index("esp_ota_write(")
+assert "ctx->aborted_by_therapy = true" in flash
+assert "therapy started; update cancelled" in upload
+assert upload.count("bsp_display_end_therapy_safe_maintenance()") >= 5
+assert url_handler.index("bsp_display_try_begin_therapy_safe_maintenance()") \
+       < url_handler.index("xTaskCreate(ota_url_task")
+assert url_task.index("ota_native_should_abort()") \
+       < url_task.index("esp_https_ota_perform(")
+assert url_task.count("bsp_display_end_therapy_safe_maintenance()") >= 2
+assert url_task.index("bsp_display_end_therapy_safe_maintenance()") \
+       < url_task.index("ota_schedule_reboot()")
+
+print("therapy lifecycle race contract passed")
+
 # Native OTA closes final publication races atomically, and releases the short
 # reservation before entering the existing therapy-aware reboot worker.
-for display in (SMALL,):
+for display in (SMALL, TOUCH):
     commit = function_body(display, "bsp_display_try_reserve_maintenance_commit")
     for prerequisite in ("s_therapy_start_claims == 0", "s_therapy_start_waiters == 0",
                          "s_as11_notifications_pending == 0", "s_therapy_safe_maintenance"):
         assert prerequisite in commit
     assert "s_therapy_safe_restart_reserving = true" in commit
     assert "s_therapy_safe_maintenance = false" in commit
-
-print("Original-screen therapy lifecycle gates and notification accounting passed")
+abort = function_body(NET, "ota_native_should_abort")
+assert "p.cancel_requested" in abort and "bsp_display_therapy_safe_maintenance_should_abort()" in abort
+commit = function_body(NET, "ota_native_commit_begin")
+assert commit.index("bsp_display_try_reserve_maintenance_commit()") < commit.index("s_ota_progress.cancellable = false")
+assert "if (!allowed) bsp_display_cancel_therapy_safe_restart()" in commit

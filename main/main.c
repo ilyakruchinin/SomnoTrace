@@ -41,6 +41,7 @@
 #include "psram_task.h"
 #include "esp_system.h"
 #include "esp_app_desc.h"
+#include "esp_ota_ops.h"
 #include "esp_heap_caps.h"
 #include "esp_wifi.h"
 #include "ftp.h"
@@ -176,6 +177,38 @@ static void show_status(const char *title, const char *lines[], int n)
     for (int i = 0; i < n; i++) {
         ESP_LOGI(TAG, "  %s", lines[i]);
     }
+}
+
+/* A newly selected OTA slot remains PENDING_VERIFY until the application has
+ * brought up the bedside-critical runtime.  With bootloader rollback enabled,
+ * any reset before this point automatically returns to the prior image. */
+static void confirm_pending_ota_image(bool core_runtime_ready)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    esp_err_t state_result = esp_ota_get_state_partition(running, &state);
+    if (state_result != ESP_OK || state != ESP_OTA_IMG_PENDING_VERIFY)
+        return;
+
+    if (!core_runtime_ready) {
+        ESP_LOGE(TAG, "OTA health gate failed; rolling back to prior firmware");
+        bsp_display_set_critical_notice("Update failed; restoring prior version");
+        vTaskDelay(pdMS_TO_TICKS(250));
+        esp_err_t rollback = esp_ota_mark_app_invalid_rollback_and_reboot();
+        ESP_LOGE(TAG, "OTA rollback failed: %s", esp_err_to_name(rollback));
+        abort();
+    }
+
+    esp_err_t valid = esp_ota_mark_app_valid_cancel_rollback();
+    if (valid != ESP_OK) {
+        ESP_LOGE(TAG, "could not confirm OTA image: %s", esp_err_to_name(valid));
+        bsp_display_set_critical_notice("Update verification failed");
+        vTaskDelay(pdMS_TO_TICKS(250));
+        esp_err_t rollback = esp_ota_mark_app_invalid_rollback_and_reboot();
+        ESP_LOGE(TAG, "OTA rollback failed: %s", esp_err_to_name(rollback));
+        abort();
+    }
+    ESP_LOGI(TAG, "OTA image passed core health gate and is now valid");
 }
 
 static void controlled_restart(void)
@@ -350,6 +383,7 @@ void app_main(void)
      * interrupted.  Initialising storage and running recovery first removes
      * both races instead of relying on reconnect_task being slow. */
     esp_err_t sd_ret = sd_storage_init();
+    bool recording_runtime_ready = sd_ret != ESP_OK;
     if (sd_ret != ESP_OK) {
         ESP_LOGE(TAG, "SD card init failed; session storage unavailable");
         /* Distinguish "no card" from "card present but mount/format error".
@@ -380,6 +414,7 @@ void app_main(void)
             ESP_LOGE(TAG, "session writer init failed; recording unavailable");
             bsp_display_set_notice("Recording OFF");
         } else {
+            recording_runtime_ready = true;
         }
         session_writer_recover();
     }
@@ -434,6 +469,12 @@ void app_main(void)
     }
     /* Native touch controls can now safely query BLE driver state. */
     bsp_display_enable_touch_services(as11_ready, oximeter_ready);
+
+    /* Missing/removable peripherals are degraded states, not bad firmware.
+     * A mounted card, however, must have a live writer; and the core display
+     * and AirSense BLE runtime must both initialise before an OTA is trusted. */
+    confirm_pending_ota_image(display_ready && recording_runtime_ready &&
+                              as11_ready);
 
     /* 4c-bis. BLE startup has begun, so reconnect can now establish whether
      * therapy is already running.  Only now is it safe to let the idle post

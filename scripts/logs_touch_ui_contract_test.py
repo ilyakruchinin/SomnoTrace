@@ -28,9 +28,12 @@ def function_body(text: str, name: str, next_name: str) -> str:
 require(BSP, r"#define\s+MANAGE_SECTION_COUNT\s+8\b",
         "eight-destination Manage rail")
 rail = BSP.split("static void build_manage_page", 1)[1].split(
-    "static void build_ui", 1)[0]
-# This topic owns Logs; later topics add their own Manage destinations.
-assert '"Logs"' in rail, "Manage rail omits Logs"
+    "static const char *s_passkey_keyboard_map", 1)[0]
+for destination in (
+    "Devices", "Connectivity", "Alerts", "Uploads",
+    "Storage", "System", "Logs", "Advanced",
+):
+    assert f'"{destination}"' in rail, f"Manage rail omits {destination}"
 assert "build_logs_section" not in BSP, "legacy Logs builder remains compiled"
 assert "refresh_logs_widgets" not in BSP, "legacy Logs refresh remains compiled"
 assert not re.search(r"\bs_logs_", BSP), "legacy Logs widget globals remain"
