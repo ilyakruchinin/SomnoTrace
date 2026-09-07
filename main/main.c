@@ -224,16 +224,21 @@ void app_main(void)
         session_writer_recover();
     }
 
-    /* 4b-2. Initialise audio codec and touch sensor BEFORE BLE —
-     * BLE RF activity during connection causes I2C bus noise that makes
-     * register writes NACK. The devices share the I2C bus on GPIO 41/42. */
+    /* 4b-2. Initialise board audio before BLE. On the compact board, also
+     * initialize its shared I2C bus and CST816 touch controller first because
+     * BLE RF activity can make setup-time register writes NACK. The 7B display
+     * owns its separate controller and GT911 initialization. */
+#if !CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B
     bsp_i2c_init();
+#endif
     if (bsp_audio_init() != ESP_OK) {
         ESP_LOGW(TAG, "audio codec init failed — buzzer will be unavailable");
     }
+#if !CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B
     if (bsp_touch_init() != ESP_OK) {
         ESP_LOGW(TAG, "touch init failed — tap to wake unavailable");
     }
+#endif
 
     /* 4c. Initialise BLE (AirSense 11 pairing). Non-fatal on failure.
      * Runs after storage init + crash recovery (see 4b). */

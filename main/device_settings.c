@@ -48,7 +48,11 @@ static const char *TAG = "dev_settings";
 
 /* Brightness stored in tenth-percent units: 1=0.1%, 200=20.0%
  * Discrete steps: 0.1, 0.2, 0.5, 1, 2, 5, 10, 20 (roughly 2x each) */
+#if CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B
+#define DEFAULT_BRIGHTNESS       200 /* Full steady brightness on 7B. */
+#else
 #define DEFAULT_BRIGHTNESS       100 /* 10.0% */
+#endif
 #define MIN_BRIGHTNESS           1   /* 0.1% */
 #define MAX_BRIGHTNESS           200 /* 20.0% */
 #define DEFAULT_THE_SCREEN       THERAPY_SCREEN_INFO

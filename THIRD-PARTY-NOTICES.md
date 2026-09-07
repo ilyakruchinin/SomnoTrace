@@ -240,3 +240,8 @@ legal advice; obtain professional advice before any commercial distribution.
 The checked ESP-IDF v5.5.1 HTTP asynchronous request fixture under
 `third_party/esp-idf-patches/` derives from Espressif ESP-IDF and is licensed
 under Apache-2.0; the license and source identity are retained beside it.
+## Waveshare 7B hardware reference
+
+The 7B pin map, controller sequence and RGB timing were checked against
+Waveshare's ESP32-S3-Touch-LCD-7B reference at commit
+`c652c902db607f7ffb376257393cfd7657aa6428`.

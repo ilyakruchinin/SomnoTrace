@@ -42,5 +42,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve hash-verified LVGL input test source
+        run: python3 scripts/prepare_host_lvgl.py
       - name: Run 7-inch host contracts
         run: ./scripts/test-host.sh
