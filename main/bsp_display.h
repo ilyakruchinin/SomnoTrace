@@ -41,9 +41,38 @@ void bsp_display_set_as11_paired(bool paired);
 void bsp_display_set_battery(int percent, bool charging, bool valid);
 
 /* Therapy graph mode */
-void bsp_display_set_therapy_active(bool active);
+bool bsp_display_set_therapy_active(bool active);
+/* Two-phase therapy-safe restart gate. Reserve before acquiring the SD lease;
+ * then commit only after the lease is held. A concurrent therapy start waits
+ * for cancellation and forces commit to fail, so it cannot lose its recording
+ * claim to a restart that subsequently defers. No state lock spans SD calls. */
+bool bsp_display_try_reserve_therapy_safe_restart(void);
+bool bsp_display_try_commit_therapy_safe_restart(void);
+void bsp_display_cancel_therapy_safe_restart(void);
+/* Hold this short-lived claim around a local command that can start therapy.
+ * It participates in the same restart reservation and must always be released. */
+bool bsp_display_reserve_therapy_start(void);
+void bsp_display_release_therapy_start(void);
+/* Account for raw AirSense notifications from enqueue through dispatch.  A
+ * queued TherapyStart must be visible to the restart gate before its JSON is
+ * decrypted and classified by the worker. */
+void bsp_display_note_as11_notification_queued(void);
+void bsp_display_note_as11_notification_processed(void);
+/* Cancellable maintenance gate used by OTA. Unlike the final restart gate,
+ * it never blocks therapy publication: an independent start makes
+ * should_abort true so recording wins immediately. */
+bool bsp_display_try_begin_therapy_safe_maintenance(void);
+bool bsp_display_therapy_safe_maintenance_should_abort(void);
+/* Short atomic OTA boot-selection reservation; cancel after SDK commit returns. */
+bool bsp_display_try_reserve_maintenance_commit(void);
+void bsp_display_end_therapy_safe_maintenance(void);
 void bsp_display_push_flow(float flow_lpm);
+/* Preserve absent 25 Hz positions without synthesizing physiological values. */
+void bsp_display_push_flow_gap(uint32_t samples);
 void bsp_display_push_leak(float leak_lpm);
+/* Live two-second metrics. Pass NAN for an unavailable value. */
+void bsp_display_push_metrics(float pressure_cmh2o, float respiratory_rate,
+                              float flow_limitation);
 void bsp_display_set_therapy_start_time(int64_t start_us);
 bool bsp_display_is_therapy_active(void);
 
@@ -78,3 +107,9 @@ void bsp_display_cancel_temporary_wake(void);
  * using the ST7789's reliable 0°/90° paths plus a software half-turn for
  * 180°/270°, and re-applied after panel reset. */
 void bsp_display_set_rotation(uint16_t degrees);
+
+void bsp_display_push_flow_gap(uint32_t samples);
+void bsp_display_set_critical_notice(const char *text);
+
+/* Storage publishes readiness; the compact screen has no separate SD badge. */
+void bsp_display_set_sd_ready(bool ready);

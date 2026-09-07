@@ -22,6 +22,7 @@
  */
 
 #include "edf_waveform.h"
+#include "edf_gen.h"
 
 static const char *TAG = "edf_wav";
 
@@ -228,7 +229,19 @@ esp_err_t edf_convert_snt_to_edf(const char *snt_path, const char *edf_path,
             fclose(snt); fclose(snt2);
             return ESP_FAIL;
         }
+        if (hdr2.version >= 2 &&
+            (hdr2.reserved & SNT_POSITION_GAP_FLAG)) {
+            fclose(snt);
+            fclose(snt2);
+            return EDF_GEN_ERR_POSITION_GAPS;
+        }
         hdr.n_channels = 2;
+    }
+
+    if (hdr.version >= 2 && (hdr.reserved & SNT_POSITION_GAP_FLAG)) {
+        fclose(snt);
+        if (snt2) fclose(snt2);
+        return EDF_GEN_ERR_POSITION_GAPS;
     }
 
     int snt_channels = hdr.n_channels;

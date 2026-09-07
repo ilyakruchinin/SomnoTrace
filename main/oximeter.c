@@ -30,6 +30,7 @@
 
 #include "oximeter.h"
 #include "oximeter_internal.h"
+#include "oximeter_store.h"
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -47,14 +48,6 @@ static const char *TAG = "oximeter";
 
 static const ox_driver_ops_t *s_active = &oxyii_driver_ops;
 static ox_driver_t s_driver_type = OX_DRIVER_OXYII;
-
-/* Forward declarations for store functions */
-bool ox_store_load_paired(char *serial, size_t serial_sz,
-                          char *firmware, size_t fw_sz,
-                          char *name_prefix, size_t prefix_sz,
-                          char *last_addr, size_t addr_sz,
-                          char *driver, size_t driver_sz,
-                          char *ble_name, size_t ble_name_sz);
 
 static void load_driver_type(void)
 {

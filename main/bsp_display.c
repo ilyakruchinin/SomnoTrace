@@ -151,6 +151,16 @@ static SemaphoreHandle_t s_state_mutex = NULL;  /* protects all shared state bel
 static disp_mode_t s_mode = DISP_MODE_STATUS;
 static bool s_status_dirty = true;              /* status content changed, force redraw */
 
+/* Two-phase restart gate, protected by s_state_mutex together with s_mode.
+ * Start waiters make the final commit fail; the restart owner releases its SD
+ * lease before cancelling the reservation and waking them. */
+static bool s_therapy_safe_restart_reserving;
+static bool s_therapy_safe_restart_committed;
+static unsigned s_therapy_start_waiters;
+static unsigned s_therapy_start_claims;
+static unsigned s_as11_notifications_pending;
+static bool s_therapy_safe_maintenance;
+
 /* Status-screen content (copied from callers) */
 static char s_status_title[STATUS_TITLE_LEN];
 static char s_status_lines[MAX_STATUS_LINES][STATUS_LINE_LEN];
@@ -184,18 +194,36 @@ static int64_t  s_therapy_start_us = 0;  /* monotonic time of TherapyStart */
 
 /* ── Public state-mutating API (never draws; render task handles drawing) ── */
 
-void bsp_display_set_therapy_active(bool active)
+bool bsp_display_set_therapy_active(bool active)
 {
     if (!s_state_mutex) {
         ESP_LOGW(TAG, "set_therapy_active(%s) called before init — ignored",
                  active ? "true" : "false");
-        return;
+        /* Display failure must not suppress therapy recording. OTA restart
+         * reservation remains unavailable while the mutex is absent. */
+        return true;
     }
 
     /* Check device settings */
     const device_settings_t *dev = device_settings_get();
 
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool waiting_for_restart = false;
+    for (;;) {
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        if (!active || !s_therapy_safe_restart_reserving) break;
+        if (!waiting_for_restart) {
+            s_therapy_start_waiters++;
+            waiting_for_restart = true;
+        }
+        xSemaphoreGive(s_state_mutex);
+        vTaskDelay(1);
+    }
+    if (waiting_for_restart) s_therapy_start_waiters--;
+    if (active && s_therapy_safe_restart_committed) {
+        xSemaphoreGive(s_state_mutex);
+        ESP_LOGW(TAG, "therapy start refused: restart already committed");
+        return false;
+    }
     disp_mode_t new_mode;
     if (active) {
         if (dev->therapy_screen == THERAPY_SCREEN_INFO)
@@ -243,7 +271,153 @@ void bsp_display_set_therapy_active(bool active)
 
     /* Wake the render task so the mode change is reflected immediately. */
     if (s_display_task) xTaskNotifyGive(s_display_task);
+    return true;
 }
+
+bool bsp_display_try_reserve_therapy_safe_restart(void)
+{
+    if (!s_state_mutex) return false;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool therapy_active = (s_mode == DISP_MODE_GRAPH || s_mode == DISP_MODE_INFO);
+    bool reserved = !therapy_active && s_therapy_start_claims == 0 &&
+                    s_therapy_start_waiters == 0 &&
+                    s_as11_notifications_pending == 0 &&
+                    !s_therapy_safe_maintenance &&
+                    !s_therapy_safe_restart_reserving &&
+                    !s_therapy_safe_restart_committed;
+    if (reserved) s_therapy_safe_restart_reserving = true;
+    xSemaphoreGive(s_state_mutex);
+    return reserved;
+}
+
+bool bsp_display_try_commit_therapy_safe_restart(void)
+{
+    if (!s_state_mutex) return false;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool therapy_active = (s_mode == DISP_MODE_GRAPH || s_mode == DISP_MODE_INFO);
+    bool committed = s_therapy_safe_restart_reserving && !therapy_active &&
+                     s_therapy_start_waiters == 0 &&
+                     s_as11_notifications_pending == 0;
+    if (committed) {
+        s_therapy_safe_restart_reserving = false;
+        s_therapy_safe_restart_committed = true;
+    }
+    xSemaphoreGive(s_state_mutex);
+    return committed;
+}
+
+void bsp_display_cancel_therapy_safe_restart(void)
+{
+    if (!s_state_mutex) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (!s_therapy_safe_restart_committed) {
+        s_therapy_safe_restart_reserving = false;
+    }
+    xSemaphoreGive(s_state_mutex);
+}
+
+bool bsp_display_reserve_therapy_start(void)
+{
+    if (!s_state_mutex) return true;
+    bool waiting_for_restart = false;
+    for (;;) {
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        if (!s_therapy_safe_restart_reserving) break;
+        if (!waiting_for_restart) {
+            s_therapy_start_waiters++;
+            waiting_for_restart = true;
+        }
+        xSemaphoreGive(s_state_mutex);
+        vTaskDelay(1);
+    }
+    if (waiting_for_restart) s_therapy_start_waiters--;
+    bool reserved = !s_therapy_safe_restart_committed;
+    if (reserved) s_therapy_start_claims++;
+    xSemaphoreGive(s_state_mutex);
+    return reserved;
+}
+
+void bsp_display_release_therapy_start(void)
+{
+    if (!s_state_mutex) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (s_therapy_start_claims > 0) s_therapy_start_claims--;
+    xSemaphoreGive(s_state_mutex);
+}
+
+void bsp_display_note_as11_notification_queued(void)
+{
+    if (!s_state_mutex) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_as11_notifications_pending++;
+    xSemaphoreGive(s_state_mutex);
+}
+
+void bsp_display_note_as11_notification_processed(void)
+{
+    if (!s_state_mutex) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (s_as11_notifications_pending > 0) s_as11_notifications_pending--;
+    xSemaphoreGive(s_state_mutex);
+}
+
+bool bsp_display_try_begin_therapy_safe_maintenance(void)
+{
+    if (!s_state_mutex) return false;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool therapy_active = (s_mode == DISP_MODE_GRAPH || s_mode == DISP_MODE_INFO);
+    bool begun = !therapy_active && s_therapy_start_claims == 0 &&
+                 s_therapy_start_waiters == 0 &&
+                 s_as11_notifications_pending == 0 &&
+                 !s_therapy_safe_maintenance &&
+                 !s_therapy_safe_restart_reserving &&
+                 !s_therapy_safe_restart_committed;
+    if (begun) s_therapy_safe_maintenance = true;
+    xSemaphoreGive(s_state_mutex);
+    return begun;
+}
+
+/* Convert an active OTA maintenance gate into a short commit reservation.
+ * This closes the check/boot-selection race under the therapy publication lock.
+ * The updater releases this reservation immediately after SDK finish/set-boot,
+ * allowing queued starts to publish before the ordinary deferred reboot loop. */
+bool bsp_display_try_reserve_maintenance_commit(void)
+{
+    if (!s_state_mutex) return false;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool reserved = s_therapy_safe_maintenance &&
+        !(s_mode == DISP_MODE_GRAPH || s_mode == DISP_MODE_INFO) &&
+        s_therapy_start_claims == 0 && s_therapy_start_waiters == 0 &&
+        s_as11_notifications_pending == 0 && !s_therapy_safe_restart_reserving &&
+        !s_therapy_safe_restart_committed;
+    if (reserved) {
+        s_therapy_safe_maintenance = false;
+        s_therapy_safe_restart_reserving = true;
+    }
+    xSemaphoreGive(s_state_mutex);
+    return reserved;
+}
+
+bool bsp_display_therapy_safe_maintenance_should_abort(void)
+{
+    if (!s_state_mutex) return true;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool therapy_active = (s_mode == DISP_MODE_GRAPH || s_mode == DISP_MODE_INFO);
+    bool abort = !s_therapy_safe_maintenance || therapy_active ||
+                 s_therapy_start_claims > 0 || s_therapy_start_waiters > 0;
+    xSemaphoreGive(s_state_mutex);
+    return abort;
+}
+
+void bsp_display_end_therapy_safe_maintenance(void)
+{
+    if (!s_state_mutex) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_therapy_safe_maintenance = false;
+    xSemaphoreGive(s_state_mutex);
+}
+
+
 
 bool bsp_display_is_therapy_active(void)
 {
@@ -260,7 +434,7 @@ void bsp_display_push_flow(float flow_lpm)
     bool notify = false;
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     if (s_mode == DISP_MODE_GRAPH && s_flow_buf) {
-        s_flow_buf[s_flow_head] = flow_lpm * 60.0f;
+        s_flow_buf[s_flow_head] = flow_lpm;
         s_flow_head = (s_flow_head + 1) % FLOW_BUF_SIZE;
         if (s_flow_count < FLOW_BUF_SIZE) s_flow_count++;
         notify = true;
@@ -268,6 +442,23 @@ void bsp_display_push_flow(float flow_lpm)
     xSemaphoreGive(s_state_mutex);
     /* In Graph Mode, wake display_task on incoming flow data */
     if (notify && s_display_task) xTaskNotifyGive(s_display_task);
+}
+
+
+void bsp_display_push_flow_gap(uint32_t samples)
+{
+    if (!s_state_mutex) return;
+    if (samples > FLOW_BUF_SIZE) samples = FLOW_BUF_SIZE;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (s_mode == DISP_MODE_GRAPH && s_flow_buf) {
+        for (uint32_t i = 0; i < samples; ++i) {
+            s_flow_buf[s_flow_head] = NAN;
+            s_flow_head = (s_flow_head + 1) % FLOW_BUF_SIZE;
+            if (s_flow_count < FLOW_BUF_SIZE) ++s_flow_count;
+        }
+    }
+    xSemaphoreGive(s_state_mutex);
+    if (s_display_task) xTaskNotifyGive(s_display_task);
 }
 
 void bsp_display_push_leak(float leak_lpm)
@@ -1252,6 +1443,7 @@ static void render_graph(void)
     /* Translucent area fill between the curve and the zero line. */
     for (int j = 0; j < m; j++) {
         int x = xbase + j;
+        if (!isfinite(yf[x])) continue;
         int y0 = (int)(yf[x] < mid_y ? yf[x] : mid_y);
         int y1 = (int)(yf[x] < mid_y ? mid_y : yf[x]);
         for (int y = y0; y <= y1; y++)
@@ -1261,10 +1453,12 @@ static void render_graph(void)
     /* Soft glow pass, then the sharp antialiased line on top. */
     for (int j = 1; j < m; j++) {
         int x = xbase + j;
+        if (!isfinite(yf[x - 1]) || !isfinite(yf[x])) continue;
         fb_draw_line_aa(x - 1, yf[x - 1], x, yf[x], 4.5f, glow_col, 45);
     }
     for (int j = 1; j < m; j++) {
         int x = xbase + j;
+        if (!isfinite(yf[x - 1]) || !isfinite(yf[x])) continue;
         fb_draw_line_aa(x - 1, yf[x - 1], x, yf[x], 2.0f, flow_col, 255);
     }
 
@@ -1617,6 +1811,12 @@ void bsp_display_set_notice(const char *text)
 
 /* The single owner of the framebuffer and LCD panel. Renders the current
  * mode at a fixed cadence and on every mode/content change. */
+
+void bsp_display_set_critical_notice(const char *text)
+{
+    bsp_display_set_notice(text);
+}
+
 static void display_task(void *arg)
 {
     (void)arg;
@@ -1707,4 +1907,10 @@ static void display_task(void *arg)
                      (unsigned)(hwm * sizeof(StackType_t)));
         }
     }
+}
+
+
+void bsp_display_set_sd_ready(bool ready)
+{
+    (void)ready;
 }

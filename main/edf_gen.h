@@ -137,3 +137,6 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder);
  * the caller owns the retry.  Call once at boot, before anything reads the
  * export tree. */
 bool edf_gen_take_interrupted_rebuild(char *out_day, size_t out_len);
+
+/* Continuous EDF cannot represent positioned missing data; retain raw sources. */
+#define EDF_GEN_ERR_POSITION_GAPS (0x7e01)

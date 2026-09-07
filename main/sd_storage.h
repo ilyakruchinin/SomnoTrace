@@ -24,6 +24,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #define SD_MOUNT_POINT   "/somnotrace"
@@ -70,6 +71,13 @@ bool sd_storage_is_ready(void);
  * a therapy recording on. */
 esp_err_t sd_storage_get_free(uint64_t *free_bytes, uint64_t *total_bytes);
 
+/* Return the last successful free-space query without touching FATFS or the
+ * SDMMC driver. Intended for frequently-polled status surfaces, where a card
+ * read would contend with recording/export and may require scarce DMA memory.
+ * Returns false until the first successful query, and after unmount/format
+ * invalidates the cached sample. */
+bool sd_storage_get_cached_free(uint64_t *free_bytes, uint64_t *total_bytes);
+
 /* Space policy for raw capture.  Raw session data is the source of truth;
  * SDCARD/ is derived and regenerable, so derived output is reclaimed before
  * recording is ever refused.
@@ -77,6 +85,9 @@ esp_err_t sd_storage_get_free(uint64_t *free_bytes, uint64_t *total_bytes);
  * Returns true if a new session may start.  Warns (on screen) when free
  * space is low, and only returns false below the hard floor. */
 bool sd_storage_reserve_for_recording(void);
+/* Cached-only admission for ingest callbacks: no FAT probe, reclaim, or UI.
+ * An unavailable cache permits capture; a known value below the floor does not. */
+bool sd_storage_reserve_for_recording_cached(void);
 
 /* ── Storage arbitration ───────────────────────────────────────────────
  * The card is shared by the raw writer, EDF generation, the uploader, FTP,
@@ -85,14 +96,16 @@ bool sd_storage_reserve_for_recording(void);
  * itself and can be refused while a session is recording.
  *
  * Roles:
- *   EXPORT      — EDF generation / day rebuild.  Mutually exclusive with
- *                 other EXPORT work and with DESTRUCTIVE work.  Allowed
- *                 during recording (a mask-off break starts a new session
- *                 while the previous one still needs exporting).
+ *   EXPORT      — EDF generation / day rebuild and O2 Ring filesystem I/O.
+ *                 Mutually exclusive with other EXPORT work and with
+ *                 DESTRUCTIVE work.  Allowed during recording (a mask-off
+ *                 break starts a new session while the previous one still
+ *                 needs exporting).
  *   DESTRUCTIVE — recreate/delete/reset/format.  Refused while recording
  *                 or while an export or upload is in progress.
  *   UPLOAD      — reads a day folder.  Excluded from concurrent EXPORT so
- *                 it can never read a day that is being replaced.
+ *                 it can never read a day that is being replaced, and from
+ *                 recording so a long reader cannot contend with raw writes.
  */
 typedef enum {
     SD_LEASE_EXPORT = 0,
@@ -100,17 +113,37 @@ typedef enum {
     SD_LEASE_UPLOAD,
 } sd_lease_t;
 
-/* Mark a therapy recording as active/inactive (called by the session
- * writer).  Destructive operations are refused while this is non-zero. */
-void sd_storage_recording_begin(void);
+/* Atomically claim/release the card for a therapy recording (called by the
+ * session writer). The begin claim fails while an UPLOAD reader or
+ * DESTRUCTIVE operation owns the card; callers may retry after it finishes. */
+bool sd_storage_recording_begin(void);
+/* Immediate version: no polling, allocation, or wait for the arbitration
+ * mutex. Requires mount-initialized arbitration; false leaves no claim. */
+bool sd_storage_recording_try_begin(void);
 void sd_storage_recording_end(void);
 bool sd_storage_recording_active(void);
+/* Pair once per pending start owner, not once per retry. Retain intent across
+ * bounded recording_begin attempts; end after successful writer admission or
+ * explicit stop/cancel. recording_begin does not consume this reference.
+ * Intent excludes new UPLOAD/DESTRUCTIVE admission but never revokes a lease. */
+void sd_storage_recording_intent_begin(void);
+void sd_storage_recording_intent_end(void);
+/* True for retained start intent OR a bounded recording_begin waiter.
+ * Lock-free read for cancellation callbacks. */
+bool sd_storage_recording_pending(void);
 
 /* Acquire/release a storage lease.  timeout_ms may be 0 to fail fast.
  * Returns false if the lease could not be acquired (busy, or refused
  * because a recording is in progress). */
 bool sd_storage_lease_acquire(sd_lease_t role, uint32_t timeout_ms);
+/* Default release conservatively invalidates History sources for EXPORT and
+ * DESTRUCTIVE, even on failure (a partial write may have changed a source). */
 void sd_storage_lease_release(sd_lease_t role);
+/* Release the same ownership without advancing the History source epoch.
+ * Use only when the entire lease left History inputs unchanged: read-only
+ * work, derived caches, or writes confined to logs. Never use after a failed
+ * source write unless it is known that no source bytes/metadata changed. */
+void sd_storage_lease_release_unchanged(sd_lease_t role);
 
 /* Format the SD card filesystem (FAT32).  All data on the card is lost.
  * Unmounts, formats, remounts, and recreates the directory tree.
@@ -124,5 +157,11 @@ esp_err_t sd_storage_format(void);
  * unflushed filesystem state.  Safe to call when nothing is mounted. */
 void sd_storage_deinit(void);
 
-/* Return the last coherent capacity sample without touching FATFS. */
-bool sd_storage_get_cached_free(uint64_t *free_bytes, uint64_t *total_bytes);
+/* Monotonic process-local epoch for possible History source mutations.
+ * Read while holding a lease. Default non-UPLOAD release bumps it; callers
+ * proving no source mutation may use the explicit unchanged release. */
+uint32_t sd_storage_content_generation(void);
+
+/* Notify source mutations not followed by a default mutation release (for
+ * example FTP imports). Call after closing/publishing. */
+void sd_storage_content_changed(void);

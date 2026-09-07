@@ -224,6 +224,7 @@ static int s_rx_len;
 typedef struct {
     uint8_t *data;
     int      len;
+    uint32_t epoch;
 } notif_item_t;
 static QueueHandle_t s_notif_queue = NULL;
 /* Backlog metrics — see BLE_GAP_EVENT_NOTIFY_RX. */
@@ -232,6 +233,22 @@ static uint32_t    s_notif_dropped = 0;
 static uint32_t    s_notif_dropped_bytes = 0;
 static uint32_t    s_notif_alloc_fail = 0;
 static TaskHandle_t  s_notif_task  = NULL;
+static uint32_t s_notif_epoch;
+static bool s_notif_loss_pending, s_notif_drop_until_connect;
+
+/* Host callback publishes uncertainty without decrypting or waiting. The owner
+ * drops partial FIG state and retained samples before accepting a new link. */
+static void notif_mark_loss(void)
+{
+    __atomic_add_fetch(&s_notif_epoch, 1, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&s_notif_loss_pending, true, __ATOMIC_RELEASE);
+    bool first = !__atomic_exchange_n(&s_notif_drop_until_connect, true, __ATOMIC_ACQ_REL);
+    therapy_alert_on_transport_loss();
+    if (first && s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
+        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+}
+
+
 /* Spool publication and fragment mutation are serialized by a dedicated
  * mutex, never held while waiting for BLE/network responses. Withdrawal waits
  * for any in-flight decoder before freeing the collector or its semaphore. */
@@ -752,15 +769,70 @@ static void rpc_accept_response(cJSON *msg)
 
 static void handle_notify(const uint8_t *data, int len);
 
+/* Only the notification owner accesses this bounded decoded queue. No
+ * admission retry waits; later lifecycle notifications continue to dispatch. */
+#define PENDING_STREAM_COUNT 32
+#define PENDING_STREAM_BYTES (64 * 1024)
+static struct { char *json; int len; } s_pending_stream[PENDING_STREAM_COUNT];
+static unsigned s_pending_head, s_pending_count;
+static size_t s_pending_bytes;
+static void pending_stream_clear(void)
+{
+    while (s_pending_count) {
+        free(s_pending_stream[s_pending_head].json);
+        s_pending_head = (s_pending_head + 1) % PENDING_STREAM_COUNT;
+        --s_pending_count;
+    }
+    s_pending_bytes = 0;
+}
+static void pending_stream_replay(void)
+{
+    /* Four decoded batches per turn bounds work ahead of a queued STOP. */
+    for (unsigned i = 0; i < 4 && s_pending_count; ++i) {
+        char *json = s_pending_stream[s_pending_head].json;
+        int len = s_pending_stream[s_pending_head].len;
+        if (!session_writer_try_stream_data_raw(json, len)) break;
+        free(json); s_pending_bytes -= len;
+        s_pending_head = (s_pending_head + 1) % PENDING_STREAM_COUNT;
+        --s_pending_count;
+    }
+}
+static void pending_stream_submit(const char *json, int len)
+{
+    if (!s_pending_count && session_writer_try_stream_data_raw(json, len)) return;
+    if (len <= 0 || s_pending_count == PENDING_STREAM_COUNT ||
+        (size_t)len > PENDING_STREAM_BYTES - s_pending_bytes) {
+        pending_stream_clear(); notif_mark_loss(); return;
+    }
+    char *copy = heap_caps_malloc((size_t)len + 1, MALLOC_CAP_SPIRAM);
+    if (!copy) { pending_stream_clear(); notif_mark_loss(); return; }
+    memcpy(copy, json, len); copy[len] = '\0';
+    unsigned tail = (s_pending_head + s_pending_count) % PENDING_STREAM_COUNT;
+    s_pending_stream[tail].json = copy; s_pending_stream[tail].len = len;
+    ++s_pending_count; s_pending_bytes += len;
+}
+
 static void notif_proc_task(void *arg)
 {
     (void)arg;
     notif_item_t item;
-    while (1) {
-        if (xQueueReceive(s_notif_queue, &item, portMAX_DELAY) == pdTRUE) {
-            handle_notify(item.data, item.len);
-            free(item.data);
+    uint32_t owner_epoch = 0;
+    for (;;) {
+        if (__atomic_exchange_n(&s_notif_loss_pending, false, __ATOMIC_ACQ_REL)) {
+            pending_stream_clear(); s_rx_len = 0;
+            session_writer_on_transport_loss();
         }
+        if (xQueueReceive(s_notif_queue, &item, pdMS_TO_TICKS(20)) == pdTRUE) {
+            uint32_t epoch = __atomic_load_n(&s_notif_epoch, __ATOMIC_ACQUIRE);
+            if (owner_epoch != epoch) { s_rx_len = 0; owner_epoch = epoch; }
+            if (item.epoch == epoch &&
+                !__atomic_load_n(&s_notif_drop_until_connect, __ATOMIC_ACQUIRE))
+                handle_notify(item.data, item.len);
+            free(item.data);
+            bsp_display_note_as11_notification_processed();
+        }
+        if (!__atomic_load_n(&s_notif_loss_pending, __ATOMIC_ACQUIRE))
+            pending_stream_replay();
     }
 }
 
@@ -769,6 +841,7 @@ static void handle_notify(const uint8_t *data, int len)
     ESP_LOGD(TAG, "handle_notify: len=%d", len);
     if (s_rx_len + len > RX_BUF_MAX) {
         ESP_LOGW(TAG, "rx buffer overflow, resetting");
+        notif_mark_loss();
         s_rx_len = 0;
         return;
     }
@@ -781,12 +854,16 @@ static void handle_notify(const uint8_t *data, int len)
     if (!decrypted) decrypted = heap_caps_malloc(RX_BUF_MAX, MALLOC_CAP_SPIRAM);
     if (!payload || !decrypted) {
         ESP_LOGE(TAG, "handle_notify: failed to allocate PSRAM decrypt buffers");
+        notif_mark_loss();
         s_rx_len = 0;
         return;
     }
     uint16_t vcid;
     int n;
     while ((n = fig_take_packet(payload, RX_BUF_MAX - 1, &vcid)) >= 0) {
+        if (__atomic_load_n(&s_notif_drop_until_connect, __ATOMIC_ACQUIRE)) {
+            s_rx_len = 0; break;
+        }
         ESP_LOGD(TAG, "FIG packet received: vcid=0x%04x len=%d", vcid, n);
         ESP_LOG_BUFFER_HEX_LEVEL(TAG, payload, n > 64 ? 64 : n, ESP_LOG_DEBUG);
 
@@ -798,6 +875,7 @@ static void handle_notify(const uint8_t *data, int len)
             int dlen = aes_cbc_decrypt(s_session_key, payload, n,
                                        decrypted, RX_BUF_MAX - 1);
             if (dlen < 0) {
+                notif_mark_loss();
                 ESP_LOGW(TAG, "AES decrypt failed for vcid=0x%04x len=%d", vcid, n);
                 continue;
             }
@@ -817,7 +895,7 @@ static void handle_notify(const uint8_t *data, int len)
             /* Ensure null-terminated for strstr */
             ((char *)parse_ptr)[parse_len] = '\0';
             if (strstr((const char *)parse_ptr, "\"method\":\"StreamData\"") != NULL) {
-                session_writer_on_stream_data_raw((const char *)parse_ptr, parse_len);
+                pending_stream_submit((const char *)parse_ptr, parse_len);
                 continue;
             }
         }
@@ -937,7 +1015,9 @@ static void handle_notify(const uint8_t *data, int len)
             /* Normal notification (HeartBeat, therapy events, data).
              * Forward to session writer for therapy detection and data logging. */
             ESP_LOGD(TAG, "notification: %s", m);
-            session_writer_on_notification(session_writer_get_active(), msg);
+            uint32_t stream_epoch = session_writer_stream_epoch();
+            session_writer_on_notification(NULL, msg);
+            if (stream_epoch != session_writer_stream_epoch()) pending_stream_clear();
             cJSON_Delete(msg);
             continue;
         }
@@ -1051,6 +1131,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         s_connect_status = event->connect.status;
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
+            __atomic_add_fetch(&s_notif_epoch, 1, __ATOMIC_ACQ_REL);
+            __atomic_store_n(&s_notif_drop_until_connect, false, __ATOMIC_RELEASE);
             s_manual_disconnect = false;
         }
         xSemaphoreGive(s_connect_sem);
@@ -1104,7 +1186,13 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_NOTIFY_RX: {
         uint16_t notif_len = OS_MBUF_PKTLEN(event->notify_rx.om);
         ESP_LOGD(TAG, "Notification RX: handle=%d len=%d", event->notify_rx.attr_handle, notif_len);
-        if (notif_len > 0 && s_notif_queue) {
+        /* Close the raw-RX-to-worker race before allocation, copy, or queue
+         * publication. Every failure path below gives this accounting back. */
+        bool lifecycle_accounted = notif_len > 0;
+        if (lifecycle_accounted)
+            bsp_display_note_as11_notification_queued();
+        if (notif_len > 0 && s_notif_queue &&
+            !__atomic_load_n(&s_notif_drop_until_connect, __ATOMIC_ACQUIRE)) {
             /* Queue-depth metrics.  Each element owns a separately malloc'd
              * payload, so depth translates into a real worst-case backlog —
              * the right way to size NOTIF_QUEUE_LEN is from the observed
@@ -1124,34 +1212,50 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             if (notif_data) {
                 int rc = os_mbuf_copydata(event->notify_rx.om, 0, notif_len, notif_data);
                 if (rc == 0) {
-                    notif_item_t item = { .data = notif_data, .len = notif_len };
+                    notif_item_t item = { .data = notif_data, .len = notif_len,
+                        .epoch = __atomic_load_n(&s_notif_epoch, __ATOMIC_ACQUIRE) };
                     if (xQueueSend(s_notif_queue, &item, 0) != pdTRUE) {
-                        /* Queue full — drop oldest, then enqueue */
+                        notif_mark_loss();
+                        /* Queue full: account/discard queued old-generation data. */
                         notif_item_t dropped;
-                        xQueueReceive(s_notif_queue, &dropped, 0);
-                        s_notif_dropped++;
-                        s_notif_dropped_bytes += (uint32_t)dropped.len;
-                        free(dropped.data);
-                        xQueueSend(s_notif_queue, &item, 0);
-                        notif_data = NULL;  /* owned by queue now */
-                        ESP_LOGW(TAG, "notif queue full, dropped 1 item "
-                                 "(total %u items / %u bytes)",
-                                 (unsigned)s_notif_dropped,
-                                 (unsigned)s_notif_dropped_bytes);
+                        if (xQueueReceive(s_notif_queue, &dropped, 0) == pdTRUE) {
+                            bsp_display_note_as11_notification_processed();
+                            s_notif_dropped++;
+                            s_notif_dropped_bytes += (uint32_t)dropped.len;
+                            free(dropped.data);
+                        }
+                        if (xQueueSend(s_notif_queue, &item, 0) == pdTRUE) {
+                            notif_data = NULL;  /* owned by queue now */
+                            lifecycle_accounted = false;
+                            ESP_LOGW(TAG, "notif queue full, dropped 1 item "
+                                     "(total %u items / %u bytes)",
+                                     (unsigned)s_notif_dropped,
+                                     (unsigned)s_notif_dropped_bytes);
+                        } else {
+                            /* Undo this frame's pre-publication accounting if
+                             * the retry could not transfer queue ownership. */
+                            bsp_display_note_as11_notification_processed();
+                            lifecycle_accounted = false;
+                        }
                     } else {
                         notif_data = NULL;  /* owned by queue now */
+                        lifecycle_accounted = false;
                     }
                 } else {
+                    notif_mark_loss();
                     ESP_LOGE(TAG, "os_mbuf_copydata failed: %d", rc);
                 }
                 if (notif_data) free(notif_data);
             } else {
                 s_notif_alloc_fail++;
+                notif_mark_loss();
                 ESP_LOGE(TAG, "failed to allocate notif_data (%u bytes, "
                          "%u alloc failures)", (unsigned)notif_len,
                          (unsigned)s_notif_alloc_fail);
             }
         }
+        if (lifecycle_accounted)
+            bsp_display_note_as11_notification_processed();
         return 0;
     }
 
@@ -3196,101 +3300,87 @@ cJSON *as11_ble_get_values(const char *const *keys, int n_keys)
     return result;
 }
 
-static esp_err_t as11_ble_stop_therapy_locked(void)
+static esp_err_t therapy_command(const char *operation, const char *rpc,
+                                 bool *may_have_run)
 {
-    if (!s_session_encrypted) {
-        ESP_LOGW(TAG, "stop_therapy: no encrypted session");
+    if (may_have_run) *may_have_run = false;
+    if (!s_session_encrypted || strcmp(as11_ble_get_status(), AS11_STATUS_PAIRED) != 0) {
+        ESP_LOGW(TAG, "%s: encrypted session is not ready", operation);
         return ESP_ERR_INVALID_STATE;
     }
 
-    const char *rpc = "{\"id\":50,\"jsonrpc\":\"1.0\",\"method\":\"EnterStandby\"}";
+    if (!s_cmd_mtx ||
+        xSemaphoreTake(s_cmd_mtx, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        ESP_LOGW(TAG, "%s: BLE command bus busy", operation);
+        return ESP_ERR_TIMEOUT;
+    }
+
     clear_response();
-    if (send_rpc_encrypted(rpc) != ESP_OK) {
-        ESP_LOGW(TAG, "stop_therapy: send failed");
-        return ESP_FAIL;
+    bool request_may_have_run = false;
+    esp_err_t send_result =
+        send_rpc_encrypted_tracked(rpc, &request_may_have_run);
+    if (may_have_run) *may_have_run = request_may_have_run;
+    if (send_result != ESP_OK) {
+        ESP_LOGW(TAG, "%s: send failed", operation);
+        xSemaphoreGive(s_cmd_mtx);
+        return send_result;
     }
 
     cJSON *resp = wait_response(10000);
     if (!resp) {
-        ESP_LOGW(TAG, "stop_therapy: timeout");
+        ESP_LOGW(TAG, "%s: timeout", operation);
+        xSemaphoreGive(s_cmd_mtx);
         return ESP_ERR_TIMEOUT;
     }
 
     cJSON *err = cJSON_GetObjectItem(resp, "error");
     if (err) {
+        /* A received JSON-RPC error is a definitive rejection, not an
+         * indeterminate post-send outcome. */
+        if (may_have_run) *may_have_run = false;
         char *s = cJSON_Print(err);
-        ESP_LOGW(TAG, "stop_therapy: RPC error: %s", s ? s : "?");
+        ESP_LOGW(TAG, "%s: RPC error: %s", operation, s ? s : "?");
         if (s) free(s);
         cJSON_Delete(resp);
+        xSemaphoreGive(s_cmd_mtx);
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "stop_therapy: EnterStandby accepted");
+    ESP_LOGI(TAG, "%s: command accepted", operation);
     cJSON_Delete(resp);
+    xSemaphoreGive(s_cmd_mtx);
     return ESP_OK;
 }
 
 esp_err_t as11_ble_stop_therapy(void)
 {
-    if (!s_cmd_mtx || xSemaphoreTake(s_cmd_mtx, pdMS_TO_TICKS(10000)) != pdTRUE)
-        return ESP_ERR_TIMEOUT;
-    esp_err_t result = as11_ble_stop_therapy_locked();
-    clear_response();
-    xSemaphoreGive(s_cmd_mtx);
-    return result;
+    return therapy_command(
+        "stop_therapy",
+        "{\"id\":50,\"jsonrpc\":\"1.0\",\"method\":\"EnterStandby\"}",
+        NULL);
 }
 
-static esp_err_t as11_ble_start_therapy_locked(void)
+esp_err_t as11_ble_start_therapy_tracked(bool *may_have_started)
 {
-    if (!s_session_encrypted) {
-        ESP_LOGW(TAG, "start_therapy: no encrypted session");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    const char *rpc = "{\"id\":51,\"jsonrpc\":\"1.0\",\"method\":\"EnterTherapy\"}";
-    clear_response();
-    if (send_rpc_encrypted(rpc) != ESP_OK) {
-        ESP_LOGW(TAG, "start_therapy: send failed");
-        return ESP_FAIL;
-    }
-
-    cJSON *resp = wait_response(10000);
-    if (!resp) {
-        ESP_LOGW(TAG, "start_therapy: timeout");
-        return ESP_ERR_TIMEOUT;
-    }
-
-    cJSON *err = cJSON_GetObjectItem(resp, "error");
-    if (err) {
-        char *s = cJSON_Print(err);
-        ESP_LOGW(TAG, "start_therapy: RPC error: %s", s ? s : "?");
-        if (s) free(s);
-        cJSON_Delete(resp);
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(TAG, "start_therapy: EnterTherapy accepted");
-    cJSON_Delete(resp);
-    return ESP_OK;
+    if (!may_have_started) return ESP_ERR_INVALID_ARG;
+    return therapy_command(
+        "start_therapy",
+        "{\"id\":51,\"jsonrpc\":\"1.0\",\"method\":\"EnterTherapy\"}",
+        may_have_started);
 }
 
-esp_err_t as11_ble_start_therapy(void)
+esp_err_t as11_ble_passthrough_rpc_tracked(const char *json_in,
+                                           char **json_out,
+                                           uint32_t timeout_ms,
+                                           bool *may_have_run)
 {
-    if (!s_cmd_mtx || xSemaphoreTake(s_cmd_mtx, pdMS_TO_TICKS(10000)) != pdTRUE)
-        return ESP_ERR_TIMEOUT;
-    esp_err_t result = as11_ble_start_therapy_locked();
-    clear_response();
-    xSemaphoreGive(s_cmd_mtx);
-    return result;
-}
-
-esp_err_t as11_ble_passthrough_rpc(const char *json_in, char **json_out, uint32_t timeout_ms)
-{
+    if (!may_have_run) return ESP_ERR_INVALID_ARG;
+    *may_have_run = false;
     if (!json_in || !*json_in || !json_out) return ESP_ERR_INVALID_ARG;
     *json_out = NULL;
 
-    if (!s_session_encrypted) {
-        ESP_LOGW(TAG, "passthrough_rpc: no active encrypted BLE session");
+    if (!s_session_encrypted || strcmp(as11_ble_get_status(), AS11_STATUS_PAIRED) != 0) {
+        ESP_LOGW(TAG, "passthrough_rpc: encrypted BLE session is not ready");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -3300,10 +3390,12 @@ esp_err_t as11_ble_passthrough_rpc(const char *json_in, char **json_out, uint32_
     }
 
     clear_response();
-    if (send_rpc_encrypted(json_in) != ESP_OK) {
+    esp_err_t send_result =
+        send_rpc_encrypted_tracked(json_in, may_have_run);
+    if (send_result != ESP_OK) {
         ESP_LOGE(TAG, "passthrough_rpc: send_rpc_encrypted failed");
         xSemaphoreGive(s_cmd_mtx);
-        return ESP_FAIL;
+        return send_result;
     }
 
     cJSON *resp = wait_response((int)timeout_ms);

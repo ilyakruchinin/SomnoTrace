@@ -23,6 +23,7 @@
 
 #include "oximetry_canonical.h"
 #include "oximetry_vld3.h"
+#include "oximeter_store.h"
 #include "sd_storage.h"
 #include "time_sync.h"
 #include "as11_time.h"
@@ -42,12 +43,6 @@
 
 #include "esp_log.h"
 #include "esp_rom_crc.h"
-
-int ox_store_index_check(const char *serial, const char *name);
-void ox_store_index_add(const char *serial, const char *name,
-                        uint32_t bytes, bool finalised);
-void ox_store_index_mark_converted(const char *serial, const char *name,
-                                   bool converted, const char *error);
 
 static const char *TAG = "ox_canon";
 

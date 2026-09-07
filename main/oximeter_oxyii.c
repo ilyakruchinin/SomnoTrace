@@ -27,6 +27,7 @@
 
 #include "oximeter.h"
 #include "oximeter_internal.h"
+#include "oximeter_store.h"
 #include "sd_storage.h"
 #include "as11_ble.h"
 #include "psram_task.h"
@@ -62,29 +63,6 @@
 #include "host/util/util.h"
 
 static const char *TAG = "ox_oxyii";
-
-/* ── Store forward declarations (oximeter_store.c) ─────────────────── */
-void ox_store_ensure_dirs(void);
-bool ox_store_load_paired(char *serial, size_t serial_sz,
-                          char *firmware, size_t fw_sz,
-                          char *name_prefix, size_t prefix_sz,
-                          char *last_addr, size_t addr_sz,
-                          char *driver, size_t driver_sz,
-                          char *ble_name, size_t ble_name_sz);
-void ox_store_save_paired(const char *serial, const char *firmware,
-                          const char *name_prefix, const char *last_addr,
-                          const char *driver, const char *ble_name);
-void ox_store_delete_paired(void);
-int  ox_store_index_check(const char *serial, const char *name);
-int  ox_store_index_conversion_check(const char *serial, const char *name);
-void ox_store_index_add(const char *serial, const char *name,
-                        uint32_t bytes, bool finalised);
-void ox_store_index_mark_converted(const char *serial, const char *name,
-                                   bool converted, const char *error);
-long ox_store_part_size(const char *name);
-esp_err_t ox_store_part_append(const char *name, const uint8_t *data, size_t len);
-bool ox_store_promote(const char *serial, const char *name);
-void ox_store_part_remove(const char *name);
 
 /* ── OxyII protocol constants ──────────────────────────────────────── */
 #define OXYII_LEAD         0xA5
@@ -1585,9 +1563,12 @@ static void canonical_migration_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(30000));
     while (sd_storage_recording_active())
         vTaskDelay(pdMS_TO_TICKS(5000));
-    if (sd_storage_is_ready()) {
+    if (sd_storage_is_ready() && ox_store_begin_io(5000)) {
         oximetry_canonical_reconcile();
         oximetry_canonical_migrate_all_legacy();
+        ox_store_end_io();
+    } else if (sd_storage_is_ready()) {
+        ESP_LOGW(TAG, "canonical migration deferred: SD maintenance active");
     }
     psram_task_delete(NULL);
 }
@@ -1627,6 +1608,15 @@ static bool do_pull_and_mark(bool *pulled_any)
     s_f1_fail_count = 0;
     ESP_LOGI(TAG, "file list: %d files", count);
 
+    /* The BLE discovery/list exchange above does not touch the card.  Claim
+     * the storage gate only for the index/download/conversion transaction so
+     * format or a controlled unmount cannot invalidate an open FATFS object. */
+    if (!ox_store_begin_io(0)) {
+        ESP_LOGW(TAG, "O2 pull deferred: SD maintenance active");
+        return false;
+    }
+    ox_store_ensure_dirs();
+
     bool pull_ok = true;
     for (int i = 0; i < count; i++) {
         if (names[i][0] == '\0') continue;
@@ -1657,6 +1647,7 @@ static bool do_pull_and_mark(bool *pulled_any)
         }
         if (pulled_any) *pulled_any = true;
     }
+    ox_store_end_io();
     return pull_ok;
 }
 
@@ -2021,8 +2012,11 @@ static void oxyii_init(void)
     }
 
     load_paired_from_nvs();
-    ox_store_ensure_dirs();
-    if (sd_storage_is_ready()) oximetry_canonical_ensure_dirs();
+    if (ox_store_begin_io(0)) {
+        ox_store_ensure_dirs();
+        oximetry_canonical_ensure_dirs();
+        ox_store_end_io();
+    }
 
     if (s_paired)
         set_state(OX_STATUS_PAIRED);

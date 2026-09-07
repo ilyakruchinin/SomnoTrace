@@ -67,6 +67,41 @@ static void show_status(const char *title, const char *lines[], int n)
     }
 }
 
+
+static void controlled_restart(void)
+{
+    if (!netprov_lifecycle_try_claim("main-reboot")) {
+        ESP_LOGW(TAG, "restart deferred because another lifecycle operation is active");
+        bsp_display_set_notice("Restart deferred: update or restart in progress");
+        return;
+    }
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active() ||
+        !bsp_display_try_reserve_therapy_safe_restart()) {
+        ESP_LOGE(TAG, "restart deferred because storage is recording or busy");
+        bsp_display_set_notice("Restart deferred: therapy or microSD is busy");
+        netprov_lifecycle_release();
+        return;
+    }
+    if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 0)) {
+        bsp_display_cancel_therapy_safe_restart();
+        ESP_LOGE(TAG, "restart deferred because storage is busy");
+        bsp_display_set_notice("Restart deferred: microSD is busy");
+        netprov_lifecycle_release();
+        return;
+    }
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active() ||
+        !bsp_display_try_commit_therapy_safe_restart()) {
+        sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
+        bsp_display_cancel_therapy_safe_restart();
+        ESP_LOGW(TAG, "restart deferred because therapy start won lifecycle gate");
+        bsp_display_set_notice("Restart deferred: therapy recording started");
+        netprov_lifecycle_release();
+        return;
+    }
+    sd_storage_deinit();
+    esp_restart();
+}
+
 static void enter_softap(const struct netprov_config *cfg)
 {
     as11_ble_disconnect();
@@ -376,7 +411,7 @@ void app_main(void)
                 }
 
                 vTaskDelay(pdMS_TO_TICKS(500));
-                esp_restart();
+                controlled_restart();
             }
         }
     } else {
@@ -475,7 +510,7 @@ void app_main(void)
             if ((xTaskGetTickCount() - softap_start_ticks) * portTICK_PERIOD_MS
                  > 10 * 60 * 1000) {
                 ESP_LOGW(TAG, "SoftAP 10-minute idle timeout: rebooting to retry connection");
-                esp_restart();
+                controlled_restart();
             }
             /* Update battery indicator in SoftAP mode */
             bsp_battery_t batt;

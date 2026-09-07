@@ -108,7 +108,7 @@ int main(void) {
 
 # Extraction boundary: all present public command owners release their bus.
 for name in ("as11_ble_get_values", "as11_ble_get_datetime", "as11_ble_spool_pull",
-             "as11_ble_start_therapy", "as11_ble_stop_therapy"):
+             "therapy_command"):
     body = function(ble, name)
     assert "xSemaphoreTake(s_cmd_mtx" in body, name
     assert "xSemaphoreGive(s_cmd_mtx)" in body, name

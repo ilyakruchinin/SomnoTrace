@@ -23,6 +23,7 @@
  */
 
 #include "oximeter.h"
+#include "oximeter_store.h"
 #include "oximetry_vld3.h"
 #include "sd_storage.h"
 
@@ -56,23 +57,52 @@ static const uint8_t TRAILER_MAGIC[4] = { 0x48, 0x12, 0x5A, 0xDA };
 #define VLD3_HEADER_LEN OX_VLD3_HEADER_LEN
 #define VLD3_RECORD_LEN OX_VLD3_RECORD_LEN
 
+bool ox_store_begin_io(uint32_t timeout_ms)
+{
+    if (!sd_storage_is_ready() ||
+        !sd_storage_lease_acquire(SD_LEASE_EXPORT, timeout_ms))
+        return false;
+
+    /* The mount may have disappeared before our lease was published. */
+    if (!sd_storage_is_ready()) {
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return false;
+    }
+    return true;
+}
+
+void ox_store_end_io(void)
+{
+    sd_storage_lease_release(SD_LEASE_EXPORT);
+}
+
 /* ── Directory helpers ─────────────────────────────────────────────── */
 
-void ox_store_ensure_dirs(void)
+static void ensure_dirs_unlocked(void)
 {
     mkdir(OXY_BASE, 0775);
     mkdir(OXY_INBOX, 0775);
     mkdir(OXY_FILES, 0775);
 }
 
+void ox_store_ensure_dirs(void)
+{
+    if (!ox_store_begin_io(0)) {
+        ESP_LOGW(TAG, "ensure directories deferred: SD unavailable or busy");
+        return;
+    }
+    ensure_dirs_unlocked();
+    ox_store_end_io();
+}
+
 /* ── paired.json ──────────────────────────────────────────────────── */
 
-bool ox_store_load_paired(char *serial, size_t serial_sz,
-                          char *firmware, size_t fw_sz,
-                          char *name_prefix, size_t prefix_sz,
-                          char *last_addr, size_t addr_sz,
-                          char *driver, size_t driver_sz,
-                          char *ble_name, size_t ble_name_sz)
+static bool load_paired_unlocked(char *serial, size_t serial_sz,
+                                 char *firmware, size_t fw_sz,
+                                 char *name_prefix, size_t prefix_sz,
+                                 char *last_addr, size_t addr_sz,
+                                 char *driver, size_t driver_sz,
+                                 char *ble_name, size_t ble_name_sz)
 {
     FILE *f = fopen(OXY_PAIRED_JSON, "r");
     if (!f) return false;
@@ -120,11 +150,26 @@ bool ox_store_load_paired(char *serial, size_t serial_sz,
     return ok;
 }
 
-void ox_store_save_paired(const char *serial, const char *firmware,
-                          const char *name_prefix, const char *last_addr,
-                          const char *driver, const char *ble_name)
+bool ox_store_load_paired(char *serial, size_t serial_sz,
+                          char *firmware, size_t fw_sz,
+                          char *name_prefix, size_t prefix_sz,
+                          char *last_addr, size_t addr_sz,
+                          char *driver, size_t driver_sz,
+                          char *ble_name, size_t ble_name_sz)
 {
-    ox_store_ensure_dirs();
+    if (!ox_store_begin_io(0)) return false;
+    bool loaded = load_paired_unlocked(serial, serial_sz, firmware, fw_sz,
+                                       name_prefix, prefix_sz, last_addr, addr_sz,
+                                       driver, driver_sz, ble_name, ble_name_sz);
+    ox_store_end_io();
+    return loaded;
+}
+
+static void save_paired_unlocked(const char *serial, const char *firmware,
+                                 const char *name_prefix, const char *last_addr,
+                                 const char *driver, const char *ble_name)
+{
+    ensure_dirs_unlocked();
     cJSON *j = cJSON_CreateObject();
     cJSON_AddStringToObject(j, "serial", serial);
     if (firmware) cJSON_AddStringToObject(j, "firmware", firmware);
@@ -144,9 +189,26 @@ void ox_store_save_paired(const char *serial, const char *firmware,
     cJSON_free(json);
 }
 
+void ox_store_save_paired(const char *serial, const char *firmware,
+                          const char *name_prefix, const char *last_addr,
+                          const char *driver, const char *ble_name)
+{
+    if (!ox_store_begin_io(0)) {
+        ESP_LOGW(TAG, "paired metadata save deferred: SD unavailable or busy");
+        return;
+    }
+    save_paired_unlocked(serial, firmware, name_prefix, last_addr, driver, ble_name);
+    ox_store_end_io();
+}
+
 void ox_store_delete_paired(void)
 {
+    if (!ox_store_begin_io(0)) {
+        ESP_LOGW(TAG, "paired metadata delete deferred: SD unavailable or busy");
+        return;
+    }
     remove(OXY_PAIRED_JSON);
+    ox_store_end_io();
 }
 
 /* ── index.json ───────────────────────────────────────────────────── */
@@ -360,7 +422,7 @@ void ox_store_index_mark_converted(const char *serial, const char *name,
     cJSON_Delete(arr);
 }
 
-char *ox_store_conversion_diagnostics_json(void)
+static char *conversion_diagnostics_json_unlocked(void)
 {
     cJSON *index = load_index_array();
     cJSON *out = cJSON_CreateArray();
@@ -380,6 +442,14 @@ char *ox_store_conversion_diagnostics_json(void)
     char *json = cJSON_PrintUnformatted(out);
     cJSON_Delete(out);
     cJSON_Delete(index);
+    return json;
+}
+
+char *ox_store_conversion_diagnostics_json(void)
+{
+    if (!ox_store_begin_io(0)) return NULL;
+    char *json = conversion_diagnostics_json_unlocked();
+    ox_store_end_io();
     return json;
 }
 

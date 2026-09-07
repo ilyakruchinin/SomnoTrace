@@ -109,6 +109,22 @@ static struct {
     int  plus_last_press_ms;
 } s_btn;
 
+static esp_err_t start_therapy_with_lifecycle_gate(void)
+{
+    if (!bsp_display_reserve_therapy_start()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    bool may_have_started = false;
+    esp_err_t result = as11_ble_start_therapy_tracked(&may_have_started);
+    if ((result == ESP_OK || may_have_started) &&
+        !bsp_display_set_therapy_active(true)) {
+        /* The start claim excludes a restart commit, so this is defensive. */
+        result = ESP_ERR_INVALID_STATE;
+    }
+    bsp_display_release_therapy_start();
+    return result;
+}
+
 static void button_monitor_task(void *arg)
 {
     (void)arg;
@@ -204,7 +220,7 @@ static void button_monitor_task(void *arg)
                     }
                 } else {
                     ESP_LOGI(TAG, "starting therapy via EnterTherapy RPC");
-                    esp_err_t ret = as11_ble_start_therapy();
+                    esp_err_t ret = start_therapy_with_lifecycle_gate();
                     if (ret != ESP_OK) {
                         ESP_LOGW(TAG, "start_therapy failed: %s",
                                  esp_err_to_name(ret));
@@ -243,7 +259,7 @@ static void button_monitor_task(void *arg)
                             }
                         } else {
                             ESP_LOGI(TAG, "starting therapy via EnterTherapy RPC");
-                            esp_err_t ret = as11_ble_start_therapy();
+                            esp_err_t ret = start_therapy_with_lifecycle_gate();
                             if (ret != ESP_OK) {
                                 ESP_LOGW(TAG, "start_therapy failed: %s",
                                          esp_err_to_name(ret));

@@ -24,6 +24,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 #include "cJSON.h"
@@ -36,6 +37,7 @@ typedef struct session_writer session_writer_t;
 esp_err_t session_writer_init(void);
 
 /* Start a new therapy session.
+ * Atomically acquires the SD recording claim before allocating session buffers.
  * Creates noon-day folder under .somnotrace/sessions/streams/YYYYMMDD/ and opens
  * YYYYMMDD_HHMMSS_*.snt files with prefix-based naming.
  * Returns a handle or NULL on failure. */
@@ -56,6 +58,12 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg);
 /* Fast-path processor for StreamData notifications using raw JSON.
  * Bypasses cJSON tree building for the high-frequency StreamData path.
  * Handles flow display push, active-flow detection, and sample routing. */
+/* False means admission is pending and the payload was not consumed. The
+ * notification owner retains/replays oldest first and cancels its copies on
+ * STOP/transport loss. Admission uses no filesystem I/O and no retry sleep. */
+bool session_writer_try_stream_data_raw(const char *json, int len);
+void session_writer_on_transport_loss(void);
+uint32_t session_writer_stream_epoch(void);
 void session_writer_on_stream_data_raw(const char *json, int len);
 
 /* Returns true if a session is currently active. */

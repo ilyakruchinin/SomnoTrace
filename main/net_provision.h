@@ -108,3 +108,7 @@ void netprov_dns_task(void *arg);
 void netprov_get_mdns_name(char *out, size_t out_len);
 esp_err_t netprov_set_mdns_name(const char *name);
 const char *netprov_mdns_name_cached(void);
+
+/* One owner for background restart/update/format lifecycle operations. */
+bool netprov_lifecycle_try_claim(const char *owner);
+void netprov_lifecycle_release(void);
