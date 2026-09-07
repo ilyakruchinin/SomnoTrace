@@ -97,4 +97,13 @@ python3 scripts/touch_history_controller_contract_test.py
 
 python3 scripts/touch_history_integration_contract_test.py
 
+
+python3 scripts/uploader_config_persistence_test.py
+
+python3 scripts/manage_config_behavior_test.py
+
+python3 scripts/manage_config_touch_test.py
+
+python3 scripts/upload_test_ownership_contract_test.py
+
 echo "All synthetic host tests passed"

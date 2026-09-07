@@ -366,3 +366,25 @@ esp_err_t uploader_reset_state(void);
  * function never has to know where they came from and nothing is written to NVS by a test. */
 esp_err_t uploader_test_connection(const char *backend_id, const uploader_config_t *cfg,
                                    bool *out_ok, char *msg, size_t msg_len);
+/* Scheduler-owned connection probes; bounded snapshots contain no credentials. */
+typedef enum { UPLOAD_TEST_IDLE, UPLOAD_TEST_QUEUED, UPLOAD_TEST_RUNNING,
+               UPLOAD_TEST_PASSED, UPLOAD_TEST_FAILED, UPLOAD_TEST_BLOCKED } uploader_test_state_t;
+typedef enum { UPLOAD_STAGE_RESOLVE, UPLOAD_STAGE_CONNECT, UPLOAD_STAGE_AUTH_MOUNT,
+               UPLOAD_STAGE_WRITE, UPLOAD_STAGE_VERIFY, UPLOAD_STAGE_CLEANUP,
+               UPLOAD_TEST_STAGE_COUNT } uploader_test_stage_t;
+typedef struct {
+    char backend[12];
+    uploader_test_state_t state;
+    uint8_t stage, completed_mask, failed_mask;
+    uint32_t generation, completed_epoch;
+    char detail[96];
+} uploader_test_snapshot_t;
+esp_err_t uploader_test_request(const char *backend, uint32_t *generation_out);
+void uploader_test_snapshot(uploader_test_snapshot_t *out);
+esp_err_t uploader_retry(const char *backend); /* NULL retries both; never clears receipts */
+/* Internal: only called on the scheduler task. */
+void uploader_test_stage(uploader_test_stage_t stage, bool completed, const char *detail);
+esp_err_t uploader_smb_probe(void);
+esp_err_t uploader_sleephq_probe(void);
+
+void uploader_test_failed(uploader_test_stage_t stage, const char *detail);

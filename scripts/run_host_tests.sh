@@ -114,6 +114,12 @@ run_test history_flow_cache_test -D_DARWIN_C_SOURCE -D_POSIX_C_SOURCE=200809L \
     -I"$SHIM" -I"$MAIN_DIR" scripts/history_flow_cache_test.c "$MAIN_DIR/history_flow_cache.c"
 run_test touch_history_model_test -DTOUCH_HISTORY_MODEL_TEST -I"$SHIM" -I"$MAIN_DIR" \
     scripts/touch_history_model_test.c "$MAIN_DIR/touch_history.c" -lm
+run_test manage_config_behavior_test -Dtime=config_test_time -I"$SHIM" -I"$MAIN_DIR" \
+    -Icomponents/therapy_alert scripts/manage_config_behavior_test.c \
+    "$MAIN_DIR/net_config_model.c" components/therapy_alert/alert_config_model.c \
+    components/therapy_alert/alert_history.c
+run_test upload_probe_behavior_test -I"$SHIM" -Icomponents/uploader \
+    scripts/upload_probe_behavior_test.c components/uploader/upload_probe_smb.c
 
 # edf_gen_test #includes the real edf_gen.c and needs a real cJSON.
 # Include order matters: the real cJSON.h must shadow the shim in $SHIM.

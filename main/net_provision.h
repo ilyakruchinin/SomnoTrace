@@ -36,10 +36,17 @@
 #define NETPROV_MAX_SSID_SLOTS  4
 #define NETPROV_SCAN_MAX_APS     20
 
+/* IPv4 policy travels with its saved network, never with a display draft. */
+struct netprov_ipv4 {
+    bool manual;
+    char address[16], netmask[16], gateway[16], dns[16];
+};
+
 /* One stored Wi-Fi credential pair. */
 struct netprov_wifi_cred {
     char ssid[NETPROV_SSID_MAXLEN + 1];
     char pass[NETPROV_PASS_MAXLEN + 1];
+    struct netprov_ipv4 ipv4;
 };
 
 /* Full configuration loaded from NVS. */
@@ -163,3 +170,10 @@ void netprov_dns_task(void *arg);
 void netprov_get_mdns_name(char *out, size_t out_len);
 esp_err_t netprov_set_mdns_name(const char *name);
 const char *netprov_mdns_name_cached(void);
+
+/* Worker-only: persist then update supervisor cache. Reorder/save never drops
+ * an existing link. reconnect=true explicitly disconnects and tries slot order;
+ * rejected while recording, scanning, portal mode, or lifecycle work is active. */
+esp_err_t netprov_apply_config(const struct netprov_config *cfg, bool reconnect);
+esp_err_t netprov_validate_config(const struct netprov_config *cfg);
+void netprov_get_mac(char out[18]);

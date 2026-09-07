@@ -19,7 +19,7 @@ These commands retain the selected build identity with the resulting images.
 
 ## Retained Logs
 
-Open Manage to view Logs; this extracted stage has no other Manage destinations.
+Open Manage and select Logs to view the retained log stream.
 The synthetic feed exercises pause, search, filtering, paging, clear/retry and
 save progress through the native controller. Run
 `python3 scripts/test-qemu-logs.py` after building this exact checkout, or capture
@@ -33,3 +33,14 @@ simulated setup run. Normal emulator boot seeds finished setup so ordinary
 captures remain deterministic. Setup owns its worker, durable state and native
 screen independently of the later Manage configuration and maintenance views.
 The host runner generates `main/zones.json` before timezone catalogue tests.
+
+## Manage configuration and Devices
+
+Manage now exposes Devices, Connectivity, Alerts, Uploads and Logs. Run
+`python3 scripts/test-qemu-rev-c.py` against the current build to exercise native
+configuration, redaction and disabled controls; this stage does not expose
+Storage, System or Advanced. Capture individual screens through
+`--interaction-state devices`, `connectivity`, `alerts` or `uploads`.
+Host validation runs production configuration and SMB-probe adapters with
+controlled dependencies. Simulated receipts do not verify physical pairing or
+external delivery.

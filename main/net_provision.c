@@ -57,7 +57,6 @@
 #include "bsp_power.h"
 #include "bsp_audio.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -158,6 +157,8 @@ static char s_link_ssid[NETPROV_SSID_MAXLEN + 1] = "";
 static SemaphoreHandle_t s_link_mutex = NULL;
 static volatile int  s_reconnect_tries = 0;
 static volatile bool s_rescan_requested = false;
+static volatile bool s_reselect_on_disconnect;
+static bool s_manual_reconnect; /* radio gate owner only */
 /* Copy of the credentials kept for autonomous failover rescans. */
 static struct netprov_config s_link_cfg;
 static bool s_link_cfg_valid = false;
@@ -213,6 +214,11 @@ static esp_err_t do_netprov_load(void *arg)
             snprintf(key, sizeof(key), NVS_KEY_PASS_FMT, i + 1);
             size_t pass_len = sizeof(local.wifi[i].pass);
             nvs_get_str(h, key, local.wifi[i].pass, &pass_len);
+            snprintf(key, sizeof(key), "ipv4_%d", i + 1);
+            size_t ip_len = sizeof(local.wifi[i].ipv4);
+            if (nvs_get_blob(h, key, &local.wifi[i].ipv4, &ip_len) != ESP_OK ||
+                ip_len != sizeof(local.wifi[i].ipv4))
+                memset(&local.wifi[i].ipv4, 0, sizeof(local.wifi[i].ipv4));
         }
     }
     nvs_close(h);
@@ -237,22 +243,25 @@ static esp_err_t do_netprov_save(void *arg)
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) return err;
 
-    nvs_set_str(h, NVS_KEY_HOSTNAME, local.hostname);
+    err = nvs_set_str(h, NVS_KEY_HOSTNAME, local.hostname);
     for (int i = 0; i < NETPROV_MAX_SSID_SLOTS; i++) {
         char key[16];
         snprintf(key, sizeof(key), NVS_KEY_SSID_FMT, i + 1);
-        nvs_set_str(h, key, local.wifi[i].ssid);
+        if (err == ESP_OK) err = nvs_set_str(h, key, local.wifi[i].ssid);
         snprintf(key, sizeof(key), NVS_KEY_PASS_FMT, i + 1);
-        nvs_set_str(h, key, local.wifi[i].pass);
+        if (err == ESP_OK) err = nvs_set_str(h, key, local.wifi[i].pass);
+        snprintf(key, sizeof(key), "ipv4_%d", i + 1);
+        if (err == ESP_OK) err = nvs_set_blob(h, key, &local.wifi[i].ipv4, sizeof(local.wifi[i].ipv4));
     }
-    err = nvs_commit(h);
+    if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     return err;
 }
 
 esp_err_t netprov_save_config(const struct netprov_config *cfg)
 {
-    /* Delegate the flash write so callers on a PSRAM stack (httpd) are safe. */
+    esp_err_t valid = netprov_validate_config(cfg);
+    if (valid != ESP_OK) return valid;
     return nvs_writer_run(do_netprov_save, (void *)cfg);
 }
 
@@ -371,7 +380,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             bsp_display_set_wifi_connected(false);
             s_reconnect_tries = 0;
             ESP_LOGW(TAG, "Wi-Fi link lost, reconnecting...");
-            if (user_scan_running()) {
+            if (s_reselect_on_disconnect || user_scan_running()) {
                 ESP_LOGI(TAG, "deferring reconnect until user scan completes");
                 s_rescan_requested = true;
             } else {
@@ -390,7 +399,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
              * only ever retries the single SSID in the driver config, so retrying
              * forever strands us on a network that has gone away while another
              * configured network sits available.  Escalate to a full rescan. */
-            if (user_scan_running()) {
+            if (s_reselect_on_disconnect || user_scan_running()) {
                 ESP_LOGI(TAG, "deferring reconnect until user scan completes");
                 s_rescan_requested = true;
             } else if (++s_reconnect_tries < RECONNECT_TRIES_BEFORE_RESCAN) {
@@ -611,12 +620,30 @@ static esp_err_t try_single_ssid(const char *ssid, const char *pass,
     return result;
 }
 
-
+static esp_err_t apply_ipv4(const struct netprov_ipv4 *cfg)
+{
+    if (!s_netif_sta) return ESP_ERR_INVALID_STATE;
+    esp_netif_dhcpc_stop(s_netif_sta);
+    esp_netif_ip_info_t ip = {0};
+    if (cfg->manual) {
+        ip.ip.addr = inet_addr(cfg->address);
+        ip.netmask.addr = inet_addr(cfg->netmask);
+        ip.gw.addr = inet_addr(cfg->gateway);
+    }
+    esp_err_t err = esp_netif_set_ip_info(s_netif_sta, &ip);
+    if (err != ESP_OK) return err;
+    if (!cfg->manual) return esp_netif_dhcpc_start(s_netif_sta);
+    esp_netif_dns_info_t dns = {0};
+    dns.ip.type = ESP_IPADDR_TYPE_V4;
+    dns.ip.u_addr.ip4.addr = inet_addr(cfg->dns);
+    return esp_netif_set_dns_info(s_netif_sta, ESP_NETIF_DNS_MAIN, &dns);
+}
 
 static esp_err_t try_connect_radio_locked(const struct netprov_config *cfg,
                                           char *ip_out, int timeout_ms)
 {
     if (s_portal_mode) return ESP_FAIL;
+    s_reselect_on_disconnect = false;
     link_mark_down();
 
     /* Cache the credentials so the link supervisor can rescan on its own
@@ -642,6 +669,7 @@ static esp_err_t try_connect_radio_locked(const struct netprov_config *cfg,
     cand_t cands[NETPROV_MAX_SSID_SLOTS];
 
     for (int attempt = 1; attempt <= scan_retries; attempt++) {
+        if (s_manual_reconnect && bsp_display_therapy_safe_maintenance_should_abort()) return ESP_ERR_INVALID_STATE;
         wifi_scan_config_t scan_cfg = { .show_hidden = false };
         esp_err_t scan_err = esp_wifi_scan_start(&scan_cfg, true);
         if (scan_err != ESP_OK) {
@@ -718,7 +746,9 @@ static esp_err_t try_connect_radio_locked(const struct netprov_config *cfg,
         ESP_LOGI(TAG, "trying candidate %d: '%s' (%d dBm)",
                  i + 1, cfg->wifi[slot].ssid, cands[i].rssi);
 
+        if (apply_ipv4(&cfg->wifi[slot].ipv4) != ESP_OK) continue;
         for (int attempt = 1; attempt <= MAX_STA_RETRY; attempt++) {
+            if (s_manual_reconnect && bsp_display_therapy_safe_maintenance_should_abort()) return ESP_ERR_INVALID_STATE;
             esp_err_t err = try_single_ssid(cfg->wifi[slot].ssid,
                                             cfg->wifi[slot].pass,
                                             cands[i].rssi > -128 ? &cands[i].rec : NULL,
@@ -2015,6 +2045,12 @@ static esp_err_t save_post_handler(httpd_req_t *req)
                 } else {
                     strlcpy(cfg.wifi[saved_count].pass, pass, sizeof(cfg.wifi[saved_count].pass));
                 }
+                for (int j = 0; j < NETPROV_MAX_SSID_SLOTS; j++) {
+                    if (!strcmp(old_cfg.wifi[j].ssid, ssid)) {
+                        cfg.wifi[saved_count].ipv4 = old_cfg.wifi[j].ipv4;
+                        break;
+                    }
+                }
                 saved_count++;
             }
         }
@@ -2060,11 +2096,25 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_sendstr(req,
+    if (!netprov_lifecycle_try_claim("reboot")) {
+        bsp_display_set_notice("Wi-Fi saved; restart waits for active update");
+        return httpd_resp_sendstr(
+            req,
+            "<html><body style=\"font-family:sans-serif\">Saved. Restart deferred until the active update finishes.</body></html>");
+    }
+    TaskHandle_t task = psram_task_create(reboot_task, "reboot", 4096, NULL, 5,
+                                          tskNO_AFFINITY, NULL, NULL);
+    if (!task) {
+        netprov_lifecycle_release();
+        bsp_display_set_notice("Wi-Fi saved; restart device manually");
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return httpd_resp_sendstr(
+            req,
+            "<html><body style=\"font-family:sans-serif\">Saved. Restart manually to apply changes.</body></html>");
+    }
+    return httpd_resp_sendstr(
+        req,
         "<html><body style=\"font-family:sans-serif\">Saved. Rebooting to connect...</body></html>");
-
-    schedule_reboot("reboot");
-    return ESP_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2447,6 +2497,50 @@ static esp_err_t upload_test_smb_handler(httpd_req_t *req)
 static esp_err_t upload_test_sleephq_handler(httpd_req_t *req)
 {
     return upload_test_send(req, "sleephq");
+}
+
+static const char *upload_test_state_name(uploader_test_state_t state)
+{
+    switch (state) {
+    case UPLOAD_TEST_QUEUED: return "queued";
+    case UPLOAD_TEST_RUNNING: return "running";
+    case UPLOAD_TEST_PASSED: return "passed";
+    case UPLOAD_TEST_FAILED: return "failed";
+    case UPLOAD_TEST_BLOCKED: return "blocked";
+    case UPLOAD_TEST_IDLE:
+    default: return "idle";
+    }
+}
+
+static esp_err_t upload_test_status_handler(httpd_req_t *req)
+{
+    uploader_test_snapshot_t snapshot;
+    uploader_test_snapshot(&snapshot);
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    cJSON_AddNumberToObject(root, "generation", snapshot.generation);
+    cJSON_AddStringToObject(root, "backend", snapshot.backend);
+    cJSON_AddStringToObject(root, "state",
+                            upload_test_state_name(snapshot.state));
+    cJSON_AddNumberToObject(root, "stage", snapshot.stage);
+    cJSON_AddNumberToObject(root, "completed_mask", snapshot.completed_mask);
+    cJSON_AddNumberToObject(root, "failed_mask", snapshot.failed_mask);
+    cJSON_AddNumberToObject(root, "completed_epoch", snapshot.completed_epoch);
+    cJSON_AddStringToObject(root, "detail", snapshot.detail);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_sendstr(req, json);
+    cJSON_free(json);
+    return ESP_OK;
 }
 
 /* ── Device settings endpoints ─────────────────────────────────────── */
@@ -3754,8 +3848,10 @@ static esp_err_t start_webserver(void)
     /* "Test connection" buttons: probe a backend with the saved settings */
     httpd_uri_t up_test_smb = { .uri = "/api/uploads/test-smb", .method = HTTP_POST, .handler = upload_test_smb_handler };
     httpd_uri_t up_test_shq = { .uri = "/api/uploads/test-sleephq", .method = HTTP_POST, .handler = upload_test_sleephq_handler };
+    httpd_uri_t up_test_status = { .uri = "/api/uploads/test-status", .method = HTTP_GET, .handler = upload_test_status_handler };
     reg_uri(s_httpd, &up_test_smb);
     reg_uri(s_httpd, &up_test_shq);
+    reg_uri(s_httpd, &up_test_status);
 
     /* Device settings endpoints (brightness, LCD therapy mode) */
     httpd_uri_t settings_all = { .uri = "/api/settings/all", .method = HTTP_GET, .handler = settings_all_get_handler };
@@ -4014,4 +4110,55 @@ esp_err_t netprov_start_connected_server(const char *ip)
     }
 
     return start_webserver();
+}
+
+void netprov_get_mac(char out[18])
+{
+    uint8_t mac[6];
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) { out[0] = 0; return; }
+    snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+esp_err_t netprov_apply_config(const struct netprov_config *cfg, bool reconnect)
+{
+    esp_err_t err = netprov_validate_config(cfg);
+    if (err != ESP_OK) return err;
+    if (!s_radio_gate || s_portal_mode ||
+        xSemaphoreTake(s_radio_gate, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
+    bool claim = false;
+    if (reconnect) {
+        if (bsp_display_is_therapy_active() || sd_storage_recording_active() ||
+            !bsp_display_try_begin_therapy_safe_maintenance()) {
+            xSemaphoreGive(s_radio_gate);
+            return ESP_ERR_INVALID_STATE;
+        }
+        claim = true;
+    }
+    err = netprov_save_config(cfg);
+    if (err == ESP_OK) {
+        s_link_cfg = *cfg;
+        s_link_cfg_valid = true;
+        s_reselect_on_disconnect = true;
+        s_status_cache.cfg_valid = false;
+        if (reconnect) {
+            char ip[16];
+            if (bsp_display_therapy_safe_maintenance_should_abort()) err = ESP_ERR_INVALID_STATE;
+            else {
+                /* Explicitly stop the old station before scanning/restarting.
+                 * Event-loop reconnects see reselect_on_disconnect and defer. */
+                esp_wifi_disconnect();
+                esp_err_t stopped = esp_wifi_stop();
+                if (stopped != ESP_OK && stopped != ESP_ERR_WIFI_NOT_STARTED) err = stopped;
+                else {
+                    s_manual_reconnect = true;
+                    err = try_connect_radio_locked(cfg, ip, 12000);
+                    s_manual_reconnect = false;
+                }
+            }
+        }
+    }
+    if (claim) bsp_display_end_therapy_safe_maintenance();
+    xSemaphoreGive(s_radio_gate);
+    return err;
 }
