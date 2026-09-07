@@ -15,9 +15,10 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 SCREEN_SCENARIOS = {
     "home": (0, (330, 563)),
+    "history": (1, (512, 563)),
     "manage": (2, (694, 563)),
 }
-INTERACTION_SCENARIOS = ('setup-wifi', 'logs', 'logs-paused', 'logs-debug', 'logs-search-keyboard', 'logs-filtered', 'logs-empty', 'logs-disconnected', 'logs-recovered', 'logs-save-progress', 'logs-save-complete', 'logs-clear-confirm', 'logs-levels-none', 'logs-keyboard-edits')
+INTERACTION_SCENARIOS = ('history-calendar', 'history-calendar-selection', 'setup-wifi', 'logs', 'logs-paused', 'logs-debug', 'logs-search-keyboard', 'logs-filtered', 'logs-empty', 'logs-disconnected', 'logs-recovered', 'logs-save-progress', 'logs-save-complete', 'logs-clear-confirm', 'logs-levels-none', 'logs-keyboard-edits')
 FATAL_MARKERS = (
     "Guru Meditation Error",
     "assert failed",
@@ -428,6 +429,7 @@ def validate_persistent_shell(name, payload, representative, interaction):
     # Every Rev C editor stays inside the pane; navigation remains visible.
     anchors.update({
         "Home navigation": ((244, 531, 416, 594), 35),
+        "History navigation": ((426, 531, 598, 594), 35),
         "Manage navigation": ((608, 531, 780, 594), 35),
     })
     for label, (bounds, minimum) in anchors.items():

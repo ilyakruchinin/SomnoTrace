@@ -1,4 +1,18 @@
-# Native History data services
+# Progressive native History
+
+The touchscreen keeps the graph and navigation visible during zoom, pan, Fit,
+and channel changes. A compact `Updating…` badge replaces the shaded graph
+panel. A bounded reprojection of the selected channel's widest retained graph
+provides immediate zoom feedback; missing bins remain gaps and cursor readouts
+identify previews. The worker replaces that preview with source-derived bins,
+then publishes event markers and exact percentiles separately.
+
+The one-slot mailbox always represents the latest requested window. New
+navigation cancels older reads, including background cache generation. Each
+publication checks the request generation and source generation. Cursor and
+calendar changes made during a read survive subsequent publications. Leaving
+History during refinement cancels the work; returning resumes the requested
+window. Failed percentile reads leave the graph available.
 
 ## Memory and repeated work
 
@@ -8,7 +22,8 @@ lives in PSRAM, preserving internal heap for RGB DMA, BLE, and OTA. There is no 
 It caches night metadata/session captions, parsed session manifests, unified
 axes, parsed respiratory events, therapy gates, graph windows, and exact
 statistics under separate keys. Calendar/index scans cannot evict the selected
-night.
+night. The controller retains one additional approximately 8 KiB graph as a
+preview source, independently of its existing display and worker snapshots.
 
 Session arrays above 64 items and event arrays above 1,024 items bypass
 retention. They keep their existing complete-source semantics. Visible events
@@ -65,5 +80,11 @@ percentile values.
 - `history_service_cache_test.py` executes production cache adapters against
   counted mutable sources, including repeated requests, invalidation, cancelled
   reads, oversized event nights, and allocation failure.
+- `history_progressive_test.py` executes the production controller publication,
+  loading, mailbox, and activation code with delayed statistics. It checks graph
+  publication first, supersession, previews, source changes, cursor/calendar
+  preservation, tab re-entry, and failed percentile allocation.
 
-Cold first-graph latency and physical SD/RGB acceptance remain open.
+The host suite and both firmware targets are required checks. QEMU validates
+native touch/rendering but uses simulated History sources; physical SD latency
+and RGB tearing acceptance require the device.
