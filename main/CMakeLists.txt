@@ -35,6 +35,8 @@ if(CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B OR
         "controller_diagnostics.c"
         "first_run_setup_ui.c"
         "first_run_setup_controller.c"
+        "touch_manage_config_ui.c"
+        "touch_manage_config_controller.c"
         "touch_logs_ui.c"
         "touch_logs_controller.c"
         "touch_history_ui.c"
@@ -66,7 +68,7 @@ if(CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B OR
         "../assets/fonts/generated/somnotrace_ibm_plex_mono_semibold_34.c")
 endif()
 
-idf_component_register(SRCS ${SOMNOTRACE_MAIN_SRC} "firmware_target.c" ${SOMNOTRACE_BSP_SRCS} "net_provision.c" "as11_ble.c"
+idf_component_register(SRCS ${SOMNOTRACE_MAIN_SRC} "firmware_target.c" ${SOMNOTRACE_BSP_SRCS} "net_provision.c" "net_config_model.c" "as11_ble.c"
                            "sd_storage.c" "session_writer.c" "time_sync.c"
                            "post_therapy.c" "edf_gen.c" "edf_header.c" "edf_waveform.c" "edf_annotations.c" "edf_summary.c" "log_stream.c" "device_settings.c"
                            "first_run_setup.c" "first_run_setup_model.c"

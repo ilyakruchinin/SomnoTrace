@@ -793,6 +793,7 @@ static upload_result_t shq_upload_file(esp_tls_t *tls,
  * The root bundle is sent for every import, not just when it changed: without
  * STR.edf the sessions in that import cannot be interpreted. */
 
+static bool s_probe_active;
 static uploader_config_t s_prepared_config;
 static esp_tls_t *s_tls;                  /* live for the whole run */
 static char s_import_id[32];
@@ -846,7 +847,10 @@ static upload_result_t shq_session_begin(void)
     const uploader_config_t cfg = s_prepared_config;
     if (!s_tls || uploader_should_cancel()) return UPLOAD_CANCELLED;
     ESP_LOGI(TAG, "TLS connected to %s", SHQ_HOST);
-
+    if (s_probe_active) {
+        uploader_test_stage(UPLOAD_STAGE_CONNECT, true, "SleepHQ TLS connected");
+        uploader_test_stage(UPLOAD_STAGE_AUTH_MOUNT, false, "Checking credentials and account access");
+    }
 
     if (shq_authenticate(s_tls, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "authentication failed");
@@ -1059,3 +1063,24 @@ const upload_backend_t sleephq_backend = {
 
 /* Runs only on the scheduler owner, so its token/session cache cannot race an
  * upload. OAuth and team lookup only: never creates an import or uploads data. */
+esp_err_t uploader_sleephq_probe(void)
+{
+    uploader_test_stage(UPLOAD_STAGE_CONNECT, false, "Connecting to SleepHQ over TLS");
+    s_token_expires = 0; /* force actual credential verification */
+    s_probe_active = true;
+    upload_result_t result = shq_prepare();
+    if (result == UPLOAD_OK) result = shq_session_begin();
+    s_probe_active = false;
+    if (result != UPLOAD_OK) {
+        shq_session_end();
+        uploader_test_snapshot_t observed;
+        uploader_test_snapshot(&observed);
+        uploader_test_failed(observed.stage,
+            result == UPLOAD_ERR_PERMANENT ? "SleepHQ authentication failed" : "SleepHQ connection or account lookup failed");
+        return ESP_FAIL;
+    }
+    uploader_test_stage(UPLOAD_STAGE_CONNECT, true, "TLS connection established");
+    uploader_test_stage(UPLOAD_STAGE_AUTH_MOUNT, true, "Credentials and account access accepted; no recording sent");
+    shq_session_end();
+    return ESP_OK;
+}

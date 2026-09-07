@@ -17,6 +17,7 @@
 #include "as11_ble.h"
 #include "board_waveshare_7b.h"
 #include "device_settings.h"
+#include "touch_manage_config.h"
 #include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -242,6 +243,14 @@ typedef struct {
     bool alert_config_busy;
 } ui_service_state_t;
 
+typedef enum {
+    BLE_UI_IDLE,
+    BLE_UI_SCAN_AS11,
+    BLE_UI_SCAN_OX,
+    BLE_UI_PAIR_AS11,
+    BLE_UI_PAIR_OX,
+    BLE_UI_FORGET,
+} ble_ui_operation_t;
 
 static const char *TAG = "display_7b";
 
@@ -307,9 +316,16 @@ static uint32_t s_first_run_setup_seen_generation;
  * flow. The machine must enter its own pairing mode before SomnoTrace scans;
  * doing these in the opposite order can display a code but fail the final
  * exchange. */
+static bool s_as11_pairing_mode_confirmed;
 static bool s_therapy_command_busy;
 static bool s_therapy_command_target;
 static bool s_alert_ack_busy;
+static bool s_alert_test_busy;
+static bool s_reboot_busy;
+static bool s_wifi_save_busy;
+static bool s_wifi_restart_pending;
+static ble_ui_operation_t s_ble_operation;
+static int64_t s_ble_operation_started_us;
 
 static lv_obj_t *s_clock_label;
 static lv_obj_t *s_date_label;
@@ -330,6 +346,7 @@ static lv_obj_t *s_status_tray_wifi;
 static lv_obj_t *s_status_tray_upload;
 static lv_obj_t *s_status_tray_ox;
 static lv_obj_t *s_status_tray_dots[5];
+static lv_obj_t *s_status_tray_actions[5];
 static lv_obj_t *s_therapy_label;
 static lv_obj_t *s_therapy_subtitle;
 static lv_obj_t *s_therapy_hero;
@@ -371,6 +388,30 @@ static touch_history_ui_t *s_history_ui;
 static touch_history_controller_t *s_history_controller;
 static uint32_t s_history_rendered_revision = UINT32_MAX;
 static bool s_history_apply_scheduled;
+static lv_obj_t *s_as11_row;
+static lv_obj_t *s_ox_row;
+static lv_obj_t *s_as11_title;
+static lv_obj_t *s_ox_title;
+static lv_obj_t *s_as11_dot;
+static lv_obj_t *s_ox_dot;
+static lv_obj_t *s_as11_status;
+static lv_obj_t *s_as11_badge;
+static lv_obj_t *s_as11_dropdown;
+static lv_obj_t *s_as11_pair_button;
+static lv_obj_t *s_ble_buttons[6];
+static lv_obj_t *s_pair_steps[5];
+static lv_obj_t *s_pair_step_labels[5];
+static lv_obj_t *s_passkey_confirm_button;
+static lv_obj_t *s_passkey;
+static lv_obj_t *s_ox_status;
+static lv_obj_t *s_ox_badge;
+static lv_obj_t *s_ox_dropdown;
+static lv_obj_t *s_device_change_row;
+static lv_obj_t *s_device_change_title;
+static lv_obj_t *s_device_change_detail;
+static lv_obj_t *s_device_section_subtitle;
+static lv_obj_t *s_connectivity_section_subtitle;
+static lv_obj_t *s_system_section_subtitle;
 static lv_obj_t *s_manage_scrolls[MANAGE_SECTION_COUNT];
 static lv_obj_t *s_manage_sections[MANAGE_SECTION_COUNT];
 static lv_obj_t *s_manage_buttons[MANAGE_SECTION_COUNT];
@@ -385,7 +426,15 @@ static lv_obj_t *s_manage_detail_host;
 static lv_obj_t *s_manage_retired_logs_section;
 static int s_rendered_manage_section = -1;
 static uint32_t s_manage_transition_generation;
+static lv_obj_t *s_manage_dialog;
+static lv_obj_t *s_keyboard_sheet;
+static lv_obj_t *s_keyboard_title;
+static lv_obj_t *s_keyboard;
+static lv_obj_t *s_keyboard_target;
+static char s_keyboard_initial[NETPROV_PASS_MAXLEN + 1];
 static lv_obj_t *s_wake_overlay;
+static unsigned s_seen_as11_version;
+static unsigned s_seen_ox_version;
 #if !CONFIG_SOMNOTRACE_BOARD_QEMU
 static TaskHandle_t s_storage_worker_task;
 #endif
@@ -399,10 +448,14 @@ static void ensure_manage_destination(void);
 static void teardown_rendered_manage_destination(void);
 static void reap_retired_logs_destination(void);
 static void update_manage_rail_selection(int section);
+static void close_manage_dialog(void);
 static void start_storage_refresh(void);
 static void apply_pending_backlight_locked(void);
 void bsp_display_restart_idle_timeout(void);
 static void wake_timer_cb(void *arg);
+static void style_manage_surface(lv_obj_t *obj);
+static void style_manage_field(lv_obj_t *field);
+static void style_manage_textarea(lv_obj_t *field);
 static bool screen_wake_input_available(void)
 {
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
@@ -415,6 +468,26 @@ static bool screen_wake_input_available(void)
 #endif
 }
 
+static bool begin_ble_operation(ble_ui_operation_t operation)
+{
+    bool started = false;
+    portENTER_CRITICAL(&s_state_lock);
+    if (s_ble_operation == BLE_UI_IDLE) {
+        s_ble_operation = operation;
+        s_ble_operation_started_us = esp_timer_get_time();
+        started = true;
+    }
+    portEXIT_CRITICAL(&s_state_lock);
+    return started;
+}
+
+static void end_ble_operation(void)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    s_ble_operation = BLE_UI_IDLE;
+    s_ble_operation_started_us = 0;
+    portEXIT_CRITICAL(&s_state_lock);
+}
 
 static bool lock_lvgl(TickType_t timeout)
 {
@@ -792,6 +865,14 @@ static lv_obj_t *make_down_chevron(lv_obj_t *parent, int x, int y)
     return chevron;
 }
 
+static lv_obj_t *make_manage_field_chevron(lv_obj_t *field)
+{
+    lv_obj_t *chevron = make_down_chevron(field, 0, 0);
+    /* Field children are positioned in the padded content box. Aligning here
+     * keeps the glyph centred when a field's font, height, or padding changes. */
+    lv_obj_align(chevron, LV_ALIGN_RIGHT_MID, 0, 0);
+    return chevron;
+}
 
 static lv_coord_t status_label_width(lv_obj_t *label)
 {
@@ -976,6 +1057,27 @@ static lv_obj_t *make_value_card(lv_obj_t *parent, int x, int y,
 }
 
 
+static void manage_dropdown_list_ready_cb(lv_event_t *event)
+{
+    lv_obj_t *list = lv_dropdown_get_list(lv_event_get_target(event));
+    if (!list) return;
+
+    /* A 45 px option pitch is large enough for reliable bedside selection;
+     * longer device and Wi-Fi result sets remain vertically scrollable. */
+    style_manage_surface(list);
+    lv_obj_set_style_max_height(list, 250, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(list, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(list, 12, LV_PART_MAIN);
+    lv_obj_set_style_text_font(list, FONT_BODY, LV_PART_MAIN);
+    lv_obj_set_style_text_line_space(list, 28, LV_PART_MAIN);
+    lv_obj_set_style_text_line_space(list, 28, LV_PART_SELECTED);
+    lv_obj_t *label = lv_obj_get_child(list, 0);
+    if (label) {
+        lv_obj_set_style_text_font(label, FONT_BODY, LV_PART_MAIN);
+        lv_obj_set_style_text_line_space(label, 28, LV_PART_MAIN);
+    }
+}
+
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
 static void qemu_upload_progress(uploader_progress_snapshot_t *progress)
 {
@@ -1094,9 +1196,380 @@ static unsigned estimated_airsense_nights(uint64_t free_bytes)
 }
 
 
+static void device_scan_task(void *arg)
+{
+    bool oxygen = (intptr_t)arg == 1;
+    cJSON *results = NULL;
+    esp_err_t result = bsp_display_is_therapy_active()
+                       ? ESP_ERR_INVALID_STATE
+                       : (oxygen ? oximeter_scan(7) : as11_ble_scan(7));
+    if (result == ESP_OK)
+        results = oxygen ? oximeter_get_scan_results() : as11_ble_get_scan_results();
+
+    ui_device_result_t local[DEVICE_RESULT_MAX] = {0};
+    size_t count = 0;
+    cJSON *item;
+    cJSON_ArrayForEach(item, results) {
+        if (count >= DEVICE_RESULT_MAX) break;
+        cJSON *addr = cJSON_GetObjectItemCaseSensitive(item, "addr");
+        cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "name");
+        cJSON *rssi = cJSON_GetObjectItemCaseSensitive(item, "rssi");
+        cJSON *type = cJSON_GetObjectItemCaseSensitive(item, "type");
+        if (!cJSON_IsString(addr)) continue;
+        strlcpy(local[count].addr, addr->valuestring, sizeof(local[count].addr));
+        strlcpy(local[count].name,
+                cJSON_IsString(name) && name->valuestring[0] ? name->valuestring : "Unnamed device",
+                sizeof(local[count].name));
+        local[count].rssi = cJSON_IsNumber(rssi) ? rssi->valueint : 0;
+        local[count].driver = cJSON_IsString(type) && !strcmp(type->valuestring, "legacy")
+                                ? OX_DRIVER_LEGACY : OX_DRIVER_OXYII;
+        count++;
+    }
+    cJSON_Delete(results);
+
+    portENTER_CRITICAL(&s_state_lock);
+    ui_device_result_t *target = oxygen ? s_services.ox : s_services.as11;
+    memcpy(target, local, sizeof(local));
+    if (oxygen) {
+        s_services.ox_count = count;
+        s_services.ox_busy = false;
+        s_services.ox_version++;
+    } else {
+        s_services.as11_count = count;
+        s_services.as11_busy = false;
+        s_services.as11_version++;
+    }
+    portEXIT_CRITICAL(&s_state_lock);
+    end_ble_operation();
+    vTaskDelete(NULL);
+}
+
+static void scan_cb(lv_event_t *event)
+{
+    bool oxygen = (intptr_t)lv_event_get_user_data(event) == 1;
+    if (!s_touch_services_ready || (oxygen ? !s_ox_service_ready
+                                          : !s_as11_service_ready)) {
+        bsp_display_set_notice("Pairing services are still starting");
+        return;
+    }
+    if (bsp_display_is_therapy_active()) {
+        bsp_display_set_notice("Stop therapy before scanning for devices");
+        return;
+    }
+    if (!begin_ble_operation(oxygen ? BLE_UI_SCAN_OX : BLE_UI_SCAN_AS11)) {
+        bsp_display_set_notice("Another Bluetooth action is already running");
+        return;
+    }
+    portENTER_CRITICAL(&s_state_lock);
+    if (oxygen) {
+        s_services.ox_busy = true;
+    } else {
+        /* Tapping “AirSense is ready” is the explicit acknowledgement that
+         * More > MyAir App > OK, downloaded > Connect was completed first. */
+        s_as11_pairing_mode_confirmed = true;
+        s_services.as11_busy = true;
+    }
+    portEXIT_CRITICAL(&s_state_lock);
+    bsp_display_set_notice(oxygen ? "Scanning for O2 rings..." : "Scanning for AirSense 11...");
+    if (xTaskCreate(device_scan_task, oxygen ? "ui_scan_ox" : "ui_scan_as11",
+                    8192, (void *)(intptr_t)(oxygen ? 1 : 0), 4, NULL) != pdPASS) {
+        portENTER_CRITICAL(&s_state_lock);
+        if (oxygen) s_services.ox_busy = false;
+        else s_services.as11_busy = false;
+        portEXIT_CRITICAL(&s_state_lock);
+        end_ble_operation();
+    }
+}
+
+typedef enum { DEVICE_PAIR_AS11, DEVICE_PAIR_OX, DEVICE_CONFIRM_AS11,
+               DEVICE_FORGET_AS11, DEVICE_FORGET_OX } device_action_t;
+
+typedef struct {
+    device_action_t action;
+    char addr[18];
+    char passkey[5];
+    ox_driver_t driver;
+} device_job_t;
+
+static void device_action_task(void *arg)
+{
+    device_job_t *job = arg;
+    esp_err_t result = ESP_FAIL;
+    if (bsp_display_is_therapy_active()) {
+        result = ESP_ERR_INVALID_STATE;
+    } else if (job->action == DEVICE_PAIR_AS11) {
+        result = as11_ble_start_pair(job->addr);
+    } else if (job->action == DEVICE_PAIR_OX) {
+        result = oximeter_pair(job->addr, OX_DRIVER_AUTO);
+    } else if (job->action == DEVICE_CONFIRM_AS11) {
+        result = as11_ble_confirm_pair(job->passkey);
+    } else if (job->action == DEVICE_FORGET_AS11) {
+        result = as11_ble_forget();
+    } else if (job->action == DEVICE_FORGET_OX) {
+        result = oximeter_forget();
+    }
+    if (job->action == DEVICE_FORGET_AS11 ||
+        (job->action == DEVICE_PAIR_AS11 && result != ESP_OK)) {
+        portENTER_CRITICAL(&s_state_lock);
+        s_as11_pairing_mode_confirmed = false;
+        portEXIT_CRITICAL(&s_state_lock);
+    }
+    bsp_display_set_notice(
+        result == ESP_OK ? "Device action started" :
+        job->action == DEVICE_PAIR_AS11
+            ? "Pairing could not start · enable AirSense pairing mode first"
+            : "Device action failed");
+    if (result != ESP_OK || job->action == DEVICE_FORGET_AS11 ||
+        job->action == DEVICE_FORGET_OX) end_ble_operation();
+    free(job);
+    vTaskDelete(NULL);
+}
+
+static void device_action_cb(lv_event_t *event)
+{
+    device_action_t action = (device_action_t)(intptr_t)lv_event_get_user_data(event);
+    bool oxygen = action == DEVICE_PAIR_OX || action == DEVICE_FORGET_OX;
+    if (!s_touch_services_ready || (oxygen ? !s_ox_service_ready
+                                          : !s_as11_service_ready)) {
+        bsp_display_set_notice("Pairing services are still starting");
+        return;
+    }
+    if (bsp_display_is_therapy_active()) {
+        bsp_display_set_notice("Stop therapy before changing paired devices");
+        return;
+    }
+    portENTER_CRITICAL(&s_state_lock);
+    bool pairing_mode_confirmed = s_as11_pairing_mode_confirmed;
+    portEXIT_CRITICAL(&s_state_lock);
+    if (action == DEVICE_PAIR_AS11 && !pairing_mode_confirmed) {
+        bsp_display_set_notice("First enable AirSense pairing mode, then scan");
+        return;
+    }
+    if (action == DEVICE_CONFIRM_AS11 &&
+        strcmp(as11_ble_get_status(), AS11_STATUS_WAIT_PASSKEY) != 0) {
+        bsp_display_set_notice("AirSense is not waiting for a passkey");
+        return;
+    }
+    ble_ui_operation_t operation =
+        action == DEVICE_PAIR_AS11 || action == DEVICE_CONFIRM_AS11 ? BLE_UI_PAIR_AS11 :
+        action == DEVICE_PAIR_OX ? BLE_UI_PAIR_OX : BLE_UI_FORGET;
+    portENTER_CRITICAL(&s_state_lock);
+    bool continuing_passkey = action == DEVICE_CONFIRM_AS11 &&
+                              s_ble_operation == BLE_UI_PAIR_AS11;
+    portEXIT_CRITICAL(&s_state_lock);
+    if (!continuing_passkey && !begin_ble_operation(operation)) {
+        bsp_display_set_notice("Another Bluetooth action is already running");
+        return;
+    }
+    device_job_t *job = calloc(1, sizeof(*job));
+    if (!job) {
+        if (!continuing_passkey) end_ble_operation();
+        bsp_display_set_notice("Unable to allocate pairing job");
+        return;
+    }
+    job->action = action;
+    if (action == DEVICE_PAIR_AS11) {
+        uint16_t selected = lv_dropdown_get_selected(s_as11_dropdown);
+        portENTER_CRITICAL(&s_state_lock);
+        if (selected < s_services.as11_count)
+            *job = (device_job_t){ .action = action, .driver = OX_DRIVER_AUTO };
+        if (selected < s_services.as11_count)
+            strlcpy(job->addr, s_services.as11[selected].addr, sizeof(job->addr));
+        portEXIT_CRITICAL(&s_state_lock);
+    } else if (action == DEVICE_PAIR_OX) {
+        uint16_t selected = lv_dropdown_get_selected(s_ox_dropdown);
+        portENTER_CRITICAL(&s_state_lock);
+        if (selected < s_services.ox_count) {
+            strlcpy(job->addr, s_services.ox[selected].addr, sizeof(job->addr));
+            job->driver = OX_DRIVER_AUTO;
+        }
+        portEXIT_CRITICAL(&s_state_lock);
+    } else if (action == DEVICE_CONFIRM_AS11) {
+        strlcpy(job->passkey, lv_textarea_get_text(s_passkey), sizeof(job->passkey));
+    }
+    if ((action == DEVICE_PAIR_AS11 || action == DEVICE_PAIR_OX) && !job->addr[0]) {
+        free(job);
+        if (!continuing_passkey) end_ble_operation();
+        bsp_display_set_notice("Scan and select a device first");
+        return;
+    }
+    if (action == DEVICE_CONFIRM_AS11 && strlen(job->passkey) != 4) {
+        free(job);
+        if (!continuing_passkey) end_ble_operation();
+        bsp_display_set_notice("Enter the 4-digit AirSense code");
+        return;
+    }
+    if (xTaskCreate(device_action_task, "ui_pair", 6144,
+                    job, 4, NULL) != pdPASS) {
+        free(job);
+        if (!continuing_passkey) end_ble_operation();
+        bsp_display_set_notice("Unable to start pairing action");
+    }
+}
+
+static void manage_dialog_deleted_cb(lv_event_t *event)
+{
+    if (s_manage_dialog == lv_event_get_target(event)) s_manage_dialog = NULL;
+}
+
+static void track_manage_dialog(lv_obj_t *dialog)
+{
+    if (!dialog) return;
+    close_manage_dialog();
+    s_manage_dialog = dialog;
+    lv_obj_add_event_cb(dialog, manage_dialog_deleted_cb, LV_EVENT_DELETE, NULL);
+}
+
+static void close_manage_dialog(void)
+{
+    lv_obj_t *dialog = s_manage_dialog;
+    if (!dialog) return;
+    /* Clear ownership before deletion because LV_EVENT_DELETE is synchronous
+     * and may run callbacks which attempt another destination transition. */
+    s_manage_dialog = NULL;
+    lv_msgbox_close(dialog);
+}
+
+static void forget_dialog_cb(lv_event_t *event)
+{
+    lv_obj_t *dialog = lv_event_get_current_target(event);
+    const char *button = lv_msgbox_get_active_btn_text(dialog);
+    if (!button) return;
+    if (!strcmp(button, "Forget")) {
+        if (!begin_ble_operation(BLE_UI_FORGET)) {
+            bsp_display_set_notice("Another Bluetooth action is already running");
+            lv_msgbox_close(dialog);
+            return;
+        }
+        device_job_t *job = calloc(1, sizeof(*job));
+        if (job) {
+            job->action = (device_action_t)(intptr_t)lv_event_get_user_data(event);
+            if (xTaskCreate(device_action_task, "ui_forget", 4096,
+                            job, 4, NULL) != pdPASS) {
+                free(job);
+                end_ble_operation();
+            }
+        } else {
+            end_ble_operation();
+        }
+    }
+    lv_msgbox_close(dialog);
+}
+
+static void forget_prompt_cb(lv_event_t *event)
+{
+    device_action_t action = (device_action_t)(intptr_t)lv_event_get_user_data(event);
+    bool oxygen = action == DEVICE_FORGET_OX;
+    if (!s_touch_services_ready || (oxygen ? !s_ox_service_ready
+                                          : !s_as11_service_ready)) {
+        bsp_display_set_notice("Pairing service is unavailable");
+        return;
+    }
+    if (bsp_display_is_therapy_active()) {
+        bsp_display_set_notice("Stop therapy before forgetting a device");
+        return;
+    }
+    static const char *buttons[] = { "Cancel", "Forget", "" };
+    const char *device = action == DEVICE_FORGET_AS11 ? "AirSense 11" : "O2 ring";
+    char question[224];
+    snprintf(question, sizeof(question),
+             "SomnoTrace will stop collecting data from %s until it is paired again. Recorded nights already on the card are kept.",
+             device);
+    lv_obj_t *dialog = lv_msgbox_create(NULL,
+                                         action == DEVICE_FORGET_AS11
+                                             ? "Forget AirSense 11?"
+                                             : "Forget O2 ring?",
+                                         question, buttons, true);
+    lv_obj_set_width(dialog, 620);
+    lv_obj_set_style_bg_color(dialog, lv_color_hex(0x172640), 0);
+    lv_obj_set_style_text_color(dialog, lv_color_hex(0xe7edf7), 0);
+    lv_obj_add_event_cb(dialog, forget_dialog_cb, LV_EVENT_VALUE_CHANGED,
+                        (void *)(intptr_t)action);
+    track_manage_dialog(dialog);
+    lv_obj_center(dialog);
+}
 
 
+static void close_keyboard_sheet(bool restore)
+{
+    if (!s_keyboard_sheet) return;
+    lv_obj_t *target = s_keyboard_target;
+    if (restore && target) lv_textarea_set_text(target, s_keyboard_initial);
+    /* Release keyboard ownership before restoring the scrolling layout so
+     * layout_connectivity_rows() can put the optional scan row and fields
+     * back in their steady-state positions in this same frame. */
+    s_keyboard_target = NULL;
+    if (target) lv_obj_clear_state(target, LV_STATE_FOCUSED);
+    lv_obj_add_flag(s_keyboard_sheet, LV_OBJ_FLAG_HIDDEN);
+    lv_keyboard_set_textarea(s_keyboard, NULL);
+}
 
+static void open_keyboard_sheet(lv_obj_t *target, lv_keyboard_mode_t mode,
+                                const char *title, int top)
+{
+    if (!target || !s_keyboard_sheet) return;
+    s_keyboard_target = target;
+    strlcpy(s_keyboard_initial, lv_textarea_get_text(target),
+            sizeof(s_keyboard_initial));
+    lv_label_set_text(s_keyboard_title, title);
+    lv_keyboard_set_mode(s_keyboard, mode);
+    lv_keyboard_set_textarea(s_keyboard, target);
+    lv_obj_set_y(s_keyboard_sheet, top);
+    lv_obj_set_height(s_keyboard_sheet, 320);
+    lv_obj_set_y(s_keyboard, top == 356 ? 58 : 67);
+    lv_obj_set_height(s_keyboard, top == 356 ? 168 : 203);
+    lv_obj_clear_flag(s_keyboard_sheet, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_keyboard_sheet);
+}
+
+static void passkey_focus_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_FOCUSED)
+        open_keyboard_sheet(lv_event_get_target(event),
+                            LV_KEYBOARD_MODE_NUMBER, "Pairing code", 356);
+}
+
+
+static void keyboard_cb(lv_event_t *event)
+{
+    lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_VALUE_CHANGED && s_keyboard_target) {
+        uint16_t selected = lv_btnmatrix_get_selected_btn(s_keyboard);
+        const char *text = lv_btnmatrix_get_btn_text(s_keyboard, selected);
+        if (!text) return;
+        if (!strcmp(text, "Clear")) {
+            lv_textarea_set_text(s_keyboard_target, "");
+        } else if (!strcmp(text, LV_SYMBOL_UP)) {
+            lv_keyboard_mode_t mode = lv_keyboard_get_mode(s_keyboard);
+            lv_keyboard_set_mode(s_keyboard,
+                                 mode == LV_KEYBOARD_MODE_TEXT_UPPER
+                                     ? LV_KEYBOARD_MODE_TEXT_LOWER
+                                     : LV_KEYBOARD_MODE_TEXT_UPPER);
+        } else if (!strcmp(text, "123")) {
+            lv_keyboard_set_mode(s_keyboard, LV_KEYBOARD_MODE_SPECIAL);
+        } else if (!strcmp(text, "space")) {
+            lv_textarea_add_char(s_keyboard_target, ' ');
+        } else {
+            lv_keyboard_def_event_cb(event);
+        }
+        return;
+    }
+    if (code == LV_EVENT_READY) close_keyboard_sheet(false);
+    else if (code == LV_EVENT_CANCEL) close_keyboard_sheet(true);
+}
+
+static void keyboard_sheet_action_cb(lv_event_t *event)
+{
+    bool cancel = (intptr_t)lv_event_get_user_data(event) == 0;
+    close_keyboard_sheet(cancel);
+}
+
+
+typedef struct {
+    char ssid[NETPROV_SSID_MAXLEN + 1];
+    char password[NETPROV_PASS_MAXLEN + 1];
+    bool keep_password;
+} wifi_job_t;
 
 
 static void set_active_page(int page)
@@ -1110,12 +1583,13 @@ static void set_active_page(int page)
     if (!already_active) s_active_page = page;
     portEXIT_CRITICAL(&s_state_lock);
     if (already_active) return;
-    if (page == 0 && s_touch_services_ready) start_storage_refresh();
 
     /* Modal controls can retain pointers into the current detail tree. Close
      * them while that tree is still valid, then release the destination when
      * Manage is no longer visible. */
     if (previous_page == 2) {
+        close_keyboard_sheet(true);
+        close_manage_dialog();
         teardown_rendered_manage_destination();
     }
     if (previous_page == 1 && s_history_controller)
@@ -1164,12 +1638,14 @@ static void nav_cb(lv_event_t *event)
 
 static void set_manage_section(int section)
 {
-    if (!(section == MANAGE_LOGS)) return;
+    if (!(section == MANAGE_DEVICES || section == MANAGE_CONNECTIVITY || section == MANAGE_ALERTS || section == MANAGE_UPLOADS || section == MANAGE_LOGS)) return;
     if (section == s_active_manage_section) return;
 
     /* Teardown must precede changing the selected index so callbacks and
      * periodic painters can no longer mistake the old tree for visible. */
     if (s_active_page == 2) {
+        close_keyboard_sheet(true);
+        close_manage_dialog();
         teardown_rendered_manage_destination();
     }
     s_active_manage_section = section;
@@ -1196,11 +1672,20 @@ static void status_tray_close_cb(lv_event_t *event)
 static void status_tray_open_cb(lv_event_t *event)
 {
     (void)event;
-    if (s_touch_services_ready) start_storage_refresh();
     lv_obj_clear_flag(s_status_scrim, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(s_status_tray, LV_OBJ_FLAG_HIDDEN);
 }
 
+static void status_tray_route_cb(lv_event_t *event)
+{
+    int section = (int)(intptr_t)lv_event_get_user_data(event);
+    status_tray_close_cb(NULL);
+    /* Select while Manage is hidden so entering it constructs only the routed
+     * destination instead of briefly constructing and discarding the prior
+     * selection. */
+    set_manage_section(section);
+    set_active_page(2);
+}
 
 static void history_controller_changed(void *context)
 {
@@ -1303,6 +1788,8 @@ static void action_cb(lv_event_t *event)
             portENTER_CRITICAL(&s_state_lock);
             s_therapy_command_busy = false;
             portEXIT_CRITICAL(&s_state_lock);
+            set_active_page(2);
+            set_manage_section(MANAGE_DEVICES);
             return;
         }
         if (xTaskCreate(action_task, "ui_therapy", 4096,
@@ -1636,6 +2123,250 @@ static void build_history_page(lv_obj_t *history)
     }
     s_history_apply_scheduled = true;
 }
+static lv_obj_t *make_manage_section(lv_obj_t *section, int index,
+                                     const char *title, const char *subtitle)
+{
+    make_label(section, title, 22, 17, 500, FONT_SCREEN_TITLE, COLOR_TEXT);
+    lv_obj_t *sub = make_label(section, subtitle, 22, 45, 672,
+                               FONT_BODY, COLOR_SECONDARY);
+    if (index == MANAGE_DEVICES) s_device_section_subtitle = sub;
+    if (index == MANAGE_CONNECTIVITY) s_connectivity_section_subtitle = sub;
+    if (index == MANAGE_SYSTEM) s_system_section_subtitle = sub;
+    s_manage_scrolls[index] = make_plain_container(
+        section, 14, 76, UI_MANAGE_SCROLL_W, UI_MANAGE_SCROLL_H);
+    /* Only panes that can exceed the viewport should participate in LVGL's
+     * drag/throw machinery.  A vertical gesture on a short pane used to move
+     * the entire surface elastically and redraw hundreds of thousands of
+     * pixels even though there was nowhere useful to scroll. */
+    bool can_overflow = index == MANAGE_DEVICES ||
+                        index == MANAGE_CONNECTIVITY ||
+                        index == MANAGE_UPLOADS ||
+                        index == MANAGE_SYSTEM;
+    if (can_overflow) {
+        lv_obj_add_flag(s_manage_scrolls[index], LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(s_manage_scrolls[index], LV_OBJ_FLAG_SCROLL_ELASTIC);
+        lv_obj_set_scroll_dir(s_manage_scrolls[index], LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(s_manage_scrolls[index],
+                                  LV_SCROLLBAR_MODE_AUTO);
+        lv_obj_set_style_width(s_manage_scrolls[index], 5, LV_PART_SCROLLBAR);
+        lv_obj_set_style_bg_color(s_manage_scrolls[index],
+                                  lv_color_hex(COLOR_TERTIARY),
+                                  LV_PART_SCROLLBAR);
+    }
+    return s_manage_scrolls[index];
+}
+
+static lv_obj_t *make_manage_row(lv_obj_t *scroll, int y, int height)
+{
+    /* Only sections whose content actually overflows reserve the handoff's
+     * 14 px scrollbar gutter. Short sections use the full 740 px column. */
+    bool has_scroll_gutter = scroll == s_manage_scrolls[MANAGE_DEVICES] ||
+                             scroll == s_manage_scrolls[MANAGE_CONNECTIVITY] ||
+                             scroll == s_manage_scrolls[MANAGE_UPLOADS] ||
+                             scroll == s_manage_scrolls[MANAGE_SYSTEM];
+    lv_obj_t *row = make_card(scroll, 0, y,
+                              has_scroll_gutter ? UI_MANAGE_ROW_W
+                                                : UI_MANAGE_ROW_FULL_W,
+                              height);
+    lv_obj_set_style_bg_color(row, lv_color_hex(COLOR_CARD), 0);
+    lv_obj_set_style_radius(row, 22, 0);
+    lv_obj_set_style_pad_all(row, 16, 0);
+    return row;
+}
+
+static void style_manage_surface(lv_obj_t *field)
+{
+    lv_obj_set_style_bg_color(field, lv_color_hex(COLOR_CONTROL), 0);
+    lv_obj_set_style_bg_opa(field, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(field, lv_color_hex(0x454b58), 0);
+    lv_obj_set_style_border_width(field, 1, 0);
+    lv_obj_set_style_border_color(field, lv_color_hex(COLOR_LIVE),
+                                  LV_STATE_FOCUSED);
+    /* Do not grow the border on focus: changing it moves the content origin. */
+    lv_obj_set_style_border_width(field, 1, LV_STATE_FOCUSED);
+    lv_obj_set_style_shadow_color(field, lv_color_hex(COLOR_LIVE),
+                                  LV_STATE_FOCUSED);
+    lv_obj_set_style_shadow_width(field, 8, LV_STATE_FOCUSED);
+    lv_obj_set_style_shadow_opa(field, LV_OPA_20, LV_STATE_FOCUSED);
+    lv_obj_set_style_radius(field, 20, 0);
+    lv_obj_set_style_text_color(field, lv_color_hex(COLOR_TEXT), 0);
+    lv_obj_set_style_pad_left(field, 16, 0);
+    lv_obj_set_style_pad_right(field, 16, 0);
+}
+
+static void style_manage_field(lv_obj_t *field)
+{
+    style_manage_surface(field);
+
+    /* LVGL v8 starts dropdown and textarea copy at pad_top; it does not
+     * vertically centre single-line content. Derive symmetric padding from
+     * the actual control height and selected font so every field shares the
+     * same optical centre. The one-pixel border is intentionally constant. */
+    const lv_font_t *font = lv_obj_get_style_text_font(field, LV_PART_MAIN);
+    /* Read the explicit style value: object coordinates still contain the
+     * widget constructor's default height until LVGL's first layout pass. */
+    lv_coord_t free_height = lv_obj_get_style_height(field, LV_PART_MAIN) -
+                             lv_font_get_line_height(font) - 2;
+    if (free_height < 0) free_height = 0;
+    lv_obj_set_style_pad_top(field, free_height / 2, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(field, free_height - free_height / 2,
+                                LV_PART_MAIN);
+}
+
+static void manage_textarea_scroll_cb(lv_event_t *event)
+{
+    lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_VALUE_CHANGED || code == LV_EVENT_FOCUSED ||
+        code == LV_EVENT_SIZE_CHANGED) {
+        /* LVGL's cursor visibility logic can introduce a vertical offset even
+         * on one-line controls after a resize or password-mode transition. */
+        lv_obj_scroll_to_y(lv_event_get_target(event), 0, LV_ANIM_OFF);
+    }
+}
+
+static void style_manage_textarea(lv_obj_t *field)
+{
+    style_manage_field(field);
+    /* The label and focused cursor need a little vertical scroll slack beyond
+     * the font line box. Keep the centred top origin, leave the lower content
+     * area open, and constrain one-line fields to horizontal scrolling. */
+    lv_obj_set_style_pad_bottom(field, 0, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(field, LV_DIR_HOR);
+    lv_obj_set_scrollbar_mode(field, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(field, manage_textarea_scroll_cb, LV_EVENT_ALL, NULL);
+}
+
+static void build_devices_section(lv_obj_t *section)
+{
+    lv_obj_t *scroll = make_manage_section(section, MANAGE_DEVICES, "Devices",
+                                            "Pair and manage bedside sensors");
+    lv_obj_t *as = make_manage_row(scroll, 0, 230);
+    s_as11_row = as;
+    s_as11_dot = make_status_dot(as, 0, 23, 12);
+    set_dot_tone(s_as11_dot, COLOR_LIVE, true);
+    lv_obj_add_flag(s_as11_dot, LV_OBJ_FLAG_HIDDEN);
+    s_as11_title = make_label(as, "AirSense 11", 0, 0, 180,
+                              FONT_ROW_TITLE, COLOR_TEXT);
+    s_as11_status = make_label(as, "Starting Bluetooth service...", 190, 2, 502,
+                               FONT_BODY_SMALL, COLOR_SECONDARY);
+    s_as11_badge = make_inner_card(as, 430, -3, 82, 32, 16);
+    lv_obj_set_style_bg_color(s_as11_badge, lv_color_hex(0x123b40), 0);
+    lv_obj_t *as_badge_label = make_label(s_as11_badge, "Paired", 0, 7, 82,
+                                           FONT_BUTTON_SMALL, 0xbaf5f2);
+    lv_obj_set_style_text_align(as_badge_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(s_as11_badge, LV_OBJ_FLAG_HIDDEN);
+    static const char *steps[] = {
+        "Searching", "Connecting", "Enter code", "Confirming", "Paired"
+    };
+    for (int i = 0; i < 5; ++i) {
+        s_pair_steps[i] = lv_obj_create(as);
+        lv_obj_set_pos(s_pair_steps[i], i * 134, 40);
+        lv_obj_set_size(s_pair_steps[i], 124, 5);
+        lv_obj_set_style_radius(s_pair_steps[i], 3, 0);
+        lv_obj_set_style_border_width(s_pair_steps[i], 0, 0);
+        lv_obj_set_style_bg_color(s_pair_steps[i], lv_color_hex(COLOR_CONTROL), 0);
+        lv_obj_clear_flag(s_pair_steps[i],
+                          LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        s_pair_step_labels[i] = make_label(as, steps[i], i * 134, 51, 124,
+                                            FONT_BODY_SMALL,
+                                            COLOR_TERTIARY);
+    }
+    s_as11_dropdown = lv_dropdown_create(as);
+    lv_dropdown_set_options(s_as11_dropdown, "No devices found");
+    lv_dropdown_set_symbol(s_as11_dropdown, NULL);
+    lv_obj_set_pos(s_as11_dropdown, 0, 82);
+    lv_obj_set_size(s_as11_dropdown, 324, 56);
+    lv_obj_set_style_text_font(s_as11_dropdown, FONT_BODY_SMALL, 0);
+    style_manage_field(s_as11_dropdown);
+    make_manage_field_chevron(s_as11_dropdown);
+    lv_obj_add_event_cb(s_as11_dropdown, manage_dropdown_list_ready_cb,
+                        LV_EVENT_READY, NULL);
+    s_ble_buttons[0] = make_touch_button(as, 336, 82, 94, 56,
+                                         "AirSense is ready", COLOR_CONTROL,
+                                         scan_cb, 0);
+    lv_obj_set_style_text_font(lv_obj_get_child(s_ble_buttons[0], 0),
+                               FONT_BUTTON_COMPACT, 0);
+    s_as11_pair_button = make_touch_button(as, 442, 82, 94, 56, "Pair",
+                                           COLOR_INVERSE, device_action_cb,
+                                           DEVICE_PAIR_AS11);
+    s_ble_buttons[1] = s_as11_pair_button;
+    lv_obj_set_style_text_color(lv_obj_get_child(s_as11_pair_button, 0),
+                                lv_color_hex(COLOR_BASE), 0);
+    s_ble_buttons[2] = make_touch_button(as, 548, 82, 146, 56,
+                                         "Forget", COLOR_CONTROL,
+                                         forget_prompt_cb, DEVICE_FORGET_AS11);
+    set_button_surface(s_ble_buttons[2], 0x511e26, LV_OPA_COVER);
+    lv_obj_set_style_border_width(s_ble_buttons[2], 1, 0);
+    lv_obj_set_style_border_color(s_ble_buttons[2], lv_color_hex(COLOR_FAULT), 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(s_ble_buttons[2], 0),
+                                lv_color_hex(0xffd0ca), 0);
+    s_passkey = lv_textarea_create(as);
+    lv_textarea_set_one_line(s_passkey, true);
+    lv_textarea_set_max_length(s_passkey, 4);
+    lv_textarea_set_accepted_chars(s_passkey, "0123456789");
+    lv_textarea_set_placeholder_text(s_passkey, "4-digit pairing code");
+    lv_obj_set_pos(s_passkey, 0, 150);
+    lv_obj_set_size(s_passkey, 324, 56);
+    lv_obj_set_style_text_font(s_passkey, FONT_BODY, 0);
+    style_manage_textarea(s_passkey);
+    lv_obj_add_event_cb(s_passkey, passkey_focus_cb, LV_EVENT_FOCUSED, NULL);
+    s_passkey_confirm_button = make_touch_button(as, 336, 150, 200, 56,
+                                                  "Confirm code", COLOR_CONTROL,
+                                                  device_action_cb,
+                                                  DEVICE_CONFIRM_AS11);
+    lv_obj_add_state(s_passkey, LV_STATE_DISABLED);
+    lv_obj_add_state(s_passkey_confirm_button, LV_STATE_DISABLED);
+
+    lv_obj_t *ox = make_manage_row(scroll, 238, 138);
+    s_ox_row = ox;
+    s_ox_dot = make_status_dot(ox, 0, 23, 12);
+    set_dot_tone(s_ox_dot, COLOR_LIVE, true);
+    lv_obj_add_flag(s_ox_dot, LV_OBJ_FLAG_HIDDEN);
+    s_ox_title = make_label(ox, "O₂ Ring", 0, 0, 160,
+                            FONT_ROW_TITLE, COLOR_TEXT);
+    s_ox_status = make_label(ox, "Optional oxygen sensor", 170, 2, 522,
+                             FONT_BODY_SMALL, COLOR_SECONDARY);
+    s_ox_badge = make_inner_card(ox, 430, -3, 82, 32, 16);
+    lv_obj_set_style_bg_color(s_ox_badge, lv_color_hex(0x123b40), 0);
+    lv_obj_t *ox_badge_label = make_label(s_ox_badge, "Paired", 0, 7, 82,
+                                           FONT_BUTTON_SMALL, 0xbaf5f2);
+    lv_obj_set_style_text_align(ox_badge_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(s_ox_badge, LV_OBJ_FLAG_HIDDEN);
+    s_ox_dropdown = lv_dropdown_create(ox);
+    lv_dropdown_set_options(s_ox_dropdown, "No devices found");
+    lv_dropdown_set_symbol(s_ox_dropdown, NULL);
+    lv_obj_set_pos(s_ox_dropdown, 0, 48);
+    lv_obj_set_size(s_ox_dropdown, 324, 56);
+    lv_obj_set_style_text_font(s_ox_dropdown, FONT_BODY_SMALL, 0);
+    style_manage_field(s_ox_dropdown);
+    make_manage_field_chevron(s_ox_dropdown);
+    lv_obj_add_event_cb(s_ox_dropdown, manage_dropdown_list_ready_cb,
+                        LV_EVENT_READY, NULL);
+    s_ble_buttons[3] = make_touch_button(ox, 336, 48, 94, 56,
+                                         "Scan", COLOR_CONTROL, scan_cb, 1);
+    s_ble_buttons[4] = make_touch_button(ox, 442, 48, 94, 56,
+                                         "Pair", COLOR_INVERSE,
+                                         device_action_cb, DEVICE_PAIR_OX);
+    lv_obj_set_style_text_color(lv_obj_get_child(s_ble_buttons[4], 0),
+                                lv_color_hex(COLOR_BASE), 0);
+    s_ble_buttons[5] = make_touch_button(ox, 548, 48, 146, 56,
+                                         "Forget", COLOR_CONTROL,
+                                         forget_prompt_cb, DEVICE_FORGET_OX);
+    set_button_surface(s_ble_buttons[5], 0x511e26, LV_OPA_COVER);
+    lv_obj_set_style_border_width(s_ble_buttons[5], 1, 0);
+    lv_obj_set_style_border_color(s_ble_buttons[5], lv_color_hex(COLOR_FAULT), 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(s_ble_buttons[5], 0),
+                                lv_color_hex(0xffd0ca), 0);
+
+    s_device_change_row = make_manage_row(scroll, 384, 82);
+    s_device_change_title = make_label(s_device_change_row, "Device changes", 0, 0,
+                                       250, FONT_ROW_TITLE, COLOR_TEXT);
+    s_device_change_detail = make_label(
+        s_device_change_row,
+        "Stop therapy first to pair or forget a device.",
+        0, 29, 672, FONT_BODY_SMALL, COLOR_SECONDARY);
+    lv_obj_add_flag(s_device_change_row, LV_OBJ_FLAG_HIDDEN);
+}
 
 
 static void clear_manage_section_pointers(int section)
@@ -1643,6 +2374,36 @@ static void clear_manage_section_pointers(int section)
     if (section < 0 || section >= MANAGE_SECTION_COUNT) return;
     s_manage_sections[section] = NULL;
     s_manage_scrolls[section] = NULL;
+
+    switch ((manage_section_t)section) {
+    case MANAGE_DEVICES:
+        s_as11_row = NULL;
+        s_ox_row = NULL;
+        s_as11_title = NULL;
+        s_ox_title = NULL;
+        s_as11_dot = NULL;
+        s_ox_dot = NULL;
+        s_as11_status = NULL;
+        s_as11_badge = NULL;
+        s_as11_dropdown = NULL;
+        s_as11_pair_button = NULL;
+        memset(s_ble_buttons, 0, sizeof(s_ble_buttons));
+        memset(s_pair_steps, 0, sizeof(s_pair_steps));
+        memset(s_pair_step_labels, 0, sizeof(s_pair_step_labels));
+        s_passkey_confirm_button = NULL;
+        s_passkey = NULL;
+        s_ox_status = NULL;
+        s_ox_badge = NULL;
+        s_ox_dropdown = NULL;
+        s_device_change_row = NULL;
+        s_device_change_title = NULL;
+        s_device_change_detail = NULL;
+        s_device_section_subtitle = NULL;
+        s_seen_as11_version = UINT_MAX;
+        s_seen_ox_version = UINT_MAX;
+        break;
+    default: break;
+    }
 }
 
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
@@ -1719,9 +2480,13 @@ static void teardown_rendered_manage_destination(void)
 
     /* Any editor or confirmation can own a pointer into this destination.
      * Tear those down before publishing NULL widget pointers. */
+    close_keyboard_sheet(true);
+    close_manage_dialog();
     lv_obj_t *root = s_manage_sections[section];
     s_rendered_manage_section = -1;
     if (section == MANAGE_LOGS) touch_logs_controller_hide();
+    if (section == MANAGE_CONNECTIVITY || section == MANAGE_ALERTS || section == MANAGE_UPLOADS)
+        touch_manage_config_hide();
 
     clear_manage_section_pointers(section); /* invalidate before lv_obj_del */
     if (section == MANAGE_LOGS &&
@@ -1758,6 +2523,18 @@ static void build_manage_destination(int section)
     s_rendered_manage_section = section;
     switch ((manage_section_t)section) {
     default: break;
+    case MANAGE_DEVICES:
+        build_devices_section(destination);
+        break;
+    case MANAGE_CONNECTIVITY:
+        touch_manage_config_show(destination, MC_WIFI);
+        break;
+    case MANAGE_ALERTS:
+        touch_manage_config_show(destination, MC_ALERTS);
+        break;
+    case MANAGE_UPLOADS:
+        touch_manage_config_show(destination, MC_UPLOADS);
+        break;
     case MANAGE_LOGS: {
         s_manage_scrolls[MANAGE_LOGS] = destination;
         esp_err_t logs_result = touch_logs_controller_show(destination);
@@ -1792,8 +2569,8 @@ static void ensure_manage_destination(void)
 
 static void build_manage_page(lv_obj_t *manage)
 {
-    static const int section_ids[] = { MANAGE_LOGS };
-    static const char *section_names[] = { "Logs" };
+    static const int section_ids[] = { MANAGE_DEVICES, MANAGE_CONNECTIVITY, MANAGE_ALERTS, MANAGE_UPLOADS, MANAGE_LOGS };
+    static const char *section_names[] = { "Devices", "Connectivity", "Alerts", "Uploads", "Logs" };
     lv_obj_t *rail = make_card(manage, UI_PANEL_X, UI_PANEL_Y,
                                UI_MANAGE_RAIL_W, UI_PANEL_H);
     lv_obj_set_style_radius(rail, 28, 0);
@@ -1836,6 +2613,45 @@ static void build_manage_page(lv_obj_t *manage)
     /* Selection is established during build_ui(), but detail allocation waits
      * until Manage actually becomes the active top-level page. */
 }
+
+static const char *s_passkey_keyboard_map[] = {
+    "1", "2", "3", LV_SYMBOL_BACKSPACE, "\n",
+    "4", "5", "6", "Clear", "\n",
+    "7", "8", "9", "0", ""
+};
+
+static const lv_btnmatrix_ctrl_t s_passkey_keyboard_ctrl[] = {
+    1, 1, 1, 1,
+    1, 1, 1, 1,
+    1, 1, 1, 1,
+};
+
+/* Five compact rows reproduce the designer's 1024x600 text-entry sheet while
+ * keeping every key inside the visible framebuffer. A literal space remains
+ * a wide, intentionally blank key so LVGL inserts the correct character. */
+static const char *s_text_keyboard_lower_map[] = {
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "\n",
+    "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "\n",
+    "a", "s", "d", "f", "g", "h", "j", "k", "l", LV_SYMBOL_BACKSPACE, "\n",
+    LV_SYMBOL_UP, "z", "x", "c", "v", "b", "n", "m", ".", "123", "\n",
+    "@", "space", "-", "_", ""
+};
+
+static const char *s_text_keyboard_upper_map[] = {
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "\n",
+    "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "\n",
+    "A", "S", "D", "F", "G", "H", "J", "K", "L", LV_SYMBOL_BACKSPACE, "\n",
+    LV_SYMBOL_UP, "Z", "X", "C", "V", "B", "N", "M", ".", "123", "\n",
+    "@", "space", "-", "_", ""
+};
+
+static const lv_btnmatrix_ctrl_t s_text_keyboard_ctrl[] = {
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 8,
+    7, 5, 5, 5, 5, 5, 5, 5, 5, 7,
+    1, 5, 1, 1,
+};
 
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
 static void qemu_setup_preview_cb(lv_event_t *event)
@@ -1991,6 +2807,10 @@ static void build_ui(void)
     static const char *tray_titles[] = {
         "AirSense 11", "microSD card", "Wi-Fi", "Uploads", "O2 Ring"
     };
+    static const char *tray_actions[] = {
+        "Pair", "Manage", "Manage", "", "Pair"
+    };
+    static const int tray_sections[] = { MANAGE_DEVICES, -1, MANAGE_CONNECTIVITY, MANAGE_UPLOADS, MANAGE_DEVICES };
     lv_obj_t **details[] = {
         &s_status_tray_as11, &s_status_tray_sd, &s_status_tray_wifi,
         &s_status_tray_upload, &s_status_tray_ox
@@ -2002,6 +2822,15 @@ static void build_ui(void)
                    FONT_BODY_SMALL, COLOR_TEXT);
         *details[i] = make_label(row, "Checking...", 42, 34, 320,
                                  FONT_BODY_SMALL, COLOR_SECONDARY);
+        if (tray_sections[i] < 0) continue;
+        s_status_tray_actions[i] = make_destination_button(
+            row, 370, 11, 82, 44, tray_actions[i], COLOR_CONTROL,
+            status_tray_route_cb, tray_sections[i]);
+        set_destination_surface(s_status_tray_actions[i], COLOR_CONTROL,
+                                LV_OPA_COVER);
+        lv_obj_set_style_text_font(lv_obj_get_child(s_status_tray_actions[i], 0),
+                                   FONT_BODY_SMALL, 0);
+        lv_obj_add_flag(s_status_tray_actions[i], LV_OBJ_FLAG_HIDDEN);
     }
     lv_obj_add_flag(s_status_tray, LV_OBJ_FLAG_HIDDEN);
 
@@ -2049,6 +2878,68 @@ static void build_ui(void)
                                 lv_color_hex(0x68191a), 0);
     lv_obj_add_flag(s_alert_banner, LV_OBJ_FLAG_HIDDEN);
 
+    /* Text entry is a deliberate bottom sheet: the field behind it never
+     * becomes the only way to commit or abandon an edit. Extending the card
+     * below the framebuffer leaves square clipped bottom corners and the
+     * handoff's 34 px rounded top corners. */
+    s_keyboard_sheet = make_card(screen, 0, 314, 1024, 320);
+    lv_obj_set_style_radius(s_keyboard_sheet, 34, 0);
+    lv_obj_set_style_pad_all(s_keyboard_sheet, 0, 0);
+    lv_obj_set_style_bg_color(s_keyboard_sheet, lv_color_hex(0x1c202a), 0);
+    lv_obj_set_style_bg_grad_dir(s_keyboard_sheet, LV_GRAD_DIR_NONE, 0);
+    lv_obj_set_style_shadow_width(s_keyboard_sheet,
+                                  UI_DECORATIVE_SHADOW_WIDTH(50), 0);
+    lv_obj_set_style_shadow_ofs_y(s_keyboard_sheet, -18, 0);
+    lv_obj_set_style_shadow_opa(s_keyboard_sheet,
+                                UI_DECORATIVE_SHADOW_OPA(LV_OPA_70), 0);
+    s_keyboard_title = make_label(s_keyboard_sheet, "Network password",
+                                  18, 24, 430,
+                                  FONT_BUTTON, COLOR_TEXT);
+    lv_obj_t *keyboard_cancel = make_touch_button(
+        s_keyboard_sheet, 798, 14, 92, 42, "Cancel", COLOR_CONTROL,
+        keyboard_sheet_action_cb, 0);
+    lv_obj_set_style_radius(keyboard_cancel, 21, 0);
+    lv_obj_set_style_text_font(lv_obj_get_child(keyboard_cancel, 0),
+                               FONT_BUTTON_COMPACT, 0);
+    lv_obj_t *keyboard_done = make_touch_button(
+        s_keyboard_sheet, 898, 14, 104, 42, "Done", COLOR_INVERSE,
+        keyboard_sheet_action_cb, 1);
+    lv_obj_set_style_radius(keyboard_done, 21, 0);
+    lv_obj_set_style_text_font(lv_obj_get_child(keyboard_done, 0),
+                               FONT_BUTTON_COMPACT, 0);
+    lv_obj_set_style_text_color(lv_obj_get_child(keyboard_done, 0),
+                                lv_color_hex(COLOR_BASE), 0);
+
+    s_keyboard = lv_keyboard_create(s_keyboard_sheet);
+    lv_obj_remove_event_cb(s_keyboard, lv_keyboard_def_event_cb);
+    lv_keyboard_set_mode(s_keyboard, LV_KEYBOARD_MODE_NUMBER);
+    lv_keyboard_set_map(s_keyboard, LV_KEYBOARD_MODE_NUMBER,
+                        s_passkey_keyboard_map, s_passkey_keyboard_ctrl);
+    lv_keyboard_set_map(s_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER,
+                        s_text_keyboard_lower_map, s_text_keyboard_ctrl);
+    lv_keyboard_set_map(s_keyboard, LV_KEYBOARD_MODE_TEXT_UPPER,
+                        s_text_keyboard_upper_map, s_text_keyboard_ctrl);
+    lv_obj_set_align(s_keyboard, LV_ALIGN_TOP_LEFT);
+    lv_obj_set_pos(s_keyboard, 14, 67);
+    lv_obj_set_size(s_keyboard, 996, 203);
+    lv_obj_set_style_bg_opa(s_keyboard, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_keyboard, 0, 0);
+    lv_obj_set_style_pad_all(s_keyboard, 0, 0);
+    lv_obj_set_style_pad_row(s_keyboard, 9, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(s_keyboard, 7, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_keyboard, lv_color_hex(COLOR_CONTROL),
+                              LV_PART_ITEMS);
+    lv_obj_set_style_bg_opa(s_keyboard, LV_OPA_COVER, LV_PART_ITEMS);
+    lv_obj_set_style_border_width(s_keyboard, 0, LV_PART_ITEMS);
+    lv_obj_set_style_radius(s_keyboard, 16, LV_PART_ITEMS);
+    lv_obj_set_style_text_color(s_keyboard, lv_color_hex(COLOR_TEXT),
+                                LV_PART_ITEMS);
+    /* The shared map contains Shift/Backspace symbols absent from the custom
+     * prose fonts. Keep those controls readable in every keyboard consumer. */
+    lv_obj_set_style_text_font(s_keyboard, LV_FONT_DEFAULT, LV_PART_ITEMS);
+    lv_obj_add_event_cb(s_keyboard, keyboard_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_flag(s_keyboard_sheet, LV_OBJ_FLAG_HIDDEN);
+
     /* Dialog backdrops also live on LVGL's top layer. Parenting the wake
      * surface there ensures it remains above a confirmation dialog while the
      * physical backlight is dark. */
@@ -2086,9 +2977,72 @@ static void build_ui(void)
     lv_obj_move_foreground(setup_preview_hotspot);
 #endif
 
-    set_manage_section(MANAGE_LOGS);
+    set_manage_section(MANAGE_DEVICES);
     set_active_page(0);
     lv_obj_invalidate(screen);
+}
+
+static void refresh_device_dropdown(bool oxygen, const ui_service_state_t *services)
+{
+    unsigned version = oxygen ? services->ox_version : services->as11_version;
+    unsigned *seen = oxygen ? &s_seen_ox_version : &s_seen_as11_version;
+    if (*seen == version) return;
+    *seen = version;
+    const ui_device_result_t *items = oxygen ? services->ox : services->as11;
+    size_t count = oxygen ? services->ox_count : services->as11_count;
+    lv_obj_t *dropdown = oxygen ? s_ox_dropdown : s_as11_dropdown;
+    char options[700] = {0};
+    if (count == 0) {
+        strlcpy(options, "No devices found", sizeof(options));
+    } else {
+        for (size_t i = 0; i < count; ++i) {
+            size_t used = strlen(options);
+            snprintf(options + used, sizeof(options) - used, "%s%s (%d dBm)",
+                     i ? "\n" : "", items[i].name, items[i].rssi);
+        }
+    }
+    lv_dropdown_set_options(dropdown, options);
+}
+
+static const char *friendly_as11_status(const char *status, bool scanning)
+{
+    if (scanning || !strcmp(status, AS11_STATUS_SCANNING))
+        return "Searching for nearby machines";
+    if (!strcmp(status, AS11_STATUS_CONNECTING)) return "Connecting securely";
+    if (!strcmp(status, AS11_STATUS_WAIT_PASSKEY))
+        return "Enter the 4-digit code shown on your AirSense";
+    if (!strcmp(status, AS11_STATUS_CONFIRMING)) return "Confirming the code";
+    if (!strcmp(status, AS11_STATUS_PAIRED)) return "Paired and ready";
+    if (!strcmp(status, AS11_STATUS_ERROR))
+        return "Pairing failed · enable pairing mode first";
+    if (!strcmp(status, "simulated preview"))
+        return "Paired · simulated device ready";
+    return "Then tap AirSense is ready to scan";
+}
+
+static const char *friendly_ox_status(const char *status, bool scanning)
+{
+    if (scanning || !strcmp(status, OX_STATUS_SCANNING))
+        return "Searching for nearby rings";
+    if (!strcmp(status, OX_STATUS_CONNECTING)) return "Connecting to ring";
+    if (!strcmp(status, OX_STATUS_PULLING)) return "Importing ring data";
+    if (!strcmp(status, OX_STATUS_PAIRED)) return "Paired and ready";
+    if (!strcmp(status, OX_STATUS_MONITORING)) return "Monitoring live data";
+    if (!strcmp(status, OX_STATUS_ERROR)) return "Ring needs attention";
+    if (!strcmp(status, "simulated preview"))
+        return "Paired · simulated device ready";
+    return "Ready to scan";
+}
+
+static int pairing_step(const char *status, bool scanning)
+{
+    if (scanning || !strcmp(status, AS11_STATUS_SCANNING)) return 0;
+    if (!strcmp(status, AS11_STATUS_CONNECTING)) return 1;
+    if (!strcmp(status, AS11_STATUS_WAIT_PASSKEY)) return 2;
+    if (!strcmp(status, AS11_STATUS_CONFIRMING)) return 3;
+    if (!strcmp(status, AS11_STATUS_PAIRED) ||
+        !strcmp(status, "simulated preview")) return 4;
+    return -1;
 }
 
 
@@ -2107,9 +3061,18 @@ static void refresh_manage_rail(const ui_state_t *state)
 
     alert_state_t alert = therapy_alert_get_state();
     bool active_alert = therapy_alert_is_actionable(alert);
+    manage_config_health_t configuration;
+    touch_manage_config_health(&configuration);
+    bool channel_attention = configuration.ready && configuration.alerts_enabled &&
+        (!configuration.push_configured || !configuration.push_verified || !state->wifi);
     /* Armed alone establishes the schedule, not push deliverability. */
     dots[MANAGE_ALERTS] = active_alert ? COLOR_FAULT :
                           alert == ALERT_ARMED ? COLOR_AMBER : COLOR_TERTIARY;
+    if (configuration.ready && !active_alert) {
+        dots[MANAGE_ALERTS] = configuration.history_storage_error ? COLOR_FAULT :
+            !configuration.alerts_enabled ? COLOR_TERTIARY :
+            channel_attention ? COLOR_AMBER : COLOR_LIVE;
+    }
     badges[MANAGE_ALERTS] = active_alert ? 1U : 0U;
 
     uploader_progress_snapshot_t uploads;
@@ -2146,7 +3109,8 @@ static void refresh_manage_rail(const ui_state_t *state)
     dots[MANAGE_SYSTEM] = controller_failed ? COLOR_FAULT :
         !controllers_known || !s_touch_services_ready ? COLOR_TERTIARY :
         !state->wifi || !state->sd_ready || !state->paired ||
-        badges[MANAGE_UPLOADS] || active_alert ? COLOR_AMBER : COLOR_LIVE;
+        badges[MANAGE_UPLOADS] || active_alert || channel_attention ||
+        configuration.history_storage_error ? COLOR_AMBER : COLOR_LIVE;
 
     log_stream_retained_info_t logs;
     esp_err_t log_result = log_stream_retained_get_info(&logs);
@@ -2163,13 +3127,249 @@ static void refresh_manage_rail(const ui_state_t *state)
 
 static void refresh_secondary_pages(const ui_state_t *state, int active_tab)
 {
+    const ui_service_state_t *services = s_render_services;
+    ble_ui_operation_t ble_operation;
+    int64_t ble_started;
+    bool reboot_busy;
+    bool wifi_save_busy;
+    bool pairing_mode_confirmed;
+    portENTER_CRITICAL(&s_state_lock);
+    ble_operation = s_ble_operation;
+    ble_started = s_ble_operation_started_us;
+    reboot_busy = s_reboot_busy;
+    wifi_save_busy = s_wifi_save_busy;
+    pairing_mode_confirmed = s_as11_pairing_mode_confirmed;
+    portEXIT_CRITICAL(&s_state_lock);
+
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    const char *as_status = "simulated preview";
+    const char *ox_status = "simulated preview";
+#else
+    const char *as_status = s_as11_service_ready ? as11_ble_get_status() : "unavailable";
+    const char *ox_status = s_ox_service_ready ? oximeter_get_status() : "unavailable";
+#endif
+
+    /* Pairing can finish after the user leaves Manage, so completion polling
+     * remains a background responsibility. Everything below this point only
+     * paints Manage widgets and should not consume render time on Home or
+     * History. */
+    if (ble_started && esp_timer_get_time() - ble_started > 1000000) {
+        bool as_done = ble_operation == BLE_UI_PAIR_AS11 &&
+                       (!strcmp(as_status, AS11_STATUS_PAIRED) ||
+                        !strcmp(as_status, AS11_STATUS_ERROR));
+        bool ox_done = ble_operation == BLE_UI_PAIR_OX &&
+                       (!strcmp(ox_status, OX_STATUS_PAIRED) ||
+                        !strcmp(ox_status, OX_STATUS_MONITORING) ||
+                        !strcmp(ox_status, OX_STATUS_ERROR));
+        if (as_done && !strcmp(as_status, AS11_STATUS_ERROR)) {
+            portENTER_CRITICAL(&s_state_lock);
+            s_as11_pairing_mode_confirmed = false;
+            portEXIT_CRITICAL(&s_state_lock);
+            pairing_mode_confirmed = false;
+        }
+        if (as_done || ox_done) end_ble_operation();
+    }
+
     reap_retired_logs_destination();
     if (active_tab != 2) return;
     refresh_manage_rail(state);
     int section = s_rendered_manage_section;
+    if (section < 0 || section >= MANAGE_SECTION_COUNT ||
+        section != s_active_manage_section || !s_manage_sections[section])
+        return;
+    lv_obj_t *active_scroll = s_manage_scrolls[section];
+    if (active_scroll && lv_obj_is_scrolling(active_scroll)) {
+        /* Static state catches up on the next 500 ms pass. Deferring it while
+         * the finger is moving prevents unrelated labels and hidden sections
+         * from competing with LVGL's scroll redraw. */
+        return;
+    }
+
     if (section == MANAGE_LOGS) {
         touch_logs_controller_refresh(state->sd_ready);
         return;
+    }
+    if (section == MANAGE_CONNECTIVITY || section == MANAGE_ALERTS || section == MANAGE_UPLOADS) {
+        touch_manage_config_refresh();
+        return;
+    }
+    if (section == MANAGE_DEVICES) {
+        refresh_device_dropdown(false, services);
+        refresh_device_dropdown(true, services);
+    }
+
+    if (!s_touch_services_ready) {
+        if (section == MANAGE_DEVICES) {
+            lv_label_set_text(s_as11_status, "Starting Bluetooth service...");
+            lv_label_set_text(s_ox_status, "Starting Bluetooth service...");
+            lv_label_set_text(s_device_section_subtitle,
+                              "Pairing services are starting");
+            for (int i = 0; i < 6; ++i)
+                lv_obj_add_state(s_ble_buttons[i], LV_STATE_DISABLED);
+            lv_obj_add_state(s_as11_dropdown, LV_STATE_DISABLED);
+            lv_obj_add_state(s_ox_dropdown, LV_STATE_DISABLED);
+            lv_obj_add_state(s_passkey, LV_STATE_DISABLED);
+            lv_obj_add_state(s_passkey_confirm_button, LV_STATE_DISABLED);
+        }
+        return;
+    }
+
+    bool as_paired = state->paired;
+#if !CONFIG_SOMNOTRACE_BOARD_QEMU
+    as_paired = s_as11_service_ready && as11_ble_is_paired();
+#endif
+    bool ox_paired = !strcmp(ox_status, OX_STATUS_PAIRED) ||
+                     !strcmp(ox_status, OX_STATUS_MONITORING) ||
+                     !strcmp(ox_status, "simulated preview");
+    if (section == MANAGE_DEVICES) {
+        lv_label_set_text(s_as11_status,
+                      as_paired && !strcmp(as_status, AS11_STATUS_IDLE)
+                          ? "Paired and ready"
+                          : friendly_as11_status(as_status, services->as11_busy));
+    lv_label_set_text(s_ox_status,
+                      friendly_ox_status(ox_status, services->ox_busy));
+    lv_label_set_text(s_device_section_subtitle,
+                      as_paired && ox_paired ? "Both devices paired"
+                      : as_paired ? "AirSense paired · oxygen sensor optional"
+                      : !pairing_mode_confirmed ||
+                        !strcmp(as_status, AS11_STATUS_ERROR)
+                          ? "First on AirSense: More › MyAir App › OK, downloaded › Connect"
+                          : "AirSense pairing mode confirmed · keep that screen open");
+    bool waiting_passkey = !strcmp(as_status, AS11_STATUS_WAIT_PASSKEY);
+    if (waiting_passkey) {
+        lv_obj_set_style_border_color(s_passkey, lv_color_hex(0x43d7e8), 0);
+    } else {
+        lv_obj_set_style_border_color(s_passkey, lv_color_hex(0x454b58), 0);
+    }
+    if (waiting_passkey && !state->therapy) {
+        lv_obj_clear_state(s_passkey, LV_STATE_DISABLED);
+        lv_obj_clear_state(s_passkey_confirm_button, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_state(s_passkey, LV_STATE_DISABLED);
+        lv_obj_add_state(s_passkey_confirm_button, LV_STATE_DISABLED);
+    }
+    bool ble_controls_blocked = state->therapy || ble_operation != BLE_UI_IDLE;
+    for (int i = 0; i < 6; ++i) {
+        if (ble_controls_blocked) lv_obj_add_state(s_ble_buttons[i], LV_STATE_DISABLED);
+        else lv_obj_clear_state(s_ble_buttons[i], LV_STATE_DISABLED);
+    }
+    lv_label_set_text(lv_obj_get_child(s_ble_buttons[0], 0),
+                      pairing_mode_confirmed ? "Scan again" : "AirSense is ready");
+    if (!pairing_mode_confirmed)
+        lv_obj_add_state(s_as11_pair_button, LV_STATE_DISABLED);
+    if (ble_controls_blocked) {
+        lv_obj_add_state(s_as11_dropdown, LV_STATE_DISABLED);
+        lv_obj_add_state(s_ox_dropdown, LV_STATE_DISABLED);
+    } else {
+        lv_obj_clear_state(s_as11_dropdown, LV_STATE_DISABLED);
+        lv_obj_clear_state(s_ox_dropdown, LV_STATE_DISABLED);
+    }
+    int phase = as_paired && !strcmp(as_status, AS11_STATUS_IDLE)
+                    ? 4 : pairing_step(as_status, services->as11_busy);
+    bool pairing_error = !strcmp(as_status, AS11_STATUS_ERROR);
+    bool as_pairing = !as_paired && phase >= 0;
+    for (int i = 0; i < 5; ++i) {
+        set_hidden(s_pair_steps[i], !as_pairing);
+        set_hidden(s_pair_step_labels[i], !as_pairing);
+        uint32_t color = pairing_error && i == (phase < 0 ? 0 : phase)
+                             ? COLOR_FAULT
+                             : phase >= i ? COLOR_LIVE : COLOR_CONTROL;
+        lv_obj_set_style_bg_color(s_pair_steps[i], lv_color_hex(color), 0);
+        lv_obj_set_style_text_color(s_pair_step_labels[i],
+                                    lv_color_hex(phase >= i ? COLOR_SECONDARY
+                                                            : COLOR_DISABLED), 0);
+    }
+
+    /* Render Devices as actual state-specific rows. In the settled paired
+     * state, scan fields and the passkey disappear instead of contradicting
+     * the status with a disabled "No devices found" form. */
+    bool show_as_results = !as_paired && !as_pairing && services->as11_count > 0;
+    bool show_as_idle = !as_paired && !as_pairing && !show_as_results;
+    int as_height = as_paired ? 92 : waiting_passkey ? 162
+                              : as_pairing ? 110
+                              : show_as_results ? 114 : 92;
+    lv_obj_set_height(s_as11_row, as_height);
+    set_hidden(s_as11_dot, !as_paired);
+    lv_obj_set_pos(s_as11_title, as_paired ? 28 : 0,
+                   as_paired ? 4 : 0);
+    lv_obj_set_pos(s_as11_status,
+                   as_paired ? 28 : (as_pairing || show_as_results) ? 190 : 0,
+                   as_paired ? 34 : (as_pairing || show_as_results) ? 2 : 29);
+    lv_obj_set_width(s_as11_status,
+                     (as_pairing || show_as_results) ? 502 : 522);
+    set_hidden(s_as11_badge, !as_paired);
+    if (as_paired) lv_obj_set_pos(s_as11_badge, 150, 0);
+    set_hidden(s_as11_dropdown, !show_as_results);
+    set_hidden(s_ble_buttons[0], !(show_as_idle || show_as_results));
+    set_hidden(s_as11_pair_button, !show_as_results);
+    set_hidden(s_ble_buttons[2], !as_paired);
+    set_hidden(s_passkey, !waiting_passkey);
+    set_hidden(s_passkey_confirm_button, !waiting_passkey);
+    if (show_as_idle || as_paired) {
+        lv_obj_set_pos(s_ble_buttons[show_as_idle ? 0 : 2], 548, -3);
+        lv_obj_set_size(s_ble_buttons[show_as_idle ? 0 : 2], 146, 56);
+    } else if (show_as_results) {
+        lv_obj_set_pos(s_as11_dropdown, 0, 40);
+        lv_obj_set_pos(s_ble_buttons[0], 336, 40);
+        lv_obj_set_size(s_ble_buttons[0], 94, 56);
+        lv_obj_set_pos(s_as11_pair_button, 442, 40);
+    } else if (waiting_passkey) {
+        lv_obj_set_pos(s_passkey, 0, 82);
+        lv_obj_set_pos(s_passkey_confirm_button, 336, 82);
+    }
+
+    bool ox_pairing = services->ox_busy || ble_operation == BLE_UI_PAIR_OX ||
+                      ble_operation == BLE_UI_SCAN_OX;
+    bool show_ox_results = !ox_paired && !ox_pairing && services->ox_count > 0;
+    bool show_ox_idle = !ox_paired && !ox_pairing && !show_ox_results;
+    int ox_height = ox_paired ? 92 : show_ox_results ? 114 : 92;
+    int ox_y = as_height + 8;
+    lv_obj_set_pos(s_ox_row, 0, ox_y);
+    lv_obj_set_height(s_ox_row, ox_height);
+    set_hidden(s_ox_dot, !ox_paired);
+    lv_obj_set_pos(s_ox_title, ox_paired ? 28 : 0,
+                   ox_paired ? 4 : 0);
+    lv_obj_set_pos(s_ox_status,
+                   ox_paired ? 28 : show_ox_results || ox_pairing ? 170 : 0,
+                   ox_paired ? 34 : show_ox_results || ox_pairing ? 2 : 29);
+    lv_obj_set_width(s_ox_status, 522);
+    set_hidden(s_ox_badge, !ox_paired);
+    if (ox_paired) lv_obj_set_pos(s_ox_badge, 112, 0);
+    set_hidden(s_ox_dropdown, !show_ox_results);
+    set_hidden(s_ble_buttons[3], !(show_ox_idle || show_ox_results));
+    set_hidden(s_ble_buttons[4], !show_ox_results);
+    set_hidden(s_ble_buttons[5], !ox_paired);
+    if (show_ox_idle || ox_paired) {
+        lv_obj_set_pos(s_ble_buttons[show_ox_idle ? 3 : 5], 548, -3);
+        lv_obj_set_size(s_ble_buttons[show_ox_idle ? 3 : 5], 146, 56);
+    } else if (show_ox_results) {
+        lv_obj_set_pos(s_ox_dropdown, 0, 40);
+        lv_obj_set_pos(s_ble_buttons[3], 336, 40);
+        lv_obj_set_size(s_ble_buttons[3], 94, 56);
+        lv_obj_set_pos(s_ble_buttons[4], 442, 40);
+    }
+
+    bool show_device_change = as_paired || ox_paired;
+    set_hidden(s_device_change_row, !show_device_change);
+    if (show_device_change) {
+        lv_obj_set_y(s_device_change_row, ox_y + ox_height + 8);
+        lv_label_set_text(s_device_change_title, "Pairing while therapy runs");
+        lv_label_set_text(s_device_change_detail,
+                          "Device changes are blocked during therapy. Stop therapy first to pair or forget a device.");
+    }
+    }
+
+    bool network_busy = reboot_busy || wifi_save_busy;
+    if (section == MANAGE_DEVICES) {
+        bool network_controls_blocked = state->therapy || network_busy;
+        if (!network_controls_blocked && services->as11_count == 0)
+            lv_obj_add_state(s_as11_pair_button, LV_STATE_DISABLED);
+        if (!network_controls_blocked && services->ox_count == 0)
+            lv_obj_add_state(s_ble_buttons[4], LV_STATE_DISABLED);
+        if (!as_paired)
+            lv_obj_add_state(s_ble_buttons[2], LV_STATE_DISABLED);
+        if (!ox_paired)
+            lv_obj_add_state(s_ble_buttons[5], LV_STATE_DISABLED);
     }
 }
 
@@ -2570,6 +3770,16 @@ static void update_ui(void)
     for (int i = 0; i < 5; ++i)
         set_dot_tone(s_status_tray_dots[i], tray_tones[i],
                      tray_tones[i] != COLOR_DISABLED);
+    bool tray_action_visible[] = {
+        !state.paired || airsense_stale,
+        storage_degraded || storage_fault,
+        !state.wifi,
+        false,
+        !ring_paired,
+    };
+    for (int i = 0; i < 5; ++i)
+        if (s_status_tray_actions[i])
+            set_hidden(s_status_tray_actions[i], !tray_action_visible[i]);
 
     bool recording;
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
@@ -2598,7 +3808,7 @@ static void update_ui(void)
         therapy_command_busy
             ? (therapy_command_target ? "Sending start command..."
                                       : "Sending stop command...")
-        : !state.paired ? "AirSense is not paired"
+        : !state.paired ? "Pair your AirSense in Manage › Devices"
         : airsense_stale ? "AirSense data is stale - reconnecting"
         : state.therapy && recording ? "Recording to card"
         : state.therapy && (!state.sd_ready || storage_fault)
@@ -2653,9 +3863,9 @@ static void update_ui(void)
         s_therapy_button_label,
         therapy_command_busy
             ? (therapy_command_target ? "Starting..." : "Stopping...")
-        : !state.paired ? "AirSense not paired"
+        : !state.paired ? "Pair a device"
                         : (state.therapy ? "Stop therapy" : "Start therapy"));
-    bool therapy_button_disabled = !state.paired || therapy_command_busy;
+    bool therapy_button_disabled = therapy_command_busy;
     if (therapy_button_disabled)
         lv_obj_add_state(s_therapy_button, LV_STATE_DISABLED);
     else
@@ -3194,7 +4404,6 @@ void bsp_display_enable_touch_services(bool as11_ready, bool oximeter_ready)
     s_as11_service_ready = as11_ready;
     s_ox_service_ready = oximeter_ready;
     portEXIT_CRITICAL(&s_state_lock);
-    start_storage_refresh();
 }
 
 esp_err_t bsp_display_start_first_run_setup(esp_err_t initial_card_result)
@@ -3853,6 +5062,21 @@ void bsp_display_qemu_seed_demo(void)
     uploader_progress_snapshot_t upload_progress;
     qemu_upload_progress(&upload_progress);
     portENTER_CRITICAL(&s_state_lock);
+    s_services.as11_count = 1;
+    strlcpy(s_services.as11[0].addr, "AA:11:00:00:00:01",
+            sizeof(s_services.as11[0].addr));
+    strlcpy(s_services.as11[0].name, "AirSense 11 (simulated)",
+            sizeof(s_services.as11[0].name));
+    s_services.as11[0].rssi = -47;
+    s_services.as11_version++;
+    s_services.ox_count = 1;
+    strlcpy(s_services.ox[0].addr, "02:00:00:00:00:02",
+            sizeof(s_services.ox[0].addr));
+    strlcpy(s_services.ox[0].name, "O2 Ring (simulated)",
+            sizeof(s_services.ox[0].name));
+    s_services.ox[0].rssi = -55;
+    s_services.ox[0].driver = OX_DRIVER_AUTO;
+    s_services.ox_version++;
     s_services.storage_free = 1932735283ULL;
     s_services.storage_total = 32ULL * 1024ULL * 1024ULL * 1024ULL;
     s_services.storage_result = ESP_OK;

@@ -99,13 +99,14 @@ static int s_n_rt = 0;
 
 /* ── Module state ─────────────────────────────────────────────────── */
 
-typedef enum { EV_EXPORT = 0, EV_INVALIDATE, EV_SCAN, EV_RESET } ev_type_t;
+typedef enum { EV_EXPORT = 0, EV_INVALIDATE, EV_SCAN, EV_RESET, EV_TEST, EV_RETRY } ev_type_t;
 
 typedef struct {
     uint8_t  type;
     uint32_t day;
 } sched_ev_t;
 
+static uploader_test_snapshot_t s_test;
 static QueueHandle_t s_queue;
 static TaskHandle_t  s_task;
 static SemaphoreHandle_t s_lock;      /* guards API-visible runtime snapshots + status */
@@ -908,6 +909,35 @@ static void sched_task(void *arg)
                 run_pass();
                 break;
 
+            case EV_TEST: {
+                if (s_busy_fn && s_busy_fn()) {
+                    xSemaphoreTake(s_lock, portMAX_DELAY);
+                    s_test.state = UPLOAD_TEST_BLOCKED;
+                    strlcpy(s_test.detail, "Recording is active; test was not started", sizeof(s_test.detail));
+                    xSemaphoreGive(s_lock);
+                    break;
+                }
+                xSemaphoreTake(s_lock, portMAX_DELAY);
+                s_test.state = UPLOAD_TEST_RUNNING;
+                xSemaphoreGive(s_lock);
+                esp_err_t result = ev.day == 1 ? uploader_smb_probe() : uploader_sleephq_probe();
+                xSemaphoreTake(s_lock, portMAX_DELAY);
+                s_test.state = result == ESP_OK ? UPLOAD_TEST_PASSED : UPLOAD_TEST_FAILED;
+                s_test.completed_epoch = now_s() > 1609459200 ? now_s() : 0;
+                xSemaphoreGive(s_lock);
+                break;
+            }
+            case EV_RETRY:
+                if (s_busy_fn && s_busy_fn()) { set_status("Retry deferred: recording active"); break; }
+                for (int i = 0; i < s_n_rt; i++) {
+                    if (ev.day && strcmp(s_rt[i].be->id, ev.day == 1 ? "smb" : "sleephq")) continue;
+                    if (!s_rt[i].be->is_configured()) continue;
+                    cooldown_reset(&s_rt[i]);
+                    set_be_state(&s_rt[i], SB_IDLE);
+                    run_backend(&s_rt[i], uploader_max_days());
+                }
+                refresh_index_progress_cache();
+                break;
             case EV_SCAN:
             default:
                 do_scan();
@@ -1002,14 +1032,6 @@ void upload_sched_request_scan(void)              { post(EV_SCAN, 0); }
 void upload_sched_request_reset(void)             { post(EV_RESET, 0); }
 
 void upload_sched_set_busy_fn(upload_sched_busy_fn_t fn) { s_busy_fn = fn; }
-
-bool upload_sched_uploading(void)
-{
-    for (int i = 0; i < s_n_rt; i++) {
-        if (s_rt[i].be && s_rt[i].state == SB_UPLOADING) return true;
-    }
-    return false;
-}
 
 /* ── Progress reporting ───────────────────────────────────────────── */
 
@@ -1200,4 +1222,67 @@ void upload_sched_summary(int *out_pending, const char **out_worst)
     if (s_lock) xSemaphoreGive(s_lock);
     if (out_pending) *out_pending = pending;
     if (out_worst) *out_worst = worst;
+}
+
+static int backend_key(const char *id)
+{
+    if (!id) return 0;
+    if (!strcmp(id, "smb")) return 1;
+    if (!strcmp(id, "sleephq")) return 2;
+    return -1;
+}
+esp_err_t uploader_retry(const char *backend)
+{
+    int key = backend_key(backend);
+    if (key < 0) return ESP_ERR_INVALID_ARG;
+    if (!s_queue || (s_busy_fn && s_busy_fn())) return ESP_ERR_INVALID_STATE;
+    sched_ev_t ev = { .type = EV_RETRY, .day = key };
+    return xQueueSend(s_queue, &ev, 0) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+esp_err_t uploader_test_request(const char *backend, uint32_t *generation_out)
+{
+    int key = backend_key(backend);
+    if (key <= 0) return ESP_ERR_INVALID_ARG;
+    if (!s_queue || (s_busy_fn && s_busy_fn())) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_test.state == UPLOAD_TEST_QUEUED || s_test.state == UPLOAD_TEST_RUNNING) {
+        xSemaphoreGive(s_lock); return ESP_ERR_INVALID_STATE;
+    }
+    uint32_t generation = s_test.generation + 1;
+    memset(&s_test, 0, sizeof(s_test));
+    s_test.generation = generation;
+    s_test.state = UPLOAD_TEST_QUEUED;
+    strlcpy(s_test.backend, backend, sizeof(s_test.backend));
+    strlcpy(s_test.detail, "Waiting for active upload to finish", sizeof(s_test.detail));
+    sched_ev_t ev = { .type = EV_TEST, .day = key };
+    bool sent = xQueueSend(s_queue, &ev, 0) == pdTRUE;
+    if (!sent) s_test.state = UPLOAD_TEST_BLOCKED;
+    if (generation_out) *generation_out = generation;
+    xSemaphoreGive(s_lock);
+    return sent ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+void uploader_test_snapshot(uploader_test_snapshot_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!s_lock) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY); *out = s_test; xSemaphoreGive(s_lock);
+}
+void uploader_test_stage(uploader_test_stage_t stage, bool completed, const char *detail)
+{
+    if (!s_lock) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_test.stage = stage;
+    if (completed) s_test.completed_mask |= 1U << stage;
+    strlcpy(s_test.detail, detail, sizeof(s_test.detail));
+    xSemaphoreGive(s_lock);
+}
+
+void uploader_test_failed(uploader_test_stage_t stage, const char *detail)
+{
+    if (!s_lock) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_test.stage = stage;
+    s_test.failed_mask |= 1U << stage;
+    strlcpy(s_test.detail,detail,sizeof(s_test.detail));
+    xSemaphoreGive(s_lock);
 }

@@ -2622,6 +2622,35 @@ function sendAlertTestPush() {
 }
 
 /* ── Upload "Test connection" ──────────────────────────────────── */
+function pollUploadConnection(id, generation, attempt) {
+  var st = document.getElementById(id + '-test-status');
+  var btn = document.getElementById(id + '-test-btn');
+  fetch('/api/uploads/test-status').then(function(r) {
+    if (!r.ok) throw new Error('Status unavailable');
+    return r.json();
+  }).then(function(d) {
+    if (d.generation !== generation) throw new Error('Another test replaced this result');
+    if (d.state === 'queued' || d.state === 'running') {
+      if (st) {
+        st.textContent = d.detail || (d.state === 'queued' ? 'Waiting…' : 'Testing…');
+        st.style.color = 'var(--text-muted)';
+      }
+      if (attempt >= 600) throw new Error('Test is still queued; try again later');
+      setTimeout(function() { pollUploadConnection(id, generation, attempt + 1); }, 1000);
+      return;
+    }
+    var ok = d.state === 'passed';
+    if (st) {
+      st.textContent = d.detail || (ok ? 'Connected' : 'Failed');
+      st.style.color = ok ? 'var(--success)' : 'var(--danger)';
+    }
+    if (btn) btn.disabled = false;
+  }).catch(function(err) {
+    if (st) { st.textContent = err.message || 'Network error'; st.style.color = 'var(--danger)'; }
+    if (btn) btn.disabled = false;
+  });
+}
+
 function testUploadConnection(id) {
   var st = document.getElementById(id + '-test-status');
   var btn = document.getElementById(id + '-test-btn');
@@ -2634,15 +2663,14 @@ function testUploadConnection(id) {
   if (st) { st.textContent = 'Testing…'; st.style.color = 'var(--text-muted)'; }
   if (btn) btn.disabled = true;
   fetch('/api/uploads/test-' + (id === 'shq' ? 'sleephq' : id), { method: 'POST' }).then(function(r) {
-    return r.json();
+    return r.json().then(function(d) {
+      if (!r.ok || !d.accepted) throw new Error(d.message || 'Test could not start');
+      return d;
+    });
   }).then(function(d) {
-    if (st) {
-      st.textContent = d.message || (d.ok ? 'Connected' : 'Failed');
-      st.style.color = d.ok ? 'var(--success)' : 'var(--danger)';
-    }
-  }).catch(function() {
-    if (st) { st.textContent = 'Network error'; st.style.color = 'var(--danger)'; }
-  }).then(function() {
+    pollUploadConnection(id, d.generation, 0);
+  }).catch(function(err) {
+    if (st) { st.textContent = err.message || 'Network error'; st.style.color = 'var(--danger)'; }
     if (btn) btn.disabled = false;
   });
 }

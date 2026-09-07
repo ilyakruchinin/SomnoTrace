@@ -343,14 +343,25 @@ esp_err_t uploader_save_config_json(const char *json_str);
  * Asynchronous: the work happens on the scheduler task. */
 esp_err_t uploader_reset_state(void);
 
-/* "Test connection" for the web UI: probe one backend ("smb" | "sleephq")
- * with the configuration currently saved in NVS, without uploading anything.
- * msg receives a one-line outcome for the user in every case.
- *   ESP_OK                 the probe ran; *out_ok says whether it passed
- *   ESP_ERR_INVALID_STATE  an upload is in progress (one transport at a time,
- *                          see the backend interface note) or the uploader
- *                          has not finished initialising
- *   ESP_ERR_NOT_FOUND      unknown backend id
- * Blocks the caller for up to the backend's probe timeout (about 10 s). */
-esp_err_t uploader_test_connection(const char *backend_id, bool *out_ok,
-                                   char *msg, size_t msg_len);
+/* Scheduler-owned connection probes; bounded snapshots contain no credentials. */
+typedef enum { UPLOAD_TEST_IDLE, UPLOAD_TEST_QUEUED, UPLOAD_TEST_RUNNING,
+               UPLOAD_TEST_PASSED, UPLOAD_TEST_FAILED, UPLOAD_TEST_BLOCKED } uploader_test_state_t;
+typedef enum { UPLOAD_STAGE_RESOLVE, UPLOAD_STAGE_CONNECT, UPLOAD_STAGE_AUTH_MOUNT,
+               UPLOAD_STAGE_WRITE, UPLOAD_STAGE_VERIFY, UPLOAD_STAGE_CLEANUP,
+               UPLOAD_TEST_STAGE_COUNT } uploader_test_stage_t;
+typedef struct {
+    char backend[12];
+    uploader_test_state_t state;
+    uint8_t stage, completed_mask, failed_mask;
+    uint32_t generation, completed_epoch;
+    char detail[96];
+} uploader_test_snapshot_t;
+esp_err_t uploader_test_request(const char *backend, uint32_t *generation_out);
+void uploader_test_snapshot(uploader_test_snapshot_t *out);
+esp_err_t uploader_retry(const char *backend); /* NULL retries both; never clears receipts */
+/* Internal: only called on the scheduler task. */
+void uploader_test_stage(uploader_test_stage_t stage, bool completed, const char *detail);
+esp_err_t uploader_smb_probe(void);
+esp_err_t uploader_sleephq_probe(void);
+
+void uploader_test_failed(uploader_test_stage_t stage, const char *detail);

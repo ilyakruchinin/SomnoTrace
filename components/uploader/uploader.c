@@ -222,28 +222,34 @@ static esp_err_t do_uploader_save_config(void *arg)
     esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (ret != ESP_OK) return ret;
 
-    nvs_set_u8(h, "smb_en", local.smb_enabled ? 1 : 0);
-    nvs_set_u8(h, "shq_en", local.shq_enabled ? 1 : 0);
-    nvs_set_u8(h, "ftp_en", local.ftp_enabled ? 1 : 0);
-    nvs_set_u8(h, "ftp_anon", local.ftp_anonymous ? 1 : 0);
-    nvs_set_i32(h, "max_days", local.max_days);
-    nvs_set_str(h, "smb_host", local.smb_host);
-    nvs_set_str(h, "smb_share", local.smb_share);
-    nvs_set_str(h, "smb_user", local.smb_user);
-    nvs_set_str(h, "smb_pass", local.smb_pass);
-    nvs_set_str(h, "smb_path", local.smb_path);
-    nvs_set_str(h, "shq_cid", local.shq_client_id);
-    nvs_set_str(h, "shq_secret", local.shq_client_secret);
-    nvs_set_str(h, "ftp_user", local.ftp_user);
-    nvs_set_str(h, "ftp_pass", local.ftp_pass);
-    nvs_commit(h);
+    if (ret == ESP_OK) ret = nvs_set_u8(h, "smb_en", local.smb_enabled ? 1 : 0);
+    if (ret == ESP_OK) ret = nvs_set_u8(h, "shq_en", local.shq_enabled ? 1 : 0);
+    if (ret == ESP_OK) ret = nvs_set_u8(h, "ftp_en", local.ftp_enabled ? 1 : 0);
+    if (ret == ESP_OK) ret = nvs_set_u8(h, "ftp_anon", local.ftp_anonymous ? 1 : 0);
+    if (ret == ESP_OK) ret = nvs_set_i32(h, "max_days", local.max_days);
+    if (ret == ESP_OK) ret = nvs_set_str(h, "smb_host", local.smb_host);
+    if (ret == ESP_OK) ret = nvs_set_str(h, "smb_share", local.smb_share);
+    if (ret == ESP_OK) ret = nvs_set_str(h, "smb_user", local.smb_user);
+    if (ret == ESP_OK) ret = nvs_set_str(h, "smb_pass", local.smb_pass);
+    if (ret == ESP_OK) ret = nvs_set_str(h, "smb_path", local.smb_path);
+    if (ret == ESP_OK) ret = nvs_set_str(h, "shq_cid", local.shq_client_id);
+    if (ret == ESP_OK) ret = nvs_set_str(h, "shq_secret", local.shq_client_secret);
+    if (ret == ESP_OK) ret = nvs_set_str(h, "ftp_user", local.ftp_user);
+    if (ret == ESP_OK) ret = nvs_set_str(h, "ftp_pass", local.ftp_pass);
+    if (ret == ESP_OK) ret = nvs_commit(h);
     nvs_close(h);
-    return ESP_OK;
+    return ret;
 }
 
 esp_err_t uploader_save_config(const uploader_config_t *cfg)
 {
-    if (!cfg) return ESP_ERR_INVALID_ARG;
+    if (!cfg || cfg->max_days < 1 || cfg->max_days > UPLOAD_MAX_DAYS_CAP ||
+        !memchr(cfg->smb_host, 0, sizeof(cfg->smb_host)) ||
+        !memchr(cfg->smb_share, 0, sizeof(cfg->smb_share)) ||
+        !memchr(cfg->smb_path, 0, sizeof(cfg->smb_path))) return ESP_ERR_INVALID_ARG;
+    if (strpbrk(cfg->smb_host, " /\\\r\n") || strpbrk(cfg->smb_share, "/\\\r\n") ||
+        strstr(cfg->smb_path, "..")) return ESP_ERR_INVALID_ARG;
+    if (cfg->ftp_enabled && !cfg->ftp_anonymous && (!cfg->ftp_user[0] || !cfg->ftp_pass[0])) return ESP_ERR_INVALID_ARG;
 
     /* Delegate the flash write to the injected executor (internal-stack
      * nvs_writer) so a caller on a PSRAM stack (httpd) is safe. Runs inline
@@ -553,43 +559,6 @@ void uploader_request_scan(void)
 {
     if (!s_initialised) return;
     upload_sched_request_scan();
-}
-
-/* ── "Test connection" (web UI) ─────────────────────────────────────── */
-
-esp_err_t uploader_test_connection(const char *backend_id, bool *out_ok,
-                                   char *msg, size_t msg_len)
-{
-    if (!backend_id || !out_ok || !msg || msg_len == 0) return ESP_ERR_INVALID_ARG;
-    *out_ok = false;
-
-    const upload_backend_t *be = NULL;
-    for (int i = 0; i < s_n_backends; i++) {
-        if (s_backends[i] && strcmp(s_backends[i]->id, backend_id) == 0) {
-            be = s_backends[i];
-            break;
-        }
-    }
-    if (!be || !be->test) {
-        snprintf(msg, msg_len, "Unknown backend");
-        return ESP_ERR_NOT_FOUND;
-    }
-    if (!s_initialised) {
-        snprintf(msg, msg_len, "Uploader is still starting up, try again in a moment");
-        return ESP_ERR_INVALID_STATE;
-    }
-    /* Only one transport at a time: TLS and SMB buffers contend for memory
-     * (see the backend interface note), and a run may be mid-transfer. */
-    if (upload_sched_uploading()) {
-        snprintf(msg, msg_len, "An upload is in progress, try again when it has finished");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    ESP_LOGI(TAG, "%s: connection test requested", be->id);
-    *out_ok = be->test(msg, msg_len);
-    ESP_LOGI(TAG, "%s: connection test %s: %s", be->id,
-             *out_ok ? "passed" : "failed", msg);
-    return ESP_OK;
 }
 
 esp_err_t uploader_get_progress_snapshot(uploader_progress_snapshot_t *out)

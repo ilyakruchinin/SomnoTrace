@@ -100,6 +100,11 @@ typedef struct {
  * the SD upgrade fallback) if not already resident.  Returns out->available. */
 bool time_sync_get_drift_snapshot(time_drift_snapshot_t *out);
 
+/* RAM-only variant for latency-sensitive paths such as therapy stop.  It
+ * never opens NVS or scans the SD card; false means the persisted snapshot
+ * has not been loaded yet. */
+bool time_sync_peek_drift_snapshot(time_drift_snapshot_t *out);
+
 /* Persist the most recent valid clock drift to NVS for use by the
  * degraded-mode fallback.  Called at session stop when clock_drift_valid.
  * drift_ms: NTP_epoch_ms - AS11_epoch_ms (positive = AS11 is behind).
@@ -126,5 +131,7 @@ esp_err_t time_sync_recover_from_as11(void);
  * not trigger the failure path. */
 bool time_sync_wait_initial(void);
 
-/* Copy cached drift without NVS or SD access. */
-bool time_sync_peek_drift_snapshot(time_drift_snapshot_t *out);
+/* Last successful callback in this boot; unknown before the first sync.
+ * Server identity is not reported by ESP-IDF's callback. */
+int64_t time_sync_last_success_epoch(void);
+esp_err_t time_sync_request_now(void);

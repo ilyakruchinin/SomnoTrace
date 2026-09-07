@@ -60,6 +60,9 @@ static const char *TAG = "time_sync";
 #define NTP_INITIAL_ATTEMPTS    3
 
 static bool s_synced = false;
+static int64_t s_last_sync_epoch;
+static portMUX_TYPE s_sync_receipt_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_sntp_initialized;
 static bool s_initial_sync_done = false;
 
 /* ── Time-source provenance ─────────────────────────────────────────── */
@@ -105,6 +108,9 @@ static void drift_cache_store(int64_t drift_ms, int64_t measured_at_ms,
 
 static void sntp_sync_cb(struct timeval *tv)
 {
+    portENTER_CRITICAL(&s_sync_receipt_lock);
+    s_last_sync_epoch = tv->tv_sec;
+    portEXIT_CRITICAL(&s_sync_receipt_lock);
     s_synced = true;
     s_source = TIME_SRC_NTP;
     time_t now = tv->tv_sec;
@@ -578,6 +584,7 @@ esp_err_t time_sync_init(void)
         return err;
     }
 
+    s_sntp_initialized = true;
     if (!has_custom_ntp) {
         /* Add a second fallback server */
         esp_sntp_setservername(2, "time.google.com");
@@ -633,4 +640,18 @@ bool time_sync_wait_initial(void)
     s_initial_sync_done = true;
     ESP_LOGE(TAG, "initial NTP sync failed after %d attempts", NTP_INITIAL_ATTEMPTS);
     return false;
+}
+
+int64_t time_sync_last_success_epoch(void)
+{
+    portENTER_CRITICAL(&s_sync_receipt_lock);
+    int64_t result = s_last_sync_epoch;
+    portEXIT_CRITICAL(&s_sync_receipt_lock);
+    return result;
+}
+esp_err_t time_sync_request_now(void)
+{
+    if (s_sntp_initialized) esp_netif_sntp_deinit();
+    s_sntp_initialized = false;
+    return time_sync_init();
 }
