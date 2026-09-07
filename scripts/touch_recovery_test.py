@@ -196,6 +196,9 @@ int main(void) {
 }
 '''
 bsp = common + r'''
+#define POLICY_PEEK_TIMEOUT_S 60
+typedef enum {BACKLIGHT_MODE_ON=0,BACKLIGHT_MODE_OFF_THRP=1,BACKLIGHT_MODE_ALWAYS_OFF=2} backlight_mode_t;
+typedef struct {uint8_t brightness;backlight_mode_t backlight_mode;uint8_t alert_volume;uint16_t lcd_rotation;uint16_t screen_timeout_s;} device_settings_t;
 #define CONFIG_SOMNOTRACE_BOARD_QEMU 0
 #define WAVESHARE_7B_H_RES 1024
 #define WAVESHARE_7B_V_RES 600
@@ -237,11 +240,13 @@ static lv_obj_t *lv_obj_get_parent(lv_obj_t *o) {(void)o;return NULL;}
 static void lv_point_transform(lv_point_t *v,int a,int z,lv_point_t *p) {(void)v;(void)a;(void)z;(void)p;}
 static void _lv_indev_scroll_throw_handler(_lv_indev_proc_t *p) {(void)p;}
 static bool s_backlight=true,s_backlight_known=true,s_backlight_requested=true;
-static bool s_wake_gesture_pending,s_touch_was_pressed;
+static bool s_wake_gesture_pending,s_touch_was_pressed,s_backlight_force_on,s_temporarily_awake;
+static struct {bool therapy,notice_critical;} s_state;
+static bool screen_wake_input_available(void) {return true;}
 static uint32_t s_touch_seen_visibility,s_touch_seen_continuity,s_backlight_revision,s_touch_read_errors,s_backlight_write_errors;
 static uint8_t s_touch_consecutive_errors,s_brightness=66;
 static uint16_t s_last_touch_x,s_last_touch_y;
-static int64_t s_last_touch_activity_us,s_backlight_retry_after_us,now;
+static int64_t s_last_touch_activity_us,s_last_off_request_us,s_backlight_retry_after_us,now;
 static int s_wake_overlay=1,power_error,brightness_error;
 static unsigned power_calls,brightness_calls;static bool hidden=true;
 static touch_observation_t observation;
@@ -257,7 +262,7 @@ static int waveshare_7b_set_brightness(unsigned p) {assert(p==33);++brightness_c
 '''
 bsp += function(LVGL_INPUT, 'lv_indev_wait_release')
 bsp += function(LVGL_INPUT, 'indev_proc_release')
-for name in ['physical_brightness','bsp_display_set_backlight','touch_read_cb','apply_pending_backlight_locked']:
+for name in ['physical_brightness','bsp_display_set_backlight','request_idle_sleep_if_due','touch_read_cb','apply_pending_backlight_locked']:
     bsp += function('main/bsp_display_7b.c', name)
 bsp += r'''
 int main(void) {
@@ -274,7 +279,7 @@ int main(void) {
     assert(s_backlight && s_backlight_requested && !s_backlight_known);
     power_error=0;apply_pending_backlight_locked();
     bsp_display_set_backlight(false);apply_pending_backlight_locked();assert(!s_backlight && !hidden);
-    now+=10000;touch_observation_update(&observation,now,0,true,true,300,200);++observation.visibility_requests;
+    now+=10000;touch_observation_update(&observation,now,0,true,true,300,200);++observation.visibility_requests;observation.visibility_requested_us=now;
     lv_indev_drv_t driver={0};lv_indev_data_t input={0};
     touch_read_cb(&driver,&input);assert(input.state==LV_INDEV_STATE_RELEASED && s_backlight_requested);
     apply_pending_backlight_locked();assert(s_backlight && hidden);
@@ -289,7 +294,7 @@ int main(void) {
     touch_read_cb(&driver,&input);assert(input.state==LV_INDEV_STATE_RELEASED && s_wake_gesture_pending);
     now += 10000;touch_observation_update(&observation,now,0,true,false,0,0);
     touch_read_cb(&driver,&input);assert(!s_wake_gesture_pending);
-    ++observation.visibility_requests;apply_pending_backlight_locked();assert(s_backlight_known && s_wake_gesture_pending);
+    ++observation.visibility_requests;observation.visibility_requested_us=now;apply_pending_backlight_locked();assert(s_backlight_known && s_wake_gesture_pending);
     /* Production LVGL release processing must send PRESS_LOST, never CLICKED,
      * for a 101-150 ms discontinuity, read error, expired point or recovery. */
     for(unsigned fault=0;fault<4;++fault) {
@@ -330,7 +335,22 @@ int main(void) {
     }
     now+=10000;touch_observation_update(&observation,now,0,true,true,300,200);
     touch_read_cb(&driver,&input);assert(input.state==LV_INDEV_STATE_PRESSED);
-    puts("production LVGL wake: cached-on reassertion, retry, input freshness and gesture suppression passed");
+    /* OFF accepted after an older board sample fences both visibility consumers. */
+    now=100000000;s_last_touch_activity_us=1;s_backlight=true;
+    s_backlight_requested=true;s_backlight_known=true;s_state.therapy=false;
+    s_state.notice_critical=false;s_backlight_force_on=false;
+    device_settings_t settings={.screen_timeout_s=60};
+    s_temporarily_awake=true;
+    assert(!request_idle_sleep_if_due(&settings,false,now-1000));
+    s_temporarily_awake=false;
+    assert(request_idle_sleep_if_due(&settings,false,now-1000));
+    assert(s_last_off_request_us==now && !s_backlight_requested);
+    ++observation.visibility_requests;observation.visibility_requested_us=now-500;
+    apply_pending_backlight_locked();assert(!s_backlight_requested);
+    touch_read_cb(&driver,&input);assert(input.state==LV_INDEV_STATE_RELEASED);
+    now++;++observation.visibility_requests;observation.visibility_requested_us=now;
+    apply_pending_backlight_locked();assert(s_backlight_requested && s_backlight);
+    puts("production LVGL wake: retry, input freshness, gesture suppression and OFF timestamp ordering passed");
 }
 '''
 assert 'esp_lcd_touch_read_data' not in function('main/bsp_display_7b.c','touch_read_cb')

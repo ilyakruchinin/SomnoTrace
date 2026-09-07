@@ -245,3 +245,9 @@ under Apache-2.0; the license and source identity are retained beside it.
 The 7B pin map, controller sequence and RGB timing were checked against
 Waveshare's ESP32-S3-Touch-LCD-7B reference at commit
 `c652c902db607f7ffb376257393cfd7657aa6428`.
+
+## Native display fonts
+
+Space Grotesk and IBM Plex Mono are distributed under the SIL Open Font License.
+See `assets/fonts/licenses/SpaceGrotesk-OFL.txt` and
+`assets/fonts/licenses/IBMPlexMono-OFL.txt`; original Roboto attribution remains above.

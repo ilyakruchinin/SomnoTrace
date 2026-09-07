@@ -338,3 +338,7 @@ The original 240×240 board remains the default build.
 
 Build and run either display profile with `scripts/build-qemu.sh --board 7b|154`
 and `scripts/run-qemu-ui.sh --board 7b|154`. See [QEMU validation and captures](docs/qemu-ui.md).
+
+The 7B native Home screen adds bedside typography, live flow and fresh scalar
+metrics, status details, and Screen off with wake-only touch. Display timeout
+settings are available through the existing web portal.

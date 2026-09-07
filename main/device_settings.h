@@ -55,6 +55,7 @@ typedef struct {
     backlight_mode_t backlight_mode; /* backlight behavior */
     uint8_t alert_volume;      /* speaker volume for alerts: 0-100 */
     uint16_t lcd_rotation;     /* clockwise degrees: 0, 90, 180, or 270 */
+    uint16_t screen_timeout_s; /* inactivity timeout in seconds; 0 = never */
     bool battery_enabled;      /* true to display battery indicator, false to hide */
     /* Temporary wake on touch */
     bool wake_on_touch;        /* true to wake screen on capacitive touch */
@@ -104,6 +105,12 @@ esp_err_t device_settings_set_alert_volume(uint8_t percent);
  * applies to hardware immediately. Call device_settings_save_current() to
  * persist. */
 esp_err_t device_settings_set_lcd_rotation(uint16_t degrees);
+
+/* Set the screen inactivity timeout. Supported values are 0 (never), 60, 120,
+ * 300, 900, and 1800 seconds. Updates in-memory state and re-applies the
+ * display policy immediately; call device_settings_save_current() to persist
+ * it. */
+esp_err_t device_settings_set_screen_timeout_s(uint16_t seconds);
 
 /* Get settings as JSON string for web UI. Caller must free(). */
 esp_err_t device_settings_get_json(char **out_json);

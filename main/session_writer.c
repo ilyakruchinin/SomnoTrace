@@ -2570,6 +2570,7 @@ static int64_t parse_starttime_ms(const char *s, int len)
 }
 
 static void publish_live_stream(const int16_t *flow_vals, int flow_n,
+                                const int16_t *press_vals, int press_n,
                                 const int16_t *pld_vals, const bool *pld_found)
 {
     /* PatientFlow is encoded as hundredths of a litre per second.  The
@@ -2591,6 +2592,19 @@ static void publish_live_stream(const int16_t *flow_vals, int flow_n,
      * pld_leak_phys() in session_graph.c. */
     if (pld_found[3] && pld_vals[3] >= 0)
         bsp_display_push_leak(pld_vals[3] * 0.6f);
+
+    float live_pressure = NAN;
+    if (pld_found[1] && pld_vals[1] >= 0) {
+        live_pressure = pld_vals[1] * 0.01f;
+    } else if (press_n > 0 && press_vals[press_n - 1] >= 0) {
+        live_pressure = press_vals[press_n - 1] * 0.01f;
+    }
+    float live_rr = (pld_found[4] && pld_vals[4] >= 0)
+                        ? pld_vals[4] * 0.01f : NAN;
+    float live_flow_lim = (pld_found[10] && pld_vals[10] >= 0)
+                              ? pld_vals[10] * 0.01f : NAN;
+    bsp_display_push_metrics(live_pressure, live_rr, live_flow_lim);
+
 
 }
 
@@ -2718,7 +2732,7 @@ bool session_writer_try_stream_data_raw(const char *json, int len)
 
     if (!s && s_start_intent) return false;
     if (!s) {
-    publish_live_stream(flow_vals, flow_n, pld_vals, pld_found);
+    publish_live_stream(flow_vals, flow_n, press_vals, press_n, pld_vals, pld_found);
         return true;
     }
 
@@ -2769,7 +2783,7 @@ bool session_writer_try_stream_data_raw(const char *json, int len)
         uint32_t missing = (uint32_t)((delta_ms - 200 + 20) / 40);
         bsp_display_push_flow_gap(missing);
     }
-    publish_live_stream(flow_vals, flow_n, pld_vals, pld_found);
+    publish_live_stream(flow_vals, flow_n, press_vals, press_n, pld_vals, pld_found);
 
     if (s->stream_position_valid) s->stream_elapsed_ms += (uint64_t)delta_ms;
     else s->stream_position_valid = true;

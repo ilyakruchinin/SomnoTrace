@@ -242,7 +242,8 @@ void app_main(void)
 
     /* 4c. Initialise BLE (AirSense 11 pairing). Non-fatal on failure.
      * Runs after storage init + crash recovery (see 4b). */
-    if (as11_ble_init() != ESP_OK) {
+    bool as11_ready = as11_ble_init() == ESP_OK;
+    if (!as11_ready) {
         ESP_LOGE(TAG, "BLE init failed; CPAP pairing unavailable");
     }
     ESP_LOGI(TAG, "[heap] after BLE init: internal free=%u min=%u",
@@ -250,9 +251,12 @@ void app_main(void)
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 
     /* 4c-ter. Initialise O2 Ring oximeter (shares NimBLE host with AS11). */
-    if (oximeter_init() != ESP_OK) {
+    bool oximeter_ready = oximeter_init() == ESP_OK;
+    if (!oximeter_ready) {
         ESP_LOGE(TAG, "Oximeter init failed; O2 Ring sync unavailable");
     }
+    bsp_display_enable_touch_services(as11_ready, oximeter_ready);
+
 
     /* 4c-bis. BLE startup has begun, so reconnect can now establish whether
      * therapy is already running.  Only now is it safe to let the idle post

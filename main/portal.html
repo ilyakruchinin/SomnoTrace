@@ -701,6 +701,18 @@ Display &amp; Sound
 <input type="range" id="lcd-brightness" class="form-control" min="0" max="7" step="1" value="6" style="padding:0" oninput="onBrightnessInput(this.value)">
 </div>
 <div class="form-group">
+<label for="screen-timeout">Turn screen off after <span id="screen-timeout-status" class="setting-status"></span></label>
+<select id="screen-timeout" class="form-control" onchange="onScreenTimeoutChange(this)">
+<option value="0">Never</option>
+<option value="60">1 minute</option>
+<option value="120">2 minutes</option>
+<option value="300" selected>5 minutes</option>
+<option value="900">15 minutes</option>
+<option value="1800">30 minutes</option>
+</select>
+<p class="card-desc" style="margin:6px 0 0">Only while therapy is stopped. The first touch wakes the screen without activating a control.</p>
+</div>
+<div class="form-group">
 <label>Screen during therapy <span id="therapy-screen-status" class="setting-status"></span></label>
 <select id="therapy-screen" class="form-control" onchange="onTherapyScreenChange(this)">
 <option value="0" selected>Show info panel (default)</option>
@@ -2315,6 +2327,23 @@ function onBacklightModeChange(sel) {
   });
 }
 
+function onScreenTimeoutChange(sel) {
+  var seconds = sel ? parseInt(sel.value, 10) : 300;
+  var allowed = [0, 60, 120, 300, 900, 1800];
+  if (allowed.indexOf(seconds) < 0) return;
+  setStatus('screen-timeout-status', '…', null);
+  fetch('/api/device/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ screen_timeout_s: seconds })
+  }).then(function(r) {
+    if (!r.ok) throw new Error('screen timeout save failed');
+    setStatus('screen-timeout-status', '✓', true);
+  }).catch(function() {
+    setStatus('screen-timeout-status', '✗', false);
+  });
+}
+
 function onLcdRotationChange(sel) {
   var rot = sel ? parseInt(sel.value) || 0 : 0;
   setStatus('rotation-status', '…', null);
@@ -2386,8 +2415,7 @@ function onWakeSettingsChange() {
   });
 }
 
-function loadDeviceSettings() {
-  fetch('/api/device/settings').then(function(r){ return r.json(); }).then(function(d) {
+function renderDeviceSettings(d) {
     var br = document.getElementById('lcd-brightness');
     if (br && typeof d.brightness === 'number') {
       var idx = BRIGHTNESS_STEPS.indexOf(d.brightness);
@@ -2403,6 +2431,12 @@ function loadDeviceSettings() {
     var bkl = document.getElementById('backlight-mode');
     if (bkl && typeof d.backlight_mode === 'number') {
       bkl.value = String(d.backlight_mode);
+    }
+    var timeoutCtl = document.getElementById('screen-timeout');
+    if (timeoutCtl && typeof d.screen_timeout_s === 'number') {
+      var allowedTimeouts = [0, 60, 120, 300, 900, 1800];
+      timeoutCtl.value = String(allowedTimeouts.indexOf(d.screen_timeout_s) >= 0
+                                ? d.screen_timeout_s : 300);
     }
     var rot = document.getElementById('lcd-rotation');
     if (rot && typeof d.lcd_rotation === 'number') {
@@ -2432,6 +2466,11 @@ function loadDeviceSettings() {
     if (tch) tch.checked = hasTouch;
     if (tm) tm.value = String(timeout > 0 ? timeout : 10);
     if (sub) sub.style.opacity = hasTouch ? '1' : '0.4';
+}
+
+function loadDeviceSettings() {
+  fetch('/api/device/settings').then(function(r){ return r.json(); }).then(function(d) {
+    renderDeviceSettings(d);
     setLoading('display-sound-details', false);
   }).catch(function() {
     setLoading('display-sound-details', false);

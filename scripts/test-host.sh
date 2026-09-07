@@ -32,3 +32,8 @@ python3 scripts/fork_backend_reconciliation_test.py
 
 ./scripts/test-platform5.sh
 python3 scripts/qemu_variant_test.py
+
+python3 scripts/font_asset_contract_test.py
+python3 scripts/live_flow_units_contract_test.py
+python3 scripts/storage_status_memory_contract_test.py
+python3 scripts/screen_timeout_contract_test.py

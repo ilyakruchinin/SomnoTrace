@@ -9,3 +9,10 @@ GT911 uses SDA8, SCL9 and INT4; the CH32V003 controller at address 0x24 owns res
 The TF socket uses one-bit SDMMC with CLK12, CMD11 and D0=13. The hardware has no supported alert speaker or battery telemetry. Do not use the compact board GPIO2/GPIO0 power/button controls: those pins carry RGB data on this board.
 
 The 1–200 stored brightness range maps to 1–100% on 7B. The default is the steady 100% endpoint. `scripts/test-platform4.sh` exercises host allocation, input recovery, and framebuffer contracts; its first run resolves the exact hash-verified LVGL 8.4.0 input source if IDF has not populated managed components.
+
+The native Home shell replaces the foundation status screen. Flow presentation
+uses elapsed 25 Hz sample positions, retains missing intervals, and resynchronizes
+after sleep or navigation. A persisted inactivity timeout defaults to five minutes
+on the large display and remains disabled on the compact target; Screen off and
+therapy policies retain wake-only input and visibility recovery. The web display
+settings expose the same 0/60/120/300/900/1800-second choices.

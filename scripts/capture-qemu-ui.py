@@ -13,6 +13,7 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SCREEN_SCENARIOS = {"home": (0, (330, 563)), "home-idle": (0, (330, 563)), "status": (0, (330, 563))}
 FATAL_MARKERS = (
     "Guru Meditation Error",
     "assert failed",
@@ -173,29 +174,6 @@ def ppm_dimensions(path):
     return int(tokens[1]), int(tokens[2])
 
 
-def validate_minimal_status(payload):
-    """Check the sparse status view by its visible content and control."""
-    if len(payload) != 1024 * 600 * 3:
-        raise AssertionError("truncated status framebuffer")
-    for label, bounds, minimum in (
-        ("title", (40, 40, 400, 85), 150),
-        ("device status", (40, 145, 790, 195), 150),
-        ("Screen off label", (820, 525, 970, 565), 60),
-    ):
-        x1, y1, x2, y2 = bounds
-        bright = sum(min(payload[(y * 1024 + x) * 3:(y * 1024 + x) * 3 + 3]) >= 180
-                     for y in range(y1, y2) for x in range(x1, x2))
-        if bright < minimum:
-            raise AssertionError(f"status capture is missing {label}")
-    blue = 0
-    for y in range(525, 565):
-        for x in range(810, 975):
-            r, g, b = payload[(y * 1024 + x) * 3:(y * 1024 + x) * 3 + 3]
-            blue += b > 180 and b > r + 80
-    if blue < 3500:
-        raise AssertionError("status capture is missing the Screen off button")
-
-
 def capture_screen(
     qemu, flash, efuse, output_dir, temporary, name, tab_index, point,
     settle_seconds, representative, interaction=False, socket_path=None,
@@ -256,6 +234,12 @@ def capture_screen(
         # the persistent header and page geometry beneath it.
         wait_healthy(process, serial_log, settle_seconds)
 
+        if representative or name == "home-idle":
+            click(process, serial_log, stream, 858, 458)
+            wait_healthy(process, serial_log, 3.5)
+        if name == "status":
+            click(process, serial_log, stream, 900, 35)
+            wait_healthy(process, serial_log, 0.5)
         # Leave at least one complete post-release refresh period before the
         # first attempt. The validation loop below handles slower host loads.
         wait_healthy(process, serial_log, 0.10 if name == "logs-save-progress" else 0.75)
@@ -277,13 +261,21 @@ def capture_screen(
             if destination.stat().st_size < 1024 * 600 * 3:
                 raise AssertionError(f"truncated framebuffer capture: {destination}")
             payload = destination.read_bytes()[-1024 * 600 * 3:]
-            try:
-                validate_minimal_status(payload)
-            except AssertionError as error:
-                last_validation_error = error
+            sampled_colours = {
+                payload[offset:offset + 3]
+                for offset in range(0, len(payload) - 2, 3 * 997)
+            }
+            if len(sampled_colours) < 8:
+                last_validation_error = AssertionError(
+                    f"blank or nearly uniform framebuffer capture: {destination}"
+                )
             else:
-                last_validation_error = None
-                break
+                try:
+                    validate_persistent_shell(name, payload)
+                    last_validation_error = None
+                    break
+                except AssertionError as error:
+                    last_validation_error = error
             if attempt < 7:
                 wait_healthy(process, serial_log, 0.4)
         if last_validation_error is not None:
@@ -307,11 +299,27 @@ def capture_screen(
             process.wait()
 
 
+def validate_persistent_shell(name, payload):
+    anchors = {
+        "clock": ((20, 8, 205, 58), 80),
+        "status": ((724, 5, 1010, 65), 45),
+        "Home navigation": ((244, 531, 416, 594), 35),
+    }
+    for label, (bounds, minimum) in anchors.items():
+        x1, y1, x2, y2 = bounds
+        bright = sum(max(payload[(y*1024+x)*3:(y*1024+x)*3+3]) >= 80
+                     for y in range(y1,y2,2) for x in range(x1,x2,2))
+        if bright < minimum:
+            raise AssertionError(f"persistent {label} is absent from {name}.ppm")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output_dir", nargs="?", default=str(ROOT / "build-qemu/captures"))
     parser.add_argument("--build", action="store_true")
-    parser.add_argument("--settle-seconds", type=float, default=1.0)
+    parser.add_argument("--settle-seconds", type=float, default=3.5)
+    parser.add_argument("--screen", action="append", choices=tuple(SCREEN_SCENARIOS))
+    parser.add_argument("--representative", action="store_true")
     args = parser.parse_args()
     if args.build:
         subprocess.run([ROOT / "scripts/build-qemu.sh"], check=True)
@@ -321,7 +329,8 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     (output / "tested-provenance.json").write_bytes((ROOT / "build-qemu/provenance.json").read_bytes())
     with tempfile.TemporaryDirectory(prefix="capture-", dir=ROOT / "build-qemu") as temporary:
-        capture_screen(qemu, ROOT / "build-qemu/qemu_flash.bin", ROOT / "build-qemu/qemu_efuse.bin", output, temporary, "status", 0, None, args.settle_seconds, False)
+        for name in args.screen or ["home"]:
+            capture_screen(qemu, ROOT / "build-qemu/qemu_flash.bin", ROOT / "build-qemu/qemu_efuse.bin", output, temporary, name, 0, None, args.settle_seconds, args.representative)
 
 if __name__ == "__main__":
     main()
