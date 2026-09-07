@@ -26,6 +26,7 @@
 #include "esp_err.h"
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "upload_scan.h"
 #include "upload_ox.h"
 
@@ -227,16 +228,73 @@ bool uploader_is_sleephq_enabled(void);
 /* Check if FTP server is enabled in config. */
 bool uploader_is_ftp_enabled(void);
 
+/* Fixed-size upload progress for memory-constrained callers such as the
+ * bedside display.  The snapshot owns all of its strings and the getter does
+ * not allocate.  Entries include every registered backend, including ones
+ * that are disabled or do not yet have complete configuration. */
+#define UPLOADER_PROGRESS_MAX_BACKENDS  4
+#define UPLOADER_PROGRESS_ID_LEN        12
+#define UPLOADER_PROGRESS_LABEL_LEN     32
+#define UPLOADER_PROGRESS_DAY_LEN       12
+#define UPLOADER_PROGRESS_ERROR_LEN     72
+#define UPLOADER_PROGRESS_STATUS_LEN    64
+
+typedef enum {
+    UPLOADER_BACKEND_DISABLED = 0,
+    UPLOADER_BACKEND_IDLE,
+    UPLOADER_BACKEND_UPLOADING,
+    UPLOADER_BACKEND_COOLDOWN,
+} uploader_backend_state_t;
+
+typedef struct {
+    char id[UPLOADER_PROGRESS_ID_LEN];
+    char label[UPLOADER_PROGRESS_LABEL_LEN];
+    bool configured;
+    uploader_backend_state_t state;
+    int days_done;
+    int days_total;
+
+    bool current_valid;
+    char current_day[UPLOADER_PROGRESS_DAY_LEN];
+    int current_unit;
+    int current_units;
+
+    bool last_success_valid;
+    uint32_t last_success_epoch_s;
+
+    bool retry_valid;
+    uint32_t retry_in_s;
+    bool error_valid;
+    bool error_permanent;
+    char error[UPLOADER_PROGRESS_ERROR_LEN];
+} uploader_backend_progress_t;
+
+typedef struct {
+    char status[UPLOADER_PROGRESS_STATUS_LEN];
+    bool scanning;
+    uint32_t next_scan_s;
+    int max_days;
+    size_t backend_count;
+    uploader_backend_progress_t backends[UPLOADER_PROGRESS_MAX_BACKENDS];
+} uploader_progress_snapshot_t;
+
+/* Populate a caller-owned, bounded RAM snapshot without heap allocation or
+ * SD/index traversal. Returns ESP_ERR_INVALID_STATE before uploader_init()
+ * has completed. */
+esp_err_t uploader_get_progress_snapshot(uploader_progress_snapshot_t *out);
+
 /* Compact upload progress for the web UI: one entry per backend with its
  * state, days done/total and, while uploading, the current day and unit.
- * Bounded in size regardless of how much history exists.
+ * Bounded in size regardless of how much history exists. Progress is
+ * serialized from the scheduler's RAM snapshot rather than the mutable index.
  * Returns ESP_ERR_INVALID_STATE before uploader_init() has completed.
  * Caller must free() the returned string. */
 esp_err_t uploader_get_progress_json(char **out_json);
 
-/* One-line summary for /api/status (header badge): how many units are still
- * outstanding across configured backends, and the worst backend state
- * ("idle" | "uploading" | "cooldown"). */
+/* Cached one-line summary for /api/status (header badge): how many units are
+ * still outstanding across configured backends, and the worst backend state
+ * ("idle" | "uploading" | "cooldown"). This is a bounded RAM-only snapshot;
+ * callers never scan or mutate the SD card. */
 void uploader_get_summary(int *out_pending, const char **out_worst);
 
 /* Debug: the parsed tracking state for one day ("YYYYMMDD").

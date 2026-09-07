@@ -23,12 +23,15 @@
  */
 
 #include "therapy_alert.h"
+#include "therapy_alert_runtime.h"
 
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
 
 #include "esp_log.h"
+#include "alert_history.h"
+#include "alert_lifecycle.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_random.h"
@@ -42,51 +45,39 @@
 #include "freertos/queue.h"
 
 static const char *TAG = "therapy_alert";
+static uint32_t s_active_history_id; /* owner task only */
+typedef struct { uint32_t gen, history_id; } alert_routine_args_t;
 
 #define NVS_NAMESPACE  "alert"
 #define NVS_KEY_CFG    "cfg"
 
 /* ── Injected functions ─────────────────────────────────────────────── */
+static alert_task_create_fn_t s_task_create;
+static alert_task_delete_fn_t s_task_delete;
+void therapy_alert_set_task_fns(alert_task_create_fn_t create,
+                                alert_task_delete_fn_t destroy)
+{ s_task_create = create; s_task_delete = destroy; }
 static alert_beep_fn_t          s_beep_fn  = NULL;
 static alert_nvs_exec_fn_t       s_nvs_exec = NULL;
 static alert_therapy_active_fn_t s_therapy_active_fn = NULL;
 
 void therapy_alert_set_beep_fn(alert_beep_fn_t fn)    { s_beep_fn = fn; }
-void therapy_alert_set_nvs_executor(alert_nvs_exec_fn_t fn) { s_nvs_exec = fn; }
+void therapy_alert_set_nvs_executor(alert_nvs_exec_fn_t fn) { s_nvs_exec = fn; alert_history_set_executor(fn); }
 void therapy_alert_set_therapy_active_fn(alert_therapy_active_fn_t fn) { s_therapy_active_fn = fn; }
 
-/* ── Concurrency model ──────────────────────────────────────────────────
- *
- * This component is single-owner: exactly one task (`alert_monitor`) reads
- * and writes the state machine.  Every external event — TherapyStart/Stop,
- * BLE disconnect, button acknowledge, config change, and the escalation
- * routine's own progress — is delivered as a message on s_evt_q and applied
- * by that task.  Callers never mutate state and never block on the alert
- * subsystem, which matters because two of them are a NimBLE host callback
- * and a button monitor.
- *
- * Why this shape rather than a lock: the previous design guarded a single
- * enum with a heap-allocated mutex, which
- *   (a) did not make the read-decide-write sequences in reevaluate_state()
- *       atomic anyway — the lock was released between the read and the
- *       write, so it bought no real mutual exclusion; and
- *   (b) placed a FreeRTOS queue object (with its embedded per-queue
- *       spinlock) on the heap, where a neighbouring task-stack overflow
- *       could corrupt the lock word.  A corrupt spinlock owner value spins
- *       forever with interrupts disabled → INT_WDT reset, which is the
- *       2026-08-09 failure.
- *
- * The event queue, its storage, the config mutex and the owner task's stack
- * are all statically allocated in .bss for the same reason: nothing in this
- * component's synchronisation path is a heap neighbour of any task stack.
- * A single writer also means s_state needs no lock at all — readers take a
- * plain aligned 32-bit load and always observe a whole value. */
+/* The monitor exclusively owns alert state. Producers publish cycle-aware
+ * semantic transitions under a short spinlock, then use the ordinary queue
+ * only to wake it. START/STOP/ACK survive queue saturation and ACK is tied to
+ * its observed cycle. Config and routine messages retain their separate owner
+ * paths. Routine tasks use the application's paired create/delete hooks so
+ * PSRAM stacks and TCBs are reclaimed by its reaper. */
 
 /* ── Config ─────────────────────────────────────────────────────────── */
 /* s_cfg is written only by the owner task.  Writers stage into s_cfg_staged
  * under s_cfg_mtx and post EVT_CONFIG; the owner promotes it. */
 static therapy_alert_config_t s_cfg = ALERT_DEFAULTS;
 static therapy_alert_config_t s_cfg_staged = ALERT_DEFAULTS;
+static bool s_cfg_pending;
 static bool s_cfg_loaded = false;
 
 static StaticSemaphore_t s_cfg_mtx_buf;
@@ -129,6 +120,17 @@ static StaticQueue_t s_evt_q_buf;
 static uint8_t       s_evt_q_storage[ALERT_EVT_Q_LEN * sizeof(alert_evt_t)];
 static QueueHandle_t s_evt_q = NULL;
 
+/* Acknowledgement is safety-significant: unlike a periodic tick or duplicate
+ * transition, it cannot be reconstructed if the event queue is saturated.
+ * Keep it in a separate one-bit latch. EVT_ACK remains the wake-up message;
+ * the owner consumes this latch before ordinary queued work, and a duplicate
+ * EVT_ACK is harmless because handle_ack() is idempotent in ALERT_ACKED. */
+static StaticSemaphore_t s_ack_pending_buf;
+static SemaphoreHandle_t s_ack_pending = NULL;
+
+static portMUX_TYPE s_lifecycle_lock = portMUX_INITIALIZER_UNLOCKED;
+static alert_lifecycle_t s_lifecycle, s_lifecycle_cursor;
+
 static StaticTask_t  s_monitor_tcb;
 static StackType_t  *s_monitor_stack;
 
@@ -141,14 +143,12 @@ static void report_stack_headroom(const char *why);
 /* Post an event.  Never blocks: callers include a NimBLE host callback and
  * the button monitor, where blocking is not acceptable.  A full queue means
  * the owner is already behind with equivalent work pending, and the periodic
- * tick will reconcile state regardless. */
+ * lifecycle mailbox remains authoritative even if its wakeup is lost. */
 static void post_evt(alert_evt_type_t type, alert_state_t st, uint32_t gen)
 {
     if (!s_evt_q) return;
     alert_evt_t ev = { .type = (uint8_t)type, .state = (uint8_t)st, .gen = gen };
-    if (xQueueSend(s_evt_q, &ev, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "event queue full, dropping event %d", (int)type);
-    }
+    (void)xQueueSend(s_evt_q, &ev, 0);
 }
 
 /* Snapshot the config for a reader outside the owner task. */
@@ -219,6 +219,8 @@ const char *therapy_alert_state_str(alert_state_t st)
         case ALERT_PUSH_SENT: return "push_sent";
         case ALERT_BUZZING:   return "buzzing";
         case ALERT_ACKED:     return "acked";
+        case ALERT_SCREEN_ONLY: return "screen_only";
+        case ALERT_PUSH_FAILED: return "push_failed";
         default:              return "unknown";
     }
 }
@@ -296,6 +298,18 @@ esp_err_t therapy_alert_save_config_json(const char *json_str)
     cJSON *root = cJSON_Parse(json_str);
     if (!root) return ESP_ERR_INVALID_ARG;
 
+    /* Validate JSON numbers before narrowing them to persisted integer types. */
+    static const struct { const char *name; int low, high; } limits[] = {
+        {"win_start",0,1439}, {"win_end",0,1439}, {"delay1",0,180},
+        {"delay2",0,180}, {"ntfy_prio",1,5}
+    };
+    for (size_t i = 0; i < sizeof(limits)/sizeof(limits[0]); i++) {
+        cJSON *v = cJSON_GetObjectItem(root, limits[i].name);
+        if (v && (!cJSON_IsNumber(v) || v->valuedouble < limits[i].low ||
+            v->valuedouble > limits[i].high || v->valuedouble != (int)v->valuedouble)) {
+            cJSON_Delete(root); return ESP_ERR_INVALID_ARG;
+        }
+    }
     therapy_alert_config_t cfg;
     cfg_snapshot(&cfg);
     cJSON *j;
@@ -313,6 +327,14 @@ esp_err_t therapy_alert_save_config_json(const char *json_str)
 
     cJSON_Delete(root);
 
+    return therapy_alert_save_config(&cfg);
+}
+
+esp_err_t therapy_alert_save_config(const therapy_alert_config_t *input)
+{
+    esp_err_t valid = therapy_alert_validate_config(input);
+    if (valid != ESP_OK) return valid;
+    therapy_alert_config_t cfg = *input;
     /* Persist via injected NVS executor (safe from PSRAM-stack httpd). */
     esp_err_t err = s_nvs_exec ? s_nvs_exec(do_save_config, &cfg)
                                : do_save_config(&cfg);
@@ -329,8 +351,8 @@ esp_err_t therapy_alert_save_config_json(const char *json_str)
         ESP_LOGI(TAG, "config saved: en=%d win=%d-%d d1=%d push=%d buzz=%d",
                  cfg.enabled, cfg.win_start, cfg.win_end, cfg.delay1,
                  cfg.push_en, cfg.buzz_en);
-        /* Re-evaluate state on the owner task: a schedule change may
-         * arm or disarm. */
+        /* A full event queue cannot lose the settings update. */
+        __atomic_store_n(&s_cfg_pending, true, __ATOMIC_RELEASE);
         post_evt(EVT_CONFIG, 0, 0);
     }
     return err;
@@ -357,6 +379,7 @@ esp_err_t therapy_alert_get_config_json(char **out_json)
 
     cJSON *st = cJSON_AddObjectToObject(root, "state");
     cJSON_AddStringToObject(st, "alert", therapy_alert_state_str(therapy_alert_get_state()));
+    cJSON_AddBoolToObject(st, "transport_uncertain", therapy_alert_transport_uncertain());
 
     *out_json = cJSON_Print(root);
     cJSON_Delete(root);
@@ -411,7 +434,7 @@ static esp_err_t send_ntfy_push(const char *srv, const char *topic,
 esp_err_t therapy_alert_send_test_push(const char *json_override)
 {
     therapy_alert_config_t cfg;
-    cfg_snapshot(&cfg);
+    therapy_alert_load_config(&cfg);
 
     if (json_override && json_override[0]) {
         cJSON *root = cJSON_Parse(json_override);
@@ -429,9 +452,13 @@ esp_err_t therapy_alert_send_test_push(const char *json_override)
         ESP_LOGW(TAG, "test push: push disabled or topic empty");
         return ESP_ERR_INVALID_STATE;
     }
-    return send_ntfy_push(cfg.ntfy_srv, cfg.ntfy_topic,
-                          "SomnoTrace test", "Test notification from SomnoTrace",
-                          cfg.ntfy_prio);
+    if (therapy_alert_validate_config(&cfg) != ESP_OK) return ESP_ERR_INVALID_ARG;
+    uint32_t id = alert_history_begin(true);
+    esp_err_t result = send_ntfy_push(cfg.ntfy_srv, cfg.ntfy_topic,
+                          "SomnoTrace test", "Test notification from SomnoTrace", cfg.ntfy_prio);
+    alert_history_result(id, result == ESP_OK ? ALERT_DELIVERY_ACCEPTED : ALERT_DELIVERY_FAILED, false);
+    alert_history_verify(cfg.ntfy_srv, cfg.ntfy_topic, result == ESP_OK);
+    return result;
 }
 
 /* ── Buzzer ─────────────────────────────────────────────────────────── */
@@ -439,10 +466,10 @@ esp_err_t therapy_alert_send_test_push(const char *json_override)
 /* True once this routine generation has been superseded or cancelled. */
 static inline bool routine_stale(uint32_t gen)
 {
-    return s_routine_gen != gen;
+    return __atomic_load_n(&s_routine_gen, __ATOMIC_ACQUIRE) != gen;
 }
 
-static void run_buzzer(uint32_t gen)
+static void __attribute__((unused)) run_buzzer(uint32_t gen)
 {
     if (!s_beep_fn) {
         ESP_LOGW(TAG, "buzzer: no beep function injected");
@@ -466,9 +493,18 @@ static void routine_request_state(uint32_t gen, alert_state_t st)
     post_evt(EVT_ROUTINE_STATE, st, gen);
 }
 
+static void finish_alert_routine(uint32_t gen)
+{
+    post_evt(EVT_ROUTINE_EXIT, 0, gen);
+    s_task_delete(NULL);
+}
+
 static void alert_routine_task(void *arg)
 {
-    const uint32_t gen = (uint32_t)(uintptr_t)arg;
+    const alert_routine_args_t args = *(alert_routine_args_t *)arg;
+    free(arg);
+    const uint32_t gen = args.gen;
+    const uint32_t history_id = args.history_id;
 
     /* Work from a snapshot: the config can be replaced mid-routine by an
      * httpd worker, and re-reading it field by field across a multi-minute
@@ -501,6 +537,9 @@ static void alert_routine_task(void *arg)
         goto done;
     }
 
+    if (routine_stale(gen)) goto done;
+    alert_history_result(history_id, ALERT_DELIVERY_SCREEN, false);
+    if (routine_stale(gen)) goto done;
     /* Phase 2: send push notification (if enabled) */
     if (cfg.push_en && cfg.ntfy_topic[0]) {
         char body[64];
@@ -510,10 +549,12 @@ static void alert_routine_task(void *arg)
         snprintf(body, sizeof(body), "Therapy stopped at %02d:%02d",
                  tm.tm_hour, tm.tm_min);
 
-        routine_request_state(gen, ALERT_PUSH_SENT);
         esp_err_t err = send_ntfy_push(cfg.ntfy_srv, cfg.ntfy_topic,
                                        "SomnoTrace Alert", body,
                                        cfg.ntfy_prio);
+        routine_request_state(gen, err == ESP_OK ? ALERT_PUSH_SENT : ALERT_PUSH_FAILED);
+        alert_history_result(history_id, err == ESP_OK ? ALERT_DELIVERY_ACCEPTED : ALERT_DELIVERY_FAILED, false);
+        alert_history_verify(cfg.ntfy_srv, cfg.ntfy_topic, err == ESP_OK);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "push failed, falling through to buzzer");
         }
@@ -522,7 +563,11 @@ static void alert_routine_task(void *arg)
     if (routine_stale(gen)) goto done;
 
     /* Phase 3: wait delay2 minutes before buzzer (only if both push+buzz) */
+#if CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B || CONFIG_SOMNOTRACE_BOARD_QEMU
+    if (cfg.push_en && cfg.ntfy_topic[0] && cfg.delay2 > 0) {
+#else
     if (cfg.push_en && cfg.buzz_en && cfg.delay2 > 0) {
+#endif
         int delay2_ms = cfg.delay2 * 60 * 1000;
         ESP_LOGI(TAG, "alert routine: waiting %d ms before buzzer", delay2_ms);
         for (int waited = 0; waited < delay2_ms; waited += 1000) {
@@ -545,11 +590,25 @@ static void alert_routine_task(void *arg)
         goto done;
     }
 
+#if CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B || CONFIG_SOMNOTRACE_BOARD_QEMU
+    /* The 7B has no speaker. Escalation is a second real push, with the
+     * existing cancellation generation checked before and after waiting. */
+    if (cfg.push_en && cfg.ntfy_topic[0]) {
+        if (routine_stale(gen)) goto done;
+        esp_err_t result = send_ntfy_push(cfg.ntfy_srv, cfg.ntfy_topic,
+            "SomnoTrace reminder", "Therapy interruption remains unacknowledged", cfg.ntfy_prio);
+        alert_history_result(history_id, result == ESP_OK ? ALERT_DELIVERY_ACCEPTED : ALERT_DELIVERY_FAILED, true);
+        routine_request_state(gen, result == ESP_OK ? ALERT_PUSH_SENT : ALERT_PUSH_FAILED);
+    } else {
+        routine_request_state(gen, ALERT_SCREEN_ONLY);
+    }
+#else
     /* Phase 4: buzzer (if enabled) */
     if (cfg.buzz_en) {
         routine_request_state(gen, ALERT_BUZZING);
         run_buzzer(gen);
     }
+#endif
 
 done:
     {
@@ -562,8 +621,7 @@ done:
                      (unsigned)free_bytes);
         }
     }
-    post_evt(EVT_ROUTINE_EXIT, 0, gen);
-    vTaskDelete(NULL);
+    finish_alert_routine(gen);
 }
 
 /* Owner task only. */
@@ -572,20 +630,31 @@ static void start_alert_routine(void)
     /* Bumping the generation cancels any routine still winding down; it will
      * observe the mismatch and exit on its own.  No handle is stored and no
      * sleep is needed, so there is nothing to dangle. */
-    uint32_t gen = ++s_routine_gen;
+    uint32_t gen = __atomic_add_fetch(&s_routine_gen, 1, __ATOMIC_ACQ_REL);
+    s_active_history_id = alert_history_begin(false);
     set_state(ALERT_PENDING);
+    /* ACK or a newer lifecycle edge may already be retained, or may arrive
+     * while history creation waits on NVS. Do not launch an already-obsolete
+     * push/buzzer task; the owner will apply the retained transition next. */
+    portENTER_CRITICAL(&s_lifecycle_lock);
+    bool obsolete = s_lifecycle.edge != ALERT_EDGE_STOPPED ||
+        (s_lifecycle.ack_cycle == s_lifecycle.cycle &&
+         s_lifecycle.ack_sequence > s_lifecycle.stop_sequence);
+    portEXIT_CRITICAL(&s_lifecycle_lock);
+    if (obsolete || gen != __atomic_load_n(&s_routine_gen, __ATOMIC_ACQUIRE)) return;
 
     TaskHandle_t h = NULL;
-    StackType_t *stack = heap_caps_malloc(16384, MALLOC_CAP_SPIRAM);
-    StaticTask_t *tcb  = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
-    if (stack && tcb) {
-        h = xTaskCreateStaticPinnedToCore(alert_routine_task, "alert_routine",
-                                          16384, (void *)(uintptr_t)gen, 5,
-                                          stack, tcb, 0);
-    }
+    alert_routine_args_t *args = malloc(sizeof(*args));
+    if (args) *args = (alert_routine_args_t){ .gen = gen, .history_id = s_active_history_id };
+    if (args && s_task_create && s_task_delete)
+        h = s_task_create(alert_routine_task, "alert_routine", 16384,
+                          args, 5, 0, NULL, NULL);
     if (!h) {
         /* Without the routine there will be no push and no buzzer, so say so
          * rather than sitting silently in PENDING for ever. */
+        free(args);
+        alert_history_result(s_active_history_id, ALERT_DELIVERY_FAILED, false);
+        s_active_history_id = 0;
         ESP_LOGE(TAG, "failed to create alert routine task — disarming");
         set_state(ALERT_DISARMED);
         return;
@@ -596,8 +665,10 @@ static void start_alert_routine(void)
 /* Owner task only. */
 static void cancel_alert_routine(void)
 {
-    s_routine_gen++;
+    __atomic_add_fetch(&s_routine_gen, 1, __ATOMIC_ACQ_REL);
     s_routine_active = false;
+    alert_history_cancel(s_active_history_id);
+    s_active_history_id = 0;
 }
 
 /* ── State re-evaluation ────────────────────────────────────────────── */
@@ -619,14 +690,17 @@ static void reevaluate_state(void)
 
     bool in_win = currently_in_window();
     bool therapy_on = therapy_is_active();
+    portENTER_CRITICAL(&s_lifecycle_lock);
+    bool observed_active = s_lifecycle.edge == ALERT_EDGE_ACTIVE;
+    portEXIT_CRITICAL(&s_lifecycle_lock);
     alert_state_t st = therapy_alert_get_state();
 
-    if (in_win && therapy_on && st == ALERT_DISARMED) {
+    if (in_win && therapy_on && observed_active && st == ALERT_DISARMED) {
         /* Window open + therapy active + not yet armed → ARM */
         set_state(ALERT_ARMED);
         ESP_LOGI(TAG, "reevaluate: therapy active inside window — armed");
     } else if (!in_win && (st == ALERT_ARMED || st == ALERT_PENDING ||
-                            st == ALERT_PUSH_SENT || st == ALERT_BUZZING)) {
+                            st == ALERT_PUSH_SENT || st == ALERT_BUZZING || st == ALERT_SCREEN_ONLY || st == ALERT_PUSH_FAILED)) {
         /* Window closed → disarm and cancel any running routine.
          * This is the deepest path in the component and the one implicated
          * in both INT_WDT events, so measure the stack here. */
@@ -710,7 +784,7 @@ static void handle_ble_disconnect(void)
     if (!s_cfg.enabled) return;
 
     alert_state_t st = s_state;
-    if (st != ALERT_DISARMED) {
+    if (st != ALERT_DISARMED && st != ALERT_ACKED) {
         ESP_LOGI(TAG, "BLE disconnect — disarming (was %s)",
                  therapy_alert_state_str(st));
         cancel_alert_routine();
@@ -724,8 +798,29 @@ static void handle_ack(void)
     if (st == ALERT_DISARMED || st == ALERT_ACKED) return;
 
     ESP_LOGI(TAG, "acknowledged (was %s)", therapy_alert_state_str(st));
+    uint32_t id = therapy_alert_is_actionable(st) ? s_active_history_id : 0;
     cancel_alert_routine();
     set_state(ALERT_ACKED);
+    alert_history_ack(id);
+}
+
+/* Drain semantic lifecycle state before ordinary config/routine wakeups. */
+static void drain_lifecycle(void)
+{
+    alert_lifecycle_t snapshot;
+    portENTER_CRITICAL(&s_lifecycle_lock);
+    snapshot = s_lifecycle;
+    portEXIT_CRITICAL(&s_lifecycle_lock);
+    alert_action_t actions[4];
+    size_t count = alert_lifecycle_actions(&snapshot, &s_lifecycle_cursor, actions);
+    for (size_t i = 0; i < count; ++i) {
+        switch (actions[i]) {
+        case ALERT_DO_START: handle_therapy_start(); break;
+        case ALERT_DO_STOP: handle_therapy_stop(); break;
+        case ALERT_DO_DISCONNECT: handle_ble_disconnect(); break;
+        case ALERT_DO_ACK: handle_ack(); break;
+        }
+    }
 }
 
 /* ── Owner task ─────────────────────────────────────────────────────── */
@@ -743,6 +838,19 @@ static void alert_owner_task(void *arg)
     int ticks = 0;
 
     for (;;) {
+        /* Consume the sticky acknowledgement before ordinary work. If the
+         * queue was full when the user acknowledged, its queued wake-up may
+         * have been dropped, but a full queue guarantees this loop is already
+         * making progress and will observe the latch on its next iteration. */
+        if (s_ack_pending && xSemaphoreTake(s_ack_pending, 0) == pdTRUE) {
+            /* Payload and cycle are retained in s_lifecycle. */
+        }
+        drain_lifecycle();
+
+        if (__atomic_exchange_n(&s_cfg_pending, false, __ATOMIC_ACQ_REL)) {
+            promote_staged_config();
+            reevaluate_state();
+        }
         alert_evt_t ev;
         if (xQueueReceive(s_evt_q, &ev, pdMS_TO_TICKS(ALERT_TICK_MS)) != pdTRUE) {
             reevaluate_state();
@@ -758,16 +866,11 @@ static void alert_owner_task(void *arg)
             reevaluate_state();
             break;
         case EVT_THERAPY_START:
-            handle_therapy_start();
-            break;
         case EVT_THERAPY_STOP:
-            handle_therapy_stop();
-            break;
         case EVT_BLE_DISCONNECT:
-            handle_ble_disconnect();
-            break;
         case EVT_ACK:
-            handle_ack();
+            /* Queue entries are wakeups, never authoritative transitions. */
+            drain_lifecycle();
             break;
         case EVT_CONFIG:
             promote_staged_config();
@@ -775,10 +878,10 @@ static void alert_owner_task(void *arg)
             break;
         case EVT_ROUTINE_STATE:
             /* Ignore requests from a superseded routine. */
-            if (ev.gen == s_routine_gen) set_state((alert_state_t)ev.state);
+            if (ev.gen == __atomic_load_n(&s_routine_gen, __ATOMIC_ACQUIRE)) set_state((alert_state_t)ev.state);
             break;
         case EVT_ROUTINE_EXIT:
-            if (ev.gen == s_routine_gen) s_routine_active = false;
+            if (ev.gen == __atomic_load_n(&s_routine_gen, __ATOMIC_ACQUIRE)) s_routine_active = false;
             break;
         default:
             break;
@@ -796,22 +899,58 @@ static void alert_owner_task(void *arg)
 
 void therapy_alert_on_therapy_start(void)
 {
+    portENTER_CRITICAL(&s_lifecycle_lock);
+    uint64_t cycle = s_lifecycle.cycle;
+    alert_lifecycle_start(&s_lifecycle);
+    if (cycle != s_lifecycle.cycle)
+        __atomic_add_fetch(&s_routine_gen, 1, __ATOMIC_ACQ_REL);
+    portEXIT_CRITICAL(&s_lifecycle_lock);
     post_evt(EVT_THERAPY_START, 0, 0);
 }
 
 void therapy_alert_on_therapy_stop(void)
 {
+    portENTER_CRITICAL(&s_lifecycle_lock);
+    alert_lifecycle_stop(&s_lifecycle);
+    portEXIT_CRITICAL(&s_lifecycle_lock);
     post_evt(EVT_THERAPY_STOP, 0, 0);
 }
 
 void therapy_alert_on_ble_disconnect(void)
 {
+    portENTER_CRITICAL(&s_lifecycle_lock);
+    alert_lifecycle_disconnect(&s_lifecycle, false);
+    __atomic_add_fetch(&s_routine_gen, 1, __ATOMIC_ACQ_REL);
+    portEXIT_CRITICAL(&s_lifecycle_lock);
     post_evt(EVT_BLE_DISCONNECT, 0, 0);
 }
 
 void therapy_alert_acknowledge(void)
 {
+    if (!s_ack_pending) return;
+    portENTER_CRITICAL(&s_lifecycle_lock);
+    alert_lifecycle_ack(&s_lifecycle);
+    __atomic_add_fetch(&s_routine_gen, 1, __ATOMIC_ACQ_REL);
+    portEXIT_CRITICAL(&s_lifecycle_lock);
+    xSemaphoreGive(s_ack_pending);
     post_evt(EVT_ACK, 0, 0);
+}
+
+void therapy_alert_on_transport_loss(void)
+{
+    portENTER_CRITICAL(&s_lifecycle_lock);
+    alert_lifecycle_disconnect(&s_lifecycle, true);
+    __atomic_add_fetch(&s_routine_gen, 1, __ATOMIC_ACQ_REL);
+    portEXIT_CRITICAL(&s_lifecycle_lock);
+    post_evt(EVT_BLE_DISCONNECT, 0, 0);
+}
+
+bool therapy_alert_transport_uncertain(void)
+{
+    portENTER_CRITICAL(&s_lifecycle_lock);
+    bool uncertain = s_lifecycle.edge == ALERT_EDGE_UNCERTAIN;
+    portEXIT_CRITICAL(&s_lifecycle_lock);
+    return uncertain;
 }
 
 /* ── Init ───────────────────────────────────────────────────────────── */
@@ -839,6 +978,9 @@ esp_err_t therapy_alert_init(void)
     s_cfg_mtx = xSemaphoreCreateMutexStatic(&s_cfg_mtx_buf);
     if (!s_cfg_mtx) return ESP_ERR_NO_MEM;
 
+    s_ack_pending = xSemaphoreCreateBinaryStatic(&s_ack_pending_buf);
+    if (!s_ack_pending) return ESP_ERR_NO_MEM;
+
     s_evt_q = xQueueCreateStatic(ALERT_EVT_Q_LEN, sizeof(alert_evt_t),
                                  s_evt_q_storage, &s_evt_q_buf);
     if (!s_evt_q) return ESP_ERR_NO_MEM;
@@ -862,3 +1004,8 @@ esp_err_t therapy_alert_init(void)
 
     return ESP_OK;
 }
+
+void therapy_alert_config_snapshot(therapy_alert_config_t *out) { if (out) cfg_snapshot(out); }
+
+bool therapy_alert_is_actionable(alert_state_t st)
+{ return st == ALERT_PENDING || st == ALERT_PUSH_SENT || st == ALERT_BUZZING || st == ALERT_SCREEN_ONLY || st == ALERT_PUSH_FAILED; }

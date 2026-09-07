@@ -609,7 +609,7 @@ static void battery_monitor_task(void *arg)
 
     if (bat_adc_init() != ESP_OK) {
         ESP_LOGE(TAG, "battery: monitor exiting, ADC unavailable");
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 

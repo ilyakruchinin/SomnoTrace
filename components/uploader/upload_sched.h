@@ -90,6 +90,12 @@ bool upload_sched_uploading(void);
 /* Compact progress for the Web UI.  Caller frees. */
 esp_err_t upload_sched_progress_json(char **out_json);
 
+/* Allocation-free structured form used by the public uploader snapshot API
+ * and as the single source for progress JSON serialization. Index aggregates
+ * are scheduler-owned RAM caches, so callers never traverse mutable index
+ * storage from the display/httpd/WebSocket tasks. */
+esp_err_t upload_sched_progress_snapshot(uploader_progress_snapshot_t *out);
+
 /* One-line summary for /api/status: number of units not yet uploaded across
  * configured backends, and the worst backend state as a short string. */
 void upload_sched_summary(int *out_pending, const char **out_worst);

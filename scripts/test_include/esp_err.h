@@ -38,6 +38,9 @@ typedef int esp_err_t;
 #define ESP_ERR_TIMEOUT          0x107
 #define ESP_ERR_INVALID_RESPONSE 0x108
 #define ESP_ERR_INVALID_CRC      0x109
+#define ESP_ERR_INVALID_VERSION  0x10A
+#define ESP_ERR_NVS_BASE         0x1100
+#define ESP_ERR_NVS_NOT_FOUND    (ESP_ERR_NVS_BASE + 0x02)
 
 static inline const char *esp_err_to_name(esp_err_t e)
 {
@@ -50,6 +53,8 @@ static inline const char *esp_err_to_name(esp_err_t e)
     case ESP_ERR_INVALID_SIZE:  return "ESP_ERR_INVALID_SIZE";
     case ESP_ERR_NOT_FOUND:     return "ESP_ERR_NOT_FOUND";
     case ESP_ERR_TIMEOUT:       return "ESP_ERR_TIMEOUT";
+    case ESP_ERR_INVALID_VERSION: return "ESP_ERR_INVALID_VERSION";
+    case ESP_ERR_NVS_NOT_FOUND: return "ESP_ERR_NVS_NOT_FOUND";
     default:                    return "ESP_ERR_?";
     }
 }

@@ -143,9 +143,58 @@ static uint16_t s_mtu = 23;
 
 /* AS11 device clock captured before stream starts (epoch ms).
  * Used to compute clock_drift_ms at session stop without sending
- * RPCs during active streaming (which congests BLE buffers). */
-static int64_t s_as11_clock_ms = 0;
-static int64_t s_as11_clock_capture_ntp_ms = 0;
+ * RPCs during active streaming (which congests BLE buffers).  The two
+ * 64-bit timestamps and their wall-clock provenance are one atomic snapshot:
+ * readers must never observe fields from different reconnect attempts. */
+typedef struct {
+    int64_t as11_ms;
+    int64_t wall_ms;
+    time_source_t wall_source;
+    bool available;
+} as11_clock_capture_t;
+
+static as11_clock_capture_t s_as11_clock_capture = {
+    .wall_source = TIME_SRC_NONE,
+};
+static uint32_t s_as11_clock_generation;
+static portMUX_TYPE s_as11_clock_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static uint32_t as11_clock_capture_invalidate(void)
+{
+    portENTER_CRITICAL(&s_as11_clock_lock);
+    uint32_t generation = ++s_as11_clock_generation;
+    s_as11_clock_capture.as11_ms = 0;
+    s_as11_clock_capture.wall_ms = 0;
+    s_as11_clock_capture.wall_source = TIME_SRC_NONE;
+    s_as11_clock_capture.available = false;
+    portEXIT_CRITICAL(&s_as11_clock_lock);
+    return generation;
+}
+
+static bool as11_clock_capture_store(uint32_t generation, int64_t as11_ms,
+                                     int64_t wall_ms,
+                                     time_source_t wall_source)
+{
+    portENTER_CRITICAL(&s_as11_clock_lock);
+    bool stored = generation == s_as11_clock_generation;
+    if (stored) {
+        s_as11_clock_capture.as11_ms = as11_ms;
+        s_as11_clock_capture.wall_ms = wall_ms;
+        s_as11_clock_capture.wall_source = wall_source;
+        s_as11_clock_capture.available = true;
+    }
+    portEXIT_CRITICAL(&s_as11_clock_lock);
+    return stored;
+}
+
+static as11_clock_capture_t as11_clock_capture_load(void)
+{
+    as11_clock_capture_t capture;
+    portENTER_CRITICAL(&s_as11_clock_lock);
+    capture = s_as11_clock_capture;
+    portEXIT_CRITICAL(&s_as11_clock_lock);
+    return capture;
+}
 
 /* Handles for characteristics discovered during full GATT scan.
  * The AS11 btmon trace shows BlueZ reads these by handle (ATT Read Request
@@ -160,6 +209,9 @@ static SemaphoreHandle_t s_connect_sem;
 static volatile int s_connect_status;
 static SemaphoreHandle_t s_resp_sem;  /* JSON RPC response arrived */
 static cJSON *s_resp_json;            /* owned; freed by waiter */
+static portMUX_TYPE s_response_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_rpc_serial, s_expected_response_id;
+static cJSON *s_response_original_id;
 static SemaphoreHandle_t s_cmd_mtx;   /* serialization mutex for RPC requests */
 
 static uint8_t *s_rx_buf;          /* PSRAM-allocated, RX_BUF_MAX bytes */
@@ -180,15 +232,11 @@ static uint32_t    s_notif_dropped = 0;
 static uint32_t    s_notif_dropped_bytes = 0;
 static uint32_t    s_notif_alloc_fail = 0;
 static TaskHandle_t  s_notif_task  = NULL;
-
-/* ── Spool fragment collector ────────────────────────────────────────
- * When a spool pull is in progress, s_spool_collector is non-NULL and
- * handle_notify() routes SpoolFragment notifications to it instead of
- * the normal notification dispatch.  This is set/cleared only by
- * as11_ble_spool_pull() which runs in the same notif_proc_task context
- * (via stop_task → post_therapy), so no extra locking is needed — the
- * collector pointer is written before PullSpoolFragments is sent and
- * cleared after the last fragment is received. */
+/* Spool publication and fragment mutation are serialized by a dedicated
+ * mutex, never held while waiting for BLE/network responses. Withdrawal waits
+ * for any in-flight decoder before freeing the collector or its semaphore. */
+static SemaphoreHandle_t s_spool_mtx;
+static bool s_spool_tainted;
 #define SPOOL_MAX_FRAGS   32
 #define SPOOL_FRAG_MAX    2808          /* matches AS11 max fragment size */
 
@@ -204,6 +252,7 @@ typedef struct {
     char     status[48];                /* SPOOL_INCOMPLETE / SPOOL_COMPLETE / ... */
     char     next_addr_json[256];       /* nextSpoolAddress for multi-round pulls */
     bool     done;                      /* set when status != SPOOL_INCOMPLETE */
+    bool     failed;
     SemaphoreHandle_t sem;              /* given when done */
 } spool_collector_t;
 
@@ -686,10 +735,23 @@ static int on_dsc(uint16_t conn, const struct ble_gatt_error *err,
     return 0;
 }
 
+/* Takes ownership, including mismatched or duplicate responses. */
+static void rpc_accept_response(cJSON *msg)
+{
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(msg, "id");
+    bool accepted = false;
+    portENTER_CRITICAL(&s_response_lock);
+    if (cJSON_IsNumber(id) && s_expected_response_id &&
+        id->valuedouble == (double)s_expected_response_id && !s_resp_json) {
+        s_resp_json = msg; accepted = true;
+    }
+    portEXIT_CRITICAL(&s_response_lock);
+    if (accepted) xSemaphoreGive(s_resp_sem);
+    else cJSON_Delete(msg);
+}
+
 static void handle_notify(const uint8_t *data, int len);
 
-/* Notification processing task — drains the queue and does the heavy
- * FIG/AES/cJSON work off the NimBLE host task. */
 static void notif_proc_task(void *arg)
 {
     (void)arg;
@@ -785,15 +847,26 @@ static void handle_notify(const uint8_t *data, int len)
              * the normal notification dispatch.  The collector buffers
              * decoded base64 fragments and signals completion when the
              * device reports SPOOL_COMPLETE or SPOOL_COMPLETE_MORE_DATA_PENDING. */
-            if (s_spool_collector && strcmp(m, "SpoolFragment") == 0) {
+            if (strcmp(m, "SpoolFragment") == 0) {
+                xSemaphoreTake(s_spool_mtx, portMAX_DELAY);
+                spool_collector_t *collector = s_spool_collector;
+                if (!collector) {
+                    xSemaphoreGive(s_spool_mtx);
+                    cJSON_Delete(msg);
+                    continue;
+                }
                 cJSON *params = cJSON_GetObjectItem(msg, "params");
                 if (params) {
                     cJSON *seq_j = cJSON_GetObjectItem(params, "seq");
                     cJSON *data_j = cJSON_GetObjectItem(params, "data");
                     cJSON *status_j = cJSON_GetObjectItem(params, "status");
 
+                    if (cJSON_IsString(data_j) && data_j->valuestring[0] &&
+                        (collector->frag_count >= SPOOL_MAX_FRAGS ||
+                         strlen(data_j->valuestring) > ((SPOOL_FRAG_MAX + 2) / 3) * 4))
+                        collector->failed = true;
                     if (data_j && cJSON_IsString(data_j) &&
-                        s_spool_collector->frag_count < SPOOL_MAX_FRAGS) {
+                        collector->frag_count < SPOOL_MAX_FRAGS) {
 
                         /* Base64-decode the fragment data.
                          * An empty base64 string (dec_len=0) is valid —
@@ -805,7 +878,7 @@ static void handle_notify(const uint8_t *data, int len)
                          * times out. */
                         const char *b64 = data_j->valuestring;
                         size_t b64_len = strlen(b64);
-                        if (b64_len > 0) {
+                        if (b64_len > 0 && b64_len <= ((SPOOL_FRAG_MAX + 2) / 3) * 4) {
                             size_t dec_max = (b64_len / 4) * 3 + 4;
                             uint8_t *frag = heap_caps_malloc(dec_max, MALLOC_CAP_SPIRAM);
                             if (!frag) frag = malloc(dec_max);
@@ -815,46 +888,48 @@ static void handle_notify(const uint8_t *data, int len)
                                     frag, dec_max, &dec_len,
                                     (const unsigned char *)b64, b64_len);
                                 if (rc == 0 && dec_len > 0) {
-                                    int idx = s_spool_collector->frag_count++;
-                                    s_spool_collector->frags[idx].seq =
+                                    int idx = collector->frag_count++;
+                                    collector->frags[idx].seq =
                                         seq_j ? seq_j->valueint : idx;
-                                    s_spool_collector->frags[idx].data = frag;
-                                    s_spool_collector->frags[idx].len = (int)dec_len;
+                                    collector->frags[idx].data = frag;
+                                    collector->frags[idx].len = (int)dec_len;
                                     ESP_LOGI(TAG, "spool frag %d: seq=%d len=%d",
-                                             idx, s_spool_collector->frags[idx].seq,
+                                             idx, collector->frags[idx].seq,
                                              (int)dec_len);
                                 } else if (rc != 0) {
+                                    collector->failed = true;
                                     ESP_LOGW(TAG, "base64 decode failed rc=%d", rc);
                                     free(frag);
                                 } else {
                                     /* rc == 0 but dec_len == 0 — empty payload */
                                     free(frag);
                                 }
-                            }
+                            } else collector->failed = true;
                         }
                     }
 
                     /* Check completion status */
                     if (status_j && cJSON_IsString(status_j)) {
-                        strlcpy(s_spool_collector->status,
+                        strlcpy(collector->status,
                                 status_j->valuestring,
-                                sizeof(s_spool_collector->status));
+                                sizeof(collector->status));
                         /* Capture nextSpoolAddress for multi-round pulls */
                         cJSON *next_j = cJSON_GetObjectItem(params, "nextSpoolAddress");
                         if (next_j) {
                             char *ns = cJSON_PrintUnformatted(next_j);
                             if (ns) {
-                                strlcpy(s_spool_collector->next_addr_json, ns,
-                                        sizeof(s_spool_collector->next_addr_json));
+                                strlcpy(collector->next_addr_json, ns,
+                                        sizeof(collector->next_addr_json));
                                 free(ns);
                             }
                         }
                         if (strcmp(status_j->valuestring, "SPOOL_INCOMPLETE") != 0) {
-                            s_spool_collector->done = true;
-                            xSemaphoreGive(s_spool_collector->sem);
+                            collector->done = true;
+                            xSemaphoreGive(collector->sem);
                         }
                     }
                 }
+                xSemaphoreGive(s_spool_mtx);
                 cJSON_Delete(msg);
                 continue;
             }
@@ -866,10 +941,7 @@ static void handle_notify(const uint8_t *data, int len)
             cJSON_Delete(msg);
             continue;
         }
-        /* RPC response */
-        if (s_resp_json) cJSON_Delete(s_resp_json);
-        s_resp_json = msg;
-        xSemaphoreGive(s_resp_sem);
+        rpc_accept_response(msg);
     }
 }
 
@@ -986,6 +1058,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGW(TAG, "disconnected (reason=%d)", event->disconnect.reason);
+        as11_clock_capture_invalidate();
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_session_encrypted = false;
         therapy_alert_on_ble_disconnect();
@@ -1121,15 +1194,45 @@ static uint8_t *fig_tx_pkt(void)
     return pkt;
 }
 
+/* Unique wire IDs fence delayed replies across repeated calls. Preserve the
+ * caller's original ID in the returned JSON (including passthrough strings). */
+static void clear_response(void);
+static char *rpc_prepare(const char *json)
+{
+    clear_response();
+    cJSON *request = cJSON_Parse(json);
+    if (!cJSON_IsObject(request)) { cJSON_Delete(request); return NULL; }
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(request, "id");
+    cJSON *original = id ? cJSON_Duplicate(id, true) : NULL;
+    if (id && !original) { cJSON_Delete(request); return NULL; }
+    uint32_t wire_id = ++s_rpc_serial;
+    if (!wire_id || wire_id > INT32_MAX) wire_id = s_rpc_serial = 1;
+    cJSON_DeleteItemFromObjectCaseSensitive(request, "id");
+    if (!cJSON_AddNumberToObject(request, "id", wire_id)) {
+        cJSON_Delete(original); cJSON_Delete(request); return NULL;
+    }
+    char *wire = cJSON_PrintUnformatted(request);
+    cJSON_Delete(request);
+    if (!wire) { cJSON_Delete(original); return NULL; }
+    portENTER_CRITICAL(&s_response_lock);
+    s_expected_response_id = wire_id;
+    s_response_original_id = original;
+    portEXIT_CRITICAL(&s_response_lock);
+    return wire;
+}
+
 static esp_err_t send_fig(uint16_t vcid, const char *json)
 {
     uint8_t *pkt = fig_tx_pkt();
     if (!pkt) return ESP_ERR_NO_MEM;
-    uint16_t plen = (uint16_t)strlen(json);
-    if (plen > TX_PAYLOAD_MAX) return ESP_ERR_INVALID_SIZE;
-    int total = fig_encode(vcid, (const uint8_t *)json, plen, pkt);
+    char *wire = rpc_prepare(json);
+    if (!wire) return ESP_ERR_NO_MEM;
+    size_t plen = strlen(wire);
+    if (plen > TX_PAYLOAD_MAX) { free(wire); return ESP_ERR_INVALID_SIZE; }
+    int total = fig_encode(vcid, (const uint8_t *)wire, (uint16_t)plen, pkt);
+    free(wire);
 
-    ESP_LOGI(TAG, "send_fig: VCID=0x%04x payload=%d total=%d", vcid, plen, total);
+    ESP_LOGI(TAG, "send_fig: VCID=0x%04x payload=%u total=%d", vcid, (unsigned)plen, total);
     ESP_LOG_BUFFER_HEX(TAG, pkt, total);
 
     /* Stream the FIG packet as chunked Write Requests, exactly like the
@@ -1156,9 +1259,13 @@ static esp_err_t send_fig(uint16_t vcid, const char *json)
     return ESP_OK;
 }
 
-/* Send a raw binary FIG packet (for encrypted payloads). */
-static esp_err_t send_fig_raw(uint16_t vcid, const uint8_t *data, int len)
+/* Send a raw binary FIG packet (for encrypted payloads).  Once a GATT write
+ * has been accepted locally, a later timeout/error is indeterminate: the AS11
+ * may already have received enough of the request to act on it. */
+static esp_err_t send_fig_raw(uint16_t vcid, const uint8_t *data, int len,
+                              bool *may_have_reached_peer)
 {
+    if (may_have_reached_peer) *may_have_reached_peer = false;
     uint8_t *pkt = fig_tx_pkt();
     if (!pkt) return ESP_ERR_NO_MEM;
     if (len > TX_PAYLOAD_MAX) return ESP_ERR_INVALID_SIZE;
@@ -1176,6 +1283,7 @@ static esp_err_t send_fig_raw(uint16_t vcid, const uint8_t *data, int len)
             ESP_LOGE(TAG, "write chunk failed rc=%d off=%d", rc, off);
             return ESP_FAIL;
         }
+        if (may_have_reached_peer) *may_have_reached_peer = true;
         if (wait_op(5000) != 0) {
             ESP_LOGE(TAG, "write chunk timeout off=%d", off);
             return ESP_FAIL;
@@ -1187,13 +1295,14 @@ static esp_err_t send_fig_raw(uint16_t vcid, const uint8_t *data, int len)
 /* Send an encrypted JSON-RPC request on VCID 0x0397.
  * Encrypts with AES-256-CBC using the session key, then sends via send_fig_raw.
  * Returns ESP_OK on success. Caller should call wait_response() to get reply. */
-static esp_err_t send_rpc_encrypted(const char *json)
+static esp_err_t send_rpc_encrypted_tracked(const char *json,
+                                             bool *may_have_reached_peer)
 {
+    if (may_have_reached_peer) *may_have_reached_peer = false;
     if (!s_session_encrypted) {
         ESP_LOGE(TAG, "send_rpc_encrypted: no session key");
         return ESP_ERR_INVALID_STATE;
     }
-    int plen = (int)strlen(json);
     uint8_t *enc = heap_caps_malloc(TX_PAYLOAD_MAX, MALLOC_CAP_SPIRAM);
     if (!enc) {
         enc = malloc(TX_PAYLOAD_MAX);
@@ -1201,35 +1310,65 @@ static esp_err_t send_rpc_encrypted(const char *json)
         ESP_LOGW(TAG, "send_rpc_encrypted: fell back to default malloc (PSRAM?)");
     }
 
-    int enc_len = aes_cbc_encrypt(s_session_key, (const uint8_t *)json, plen,
-                                  enc, TX_PAYLOAD_MAX);
+    char *wire = rpc_prepare(json);
+    if (!wire) { free(enc); return ESP_ERR_NO_MEM; }
+    int enc_len = aes_cbc_encrypt(s_session_key, (const uint8_t *)wire,
+                                  (int)strlen(wire), enc, TX_PAYLOAD_MAX);
+    free(wire);
     if (enc_len < 0) {
         free(enc);
         ESP_LOGE(TAG, "AES encrypt failed");
         return ESP_FAIL;
     }
 
-    esp_err_t ret = send_fig_raw(FIG_VCID_TX_ENC, enc, enc_len);
+    esp_err_t ret = send_fig_raw(FIG_VCID_TX_ENC, enc, enc_len,
+                                 may_have_reached_peer);
     free(enc);
     return ret;
+}
+
+static esp_err_t send_rpc_encrypted(const char *json)
+{
+    return send_rpc_encrypted_tracked(json, NULL);
 }
 
 /* Clear any stale RPC response state before sending a new RPC. */
 static void clear_response(void)
 {
-    while (xSemaphoreTake(s_resp_sem, 0) == pdTRUE) { /* drain */ }
-    if (s_resp_json) { cJSON_Delete(s_resp_json); s_resp_json = NULL; }
+    portENTER_CRITICAL(&s_response_lock);
+    cJSON *old = s_resp_json, *id = s_response_original_id;
+    s_resp_json = NULL;
+    s_response_original_id = NULL;
+    s_expected_response_id = 0;
+    portEXIT_CRITICAL(&s_response_lock);
+    cJSON_Delete(old); cJSON_Delete(id);
+    while (xSemaphoreTake(s_resp_sem, 0) == pdTRUE) { }
 }
 
-/* Wait for an RPC response; returns parsed cJSON (caller frees) or NULL. */
+/* A wakeup may belong to a withdrawn request. Only the protected response
+ * pointer is authoritative; keep the original absolute timeout across wakes. */
 static cJSON *wait_response(int timeout_ms)
 {
-    if (xSemaphoreTake(s_resp_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-        return NULL;
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    for (;;) {
+        portENTER_CRITICAL(&s_response_lock);
+        cJSON *result = s_resp_json;
+        cJSON *id = NULL;
+        if (result) {
+            s_resp_json = NULL;
+            s_expected_response_id = 0;
+            id = s_response_original_id;
+            s_response_original_id = NULL;
+        }
+        portEXIT_CRITICAL(&s_response_lock);
+        if (result) {
+            if (id) cJSON_ReplaceItemInObjectCaseSensitive(result, "id", id);
+            return result;
+        }
+        int64_t remaining = deadline - esp_timer_get_time();
+        if (remaining <= 0) { clear_response(); return NULL; }
+        xSemaphoreTake(s_resp_sem, pdMS_TO_TICKS((remaining + 999) / 1000));
     }
-    cJSON *j = s_resp_json;
-    s_resp_json = NULL;
-    return j;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1613,7 +1752,7 @@ static void pair_task(void *arg)
         if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
             ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         }
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -1623,7 +1762,7 @@ static void pair_task(void *arg)
     if (srp_begin() != ESP_OK) {
         set_error("SRP keygen failed");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
     ESP_LOGI(TAG, "pair_task: srp_begin took %lld ms", (esp_timer_get_time() - pair_t0) / 1000);
@@ -1638,7 +1777,7 @@ static void pair_task(void *arg)
     if (!json) {
         set_error("StartKeyExchange: out of memory");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
     snprintf(json, 800,
@@ -1650,7 +1789,7 @@ static void pair_task(void *arg)
     if (se != ESP_OK) {
         set_error("StartKeyExchange send failed");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -1668,7 +1807,7 @@ static void pair_task(void *arg)
     if (!resp) {
         set_error("no StartKeyExchange response");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
     cJSON *result = cJSON_GetObjectItem(resp, "result");
@@ -1678,7 +1817,7 @@ static void pair_task(void *arg)
         cJSON_Delete(resp);
         set_error("bad StartKeyExchange response");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
     /* stash serverPk + salt for the confirm step */
@@ -1688,7 +1827,7 @@ static void pair_task(void *arg)
     cJSON_Delete(resp);
 
     ESP_LOGI(TAG, "StartKeyExchange OK - device should show a 4-digit passkey");
-    vTaskDelete(NULL);
+    psram_task_delete(NULL);
 }
 
 static void confirm_task(void *arg)
@@ -1697,7 +1836,7 @@ static void confirm_task(void *arg)
     set_state(AS11_STATUS_CONFIRMING);
 
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-        set_error("not connected"); vTaskDelete(NULL); return;
+        set_error("not connected"); psram_task_delete(NULL); return;
     }
     /* The StartKeyExchange response may still be arriving if the user
      * entered the PIN quickly.  Wait up to 5 s for s_kex_ready. */
@@ -1705,7 +1844,7 @@ static void confirm_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     if (!s_kex_ready || !s_server_pk || !s_salt) {
-        set_error("no key-exchange state"); vTaskDelete(NULL); return;
+        set_error("no key-exchange state"); psram_task_delete(NULL); return;
     }
 
     char m1_hex[65];
@@ -1715,7 +1854,7 @@ static void confirm_task(void *arg)
                     m1_hex, m2_expected) != ESP_OK) {
         set_error("SRP computation failed");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
     ESP_LOGI(TAG, "confirm_task: srp_compute took %lld ms", (esp_timer_get_time() - conf_t0) / 1000);
@@ -1728,7 +1867,7 @@ static void confirm_task(void *arg)
     if (send_fig(FIG_VCID_TX, json) != ESP_OK) {
         set_error("ConfirmKeyExchange send failed");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -1739,7 +1878,7 @@ static void confirm_task(void *arg)
     if (!resp) {
         set_error("no ConfirmKeyExchange response");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
     cJSON *err = cJSON_GetObjectItem(resp, "error");
@@ -1747,7 +1886,7 @@ static void confirm_task(void *arg)
         cJSON_Delete(resp);
         set_error("device rejected passkey");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
     cJSON *result = cJSON_GetObjectItem(resp, "result");
@@ -1757,7 +1896,7 @@ static void confirm_task(void *arg)
         cJSON_Delete(resp);
         set_error("bad ConfirmKeyExchange response");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
     /* verify server proof (M2) */
@@ -1767,7 +1906,7 @@ static void confirm_task(void *arg)
         cJSON_Delete(resp);
         set_error("server proof mismatch");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -1785,7 +1924,7 @@ static void confirm_task(void *arg)
     if (ns != ESP_OK) {
         set_error("NVS save failed");
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -1799,13 +1938,14 @@ static void confirm_task(void *arg)
      * Without this, therapy data never flows until a manual reboot.
      * Set s_manual_disconnect so the GAP disconnect event doesn't
      * launch a duplicate auto_reconnect_task. */
+    as11_clock_capture_invalidate();
     s_manual_disconnect = true;
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
     vTaskDelay(pdMS_TO_TICKS(500));
     psram_task_create(reconnect_task, "as11_reconn", 8192, NULL, 5, tskNO_AFFINITY, NULL, NULL);
-    vTaskDelete(NULL);
+    psram_task_delete(NULL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1937,6 +2077,7 @@ static esp_err_t do_setup_encrypted_session(const char *cid_str,
         sha256_segs(segs, lens, 2, s_session_key);
     }
     s_session_encrypted = true;
+    __atomic_store_n(&s_spool_tainted, false, __ATOMIC_RELEASE);
     ESP_LOGI(TAG, "reconnect: session key derived");
     return ESP_OK;
 }
@@ -1956,14 +2097,14 @@ static void reconnect_task(void *arg)
     }
     if (!s_host_ready) {
         ESP_LOGW(TAG, "reconnect: host not ready, aborting");
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
     /* Use cached pairing info (loaded at init or after pairing). */
     if (!s_pair_cache.valid) {
         ESP_LOGD(TAG, "reconnect: no cached pairing");
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -1978,7 +2119,7 @@ static void reconnect_task(void *arg)
 
     if (addr_str[0] == '\0' || cid_str[0] == '\0' || pair_key_hex[0] == '\0') {
         ESP_LOGD(TAG, "reconnect: incomplete pairing cache");
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -1988,7 +2129,7 @@ static void reconnect_task(void *arg)
     s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
     if (!str_to_addr(addr_str, &s_target_addr)) {
         ESP_LOGE(TAG, "reconnect: bad addr '%s'", addr_str);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
     strlcpy(s_target_name, name_str, sizeof(s_target_name));
@@ -1999,7 +2140,7 @@ static void reconnect_task(void *arg)
             ESP_LOGI(TAG, "reconnect: aborted (pairing=%d manual=%d)",
                      s_pair_cache.valid, s_manual_disconnect);
             set_state(AS11_STATUS_IDLE);
-            vTaskDelete(NULL);
+            psram_task_delete(NULL);
             return;
         }
 
@@ -2024,7 +2165,7 @@ static void reconnect_task(void *arg)
                 ESP_LOGI(TAG, "reconnect: aborted (pairing=%d manual=%d)",
                          s_pair_cache.valid, s_manual_disconnect);
                 set_state(AS11_STATUS_IDLE);
-                vTaskDelete(NULL);
+                psram_task_delete(NULL);
                 return;
             }
             if (do_connect_and_discover() == ESP_OK) {
@@ -2047,7 +2188,7 @@ static void reconnect_task(void *arg)
                              "(pairing=%d manual=%d)",
                          s_pair_cache.valid, s_manual_disconnect);
                 set_state(AS11_STATUS_IDLE);
-                vTaskDelete(NULL);
+                psram_task_delete(NULL);
                 return;
             }
             slow_attempt++;
@@ -2059,7 +2200,7 @@ static void reconnect_task(void *arg)
             if (!s_pair_cache.valid || s_manual_disconnect) {
                 ESP_LOGI(TAG, "reconnect: aborted during slow retry wait");
                 set_state(AS11_STATUS_IDLE);
-                vTaskDelete(NULL);
+                psram_task_delete(NULL);
                 return;
             }
             set_state(AS11_STATUS_CONNECTING);
@@ -2079,7 +2220,7 @@ static void reconnect_task(void *arg)
         if (!connected) {
             ESP_LOGE(TAG, "reconnect: all connect attempts failed");
             set_state(AS11_STATUS_IDLE);
-            vTaskDelete(NULL);
+            psram_task_delete(NULL);
             return;
         }
 
@@ -2105,7 +2246,7 @@ static void reconnect_task(void *arg)
         if (hard_fail && setup_failures >= 3) {
             ESP_LOGE(TAG, "reconnect: persistent session setup rejection, latching error state");
             set_state(AS11_STATUS_ERROR);
-            vTaskDelete(NULL);
+            psram_task_delete(NULL);
             return;
         }
 
@@ -2220,12 +2361,30 @@ after_subscribe:
      * GetDateTime must be sent before StartStream because active streaming
      * congests BLE ACL buffers, making subsequent RPCs fail. */
     {
+        /* A failed recapture must not leave a measurement from the previous
+         * connection looking current. */
+        uint32_t capture_generation = as11_clock_capture_invalidate();
         int64_t as11_ms = 0;
         if (as11_ble_get_datetime(&as11_ms) == ESP_OK) {
-            s_as11_clock_ms = as11_ms;
-            s_as11_clock_capture_ntp_ms = (int64_t)time(NULL) * 1000;
-            ESP_LOGI(TAG, "reconnect: AS11 clock captured: %lld ms (NTP=%lld)",
-                     (long long)as11_ms, (long long)s_as11_clock_capture_ntp_ms);
+            /* Read provenance before wall time.  If NTP synchronises between
+             * the two reads we conservatively retain the older, degraded
+             * provenance; the next reconnect can produce a measured drift. */
+            time_source_t wall_source = time_source_get();
+            int64_t wall_ms = (int64_t)time(NULL) * 1000;
+            bool stored = as11_clock_capture_store(capture_generation,
+                                                   as11_ms, wall_ms,
+                                                   wall_source);
+            if (!stored) {
+                ESP_LOGW(TAG, "reconnect: link changed during AS11 clock "
+                              "capture; discarding stale result");
+            } else if (wall_source == TIME_SRC_NTP) {
+                ESP_LOGI(TAG, "reconnect: AS11 clock captured: %lld ms (NTP=%lld)",
+                         (long long)as11_ms, (long long)wall_ms);
+            } else {
+                ESP_LOGW(TAG, "reconnect: AS11 clock captured against "
+                              "non-NTP source=%d; measured drift unavailable",
+                         (int)wall_source);
+            }
         } else {
             ESP_LOGW(TAG, "reconnect: GetDateTime failed — clock_drift_ms will be unavailable");
         }
@@ -2278,7 +2437,7 @@ after_start_stream:
     #endif
     ESP_LOGI(TAG, "reconnect: connected to %s, session established, streams started", addr_str);
 
-    vTaskDelete(NULL);
+    psram_task_delete(NULL);
 }
 
 /* ------------------------------------------------------------------
@@ -2302,13 +2461,13 @@ static void auto_reconnect_task(void *arg)
             ESP_LOGI(TAG, "auto-reconnect: aborted during wait "
                          "(pairing=%d manual=%d)",
                      s_pair_cache.valid, s_manual_disconnect);
-            vTaskDelete(NULL);
+            psram_task_delete(NULL);
             return;
         }
     }
 
     /* reconnect_task handles the full connect + encrypted session +
-     * stream setup.  It calls vTaskDelete(NULL) internally, so this
+     * stream setup.  It calls psram_task_delete(NULL) internally, so this
      * task is cleaned up when reconnect_task finishes. */
     reconnect_task(arg);
 }
@@ -2352,11 +2511,12 @@ esp_err_t as11_ble_init(void)
 {
     s_state_mtx  = xSemaphoreCreateMutex();
     s_cmd_mtx    = xSemaphoreCreateMutex();
+    s_spool_mtx = xSemaphoreCreateMutex();
     s_op_sem     = xSemaphoreCreateBinary();
     s_connect_sem = xSemaphoreCreateBinary();
     s_resp_sem   = xSemaphoreCreateBinary();
     s_scan_done  = xSemaphoreCreateBinary();
-    if (!s_state_mtx || !s_cmd_mtx || !s_op_sem || !s_connect_sem || !s_resp_sem || !s_scan_done) {
+    if (!s_state_mtx || !s_cmd_mtx || !s_spool_mtx || !s_op_sem || !s_connect_sem || !s_resp_sem || !s_scan_done) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -2549,6 +2709,7 @@ static esp_err_t do_forget_nvs(void *arg)
 
 esp_err_t as11_ble_forget(void)
 {
+    as11_clock_capture_invalidate();
     /* Delegate the NVS erase so callers on a PSRAM stack (httpd forget handler)
      * are safe; the BLE teardown below stays on the caller (no flash). */
     esp_err_t e = nvs_writer_run(do_forget_nvs, NULL);
@@ -2565,6 +2726,7 @@ esp_err_t as11_ble_forget(void)
 
 esp_err_t as11_ble_disconnect(void)
 {
+    as11_clock_capture_invalidate();
     s_manual_disconnect = true;
     if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ESP_LOGI(TAG, "disconnecting BLE (conn_handle=%d)", s_conn_handle);
@@ -2592,15 +2754,21 @@ esp_err_t as11_ble_stop_stream(void)
 esp_err_t as11_ble_get_clock_drift(int64_t *out_drift_ms)
 {
     if (!out_drift_ms) return ESP_ERR_INVALID_ARG;
-    if (s_as11_clock_ms == 0 || s_as11_clock_capture_ntp_ms == 0) {
+    as11_clock_capture_t capture = as11_clock_capture_load();
+    if (!capture.available) {
         ESP_LOGW(TAG, "get_clock_drift: no AS11 clock capture available");
         return ESP_ERR_INVALID_STATE;
     }
-    *out_drift_ms = s_as11_clock_capture_ntp_ms - s_as11_clock_ms;
+    if (capture.wall_source != TIME_SRC_NTP) {
+        ESP_LOGW(TAG, "get_clock_drift: capture wall source=%d is not NTP",
+                 (int)capture.wall_source);
+        return ESP_ERR_INVALID_STATE;
+    }
+    *out_drift_ms = capture.wall_ms - capture.as11_ms;
     ESP_LOGI(TAG, "get_clock_drift: drift=%lld ms (NTP=%lld AS11=%lld)",
              (long long)*out_drift_ms,
-             (long long)s_as11_clock_capture_ntp_ms,
-             (long long)s_as11_clock_ms);
+             (long long)capture.wall_ms,
+             (long long)capture.as11_ms);
     return ESP_OK;
 }
 
@@ -2608,7 +2776,7 @@ esp_err_t as11_ble_get_clock_drift(int64_t *out_drift_ms)
  * Returns ESP_OK and stores epoch milliseconds in *out_epoch_ms.
  * The response format is {"result":{"dateTime":"2026-06-25T15:08:00.000Z"}}.
  * Returns ESP_FAIL if the RPC fails or the response can't be parsed. */
-esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms)
+static esp_err_t get_datetime_locked(int64_t *out_epoch_ms)
 {
     if (!out_epoch_ms) return ESP_ERR_INVALID_ARG;
     if (!s_session_encrypted) {
@@ -2679,6 +2847,17 @@ esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms)
     return ret;
 }
 
+esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms)
+{
+    if (!s_cmd_mtx || xSemaphoreTake(s_cmd_mtx, pdMS_TO_TICKS(10000)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    esp_err_t result = get_datetime_locked(out_epoch_ms);
+    clear_response();
+    xSemaphoreGive(s_cmd_mtx);
+    return result;
+}
+
+
 /* ── Spool RPC ────────────────────────────────────────────────────────
  *
  * Post-therapy data collection.  The AS11 stores session summaries, event
@@ -2687,10 +2866,9 @@ esp_err_t as11_ble_get_datetime(int64_t *out_epoch_ms)
  * asynchronously on the same BLE characteristic as StreamData and RPC
  * responses; handle_notify() intercepts them when s_spool_collector is set.
  *
- * The pull function runs in the notif_proc_task context (via stop_task →
- * post_therapy), which is the same task that processes notifications.  This
- * is intentional: it allows SpoolFragment notifications to be handled
- * synchronously while we wait on the collector semaphore.
+ * The pull function runs on the post worker (via stop_task →
+ * post_therapy), while notif_proc decodes fragments concurrently. A dedicated
+ * mutex joins any in-flight decoder before a collector or semaphore is freed.
  *
  * Multi-round pulls: if the device returns SPOOL_COMPLETE_MORE_DATA_PENDING,
  * the last fragment includes a nextSpoolAddress JSON object.  We loop with
@@ -2710,6 +2888,25 @@ static int frag_cmp(const void *a, const void *b)
  * SPOOL_COMPLETE_MORE_DATA_PENDING, *next_addr_out is set to the
  * nextSpoolAddress JSON string (caller uses it for the next round).
  * Otherwise *next_addr_out is set to empty string. */
+static void spool_withdraw(spool_collector_t *collector, bool aborting)
+{
+    xSemaphoreTake(s_spool_mtx, portMAX_DELAY);
+    if (s_spool_collector == collector) s_spool_collector = NULL;
+    xSemaphoreGive(s_spool_mtx);
+    vSemaphoreDelete(collector->sem);
+    collector->sem = NULL;
+    if (aborting) {
+        for (int i = 0; i < collector->frag_count; ++i)
+            free(collector->frags[i].data);
+        collector->frag_count = 0;
+        /* Fragments carry no trustworthy request generation. End this link
+         * before admitting another collector, rather than mixing late data. */
+        __atomic_store_n(&s_spool_tainted, true, __ATOMIC_RELEASE);
+        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
+            ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+}
+
 static esp_err_t spool_one_round(const char *spool_addr_json,
                                  uint8_t **round_data, size_t *round_len,
                                  char *next_addr_out, size_t next_addr_max)
@@ -2718,12 +2915,11 @@ static esp_err_t spool_one_round(const char *spool_addr_json,
     *round_len = 0;
     next_addr_out[0] = '\0';
 
-    /* Set up collector before sending RPCs so we don't miss fragments. */
+    /* Own the collector locally until StartSpool responds; publish before
+     * PullSpoolFragments can generate any fragments for this round. */
     spool_collector_t coll = {0};
     coll.sem = xSemaphoreCreateBinary();
     if (!coll.sem) return ESP_ERR_NO_MEM;
-    s_spool_collector = &coll;
-
     /* 1. StartSpool RPC */
     char rpc[512];
     snprintf(rpc, sizeof(rpc),
@@ -2733,16 +2929,14 @@ static esp_err_t spool_one_round(const char *spool_addr_json,
     clear_response();
     if (send_rpc_encrypted(rpc) != ESP_OK) {
         ESP_LOGE(TAG, "spool: StartSpool send failed");
-        vSemaphoreDelete(coll.sem);
-        s_spool_collector = NULL;
+        spool_withdraw(&coll, true);
         return ESP_FAIL;
     }
 
     cJSON *resp = wait_response(10000);
     if (!resp) {
         ESP_LOGE(TAG, "spool: StartSpool timeout");
-        vSemaphoreDelete(coll.sem);
-        s_spool_collector = NULL;
+        spool_withdraw(&coll, true);
         return ESP_FAIL;
     }
     cJSON *result = cJSON_GetObjectItem(resp, "result");
@@ -2752,13 +2946,16 @@ static esp_err_t spool_one_round(const char *spool_addr_json,
         ESP_LOGE(TAG, "spool: StartSpool bad response: %s", s ? s : "?");
         if (s) free(s);
         cJSON_Delete(resp);
-        vSemaphoreDelete(coll.sem);
-        s_spool_collector = NULL;
+        spool_withdraw(&coll, true);
         return ESP_FAIL;
     }
     int spool_id = spool_id_j->valueint;
     cJSON_Delete(resp);
     ESP_LOGI(TAG, "spool: StartSpool ok, spoolId=%d", spool_id);
+
+    xSemaphoreTake(s_spool_mtx, portMAX_DELAY);
+    s_spool_collector = &coll;
+    xSemaphoreGive(s_spool_mtx);
 
     /* 2. PullSpoolFragments RPC — triggers SpoolFragment notifications */
     snprintf(rpc, sizeof(rpc),
@@ -2768,8 +2965,7 @@ static esp_err_t spool_one_round(const char *spool_addr_json,
     clear_response();
     if (send_rpc_encrypted(rpc) != ESP_OK) {
         ESP_LOGE(TAG, "spool: PullSpoolFragments send failed");
-        vSemaphoreDelete(coll.sem);
-        s_spool_collector = NULL;
+        spool_withdraw(&coll, true);
         return ESP_FAIL;
     }
 
@@ -2780,19 +2976,8 @@ static esp_err_t spool_one_round(const char *spool_addr_json,
 
     /* 3. Wait for all fragments to arrive */
     if (xSemaphoreTake(coll.sem, pdMS_TO_TICKS(30000)) != pdTRUE) {
-        ESP_LOGE(TAG, "spool: fragment collection timeout (%d frags received)",
-                 coll.frag_count);
-        /* Detach first: a SpoolFragment notification arriving late must not
-         * append to a collector that is being torn down. */
-        s_spool_collector = NULL;
-        vSemaphoreDelete(coll.sem);
-        /* Fragments already received were malloc'd by the notification
-         * handler.  The success and out-of-memory paths free them; this one
-         * did not, leaking up to SPOOL_MAX_FRAGS x maxFragmentSize per
-         * timed-out round. */
-        for (int i = 0; i < coll.frag_count; i++) {
-            free(coll.frags[i].data);
-        }
+        ESP_LOGE(TAG, "spool: fragment collection timeout");
+        spool_withdraw(&coll, true);
         /* Clear any stale RPC response state so subsequent RPCs
          * don't pick up a leftover response from the timed-out pull. */
         clear_response();
@@ -2800,8 +2985,11 @@ static esp_err_t spool_one_round(const char *spool_addr_json,
     }
 
     /* Clear collector before processing (new fragments would be lost) */
-    s_spool_collector = NULL;
-    vSemaphoreDelete(coll.sem);
+    spool_withdraw(&coll, false);
+    if (coll.failed) {
+        for (int i = 0; i < coll.frag_count; ++i) free(coll.frags[i].data);
+        return ESP_FAIL;
+    }
 
     ESP_LOGI(TAG, "spool: collected %d fragments, status=%s",
              coll.frag_count, coll.status);
@@ -2845,7 +3033,7 @@ static esp_err_t spool_one_round(const char *spool_addr_json,
     return ESP_OK;
 }
 
-esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
+static esp_err_t spool_pull_locked(const char *spool_type, const char *from_dt,
                               uint8_t **out_data, size_t *out_len)
 {
     if (!spool_type || !from_dt || !out_data || !out_len) {
@@ -2924,11 +3112,25 @@ esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
     return ESP_OK;
 }
 
+esp_err_t as11_ble_spool_pull(const char *spool_type, const char *from_dt,
+                            uint8_t **out_data, size_t *out_len)
+{
+    if (!out_data || !out_len) return ESP_ERR_INVALID_ARG;
+    *out_data = NULL; *out_len = 0;
+    if (!s_cmd_mtx || xSemaphoreTake(s_cmd_mtx, pdMS_TO_TICKS(10000)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    esp_err_t result = __atomic_load_n(&s_spool_tainted, __ATOMIC_ACQUIRE) ? ESP_ERR_INVALID_STATE
+        : spool_pull_locked(spool_type, from_dt, out_data, out_len);
+    clear_response();
+    xSemaphoreGive(s_cmd_mtx);
+    return result;
+}
+
 cJSON *as11_ble_get_values(const char *const *keys, int n_keys)
 {
     if (!keys || n_keys <= 0) return NULL;
-    if (!s_session_encrypted) {
-        ESP_LOGW(TAG, "get_values: no encrypted session");
+    if (!s_session_encrypted || strcmp(as11_ble_get_status(), AS11_STATUS_PAIRED) != 0) {
+        ESP_LOGW(TAG, "get_values: encrypted session is not ready");
         return NULL;
     }
 
@@ -2954,15 +3156,23 @@ cJSON *as11_ble_get_values(const char *const *keys, int n_keys)
              params);
     free(params);
 
+    if (!s_cmd_mtx ||
+        xSemaphoreTake(s_cmd_mtx, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        ESP_LOGW(TAG, "get_values: BLE command bus busy");
+        return NULL;
+    }
+
     clear_response();
     if (send_rpc_encrypted(rpc) != ESP_OK) {
         ESP_LOGW(TAG, "get_values: send failed");
+        xSemaphoreGive(s_cmd_mtx);
         return NULL;
     }
 
     cJSON *resp = wait_response(10000);
     if (!resp) {
         ESP_LOGW(TAG, "get_values: timeout");
+        xSemaphoreGive(s_cmd_mtx);
         return NULL;
     }
 
@@ -2972,6 +3182,7 @@ cJSON *as11_ble_get_values(const char *const *keys, int n_keys)
         ESP_LOGW(TAG, "get_values: RPC error: %s", s ? s : "?");
         if (s) free(s);
         cJSON_Delete(resp);
+        xSemaphoreGive(s_cmd_mtx);
         return NULL;
     }
 
@@ -2981,10 +3192,11 @@ cJSON *as11_ble_get_values(const char *const *keys, int n_keys)
         result = cJSON_DetachItemFromObject(resp, "result");
     }
     cJSON_Delete(resp);
+    xSemaphoreGive(s_cmd_mtx);
     return result;
 }
 
-esp_err_t as11_ble_stop_therapy(void)
+static esp_err_t as11_ble_stop_therapy_locked(void)
 {
     if (!s_session_encrypted) {
         ESP_LOGW(TAG, "stop_therapy: no encrypted session");
@@ -3018,7 +3230,17 @@ esp_err_t as11_ble_stop_therapy(void)
     return ESP_OK;
 }
 
-esp_err_t as11_ble_start_therapy(void)
+esp_err_t as11_ble_stop_therapy(void)
+{
+    if (!s_cmd_mtx || xSemaphoreTake(s_cmd_mtx, pdMS_TO_TICKS(10000)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    esp_err_t result = as11_ble_stop_therapy_locked();
+    clear_response();
+    xSemaphoreGive(s_cmd_mtx);
+    return result;
+}
+
+static esp_err_t as11_ble_start_therapy_locked(void)
 {
     if (!s_session_encrypted) {
         ESP_LOGW(TAG, "start_therapy: no encrypted session");
@@ -3050,6 +3272,16 @@ esp_err_t as11_ble_start_therapy(void)
     ESP_LOGI(TAG, "start_therapy: EnterTherapy accepted");
     cJSON_Delete(resp);
     return ESP_OK;
+}
+
+esp_err_t as11_ble_start_therapy(void)
+{
+    if (!s_cmd_mtx || xSemaphoreTake(s_cmd_mtx, pdMS_TO_TICKS(10000)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    esp_err_t result = as11_ble_start_therapy_locked();
+    clear_response();
+    xSemaphoreGive(s_cmd_mtx);
+    return result;
 }
 
 esp_err_t as11_ble_passthrough_rpc(const char *json_in, char **json_out, uint32_t timeout_ms)

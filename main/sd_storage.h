@@ -123,3 +123,6 @@ esp_err_t sd_storage_format(void);
  * called just before a deliberate reboot so a hard reset never lands on top of
  * unflushed filesystem state.  Safe to call when nothing is mounted. */
 void sd_storage_deinit(void);
+
+/* Return the last coherent capacity sample without touching FATFS. */
+bool sd_storage_get_cached_free(uint64_t *free_bytes, uint64_t *total_bytes);

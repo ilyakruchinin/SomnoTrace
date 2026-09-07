@@ -68,6 +68,40 @@ static int64_t s_drift_ms = 0;       /* last known drift (NTP - AS11) */
 static int64_t s_drift_at_ms = 0;    /* NTP epoch ms when drift was measured */
 static bool s_drift_loaded = false;  /* true once s_drift_ms/at loaded from NVS */
 static const char *s_drift_src = "none";  /* provenance of s_drift_ms */
+static portMUX_TYPE s_drift_lock = portMUX_INITIALIZER_UNLOCKED;
+
+typedef struct {
+    int64_t drift_ms;
+    int64_t measured_at_ms;
+    bool loaded;
+    const char *source;
+} drift_cache_snapshot_t;
+
+/* The drift cache is read by the BLE/session tasks and written by NTP/NVS
+ * recovery paths.  ESP32-S3 cannot atomically load or store int64_t values,
+ * so every field (including provenance) must be published as one snapshot. */
+static drift_cache_snapshot_t drift_cache_load(void)
+{
+    drift_cache_snapshot_t snap;
+    portENTER_CRITICAL(&s_drift_lock);
+    snap.drift_ms = s_drift_ms;
+    snap.measured_at_ms = s_drift_at_ms;
+    snap.loaded = s_drift_loaded;
+    snap.source = s_drift_src;
+    portEXIT_CRITICAL(&s_drift_lock);
+    return snap;
+}
+
+static void drift_cache_store(int64_t drift_ms, int64_t measured_at_ms,
+                              const char *source)
+{
+    portENTER_CRITICAL(&s_drift_lock);
+    s_drift_ms = drift_ms;
+    s_drift_at_ms = measured_at_ms;
+    s_drift_loaded = true;
+    s_drift_src = source ? source : "none";
+    portEXIT_CRITICAL(&s_drift_lock);
+}
 
 static void sntp_sync_cb(struct timeval *tv)
 {
@@ -236,18 +270,35 @@ bool time_is_usable(void)
 
 int64_t time_source_drift_age_ms(void)
 {
-    if (s_drift_at_ms == 0) return -1;
+    drift_cache_snapshot_t snap = drift_cache_load();
+    if (!snap.loaded || snap.measured_at_ms == 0) return -1;
     int64_t now_ms = (int64_t)time(NULL) * 1000;
-    return now_ms - s_drift_at_ms;
+    return now_ms - snap.measured_at_ms;
 }
 
 bool time_sync_has_drift(void)
 {
-    if (s_drift_loaded) return true;
-    return load_drift_from_nvs();
+    if (drift_cache_load().loaded) return true;
+    load_drift_from_nvs();
+    return drift_cache_load().loaded;
 }
 
 static bool load_drift_from_sd(void);
+
+bool time_sync_peek_drift_snapshot(time_drift_snapshot_t *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    out->source = "none";
+    drift_cache_snapshot_t snap = drift_cache_load();
+    if (!snap.loaded) return false;
+
+    out->available = true;
+    out->drift_ms = snap.drift_ms;
+    out->measured_at_ms = snap.measured_at_ms;
+    out->source = snap.source;
+    return true;
+}
 
 bool time_sync_get_drift_snapshot(time_drift_snapshot_t *out)
 {
@@ -255,18 +306,12 @@ bool time_sync_get_drift_snapshot(time_drift_snapshot_t *out)
     memset(out, 0, sizeof(*out));
     out->source = "none";
 
-    if (!s_drift_loaded) {
+    if (!drift_cache_load().loaded) {
         /* NVS first, then the SD upgrade fallback (devices that predate the
          * NVS keys still have drift recorded in session manifests). */
         if (!load_drift_from_nvs()) load_drift_from_sd();
     }
-    if (!s_drift_loaded) return false;
-
-    out->available = true;
-    out->drift_ms = s_drift_ms;
-    out->measured_at_ms = s_drift_at_ms;
-    out->source = s_drift_src;
-    return true;
+    return time_sync_peek_drift_snapshot(out);
 }
 
 /* ── Drift persistence ─────────────────────────────────────────────── */
@@ -293,10 +338,7 @@ static esp_err_t do_save_drift(void *arg)
 
 void time_sync_save_drift(int64_t drift_ms, int64_t measured_at_ms)
 {
-    s_drift_ms = drift_ms;
-    s_drift_at_ms = measured_at_ms;
-    s_drift_loaded = true;
-    s_drift_src = "nvs";
+    drift_cache_store(drift_ms, measured_at_ms, "nvs");
 
     drift_save_args_t args = { .drift_ms = drift_ms, .measured_at_ms = measured_at_ms };
     esp_err_t err = nvs_writer_run(do_save_drift, &args);
@@ -348,10 +390,7 @@ static bool load_drift_from_nvs(void)
     nvs_writer_run(do_load_drift_from_nvs, &args);
 
     if (args.ok) {
-        s_drift_ms = args.drift_ms;
-        s_drift_at_ms = args.measured_at_ms;
-        s_drift_loaded = true;
-        s_drift_src = "nvs";
+        drift_cache_store(args.drift_ms, args.measured_at_ms, "nvs");
         ESP_LOGI(TAG, "drift loaded from NVS: %lld ms (age %lld s)",
                  (long long)args.drift_ms,
                  (long long)((time(NULL) * 1000 - args.measured_at_ms) / 1000));
@@ -434,10 +473,7 @@ static bool load_drift_from_sd(void)
     closedir(streams_dir);
 
     if (found) {
-        s_drift_ms = best_drift;
-        s_drift_at_ms = best_start;
-        s_drift_loaded = true;
-        s_drift_src = "sd";
+        drift_cache_store(best_drift, best_start, "sd");
         ESP_LOGI(TAG, "drift loaded from SD: %lld ms (session start %lld)",
                  (long long)best_drift, (long long)best_start);
     }
@@ -452,11 +488,14 @@ esp_err_t time_sync_recover_from_as11(void)
     }
 
     /* Load drift from NVS, or fall back to SD scan for upgrades. */
-    if (!s_drift_loaded) {
+    drift_cache_snapshot_t drift = drift_cache_load();
+    if (!drift.loaded) {
         if (!load_drift_from_nvs() && !load_drift_from_sd()) {
             ESP_LOGW(TAG, "recover_from_as11: no drift sample available");
             return ESP_ERR_NOT_FOUND;
         }
+        drift = drift_cache_load();
+        if (!drift.loaded) return ESP_ERR_NOT_FOUND;
     }
 
     /* Query AS11 wall clock. */
@@ -469,7 +508,9 @@ esp_err_t time_sync_recover_from_as11(void)
     }
 
     /* Apply: wall = AS11 + drift. */
-    int64_t wall_ms = as11_ms + s_drift_ms;
+    int64_t wall_ms = as11_ms + drift.drift_ms;
+    int64_t drift_age_ms = drift.measured_at_ms > 0
+                         ? wall_ms - drift.measured_at_ms : -1;
     struct timeval tv = { .tv_sec = wall_ms / 1000, .tv_usec = (wall_ms % 1000) * 1000 };
     settimeofday(&tv, NULL);
 
@@ -483,8 +524,8 @@ esp_err_t time_sync_recover_from_as11(void)
              "(AS11=%lld drift=%lld ms, drift age=%lld s)",
              tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
              tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec,
-             (long long)as11_ms, (long long)s_drift_ms,
-             (long long)(time_source_drift_age_ms() / 1000));
+             (long long)as11_ms, (long long)drift.drift_ms,
+             (long long)(drift_age_ms / 1000));
 
     return ESP_OK;
 }

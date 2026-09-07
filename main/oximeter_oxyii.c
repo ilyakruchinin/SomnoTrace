@@ -1277,15 +1277,24 @@ static esp_err_t do_save_nvs(void *arg)
     nvs_handle_t h;
     esp_err_t e = nvs_open(OX_NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
-    nvs_set_str(h, "serial", local.serial);
-    nvs_set_str(h, "firmware", local.firmware);
-    nvs_set_str(h, "name_prefix", local.name_prefix);
-    nvs_set_str(h, "ble_name", local.ble_name);
-    nvs_set_str(h, "last_addr", local.last_addr);
-    nvs_set_u8(h, "driver", (uint8_t)OX_DRIVER_OXYII);
-    e = nvs_commit(h);
+    e = nvs_set_str(h, "serial", local.serial);
+    if (e == ESP_OK) e = nvs_set_str(h, "firmware", local.firmware);
+    if (e == ESP_OK) e = nvs_set_str(h, "name_prefix", local.name_prefix);
+    if (e == ESP_OK) e = nvs_set_str(h, "ble_name", local.ble_name);
+    if (e == ESP_OK) e = nvs_set_str(h, "last_addr", local.last_addr);
+    if (e == ESP_OK) e = nvs_set_u8(h, "driver", (uint8_t)OX_DRIVER_OXYII);
+    /* Clear a prior Forget tombstone only after the complete replacement
+     * pairing record has been accepted by NVS. */
+    if (e == ESP_OK) e = nvs_set_u8(h, "forgotten", 0);
+    if (e == ESP_OK) e = nvs_commit(h);
     nvs_close(h);
     return e;
+}
+
+static esp_err_t erase_nvs_key_if_present(nvs_handle_t h, const char *key)
+{
+    esp_err_t e = nvs_erase_key(h, key);
+    return e == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : e;
 }
 
 static esp_err_t do_erase_nvs(void *arg)
@@ -1294,14 +1303,17 @@ static esp_err_t do_erase_nvs(void *arg)
     nvs_handle_t h;
     esp_err_t e = nvs_open(OX_NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
-    nvs_erase_key(h, "serial");
-    nvs_erase_key(h, "firmware");
-    nvs_erase_key(h, "name_prefix");
-    nvs_erase_key(h, "ble_name");
-    nvs_erase_key(h, "last_addr");
-    nvs_erase_key(h, "driver");
-    nvs_erase_key(h, "probe_mode");
-    e = nvs_commit(h);
+    e = erase_nvs_key_if_present(h, "serial");
+    if (e == ESP_OK) e = erase_nvs_key_if_present(h, "firmware");
+    if (e == ESP_OK) e = erase_nvs_key_if_present(h, "name_prefix");
+    if (e == ESP_OK) e = erase_nvs_key_if_present(h, "ble_name");
+    if (e == ESP_OK) e = erase_nvs_key_if_present(h, "last_addr");
+    if (e == ESP_OK) e = erase_nvs_key_if_present(h, "driver");
+    if (e == ESP_OK) e = erase_nvs_key_if_present(h, "probe_mode");
+    /* Keep this key after erasing the pairing record.  If paired.json cannot
+     * be deleted because the card is busy, reboot must not resurrect it. */
+    if (e == ESP_OK) e = nvs_set_u8(h, "forgotten", 1);
+    if (e == ESP_OK) e = nvs_commit(h);
     nvs_close(h);
     return e;
 }
@@ -1321,52 +1333,57 @@ static esp_err_t do_save_probe_mode(void *arg)
 static void load_paired_from_nvs(void)
 {
     nvs_handle_t h;
+    bool forgotten = false;
     nvs_writer_lock();
-    if (nvs_open(OX_NVS_NS, NVS_READONLY, &h) != ESP_OK) { nvs_writer_unlock(); return; }
-    size_t len;
+    if (nvs_open(OX_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t len;
+        uint8_t forgotten_value = 0;
+        forgotten = nvs_get_u8(h, "forgotten", &forgotten_value) == ESP_OK &&
+                    forgotten_value == 1;
 
-    uint8_t drv;
-    bool driver_matches = nvs_get_u8(h, "driver", &drv) == ESP_OK && drv == OX_DRIVER_OXYII;
-    len = sizeof(s_serial);
-    if (driver_matches && nvs_get_str(h, "serial", s_serial, &len) == ESP_OK && s_serial[0]) {
-        s_paired = true;
-        len = sizeof(s_firmware);
-        nvs_get_str(h, "firmware", s_firmware, &len);
-        len = sizeof(s_name_prefix);
-        nvs_get_str(h, "name_prefix", s_name_prefix, &len);
-        len = sizeof(s_ble_name);
-        nvs_get_str(h, "ble_name", s_ble_name, &len);
-        len = sizeof(s_paired_addr);
-        nvs_get_str(h, "last_addr", s_paired_addr, &len);
+        uint8_t drv;
+        bool driver_matches = nvs_get_u8(h, "driver", &drv) == ESP_OK && drv == OX_DRIVER_OXYII;
+        len = sizeof(s_serial);
+        if (driver_matches && nvs_get_str(h, "serial", s_serial, &len) == ESP_OK && s_serial[0]) {
+            s_paired = true;
+            len = sizeof(s_firmware);
+            nvs_get_str(h, "firmware", s_firmware, &len);
+            len = sizeof(s_name_prefix);
+            nvs_get_str(h, "name_prefix", s_name_prefix, &len);
+            len = sizeof(s_ble_name);
+            nvs_get_str(h, "ble_name", s_ble_name, &len);
+            len = sizeof(s_paired_addr);
+            nvs_get_str(h, "last_addr", s_paired_addr, &len);
 
-        /* Validate loaded serial format: if corrupted from pre-AES firmware, clear */
-        size_t slen = strlen(s_serial);
-        bool valid = (slen >= 4);
-        for (size_t i = 0; i < slen; i++) {
-            if ((unsigned char)s_serial[i] < 0x20 || (unsigned char)s_serial[i] > 0x7E) {
-                valid = false;
-                break;
+            /* Validate loaded serial format: if corrupted from pre-AES firmware, clear */
+            size_t slen = strlen(s_serial);
+            bool valid = (slen >= 4);
+            for (size_t i = 0; i < slen; i++) {
+                if ((unsigned char)s_serial[i] < 0x20 || (unsigned char)s_serial[i] > 0x7E) {
+                    valid = false;
+                    break;
+                }
             }
-        }
-        if (!valid) {
-            ESP_LOGW(TAG, "invalid or corrupted serial in NVS ('%s') — clearing paired state", s_serial);
-            s_paired = false;
-            s_serial[0] = '\0';
+            if (!valid) {
+                ESP_LOGW(TAG, "invalid or corrupted serial in NVS ('%s') — clearing paired state", s_serial);
+                s_paired = false;
+                s_serial[0] = '\0';
+            } else {
+                ESP_LOGI(TAG, "paired ring loaded: serial='%s' name='%s' addr='%s'",
+                         s_serial, s_ble_name, s_paired_addr);
+            }
         } else {
-            ESP_LOGI(TAG, "paired ring loaded: serial='%s' name='%s' addr='%s'",
-                     s_serial, s_ble_name, s_paired_addr);
+            s_serial[0] = '\0';
         }
-    } else {
-        s_serial[0] = '\0';
+        uint8_t pm;
+        if (nvs_get_u8(h, "probe_mode", &pm) == ESP_OK && pm <= 1)
+            s_probe_mode = (ox_probe_mode_t)pm;
+        nvs_close(h);
     }
-    uint8_t pm;
-    if (nvs_get_u8(h, "probe_mode", &pm) == ESP_OK && pm <= 1)
-        s_probe_mode = (ox_probe_mode_t)pm;
-    nvs_close(h);
     nvs_writer_unlock();
 
     /* Also try loading from paired.json (SD) as fallback */
-    if (!s_paired) {
+    if (!s_paired && !forgotten) {
         char serial[32], fw[16], prefix[16], addr[18], drv[16], bname[40];
         if (ox_store_load_paired(serial, sizeof(serial),
                                  fw, sizeof(fw),
@@ -1401,7 +1418,7 @@ static void pair_task(void *arg)
         set_error("invalid address: %s", addr_str);
         free(pa);
         xSemaphoreGive(s_ops_mtx);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -1409,7 +1426,7 @@ static void pair_task(void *arg)
         do_disconnect();
         free(pa);
         xSemaphoreGive(s_ops_mtx);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -1418,7 +1435,7 @@ static void pair_task(void *arg)
         do_disconnect();
         free(pa);
         xSemaphoreGive(s_ops_mtx);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -1428,7 +1445,7 @@ static void pair_task(void *arg)
         do_disconnect();
         free(pa);
         xSemaphoreGive(s_ops_mtx);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -1437,7 +1454,7 @@ static void pair_task(void *arg)
         do_disconnect();
         free(pa);
         xSemaphoreGive(s_ops_mtx);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -1455,7 +1472,7 @@ static void pair_task(void *arg)
         do_disconnect();
         free(pa);
         xSemaphoreGive(s_ops_mtx);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -1497,7 +1514,15 @@ static void pair_task(void *arg)
     strlcpy(nvs_arg.name_prefix, prefix, sizeof(nvs_arg.name_prefix));
     strlcpy(nvs_arg.ble_name, display_name, sizeof(nvs_arg.ble_name));
     strlcpy(nvs_arg.last_addr, addr_str, sizeof(nvs_arg.last_addr));
-    nvs_writer_run(do_save_nvs, &nvs_arg);
+    esp_err_t persisted = nvs_writer_run(do_save_nvs, &nvs_arg);
+    if (persisted != ESP_OK) {
+        set_error("pairing storage failed: %s", esp_err_to_name(persisted));
+        do_disconnect();
+        free(pa);
+        xSemaphoreGive(s_ops_mtx);
+        psram_task_delete(NULL);
+        return;
+    }
 
     /* Save to paired.json on SD */
     ox_store_save_paired(serial, firmware, prefix, addr_str, "wellue_oxyii", display_name);
@@ -1520,7 +1545,7 @@ static void pair_task(void *arg)
 
     free(pa);
     xSemaphoreGive(s_ops_mtx);
-    vTaskDelete(NULL);
+    psram_task_delete(NULL);
 }
 
 /* ── Low-duty OxyII scan (caller holds s_ops_mtx) ──────────────────── */
@@ -1564,7 +1589,7 @@ static void canonical_migration_task(void *arg)
         oximetry_canonical_reconcile();
         oximetry_canonical_migrate_all_legacy();
     }
-    vTaskDelete(NULL);
+    psram_task_delete(NULL);
 }
 
 /* ── File pull helper (shared by legacy and persistent paths) ─────── */
@@ -1647,7 +1672,7 @@ static void pull_task(void *arg)
     }
     if (!as11_ble_is_host_ready()) {
         ESP_LOGW(TAG, "watch: host not ready, aborting");
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -2098,8 +2123,18 @@ static esp_err_t oxyii_pair(const char *addr_str)
     return ESP_OK;
 }
 
-static void oxyii_forget(void)
+static esp_err_t oxyii_forget(void)
 {
+    esp_err_t persisted = nvs_writer_run(do_erase_nvs, NULL);
+    if (persisted != ESP_OK) {
+        set_error("forget storage failed: %s", esp_err_to_name(persisted));
+        return persisted;
+    }
+
+    /* The NVS tombstone is authoritative.  paired.json is only a compatibility
+     * mirror, so failure to remove it must not resurrect the device. */
+    ox_store_delete_paired();
+
     s_paired = false;
     s_presence_served = false;
     s_synced_this_idle = false;
@@ -2111,10 +2146,8 @@ static void oxyii_forget(void)
     s_ble_name[0] = '\0';
     s_paired_addr[0] = '\0';
 
-    nvs_writer_run(do_erase_nvs, NULL);
-    ox_store_delete_paired();
-
     set_state(OX_STATUS_IDLE);
+    return ESP_OK;
 }
 
 static const char *oxyii_get_status(void)

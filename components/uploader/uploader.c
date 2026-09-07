@@ -566,3 +566,11 @@ esp_err_t uploader_test_connection(const char *backend_id, bool *out_ok,
              *out_ok ? "passed" : "failed", msg);
     return ESP_OK;
 }
+
+esp_err_t uploader_get_progress_snapshot(uploader_progress_snapshot_t *out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    if (!s_initialised) return ESP_ERR_INVALID_STATE;
+    return upload_sched_progress_snapshot(out);
+}

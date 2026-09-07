@@ -37,6 +37,8 @@
 #include "sd_storage.h"
 #include "session_writer.h"
 #include "nvs_writer.h"
+#include "psram_task.h"
+#include "therapy_alert_runtime.h"
 #include "esp_system.h"
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
@@ -105,6 +107,7 @@ void app_main(void)
     /* 1c. Log reset reason and check for crash core dump from previous boot.
      * Must be after log_stream_init() so output is captured. */
     crash_diag_check();
+    ESP_ERROR_CHECK(psram_task_init());
 
     /* 2. Start button monitors. */
     bsp_power_start_button_monitor(5000);   /* PWR 5 s = power off */
@@ -216,6 +219,7 @@ void app_main(void)
     session_writer_enable_deferred_export();
 
     /* 4d. Init therapy alert subsystem (loads config from NVS). */
+    therapy_alert_set_task_fns(psram_task_create, psram_task_delete);
     therapy_alert_set_beep_fn(bsp_audio_beep);
     therapy_alert_set_therapy_active_fn(bsp_display_is_therapy_active);
     therapy_alert_init();
