@@ -65,6 +65,8 @@ typedef enum {
     ALERT_PUSH_SENT,
     ALERT_BUZZING,
     ALERT_ACKED,
+    ALERT_SCREEN_ONLY,
+    ALERT_PUSH_FAILED,
 } alert_state_t;
 
 /* ── Injection (app → component) ────────────────────────────────────── */
@@ -103,6 +105,10 @@ void therapy_alert_on_therapy_stop(void);
 
 /* Called when the BLE link drops (disconnect).  Disarms without alerting. */
 void therapy_alert_on_ble_disconnect(void);
+/* Transport fragments were lost: lifecycle state is unknown until a new START.
+ * Called by the notification owner, never decrypts in the BLE callback. */
+void therapy_alert_on_transport_loss(void);
+bool therapy_alert_transport_uncertain(void);
 
 /* Called when the PLUS button is single-clicked.  Acknowledges and silences. */
 void therapy_alert_acknowledge(void);
@@ -128,3 +134,10 @@ const char *therapy_alert_state_str(alert_state_t st);
  * If json_override is non-NULL, parse push_en/ntfy_srv/ntfy_topic/ntfy_prio
  * from it; otherwise use the saved config. */
 esp_err_t therapy_alert_send_test_push(const char *json_override);
+
+/* Typed service API for native controllers; validates before persisting. */
+esp_err_t therapy_alert_save_config(const therapy_alert_config_t *cfg);
+esp_err_t therapy_alert_validate_config(const therapy_alert_config_t *cfg);
+void therapy_alert_config_snapshot(therapy_alert_config_t *out);
+
+bool therapy_alert_is_actionable(alert_state_t state);

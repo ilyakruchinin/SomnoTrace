@@ -65,8 +65,15 @@ typedef struct {
  * if no settings stored (defaults are filled in). */
 esp_err_t device_settings_load(device_settings_t *cfg);
 
-/* Save settings to NVS. */
+/* Replace the complete in-memory settings structure and save it to NVS. */
 esp_err_t device_settings_save(const device_settings_t *cfg);
+
+/* Persist the latest in-memory settings without replacing changes made by a
+ * concurrent web or touchscreen task. */
+esp_err_t device_settings_save_current(void);
+
+/* Copy a coherent snapshot of the current in-memory settings. */
+void device_settings_snapshot(device_settings_t *out);
 
 /* Get current in-memory settings (loaded at boot). */
 const device_settings_t *device_settings_get(void);
@@ -78,23 +85,24 @@ bool device_settings_battery_enabled(void);
 esp_err_t device_settings_set_battery_enabled(bool enabled);
 
 /* Set brightness immediately (applies to hardware + updates in-memory copy).
- * Does NOT persist to NVS — call device_settings_save() for that. */
+ * Does NOT persist to NVS — call device_settings_save_current() for that. */
 esp_err_t device_settings_set_brightness(uint8_t percent);
 
 /* Set therapy screen (updates in-memory copy only).
- * Call device_settings_save() to persist. */
+ * Call device_settings_save_current() to persist. */
 esp_err_t device_settings_set_therapy_screen(therapy_screen_t screen);
 
 /* Set backlight policy (updates in-memory copy only).
- * Call device_settings_save() to persist. */
+ * Call device_settings_save_current() to persist. */
 esp_err_t device_settings_set_backlight_mode(backlight_mode_t mode);
 
 /* Set alert speaker volume (0-100). Updates in-memory copy and applies to
- * bsp_audio. Call device_settings_save() to persist. */
+ * bsp_audio. Call device_settings_save_current() to persist. */
 esp_err_t device_settings_set_alert_volume(uint8_t percent);
 
 /* Set LCD rotation (0, 90, 180, or 270 degrees). Updates in-memory copy and
- * applies to hardware immediately. Call device_settings_save() to persist. */
+ * applies to hardware immediately. Call device_settings_save_current() to
+ * persist. */
 esp_err_t device_settings_set_lcd_rotation(uint16_t degrees);
 
 /* Get settings as JSON string for web UI. Caller must free(). */

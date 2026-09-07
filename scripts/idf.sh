@@ -72,4 +72,4 @@ exec docker run --rm \
     -v "${PROJECT_DIR}:/project" \
     -w /project \
     "$IMAGE" \
-    "$@"
+    /bin/bash /project/scripts/idf-command.sh "$@"

@@ -872,22 +872,15 @@ static struct {
     char     ntp_srv[64];
     TickType_t tz_tick;
 } s_status_cache;
-
 static volatile bool s_sd_refreshing = false;
 
 static void sd_refresh_task(void *arg)
 {
     (void)arg;
-    if (sd_storage_is_ready()) {
-        FATFS *fs = NULL;
-        DWORD free_clst = 0;
-        if (f_getfree("0:", &free_clst, &fs) == FR_OK && fs) {
-            s_status_cache.sd_total = (uint64_t)fs->n_fatent * fs->csize * fs->ssize;
-            s_status_cache.sd_free  = (uint64_t)free_clst * fs->csize * fs->ssize;
-            s_status_cache.sd_valid = true;
-        }
+    if (sd_storage_is_ready() &&
+        sd_storage_get_free(NULL, NULL) == ESP_OK) {
+        s_status_cache.sd_tick = xTaskGetTickCount();
     }
-    s_status_cache.sd_tick = xTaskGetTickCount();
     s_sd_refreshing = false;
     vTaskDelete(NULL);
 }
@@ -899,6 +892,12 @@ static void trigger_sd_refresh(void)
     if (xTaskCreate(sd_refresh_task, "sd_refresh", 3072, NULL, 1, NULL) != pdPASS) {
         s_sd_refreshing = false;
     }
+}
+
+static void status_cache_refresh_sd(void)
+{
+    s_status_cache.sd_valid = sd_storage_get_cached_free(
+        &s_status_cache.sd_free, &s_status_cache.sd_total);
 }
 
 static void status_cache_refresh_nvs(void)
@@ -914,11 +913,13 @@ cJSON *netprov_build_status_json(void)
     TickType_t now = xTaskGetTickCount();
     uint32_t ms = portTICK_PERIOD_MS;
 
-    /* Refresh SD free space asynchronously at most once per STATUS_CACHE_SD_MS */
+    /* Refresh free space asynchronously, then copy its coherent cached
+     * snapshot into this request's status cache. */
     if (!s_status_cache.sd_valid ||
         (uint32_t)((now - s_status_cache.sd_tick) * ms) >= STATUS_CACHE_SD_MS) {
         trigger_sd_refresh();
     }
+    status_cache_refresh_sd();
 
     /* Refresh NVS-backed settings at most once per STATUS_CACHE_NVS_MS */
     if (!s_status_cache.cfg_valid ||
@@ -1172,7 +1173,7 @@ static void wifi_scan_task(void *arg)
     s_scan_running = false;
     if (s_scan_mutex) xSemaphoreGive(s_scan_mutex);
 
-    vTaskDelete(NULL);
+    psram_task_delete(NULL);
 }
 
 static esp_err_t scan_get_handler(httpd_req_t *req)
@@ -1355,7 +1356,11 @@ static esp_err_t ox_pair_handler(httpd_req_t *req)
 
 static esp_err_t ox_forget_handler(httpd_req_t *req)
 {
-    oximeter_forget();
+    esp_err_t e = oximeter_forget();
+    if (e != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "forget failed");
+        return ESP_FAIL;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
@@ -2285,7 +2290,7 @@ static void recreate_edfs_task(void *arg)
 
     if (total_sessions == 0) {
         ESP_LOGI(TAG, "recreate_edfs_task: no sessions found");
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -2295,7 +2300,7 @@ static void recreate_edfs_task(void *arg)
             sizeof(recreate_session_t), MALLOC_CAP_SPIRAM);
     if (!sessions) {
         ESP_LOGE(TAG, "recreate_edfs_task: failed to allocate %d sessions", total_sessions);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
     int n_sessions = 0;
@@ -2389,7 +2394,7 @@ static void recreate_edfs_task(void *arg)
     if (!queued_days) {
         ESP_LOGE(TAG, "recreate_edfs_task: failed to allocate queued_days");
         free(sessions);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
     int n_queued_days = 0;
@@ -2436,7 +2441,7 @@ static void recreate_edfs_task(void *arg)
              n_processed, n_sessions, n_queued_days);
     free(queued_days);
     free(sessions);
-    vTaskDelete(NULL);
+    psram_task_delete(NULL);
 }
 
 /* Scoped single-day rebuild.  Unlike recreate_edfs_task() this deletes
@@ -2445,7 +2450,7 @@ static void recreate_edfs_task(void *arg)
 static void rebuild_day_task(void *arg)
 {
     char *day = (char *)arg;
-    if (!day) { vTaskDelete(NULL); return; }
+    if (!day) { psram_task_delete(NULL); return; }
 
     esp_err_t ret = edf_gen_rebuild_day(day);
     if (ret == ESP_OK) {
@@ -2458,7 +2463,7 @@ static void rebuild_day_task(void *arg)
                  day, esp_err_to_name(ret));
     }
     free(day);
-    vTaskDelete(NULL);
+    psram_task_delete(NULL);
 }
 
 /* SD format progress, polled by the browser via /api/format-progress.  The
@@ -2519,7 +2524,7 @@ static void format_sd_task(void *arg)
     s_format_progress.done = true;
     s_format_progress.active = false;
     xSemaphoreGive(s_format_mtx);
-    vTaskDelete(NULL);
+    psram_task_delete(NULL);
 }
 
 static esp_err_t format_progress_handler(httpd_req_t *req)
@@ -3328,7 +3333,7 @@ void netprov_dns_task(void *arg)
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
         ESP_LOGE(TAG, "dns socket create failed");
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 
@@ -3340,7 +3345,7 @@ void netprov_dns_task(void *arg)
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         ESP_LOGE(TAG, "dns bind failed");
         close(sock);
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
 

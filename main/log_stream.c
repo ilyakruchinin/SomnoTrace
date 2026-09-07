@@ -555,7 +555,7 @@ static void ws_forwarder_task(void *arg)
     char *frame_buf = heap_caps_malloc(LOG_LINE_MAX * 16, MALLOC_CAP_SPIRAM);
     if (!frame_buf) {
         ESP_LOGE(TAG, "ws_fwd: failed to allocate frame buffer");
-        vTaskDelete(NULL);
+        psram_task_delete(NULL);
         return;
     }
     size_t frame_cap = LOG_LINE_MAX * 16;

@@ -96,7 +96,7 @@ skip_test() {
 }
 
 # Maintainer's existing tests (shim cJSON is enough for these).
-run_test as11_time_test    -I"$SHIM" -I"$MAIN_DIR" scripts/as11_time_test.c "$MAIN_DIR/as11_time.c"
+run_test as11_time_test    -D_DARWIN_C_SOURCE -I"$SHIM" -I"$MAIN_DIR" scripts/as11_time_test.c "$MAIN_DIR/as11_time.c"
 run_test as11_events_test  -I"$SHIM" -I"$MAIN_DIR" scripts/as11_events_test.c
 run_test vld3_decoder_test -I"$SHIM" -I"$MAIN_DIR" scripts/vld3_decoder_test.c "$MAIN_DIR/oximetry_vld3.c"
 
@@ -131,4 +131,3 @@ done
 
 echo "host tests: $ran run, $failed failed, $skipped skipped"
 [ $failed = 0 ]
-

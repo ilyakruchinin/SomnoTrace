@@ -10,9 +10,9 @@ scripts/run_host_tests.sh --only edf_gen_test
 python3 scripts/mutants.py             # does the suite notice planted bugs?
 ```
 
-Both are plain commands with no repo-specific setup, so they drop into CI as
-two steps (`apt-get install -y libcjson-dev`, then the two lines above) if
-that is wanted; nothing here depends on running there.
+`run_host_tests.sh` is the required CI gate. It uses the shared shims below and
+keeps a strict roster of every `scripts/*_test.c` file. `test-host.sh` runs the
+broader Python source-contract suite for local regression checks.
 
 ## Layout
 
@@ -124,4 +124,3 @@ Not part of CI.
 built on the host. A writer→reader round trip is the natural next test.
 `bsp_power.c`'s OCV curve and IR-drop compensation are pure functions but
 sit in a FreeRTOS/ADC/NVS file; they need a stub layer first.
-

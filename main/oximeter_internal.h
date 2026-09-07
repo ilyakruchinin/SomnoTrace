@@ -50,8 +50,9 @@ typedef struct {
      * background task.  Stores serial + metadata via ox_store_save_paired. */
     esp_err_t (*pair)(const char *addr_str);
 
-    /* Forget the paired device.  Clears driver-internal state. */
-    void (*forget)(void);
+    /* Forget the paired device.  Clears driver-internal state only after the
+     * durable NVS tombstone commits successfully. */
+    esp_err_t (*forget)(void);
 
     /* Return current status string (one of OX_STATUS_*). */
     const char *(*get_status)(void);

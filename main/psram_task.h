@@ -23,8 +23,19 @@
 
 #pragma once
 
+#include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+/**
+ * Start the retained internal-RAM task that reclaims WithCaps tasks.
+ *
+ * ESP-IDF's self-delete path creates a temporary cleanup task for every
+ * vTaskDeleteWithCaps(NULL).  That allocation aborts when internal RAM is
+ * exhausted.  SomnoTrace instead creates one static reaper during boot, while
+ * memory pressure is bounded, and routes all later self-deletion through it.
+ */
+esp_err_t psram_task_init(void);
 
 /**
  * Create a FreeRTOS task with its stack in PSRAM and TCB in internal RAM.
@@ -33,13 +44,14 @@
  * by moving the stack to the 8 MB PSRAM.  Requires
  * CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y (already enabled).
  *
- * The StaticTask_t (TCB, ~92 bytes) stays in internal RAM (FreeRTOS
- * requirement).  The stack is allocated with MALLOC_CAP_SPIRAM.
+ * The StaticTask_t (TCB) stays in internal RAM (FreeRTOS requirement).  The
+ * stack is allocated with MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT.
  *
  * For long-lived tasks (run forever): just call this once and forget.
- * For self-deleting tasks: the caller must keep the out_stack/out_tcb
- * pointers and free them after the task has exited (e.g. on next
- * invocation — "deferred free" pattern).
+ * A self-deleting task MUST call psram_task_delete(NULL), never
+ * vTaskDelete(NULL).  The retained reaper then calls the ESP-IDF WithCaps
+ * deletion API from another task, reclaiming both the PSRAM stack and internal
+ * TCB without allocating a one-shot cleanup task under peak memory pressure.
  *
  * @param task_func   Task function
  * @param name        FreeRTOS task name
@@ -47,8 +59,8 @@
  * @param arg         Task argument
  * @param priority    Task priority
  * @param core_id     Core affinity (0, 1, or tskNO_AFFINITY)
- * @param out_stack   If non-NULL, receives the PSRAM stack pointer (caller frees)
- * @param out_tcb     If non-NULL, receives the internal TCB pointer (caller frees)
+ * @param out_stack   Deprecated; always set to NULL. Memory is helper-owned.
+ * @param out_tcb     Deprecated; always set to NULL. Memory is helper-owned.
  * @return Task handle, or NULL on failure
  */
 TaskHandle_t psram_task_create(TaskFunction_t task_func,
@@ -59,3 +71,9 @@ TaskHandle_t psram_task_create(TaskFunction_t task_func,
                                BaseType_t core_id,
                                StackType_t **out_stack,
                                StaticTask_t **out_tcb);
+
+/**
+ * Delete a task created by psram_task_create() and reclaim its WithCaps stack
+ * and TCB. Pass NULL for self-deletion, matching vTaskDelete(NULL) semantics.
+ */
+void psram_task_delete(TaskHandle_t task);

@@ -234,3 +234,9 @@ triggered. Reverse engineering for interoperability is recognised in many
 jurisdictions (e.g. the EU Software Directive, US DMCA s.1201(f), and
 interoperability provisions of Australia's Copyright Act 1968). This is not
 legal advice; obtain professional advice before any commercial distribution.
+
+## ESP-IDF HTTP asynchronous request cleanup
+
+The checked ESP-IDF v5.5.1 HTTP asynchronous request fixture under
+`third_party/esp-idf-patches/` derives from Espressif ESP-IDF and is licensed
+under Apache-2.0; the license and source identity are retained beside it.

@@ -125,3 +125,6 @@ esp_err_t time_sync_recover_from_as11(void);
  * Must be called after time_sync_init(). Subsequent periodic re-syncs do
  * not trigger the failure path. */
 bool time_sync_wait_initial(void);
+
+/* Copy cached drift without NVS or SD access. */
+bool time_sync_peek_drift_snapshot(time_drift_snapshot_t *out);
