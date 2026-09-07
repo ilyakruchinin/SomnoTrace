@@ -44,6 +44,7 @@
 #include "sd_storage.h"
 #include "somnotrace_fonts.h"
 #include "therapy_alert.h"
+#include "touch_logs_controller.h"
 #include "uploader.h"
 
 #define FLOW_POINTS 300
@@ -354,11 +355,18 @@ static lv_obj_t *s_pages[3];
 static lv_obj_t *s_nav_buttons[3];
 static lv_obj_t *s_nav_labels[3];
 static int s_active_page = -1;
+static lv_obj_t *s_manage_scrolls[MANAGE_SECTION_COUNT];
+static lv_obj_t *s_manage_sections[MANAGE_SECTION_COUNT];
+static lv_obj_t *s_manage_buttons[MANAGE_SECTION_COUNT];
+static lv_obj_t *s_manage_labels[MANAGE_SECTION_COUNT];
+static lv_obj_t *s_manage_dots[MANAGE_SECTION_COUNT];
+static lv_obj_t *s_manage_badges[MANAGE_SECTION_COUNT];
 static int s_active_manage_section = -1;
 /* The rail is persistent, but the 768 x 450 detail pane owns only the visible
  * destination. Logs may briefly remain as one hidden retired tree while its
  * bounded worker releases the controller; no other destination is retained. */
 static lv_obj_t *s_manage_detail_host;
+static lv_obj_t *s_manage_retired_logs_section;
 static int s_rendered_manage_section = -1;
 static uint32_t s_manage_transition_generation;
 static lv_obj_t *s_wake_overlay;
@@ -369,8 +377,13 @@ static TaskHandle_t s_storage_worker_task;
 static uint8_t s_qemu_requested_tab = UINT8_MAX;
 #endif
 
-static void start_storage_refresh(void);
 static void set_active_page(int page);
+static void set_manage_section(int section);
+static void ensure_manage_destination(void);
+static void teardown_rendered_manage_destination(void);
+static void reap_retired_logs_destination(void);
+static void update_manage_rail_selection(int section);
+static void start_storage_refresh(void);
 static void apply_pending_backlight_locked(void);
 void bsp_display_restart_idle_timeout(void);
 static void wake_timer_cb(void *arg);
@@ -1034,7 +1047,6 @@ static void storage_status_task(void *arg)
 #endif
 }
 
-
 static void start_storage_refresh(void)
 {
     portENTER_CRITICAL(&s_state_lock);
@@ -1056,7 +1068,6 @@ static void start_storage_refresh(void)
     }
 }
 
-
 static unsigned estimated_airsense_nights(uint64_t free_bytes)
 {
     uint64_t raw = free_bytes / AIRSENSE_NIGHT_ESTIMATE_BYTES;
@@ -1074,7 +1085,7 @@ static unsigned estimated_airsense_nights(uint64_t free_bytes)
 
 static void set_active_page(int page)
 {
-    if (page != 0) return;
+    if (page < 0 || page >= 3 || page == 1) return;
     portENTER_CRITICAL(&s_state_lock);
     int previous_page = s_active_page;
     portEXIT_CRITICAL(&s_state_lock);
@@ -1088,8 +1099,11 @@ static void set_active_page(int page)
     /* Modal controls can retain pointers into the current detail tree. Close
      * them while that tree is still valid, then release the destination when
      * Manage is no longer visible. */
+    if (previous_page == 2) {
+        teardown_rendered_manage_destination();
+    }
     for (int i = 0; i < 3; ++i) {
-        if (i != 0) continue;
+        if (i == 1) continue;
         bool selected = i == page;
         set_hidden(s_pages[i], !selected);
         set_destination_surface(s_nav_buttons[i],
@@ -1111,6 +1125,8 @@ static void set_active_page(int page)
                                      selected ? LV_OPA_50 : LV_OPA_TRANSP),
                                  0);
     }
+    if (page == 2) ensure_manage_destination();
+    else touch_logs_controller_hide();
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
     ESP_LOGI(TAG, "emulated touch selected page %u", (unsigned)page);
 #endif
@@ -1119,6 +1135,29 @@ static void set_active_page(int page)
 static void nav_cb(lv_event_t *event)
 {
     set_active_page((int)(intptr_t)lv_event_get_user_data(event));
+}
+
+static void set_manage_section(int section)
+{
+    if (!(section == MANAGE_LOGS)) return;
+    if (section == s_active_manage_section) return;
+
+    /* Teardown must precede changing the selected index so callbacks and
+     * periodic painters can no longer mistake the old tree for visible. */
+    if (s_active_page == 2) {
+        teardown_rendered_manage_destination();
+    }
+    s_active_manage_section = section;
+    update_manage_rail_selection(section);
+    if (s_active_page == 2) ensure_manage_destination();
+    /* Rev C controller owns alert configuration refresh. */
+    if (section == MANAGE_STORAGE || section == MANAGE_UPLOADS)
+        start_storage_refresh();
+}
+
+static void manage_section_cb(lv_event_t *event)
+{
+    set_manage_section((int)(intptr_t)lv_event_get_user_data(event));
 }
 
 
@@ -1521,6 +1560,13 @@ static void build_home_page(lv_obj_t *home)
 }
 
 
+static void clear_manage_section_pointers(int section)
+{
+    if (section < 0 || section >= MANAGE_SECTION_COUNT) return;
+    s_manage_sections[section] = NULL;
+    s_manage_scrolls[section] = NULL;
+}
+
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
 static unsigned manage_descendant_count(lv_obj_t *root)
 {
@@ -1551,6 +1597,167 @@ static void log_manage_ownership(const char *action)
 }
 #endif
 
+static void update_manage_rail_selection(int section)
+{
+    for (int i = 0; i < MANAGE_SECTION_COUNT; ++i) {
+        if (!s_manage_buttons[i]) continue;
+        bool selected = i == section;
+        set_destination_surface(s_manage_buttons[i],
+                                selected ? COLOR_INVERSE : COLOR_PANEL,
+                                selected ? LV_OPA_COVER : LV_OPA_TRANSP);
+        set_style_color_if_changed(s_manage_labels[i], LV_STYLE_TEXT_COLOR,
+                                   selected ? COLOR_BASE : COLOR_SECONDARY, 0);
+        set_style_ptr_if_changed(s_manage_labels[i], LV_STYLE_TEXT_FONT,
+                                 selected ? FONT_BUTTON : FONT_BODY_LARGE, 0);
+        set_style_color_if_changed(s_manage_buttons[i], LV_STYLE_SHADOW_COLOR,
+                                   COLOR_BASE, 0);
+        set_style_num_if_changed(s_manage_buttons[i], LV_STYLE_SHADOW_WIDTH,
+                                 UI_DECORATIVE_SHADOW_WIDTH(selected ? 18 : 0),
+                                 0);
+        set_style_num_if_changed(s_manage_buttons[i], LV_STYLE_SHADOW_OFS_Y,
+                                 selected ? 6 : 0, 0);
+        set_style_num_if_changed(s_manage_buttons[i], LV_STYLE_SHADOW_OPA,
+                                 UI_DECORATIVE_SHADOW_OPA(
+                                     selected ? LV_OPA_50 : LV_OPA_TRANSP),
+                                 0);
+    }
+}
+
+static void reap_retired_logs_destination(void)
+{
+    lv_obj_t *retired = s_manage_retired_logs_section;
+    if (!retired || s_rendered_manage_section == MANAGE_LOGS) return;
+    if (touch_logs_controller_destroy() != ESP_OK) return;
+    s_manage_retired_logs_section = NULL;
+    lv_obj_del(retired);
+    s_manage_transition_generation++;
+    log_manage_ownership("logs-reaped");
+}
+
+static void teardown_rendered_manage_destination(void)
+{
+    int section = s_rendered_manage_section;
+    if (section < 0 || section >= MANAGE_SECTION_COUNT) return;
+
+    /* Any editor or confirmation can own a pointer into this destination.
+     * Tear those down before publishing NULL widget pointers. */
+    lv_obj_t *root = s_manage_sections[section];
+    s_rendered_manage_section = -1;
+    if (section == MANAGE_LOGS) touch_logs_controller_hide();
+
+    clear_manage_section_pointers(section); /* invalidate before lv_obj_del */
+    if (section == MANAGE_LOGS &&
+        touch_logs_controller_destroy() == ESP_ERR_INVALID_STATE) {
+        lv_obj_add_flag(root, LV_OBJ_FLAG_HIDDEN);
+        s_manage_retired_logs_section = root;
+    } else if (root) {
+        lv_obj_del(root);
+    }
+    clear_manage_section_pointers(section); /* remain invalid after teardown */
+    s_manage_transition_generation++;
+    log_manage_ownership(section == MANAGE_LOGS &&
+                         s_manage_retired_logs_section
+                             ? "logs-retired" : "destroy");
+}
+
+static void build_manage_destination(int section)
+{
+    if (!s_manage_detail_host || section < 0 ||
+        section >= MANAGE_SECTION_COUNT) return;
+
+    reap_retired_logs_destination();
+    lv_obj_t *destination = NULL;
+    if (section == MANAGE_LOGS && s_manage_retired_logs_section) {
+        destination = s_manage_retired_logs_section;
+        s_manage_retired_logs_section = NULL;
+        lv_obj_clear_flag(destination, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        destination = make_plain_container(
+            s_manage_detail_host, 0, 0, UI_MANAGE_DETAIL_W, UI_PANEL_H);
+    }
+
+    s_manage_sections[section] = destination;
+    s_rendered_manage_section = section;
+    switch ((manage_section_t)section) {
+    default: break;
+    case MANAGE_LOGS: {
+        s_manage_scrolls[MANAGE_LOGS] = destination;
+        esp_err_t logs_result = touch_logs_controller_show(destination);
+        if (logs_result != ESP_OK) {
+            make_label(destination, "Logs are unavailable", 24, 24, 620,
+                       FONT_SCREEN_TITLE, COLOR_TEXT);
+            make_label(destination, "The retained log viewer could not be allocated.",
+                       24, 62, 620, FONT_BODY, COLOR_SECONDARY);
+            bsp_display_set_notice("Unable to open retained logs");
+        }
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+        else
+            ESP_LOGI(TAG, "QEMU native Logs pane ready");
+#endif
+        break;
+    }
+    }
+    s_manage_transition_generation++;
+    log_manage_ownership("build");
+}
+
+static void ensure_manage_destination(void)
+{
+    if (s_active_page != 2 || s_active_manage_section < 0 ||
+        s_active_manage_section >= MANAGE_SECTION_COUNT) return;
+    if (s_rendered_manage_section == s_active_manage_section &&
+        s_manage_sections[s_active_manage_section]) return;
+    if (s_rendered_manage_section >= 0)
+        teardown_rendered_manage_destination();
+    build_manage_destination(s_active_manage_section);
+}
+
+static void build_manage_page(lv_obj_t *manage)
+{
+    static const int section_ids[] = { MANAGE_LOGS };
+    static const char *section_names[] = { "Logs" };
+    lv_obj_t *rail = make_card(manage, UI_PANEL_X, UI_PANEL_Y,
+                               UI_MANAGE_RAIL_W, UI_PANEL_H);
+    lv_obj_set_style_radius(rail, 28, 0);
+    lv_obj_set_style_pad_all(rail, 8, 0);
+    for (unsigned row = 0; row < sizeof(section_ids) / sizeof(section_ids[0]); ++row) {
+        int i = section_ids[row];
+        s_manage_buttons[i] = make_destination_button(
+            rail, 0, i * 52, 196, 46, section_names[row], COLOR_PANEL,
+            manage_section_cb, i);
+        lv_obj_set_style_radius(s_manage_buttons[i], 20, 0);
+        s_manage_labels[i] = lv_obj_get_child(s_manage_buttons[i], 0);
+        lv_obj_align(s_manage_labels[i], LV_ALIGN_LEFT_MID, 36, 0);
+        lv_obj_set_style_text_font(s_manage_labels[i], FONT_BODY, 0);
+        s_manage_dots[i] = lv_obj_create(s_manage_buttons[i]);
+        lv_obj_set_pos(s_manage_dots[i], 16, 19);
+        lv_obj_set_size(s_manage_dots[i], 8, 8);
+        lv_obj_set_style_radius(s_manage_dots[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(s_manage_dots[i], 0, 0);
+        lv_obj_set_style_bg_color(s_manage_dots[i], lv_color_hex(COLOR_TERTIARY), 0);
+        lv_obj_clear_flag(s_manage_dots[i],
+                          LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        s_manage_badges[i] = lv_label_create(s_manage_buttons[i]);
+        lv_obj_set_size(s_manage_badges[i], 24, 24);
+        lv_obj_align(s_manage_badges[i], LV_ALIGN_RIGHT_MID, -10, 0);
+        lv_obj_set_style_text_font(s_manage_badges[i], FONT_BUTTON_SMALL, 0);
+        lv_obj_set_style_text_align(s_manage_badges[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_pad_top(s_manage_badges[i], 3, 0);
+        lv_obj_set_style_radius(s_manage_badges[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(s_manage_badges[i], lv_color_hex(COLOR_FAULT), 0);
+        lv_obj_set_style_bg_opa(s_manage_badges[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(s_manage_badges[i], lv_color_hex(COLOR_TEXT), 0);
+        lv_obj_clear_flag(s_manage_badges[i], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(s_manage_badges[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    s_manage_detail_host = make_card(manage, UI_MANAGE_DETAIL_X, UI_PANEL_Y,
+                                     UI_MANAGE_DETAIL_W, UI_PANEL_H);
+    lv_obj_set_style_radius(s_manage_detail_host, 28, 0);
+    lv_obj_set_style_pad_all(s_manage_detail_host, 0, 0);
+    /* Selection is established during build_ui(), but detail allocation waits
+     * until Manage actually becomes the active top-level page. */
+}
 
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
 
@@ -1635,20 +1842,21 @@ static void build_ui(void)
     layout_status_capsule();
 
     for (int i = 0; i < 3; ++i) {
-        if (i != 0) continue;
+        if (i == 1) continue;
         s_pages[i] = make_plain_container(screen, 0, UI_CONTENT_Y,
                                            1024, UI_CONTENT_H);
         lv_obj_set_style_bg_color(s_pages[i], lv_color_hex(COLOR_BASE), 0);
         lv_obj_set_style_bg_opa(s_pages[i], LV_OPA_TRANSP, 0);
     }
     build_home_page(s_pages[0]);
+    build_manage_page(s_pages[2]);
 
     lv_obj_t *nav = make_plain_container(screen, 0, UI_CONTENT_Y + UI_CONTENT_H,
                                           1024, UI_NAV_H);
     lv_obj_set_style_bg_opa(nav, LV_OPA_TRANSP, 0);
     static const char *nav_names[] = { "Home", "History", "Manage" };
     for (int i = 0; i < 3; ++i) {
-        if (i != 0) continue;
+        if (i == 1) continue;
         s_nav_buttons[i] = make_destination_button(
             nav, UI_NAV_PILL_X + i * UI_NAV_PILL_STEP, UI_NAV_PILL_Y,
             UI_NAV_PILL_W, UI_NAV_PILL_H, nav_names[i], COLOR_CAPSULE,
@@ -1773,6 +1981,7 @@ static void build_ui(void)
     lv_obj_move_foreground(s_status_scrim);
     lv_obj_move_foreground(s_status_tray);
 
+    set_manage_section(MANAGE_LOGS);
     set_active_page(0);
     lv_obj_invalidate(screen);
 }
@@ -1780,7 +1989,84 @@ static void build_ui(void)
 
 /* Persistent rail state must update before any lazy detail returns. Read only
  * bounded RAM observations here: no NVS, filesystem traversal or service I/O. */
+static void refresh_manage_rail(const ui_state_t *state)
+{
+    uint32_t dots[MANAGE_SECTION_COUNT];
+    unsigned badges[MANAGE_SECTION_COUNT] = {0};
+    for (size_t i = 0; i < MANAGE_SECTION_COUNT; ++i) dots[i] = COLOR_TERTIARY;
+    if (s_touch_services_ready) {
+        dots[MANAGE_DEVICES] = state->paired ? COLOR_LIVE : COLOR_AMBER;
+        dots[MANAGE_CONNECTIVITY] = state->wifi ? COLOR_LIVE : COLOR_AMBER;
+        dots[MANAGE_STORAGE] = state->sd_ready ? COLOR_LIVE : COLOR_FAULT;
+    }
 
+    alert_state_t alert = therapy_alert_get_state();
+    bool active_alert = therapy_alert_is_actionable(alert);
+    /* Armed alone establishes the schedule, not push deliverability. */
+    dots[MANAGE_ALERTS] = active_alert ? COLOR_FAULT :
+                          alert == ALERT_ARMED ? COLOR_AMBER : COLOR_TERTIARY;
+    badges[MANAGE_ALERTS] = active_alert ? 1U : 0U;
+
+    uploader_progress_snapshot_t uploads;
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    uploads = s_render_services->upload_progress;
+    bool uploads_known = s_render_services->upload_progress_result == ESP_OK;
+#else
+    bool uploads_known = uploader_get_progress_snapshot(&uploads) == ESP_OK;
+#endif
+    unsigned configured = 0;
+    bool retrying = false;
+    for (size_t i = 0; uploads_known && i < uploads.backend_count &&
+                       i < UPLOADER_PROGRESS_MAX_BACKENDS; ++i) {
+        const uploader_backend_progress_t *backend = &uploads.backends[i];
+        if (!backend->configured) continue;
+        configured++;
+        if (backend->error_valid) badges[MANAGE_UPLOADS]++;
+        if (backend->state == UPLOADER_BACKEND_COOLDOWN) retrying = true;
+    }
+    dots[MANAGE_UPLOADS] = badges[MANAGE_UPLOADS] ? COLOR_FAULT :
+                           retrying ? COLOR_AMBER :
+                           configured ? COLOR_LIVE : COLOR_TERTIARY;
+
+    controller_diagnostics_snapshot_t controllers;
+    controller_diagnostics_get_snapshot(&controllers);
+    bool controller_failed = false;
+    for (size_t i = 0; i < CONTROLLER_OPERATION_COUNT; ++i)
+        if (controllers.operations[i].observed &&
+            controllers.operations[i].last_result != ESP_OK)
+            controller_failed = true;
+    bool controllers_known = controllers.initialized &&
+        controllers.operations[CONTROLLER_PANEL_INIT].observed &&
+        controllers.operations[CONTROLLER_TOUCH_INIT].observed;
+    dots[MANAGE_SYSTEM] = controller_failed ? COLOR_FAULT :
+        !controllers_known || !s_touch_services_ready ? COLOR_TERTIARY :
+        !state->wifi || !state->sd_ready || !state->paired ||
+        badges[MANAGE_UPLOADS] || active_alert ? COLOR_AMBER : COLOR_LIVE;
+
+    log_stream_retained_info_t logs;
+    esp_err_t log_result = log_stream_retained_get_info(&logs);
+    dots[MANAGE_LOGS] = log_result == ESP_OK && logs.available ?
+        (touch_logs_controller_is_paused() ? COLOR_AMBER : COLOR_LIVE) :
+        s_touch_services_ready ? COLOR_FAULT : COLOR_TERTIARY;
+    for (size_t i = 0; i < MANAGE_SECTION_COUNT; ++i) {
+        if (!s_manage_buttons[i]) continue;
+        set_dot_tone(s_manage_dots[i], dots[i], dots[i] != COLOR_TERTIARY);
+        set_hidden(s_manage_badges[i], badges[i] == 0);
+        if (badges[i]) set_label_text_fmt_if_changed(s_manage_badges[i], "%u", badges[i]);
+    }
+}
+
+static void refresh_secondary_pages(const ui_state_t *state, int active_tab)
+{
+    reap_retired_logs_destination();
+    if (active_tab != 2) return;
+    refresh_manage_rail(state);
+    int section = s_rendered_manage_section;
+    if (section == MANAGE_LOGS) {
+        touch_logs_controller_refresh(state->sd_ready);
+        return;
+    }
+}
 
 static void resync_flow_visual(const ui_state_t *state)
 {
@@ -2379,6 +2665,7 @@ static void update_ui(void)
         set_hidden(s_chart_message_sub, false);
     }
 
+    refresh_secondary_pages(&state, active_tab);
 
     bool ordinary_notice = state.notice[0] && !state.notice_critical;
     bool attention = !state.therapy && state.attention[0] &&
@@ -3362,7 +3649,7 @@ void bsp_display_qemu_seed_demo(void)
 void bsp_display_qemu_set_tab(uint8_t tab)
 {
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
-    if (tab != 0) return;
+    if (tab >= 3 || tab == 1) return;
     /* The display task owns LVGL. Queue navigation into that task so preview
      * input never mutates the object tree from a service callback. */
     portENTER_CRITICAL(&s_state_lock);
