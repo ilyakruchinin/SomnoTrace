@@ -1,0 +1,38 @@
+diff --git a/hw/display/esp_rgb.c b/hw/display/esp_rgb.c
+index cf8b9ab..3b36665 100644
+--- a/hw/display/esp_rgb.c
++++ b/hw/display/esp_rgb.c
+@@ -38 +38,6 @@ static void esp_rgb_touch_event(void *opaque, int x, int y, int dz,
+-    s->touch_pressed = (buttons_state & MOUSE_EVENT_LBUTTON) != 0;
++    const bool pressed = (buttons_state & MOUSE_EVENT_LBUTTON) != 0;
++    /* SomnoTrace: retain a complete short click until the guest polls it. */
++    if (pressed && !s->touch_pressed) {
++        s->touch_press_latched = true;
++    }
++    s->touch_pressed = pressed;
+@@ -115,2 +120,5 @@ static uint64_t esp_rgb_read(void *opaque, hwaddr addr, unsigned int size)
+-        case A_RGB_TOUCH_STATUS:
+-            r = FIELD_DP32(r, RGB_TOUCH_STATUS, PRESSED, s->touch_pressed);
++        case A_RGB_TOUCH_STATUS: {
++            const bool pressed = s->touch_pressed || s->touch_press_latched;
++            r = FIELD_DP32(r, RGB_TOUCH_STATUS, PRESSED, pressed);
++            /* SomnoTrace: one guest observation consumes a latched click. */
++            s->touch_press_latched = false;
+@@ -117,0 +126 @@ static uint64_t esp_rgb_read(void *opaque, hwaddr addr, unsigned int size)
++        }
+@@ -270,4 +279,2 @@ static void rgb_invalidate(void *opaque)
+-        uint32_t* data = surface_data(qemu_console_surface(s->con));
+-
+-        /* On invalidate, reset the display */
+-        memset(data, 0, (s->width * s->height * s->bpp) / 8);
++        /* SomnoTrace: an SDL expose must preserve the last complete frame. */
++        dpy_gfx_update(s->con, 0, 0, s->width, s->height);
+@@ -347,0 +355,2 @@ static void esp_rgb_reset_hold(Object *obj, ResetType type)
++    s->touch_pressed = false;
++    s->touch_press_latched = false;
+diff --git a/include/hw/display/esp_rgb.h b/include/hw/display/esp_rgb.h
+index f3144e5..b7a5cb8 100644
+--- a/include/hw/display/esp_rgb.h
++++ b/include/hw/display/esp_rgb.h
+@@ -54,0 +55 @@ typedef struct ESPRgbState {
++    bool touch_press_latched;

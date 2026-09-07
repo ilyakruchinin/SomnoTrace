@@ -1,0 +1,8 @@
+diff --git a/include/hw/display/esp_rgb.h b/include/hw/display/esp_rgb.h
+--- a/include/hw/display/esp_rgb.h
++++ b/include/hw/display/esp_rgb.h
+@@ -13,3 +13,3 @@
+-#define ESP_RGB_MAX_WIDTH   (800)
++#define ESP_RGB_MAX_WIDTH   (1024)
+ #define ESP_RGB_MAX_HEIGHT  (600)
+ #define ESP_RGB_MAX_VRAM_SIZE   (ESP_RGB_MAX_WIDTH * ESP_RGB_MAX_HEIGHT * 4)

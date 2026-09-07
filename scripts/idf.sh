@@ -66,10 +66,28 @@ else
     set -- idf.py "$@"
 fi
 
-exec docker run --rm \
-    "${TTY_ARGS[@]}" \
-    "${DEVICE_ARGS[@]}" \
+DOCKER_ARGS=(--rm)
+# A linked checkout's .git file points outside /project. ESP-IDF also records
+# files in that common directory as absolute Ninja/CMake dependencies. Mount
+# only the shared Git metadata at its original path, read-only; firmware and
+# configuration remain in this checkout's /project mount.
+GIT_COMMON_DIR="$(git -C "${PROJECT_DIR}" rev-parse --path-format=absolute --git-common-dir)"
+if [ -f "${PROJECT_DIR}/.git" ]; then
+    DOCKER_ARGS+=(-v "${GIT_COMMON_DIR}:${GIT_COMMON_DIR}:ro")
+fi
+DOCKER_ARGS+=(-e GIT_CONFIG_COUNT=1
+    -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/project)
+if [ "${#TTY_ARGS[@]}" -gt 0 ]; then
+    DOCKER_ARGS+=("${TTY_ARGS[@]}")
+fi
+if [ "${#DEVICE_ARGS[@]}" -gt 0 ]; then
+    DOCKER_ARGS+=("${DEVICE_ARGS[@]}")
+fi
+
+exec docker run \
+    "${DOCKER_ARGS[@]}" \
     -v "${PROJECT_DIR}:/project" \
     -w /project \
     "$IMAGE" \
-    /bin/bash /project/scripts/idf-command.sh "$@"
+    /bin/bash /project/scripts/idf-command.sh \
+    "$@"

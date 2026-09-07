@@ -1,0 +1,98 @@
+diff --git a/hw/display/esp_rgb.c b/hw/display/esp_rgb.c
+--- a/hw/display/esp_rgb.c
++++ b/hw/display/esp_rgb.c
+@@ -16,6 +16,7 @@
+ #include "hw/irq.h"
+ #include "hw/display/esp_rgb.h"
+ #include "ui/console.h"
++#include "ui/input.h"
+ #include "qemu/error-report.h"
+ #include "sysemu/dma.h"
+ 
+@@ -25,6 +26,19 @@
+ #define RGB_VERSION_MAJOR 0
+ #define RGB_VERSION_MINOR 2
+ 
++static void esp_rgb_touch_event(void *opaque, int x, int y, int dz,
++                                int buttons_state)
++{
++    ESPRgbState *s = ESP_RGB(opaque);
++
++    s->touch_x = qemu_input_scale_axis(x, INPUT_EVENT_ABS_MIN,
++                                       INPUT_EVENT_ABS_MAX, 0, s->width - 1);
++    s->touch_y = qemu_input_scale_axis(y, INPUT_EVENT_ABS_MIN,
++                                       INPUT_EVENT_ABS_MAX, 0, s->height - 1);
++    s->touch_pressed = (buttons_state & MOUSE_EVENT_LBUTTON) != 0;
++    (void)dz;
++}
++
+ static void update_rgb_surface(ESPRgbState* s){
+     DisplaySurface *surface;
+     switch (s->bpp){
+@@ -93,6 +107,15 @@ static uint64_t esp_rgb_read(void *opaque, hwaddr addr, unsigned int size)
+             r = s->bpp;
+             break;
+ 
++        case A_RGB_TOUCH_POSITION:
++            r = FIELD_DP32(r, RGB_TOUCH_POSITION, X, s->touch_x);
++            r = FIELD_DP32(r, RGB_TOUCH_POSITION, Y, s->touch_y);
++            break;
++
++        case A_RGB_TOUCH_STATUS:
++            r = FIELD_DP32(r, RGB_TOUCH_STATUS, PRESSED, s->touch_pressed);
++            break;
++
+         default:
+ #if RGB_WARNING
+             warn_report("[ESP RGB] Unsupported read to 0x%lx", (unsigned long) addr);
+@@ -247,6 +270,6 @@ static void rgb_invalidate(void *opaque)
+         uint32_t* data = surface_data(qemu_console_surface(s->con));
+ 
+         /* On invalidate, reset the display */
+-        memset(data, 0, s->width * s->height * 4);
++        memset(data, 0, (s->width * s->height * s->bpp) / 8);
+     }
+ }
+@@ -299,6 +322,9 @@ static void esp_rgb_init(Object *obj)
+         memset(data, 0, (s->width * s->height * s->bpp) / 8);
+     }
+ 
++    qemu_add_mouse_event_handler(esp_rgb_touch_event, s, true,
++                                 "esp-rgb-touch");
++
+     /* Create a memory region that can be used as a framebuffer by the guest */
+     memory_region_init_ram(&s->vram, OBJECT(s), "esp-rgb-vram", ESP_RGB_MAX_VRAM_SIZE, &error_abort);
+ 
+diff --git a/include/hw/display/esp_rgb.h b/include/hw/display/esp_rgb.h
+--- a/include/hw/display/esp_rgb.h
++++ b/include/hw/display/esp_rgb.h
+@@ -47,9 +47,14 @@ typedef struct ESPRgbState {
+ 
+     /* BPP */
+     BppEnum bpp;
++
++    /* Absolute host pointer exposed to the guest as a single touch point. */
++    uint32_t touch_x;
++    uint32_t touch_y;
++    bool touch_pressed;
+ } ESPRgbState;
+ 
+-#define ESP_RGB_IO_SIZE (A_RGB_BPP_VALUE + 4)
++#define ESP_RGB_IO_SIZE (A_RGB_TOUCH_STATUS + 4)
+ 
+ REG32(RGB_VERSION, 0x00)
+     FIELD(RGB_VERSION, MAJOR, 16, 16)
+@@ -77,4 +82,11 @@ REG32(RGB_UPDATE_STATUS, 0x14)
+      * Automatically cleared by the hardware after window update. */
+     FIELD(RGB_UPDATE_STATUS, ENA, 0, 1)
+ 
+-REG32(RGB_BPP_VALUE, 0x18)
+\ No newline at end of file
++REG32(RGB_BPP_VALUE, 0x18)
++
++REG32(RGB_TOUCH_POSITION, 0x1c)
++    FIELD(RGB_TOUCH_POSITION, X, 16, 16)
++    FIELD(RGB_TOUCH_POSITION, Y, 0, 16)
++
++REG32(RGB_TOUCH_STATUS, 0x20)
++    FIELD(RGB_TOUCH_STATUS, PRESSED, 0, 1)

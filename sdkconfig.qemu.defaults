@@ -1,0 +1,37 @@
+# SomnoTrace ESP32-S3 QEMU UI preview overlay.
+CONFIG_SOMNOTRACE_BOARD_QEMU=y
+
+# QEMU's stable 8 MB model is Quad SPI; the physical 7B profile remains octal.
+CONFIG_SPIRAM_MODE_QUAD=y
+# CONFIG_SPIRAM_MODE_OCT is not set
+# QEMU's generic ISSI flash model does not implement suspend/resume.
+# CONFIG_SPI_FLASH_AUTO_SUSPEND is not set
+
+# QEMU exposes UART0, not the board's native USB Serial/JTAG console.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+# CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG is not set
+
+# Match the physical profile's one-time build_ui() stack headroom so the
+# emulator exercises the same object-tree construction envelope.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=14336
+
+# The virtual panel exposes a dedicated RGB565 framebuffer.
+CONFIG_LV_COLOR_DEPTH_16=y
+CONFIG_LV_MEM_CUSTOM=y
+CONFIG_LV_MEMCPY_MEMSET_STD=y
+CONFIG_LV_USE_FONT_COMPRESSED=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_18=y
+CONFIG_LV_FONT_MONTSERRAT_22=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+CONFIG_LV_SPRINTF_USE_FLOAT=y
+CONFIG_LV_FONT_MONTSERRAT_36=y
+CONFIG_LV_FONT_MONTSERRAT_48=y
+CONFIG_LV_USE_CHART=y
+CONFIG_LV_USE_BTN=y
+CONFIG_LV_USE_LABEL=y
+CONFIG_LV_USE_MSGBOX=y
+# CONFIG_LV_BUILD_EXAMPLES is not set
+
+# The launch scripts disable the emulated hardware watchdog. Keep the normal
+# ESP-IDF watchdog symbols present so shared diagnostic code still compiles.

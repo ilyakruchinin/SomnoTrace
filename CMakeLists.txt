@@ -92,7 +92,8 @@ project(somnotrace)
 # The 7-inch UI creates a much larger LVGL object tree than the original
 # display. Scope its allocator to PSRAM first so small widgets and copied text
 # do not consume the internal heap needed by Wi-Fi, BLE and RTOS stacks.
-if(CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B)
+if(CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B OR
+   (CONFIG_SOMNOTRACE_BOARD_QEMU AND NOT CONFIG_SOMNOTRACE_QEMU_DISPLAY_154))
     idf_component_get_property(_somnotrace_lvgl_lib lvgl__lvgl COMPONENT_LIB)
     target_include_directories(${_somnotrace_lvgl_lib} PRIVATE
         "${CMAKE_CURRENT_LIST_DIR}/main")

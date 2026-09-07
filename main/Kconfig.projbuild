@@ -10,6 +10,18 @@ config SOMNOTRACE_BOARD_WAVESHARE_154
 config SOMNOTRACE_BOARD_WAVESHARE_7B
     bool "Waveshare ESP32-S3-Touch-LCD-7B (1024x600)"
 
+config SOMNOTRACE_BOARD_QEMU
+    bool "ESP32-S3 QEMU UI emulator"
+
 endchoice
+
+config SOMNOTRACE_QEMU_DISPLAY_154
+    bool "Emulate the original 1.54-inch display (240x240)"
+    depends on SOMNOTRACE_BOARD_QEMU
+    default n
+    help
+        Run the original compact display renderer against QEMU's virtual RGB
+        framebuffer. Leave disabled for the native 7B UI at 1024x600.
+        Both emulator profiles use simulated data and disable device services.
 
 endmenu
