@@ -33,6 +33,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include "esp_log.h"
 #include "cJSON.h"
@@ -116,75 +117,87 @@ static void noon_day_from_epoch(int64_t epoch_ms, char *out, size_t out_len)
 
 /* Read a binary file into a malloc'd buffer.
  * Returns NULL on failure.  Caller must free(). */
+/* BLE responses are fully owned in RAM before entering this gate. No
+ * descriptor or storage lease crosses an RPC or a spool wait. */
+static bool post_storage_begin(void)
+{
+    if (!sd_storage_lease_acquire(SD_LEASE_EXPORT, 250)) return false;
+    if (!sd_storage_is_ready() || sd_storage_recording_pending() || sd_storage_recording_active()) {
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return false;
+    }
+    return true;
+}
+
 static uint8_t *read_bin_file(const char *path, size_t *out_len)
 {
+    if (out_len) *out_len = 0;
+    if (!post_storage_begin()) return NULL;
     FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); return NULL; }
-    uint8_t *buf = malloc(sz);
-    if (!buf) { fclose(f); return NULL; }
-    size_t rd = fread(buf, 1, sz, f);
-    fclose(f);
-    if (rd != (size_t)sz) { free(buf); return NULL; }
-    if (out_len) *out_len = rd;
+    uint8_t *buf = NULL;
+    long sz = -1;
+    if (f && fseek(f, 0, SEEK_END) == 0) sz = ftell(f);
+    if (sz > 0 && sz <= 100000 && fseek(f, 0, SEEK_SET) == 0) {
+        buf = malloc((size_t)sz);
+        if (buf && fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+            free(buf); buf = NULL;
+        }
+    }
+    if (f && fclose(f) != 0) { free(buf); buf = NULL; }
+    sd_storage_lease_release(SD_LEASE_EXPORT);
+    if (buf && out_len) *out_len = (size_t)sz;
     return buf;
 }
 
-static esp_err_t write_bin_file(const char *path, const uint8_t *data, size_t len)
-{
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-        ESP_LOGE(TAG, "failed to open %s for writing: %s", path, strerror(errno));
-        return ESP_FAIL;
-    }
-    size_t written = fwrite(data, 1, len, f);
-    fclose(f);
-    if (written != len) {
-        ESP_LOGE(TAG, "short write to %s: %u/%u", path, (unsigned)written, (unsigned)len);
-        return ESP_FAIL;
-    }
-    return ESP_OK;
-}
-
-/* Atomic-ish write: write to temp file, then rename over target.
- * FAT32 rename() fails with EEXIST, so remove the target first. */
 static esp_err_t write_bin_atomic(const char *path, const uint8_t *data, size_t len)
 {
-    char tmp_path[330];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
-
-    if (write_bin_file(tmp_path, data, len) != ESP_OK) return ESP_FAIL;
-
-    remove(path);
-    if (rename(tmp_path, path) != 0) {
-        ESP_LOGE(TAG, "rename %s → %s failed: %s", tmp_path, path, strerror(errno));
-        remove(tmp_path);
+    if (!post_storage_begin()) return ESP_ERR_TIMEOUT;
+    char tmp[380], backup[380];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    snprintf(backup, sizeof(backup), "%s.bak", path);
+    /* Recover a prior interrupted rename before replacing it. */
+    struct stat st;
+    int recovery_error = 0;
+    if (stat(path, &st) != 0) {
+        if (errno != ENOENT) recovery_error = errno;
+        else if (rename(backup, path) != 0 && errno != ENOENT) recovery_error = errno;
+    }
+    if (recovery_error) {
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        errno = recovery_error;
         return ESP_FAIL;
     }
-    ESP_LOGD(TAG, "wrote %s (%u bytes)", path, (unsigned)len);
+    FILE *f = fopen(tmp, "wb");
+    int first_error = f ? 0 : (errno ? errno : EIO);
+    if (f) {
+        if (len && fwrite(data, 1, len, f) != len) first_error = errno ? errno : EIO;
+        if (!first_error && fflush(f) != 0) first_error = errno ? errno : EIO;
+        if (!first_error && fsync(fileno(f)) != 0) first_error = errno ? errno : EIO;
+        if (fclose(f) != 0 && !first_error) first_error = errno ? errno : EIO;
+    }
+    bool moved_old = false;
+    if (!first_error) {
+        if (unlink(backup) != 0 && errno != ENOENT) first_error = errno;
+        if (!first_error && rename(path, backup) == 0) moved_old = true;
+        else if (!first_error && errno != ENOENT) first_error = errno;
+        if (!first_error && rename(tmp, path) != 0) first_error = errno;
+        if (first_error && moved_old) rename(backup, path);
+        if (!first_error && moved_old) unlink(backup);
+    }
+    if (first_error) unlink(tmp);
+    /* A failed transaction can still have changed a directory entry. */
+    sd_storage_lease_release(SD_LEASE_EXPORT);
+    if (first_error) { errno = first_error; return ESP_FAIL; }
     return ESP_OK;
 }
 
 static esp_err_t write_json_file(const char *path, const cJSON *json)
 {
-    char *str = cJSON_Print(json);
-    if (!str) return ESP_FAIL;
-
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        ESP_LOGE(TAG, "failed to open %s: %s", path, strerror(errno));
-        free(str);
-        return ESP_FAIL;
-    }
-    fputs(str, f);
-    fputc('\n', f);
-    fclose(f);
+    char *str = cJSON_PrintUnformatted(json);
+    if (!str) return ESP_ERR_NO_MEM;
+    esp_err_t ret = write_bin_atomic(path, (const uint8_t *)str, strlen(str));
     free(str);
-    ESP_LOGI(TAG, "wrote %s", path);
-    return ESP_OK;
+    return ret;
 }
 
 static void epoch_ms_to_iso_utc(int64_t epoch_ms, char *out, size_t out_len)
@@ -262,7 +275,8 @@ static esp_err_t collect_summary_spool(int64_t clock_drift_ms)
                 char spool_path[300];
                 snprintf(spool_path, sizeof(spool_path), "%s/%s.spool",
                          SD_SUMMARIES_DIR, day_label);
-                write_bin_atomic(spool_path, rec, rec_len);
+                ret = write_bin_atomic(spool_path, rec, rec_len);
+                if (ret != ESP_OK) { free(data); return ret; }
                 days_written++;
             }
             pos += flen;
@@ -301,20 +315,11 @@ static esp_err_t collect_resp_events(const char *dir, const char *prefix,
         return ret;
     }
 
-    if (data && len > 0) {
-        char path[330];
-        snprintf(path, sizeof(path), "%s/%s_resp_events.bin", dir, prefix);
-        write_bin_file(path, data, len);
-    } else {
-        ESP_LOGI(TAG, "resp events spool is empty");
-        char path[330];
-        snprintf(path, sizeof(path), "%s/%s_resp_events.bin", dir, prefix);
-        FILE *f = fopen(path, "wb");
-        if (f) fclose(f);
-    }
-
+    char path[330];
+    snprintf(path, sizeof(path), "%s/%s_resp_events.bin", dir, prefix);
+    ret = write_bin_atomic(path, data, len);
     free(data);
-    return ESP_OK;
+    return ret;
 }
 
 /* ── Device identification via Get RPC ──────────────────────────────── */
@@ -352,9 +357,9 @@ static esp_err_t collect_identification(const char *dir, const char *prefix)
 
     char path[330];
     snprintf(path, sizeof(path), "%s/%s_ident.json", dir, prefix);
-    write_json_file(path, ident);
+    esp_err_t ret = write_json_file(path, ident);
     cJSON_Delete(ident);
-    return ESP_OK;
+    return ret;
 }
 
 static esp_err_t collect_settings(const char *dir, const char *prefix)
@@ -377,7 +382,7 @@ static esp_err_t collect_settings(const char *dir, const char *prefix)
 
     char path[330];
     snprintf(path, sizeof(path), "%s/%s_settings.json", dir, prefix);
-    write_json_file(path, settings);
+    esp_err_t ret = write_json_file(path, settings);
 
     /* Also save to summaries directory for fast O(1) STR.edf lookup */
     const char *slash = strrchr(dir, '/');
@@ -386,11 +391,12 @@ static esp_err_t collect_settings(const char *dir, const char *prefix)
         char sum_settings_path[300];
         snprintf(sum_settings_path, sizeof(sum_settings_path), "%s/%s.settings.json",
                  SD_SUMMARIES_DIR, day_label);
-        write_json_file(sum_settings_path, settings);
+        esp_err_t mirror = write_json_file(sum_settings_path, settings);
+        if (ret == ESP_OK) ret = mirror;
     }
 
     cJSON_Delete(settings);
-    return ESP_OK;
+    return ret;
 }
 
 /* ── Spool staleness detection ──────────────────────────────────────── */
@@ -520,7 +526,8 @@ static esp_err_t refresh_today_summary_spool(int64_t end_epoch_ms,
                 char spool_path[300];
                 snprintf(spool_path, sizeof(spool_path), "%s/%s.spool",
                          SD_SUMMARIES_DIR, day_label);
-                write_bin_atomic(spool_path, rec, rec_len);
+                ret = write_bin_atomic(spool_path, rec, rec_len);
+                if (ret != ESP_OK) { free(data); return ret; }
                 days_written++;
             }
             pos += flen;
@@ -601,7 +608,7 @@ esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
     cJSON_AddBoolToObject(manifest, "spool_current", fresh);
     char mpath[330];
     snprintf(mpath, sizeof(mpath), "%s/%s_manifest.json", session_dir, file_prefix);
-    write_json_file(mpath, manifest);
+    if (!manifest || write_json_file(mpath, manifest) != ESP_OK) errors++;
     cJSON_Delete(manifest);
 
     ESP_LOGI(TAG, "=== POST-THERAPY COLLECTION DONE (%d errors, spool %s) ===",

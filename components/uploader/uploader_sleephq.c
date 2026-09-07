@@ -40,6 +40,8 @@
 #include "esp_system.h"
 #include "esp_random.h"
 #include "esp_tls.h"
+#include <fcntl.h>
+#include <arpa/inet.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "cJSON.h"
@@ -82,30 +84,35 @@ static bool shq_token_ready(void)
 
 /* ── TLS socket layer ───────────────────────────────────────────────── */
 
+/* Once storage is leased, all TLS I/O uses a nonblocking socket. A request
+ * deadline is not renewed by trickle progress; cancellation is checked before
+ * every transport call and at most 20ms apart while waiting for readiness. */
+static int64_t s_request_deadline;
+static bool shq_io_allowed(void)
+{
+    return !uploader_should_cancel() && esp_timer_get_time() < s_request_deadline;
+}
+static ssize_t shq_tls_read(esp_tls_t *tls, void *data, size_t len)
+{
+    while (shq_io_allowed()) {
+        ssize_t n = esp_tls_conn_read(tls, data, len);
+        if (n != ESP_TLS_ERR_SSL_WANT_READ && n != ESP_TLS_ERR_SSL_WANT_WRITE) return n;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return -1;
+}
 static int shq_tls_write_all(esp_tls_t *tls, const void *data, size_t len)
 {
-    const char *p = (const char *)data;
     size_t total = 0;
-    int write_calls = 0;
-    while (total < len) {
-        ssize_t w = esp_tls_conn_write(tls, p + total, len - total);
-        write_calls++;
-        if (w < 0) {
-            ESP_LOGE(TAG, "TLS write error: %d (after %u/%u bytes, %d calls)",
-                     (int)w, (unsigned)total, (unsigned)len, write_calls);
-            return -1;
+    while (total < len && shq_io_allowed()) {
+        ssize_t w = esp_tls_conn_write(tls, (const char *)data + total, len - total);
+        if (w == ESP_TLS_ERR_SSL_WANT_READ || w == ESP_TLS_ERR_SSL_WANT_WRITE) {
+            vTaskDelay(pdMS_TO_TICKS(20)); continue;
         }
-        if (w == 0) {
-            if (write_calls > 100) {
-                ESP_LOGE(TAG, "TLS write stuck: 0 return after %d calls", write_calls);
-                return -1;
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
+        if (w <= 0) return -1;
         total += w;
     }
-    return (int)total;
+    return total == len ? (int)total : -1;
 }
 
 /* Read a complete HTTP response from the TLS socket.
@@ -132,7 +139,7 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
             free(buf);
             return -1;
         }
-        ssize_t n = esp_tls_conn_read(tls, buf + buf_len, buf_cap - buf_len - 1);
+        ssize_t n = shq_tls_read(tls, buf + buf_len, buf_cap - buf_len - 1);
         if (n < 0) {
             ESP_LOGE(TAG, "TLS read error during headers: %d", (int)n);
             free(buf);
@@ -197,7 +204,7 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
             if (buf_len >= buf_cap - 1) break;
             size_t to_read = remaining < (buf_cap - buf_len - 1) ?
                              remaining : (buf_cap - buf_len - 1);
-            ssize_t n = esp_tls_conn_read(tls, buf + buf_len, to_read);
+            ssize_t n = shq_tls_read(tls, buf + buf_len, to_read);
             if (n < 0) {
                 ESP_LOGE(TAG, "TLS read error during body: %d", (int)n);
                 free(buf);
@@ -211,7 +218,7 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
         /* Read until we see 0\r\n\r\n or connection closes */
         while (1) {
             if (buf_len >= buf_cap - 1) break;
-            ssize_t n = esp_tls_conn_read(tls, buf + buf_len, buf_cap - buf_len - 1);
+            ssize_t n = shq_tls_read(tls, buf + buf_len, buf_cap - buf_len - 1);
             if (n < 0) { free(buf); return -1; }
             if (n == 0) break;
             buf_len += n;
@@ -222,7 +229,7 @@ static int shq_http_read_response(esp_tls_t *tls, char **body_out, size_t *body_
         /* No Content-Length, no chunked — read until connection closes */
         while (1) {
             if (buf_len >= buf_cap - 1) break;
-            ssize_t n = esp_tls_conn_read(tls, buf + buf_len, buf_cap - buf_len - 1);
+            ssize_t n = shq_tls_read(tls, buf + buf_len, buf_cap - buf_len - 1);
             if (n <= 0) break;
             buf_len += n;
         }
@@ -301,6 +308,7 @@ static int shq_http_request(esp_tls_t *tls, const char *method,
                             const char *body, const char *content_type,
                             char **body_out, size_t *body_len)
 {
+    s_request_deadline = esp_timer_get_time() + (int64_t)SHQ_TIMEOUT_MS * 1000;
     /* Build request line + headers */
     char req[2048];
     int pos = 0;
@@ -574,7 +582,10 @@ static esp_err_t shq_wait_import(esp_tls_t *tls, const char *import_id)
         cJSON_Delete(root);
         if (complete) return ESP_OK;
         if (failed) return ESP_FAIL;
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        for (int slice = 0; slice < 100; ++slice) {
+            if (uploader_should_cancel()) return ESP_ERR_INVALID_STATE;
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
     }
     return ESP_ERR_TIMEOUT;
 }
@@ -593,6 +604,7 @@ static upload_result_t shq_upload_file(esp_tls_t *tls,
                                        const char *filename,
                                        bool filename_first)
 {
+    s_request_deadline = esp_timer_get_time() + (int64_t)SHQ_TIMEOUT_MS * 1000;
     FILE *f = fopen(local_path, "rb");
     if (!f) {
         ESP_LOGW(TAG, "  cannot open %s", local_path);
@@ -781,6 +793,7 @@ static upload_result_t shq_upload_file(esp_tls_t *tls,
  * The root bundle is sent for every import, not just when it changed: without
  * STR.edf the sessions in that import cannot be interpreted. */
 
+static uploader_config_t s_prepared_config;
 static esp_tls_t *s_tls;                  /* live for the whole run */
 static char s_import_id[32];
 static int  s_day_files;                  /* files sent in the current import */
@@ -790,16 +803,21 @@ static bool shq_is_configured(void)
     return uploader_is_sleephq_configured();
 }
 
-static upload_result_t shq_session_begin(void)
+/* DNS and TLS handshake can contain synchronous SDK work. Prepare performs
+ * both before the SD lease, so even a stalled handshake cannot deny recording.
+ * Retries under a lease are forbidden; the next pass prepares a new session. */
+static upload_result_t shq_prepare(void)
 {
-    uploader_config_t cfg;
-    uploader_load_config(&cfg);
-    if (!cfg.shq_client_id[0] || !cfg.shq_client_secret[0])
+    uploader_load_config(&s_prepared_config);
+    if (!s_prepared_config.shq_client_id[0] || !s_prepared_config.shq_client_secret[0])
         return UPLOAD_NOT_CONFIGURED;
-
+    char server_ip[INET_ADDRSTRLEN];
+    if (!uploader_resolve_host(SHQ_HOST, server_ip, sizeof(server_ip)))
+        return UPLOAD_ERR_TRANSIENT;
     esp_tls_cfg_t tls_cfg = {
         .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = SHQ_TIMEOUT_MS,
+        .common_name = SHQ_HOST,
     };
 
     s_tls = esp_tls_init();
@@ -808,15 +826,27 @@ static upload_result_t shq_session_begin(void)
         return UPLOAD_ERR_TRANSIENT;
     }
 
-    char url[128];
-    snprintf(url, sizeof(url), "https://%s", SHQ_HOST);
-    if (esp_tls_conn_http_new_sync(url, &tls_cfg, s_tls) != 1) {
+    if (esp_tls_conn_new_sync(server_ip, strlen(server_ip), SHQ_PORT, &tls_cfg, s_tls) != 1) {
         ESP_LOGE(TAG, "TLS connect to %s failed", SHQ_HOST);
         esp_tls_conn_destroy(s_tls);
         s_tls = NULL;
         return UPLOAD_ERR_TRANSIENT;
     }
+    int fd = -1;
+    if (esp_tls_get_conn_sockfd(s_tls, &fd) != ESP_OK || fd < 0 ||
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) < 0 ||
+        uploader_should_cancel()) {
+        esp_tls_conn_destroy(s_tls); s_tls = NULL; return UPLOAD_CANCELLED;
+    }
+    return UPLOAD_OK;
+}
+
+static upload_result_t shq_session_begin(void)
+{
+    const uploader_config_t cfg = s_prepared_config;
+    if (!s_tls || uploader_should_cancel()) return UPLOAD_CANCELLED;
     ESP_LOGI(TAG, "TLS connected to %s", SHQ_HOST);
+
 
     if (shq_authenticate(s_tls, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "authentication failed");
@@ -903,46 +933,21 @@ static bool shq_test(char *msg, size_t msg_len)
 
 static upload_result_t shq_day_begin(const char *day)
 {
-    if (!s_tls) {
-        if (shq_session_begin() != UPLOAD_OK)
-            return UPLOAD_ERR_TRANSIENT;
-    }
-    s_import_id[0] = '\0';
-    s_day_files = 0;
-
-    if (shq_create_import(s_tls, s_import_id, sizeof(s_import_id), false) != ESP_OK) {
-        /* TLS connection may have been closed by remote server. Try reconnecting once. */
-        ESP_LOGW(TAG, "import creation failed on existing TLS connection, reconnecting...");
-        shq_session_end();
-        if (shq_session_begin() != UPLOAD_OK ||
-            shq_create_import(s_tls, s_import_id, sizeof(s_import_id), false) != ESP_OK) {
-            ESP_LOGE(TAG, "import creation failed for day %s", day);
-            return UPLOAD_ERR_TRANSIENT;
-        }
-    }
-    ESP_LOGI(TAG, "day %s -> import %s", day, s_import_id);
+    (void)day;
+    if (!s_tls || uploader_should_cancel()) return UPLOAD_CANCELLED;
+    s_import_id[0] = '\0'; s_day_files = 0;
+    if (shq_create_import(s_tls, s_import_id, sizeof(s_import_id), false) != ESP_OK)
+        return UPLOAD_ERR_TRANSIENT;
     return UPLOAD_OK;
 }
 
 static upload_result_t shq_ox_day_begin(const char *day)
 {
-    if (!s_tls) {
-        if (shq_session_begin() != UPLOAD_OK)
-            return UPLOAD_ERR_TRANSIENT;
-    }
-    s_import_id[0] = '\0';
-    s_day_files = 0;
-    if (shq_create_import(s_tls, s_import_id, sizeof(s_import_id), true) != ESP_OK) {
-        /* TLS connection may have been closed by remote server. Try reconnecting once. */
-        ESP_LOGW(TAG, "O2 import creation failed on existing TLS connection, reconnecting...");
-        shq_session_end();
-        if (shq_session_begin() != UPLOAD_OK ||
-            shq_create_import(s_tls, s_import_id, sizeof(s_import_id), true) != ESP_OK) {
-            ESP_LOGE(TAG, "O2 import creation failed for day %s", day);
-            return UPLOAD_ERR_TRANSIENT;
-        }
-    }
-    ESP_LOGI(TAG, "O2 day %s -> import %s", day, s_import_id);
+    (void)day;
+    if (!s_tls || uploader_should_cancel()) return UPLOAD_CANCELLED;
+    s_import_id[0] = '\0'; s_day_files = 0;
+    if (shq_create_import(s_tls, s_import_id, sizeof(s_import_id), true) != ESP_OK)
+        return UPLOAD_ERR_TRANSIENT;
     return UPLOAD_OK;
 }
 
@@ -1039,6 +1044,7 @@ const upload_backend_t sleephq_backend = {
     .label = "SleepHQ Cloud",
     .bundle_only_ok = false,    /* would create an import with no sessions */
     .is_configured = shq_is_configured,
+    .prepare = shq_prepare,
     .session_begin = shq_session_begin,
     .day_begin = shq_day_begin,
     .put_group = shq_put_group,
@@ -1050,3 +1056,6 @@ const upload_backend_t sleephq_backend = {
     .session_end = shq_session_end,
     .test = shq_test,
 };
+
+/* Runs only on the scheduler owner, so its token/session cache cannot race an
+ * upload. OAuth and team lookup only: never creates an import or uploads data. */

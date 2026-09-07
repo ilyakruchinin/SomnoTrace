@@ -253,7 +253,14 @@ esp_err_t upload_index_forget_day(uint32_t day)
 {
     char path[160];
     day_path(day, path, sizeof(path));
-    unlink(path);
+    /* The durable export owner may acknowledge an invalidation only after
+     * the old on-card success state is gone. Keep the RAM owner unchanged
+     * on failure so a caller cannot mistake a failed unlink for completion.
+     * ENOENT is the idempotent retry after deletion succeeded before reset. */
+    if (unlink(path) != 0 && errno != ENOENT) {
+        ESP_LOGE(TAG, "cannot forget day %08u: %s", (unsigned)day, strerror(errno));
+        return ESP_FAIL;
+    }
 
     int i = find_day_idx(day);
     if (i >= 0) {
@@ -454,9 +461,10 @@ static void load_bundle_state(void)
     cJSON_Delete(root);
 }
 
-static void save_bundle_state(void)
+static esp_err_t save_bundle_state(void)
 {
     cJSON *root = cJSON_CreateObject();
+    if (!root) return ESP_ERR_NO_MEM;
     for (int b = 0; b < s_n_backends; b++) {
         char hex[24];
         snprintf(hex, sizeof(hex), "%016llx",
@@ -465,9 +473,10 @@ static void save_bundle_state(void)
     }
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    if (!json) return;
-    write_json_atomic(UPLOAD_BUNDLE_STATE_PATH, json);
+    if (!json) return ESP_ERR_NO_MEM;
+    esp_err_t ret = write_json_atomic(UPLOAD_BUNDLE_STATE_PATH, json);
     free(json);
+    return ret;
 }
 
 uint64_t upload_index_bundle_ok_fp(int slot)
@@ -476,12 +485,15 @@ uint64_t upload_index_bundle_ok_fp(int slot)
     return s_bundle_ok_fp[slot];
 }
 
-void upload_index_set_bundle_ok(int slot, uint64_t fp)
+esp_err_t upload_index_set_bundle_ok(int slot, uint64_t fp)
 {
-    if (slot < 0 || slot >= UPLOAD_MAX_BACKENDS) return;
-    if (s_bundle_ok_fp[slot] == fp) return;
+    if (slot < 0 || slot >= UPLOAD_MAX_BACKENDS) return ESP_ERR_INVALID_ARG;
+    if (s_bundle_ok_fp[slot] == fp) return ESP_OK;
+    uint64_t previous = s_bundle_ok_fp[slot];
     s_bundle_ok_fp[slot] = fp;
-    save_bundle_state();
+    esp_err_t ret = save_bundle_state();
+    if (ret != ESP_OK) s_bundle_ok_fp[slot] = previous;
+    return ret;
 }
 
 /* ── Lifecycle ────────────────────────────────────────────────────── */

@@ -22,6 +22,8 @@
  */
 
 #include "uploader.h"
+#include <netdb.h>
+#include <arpa/inet.h>
 #include "upload_index.h"
 #include "upload_scan.h"
 #include "upload_sched.h"
@@ -162,6 +164,22 @@ esp_err_t uploader_load_config(uploader_config_t *cfg)
 }
 
 /* Injected storage-lease hooks (the app's sd_storage arbitration). */
+static uploader_cancel_fn_t s_should_cancel;
+void uploader_set_cancel_fn(uploader_cancel_fn_t fn) { s_should_cancel = fn; }
+bool uploader_should_cancel(void) { return s_should_cancel && s_should_cancel(); }
+
+bool uploader_resolve_host(const char *host, char *out, size_t out_size)
+{
+    if (uploader_should_cancel()) return false;
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *result = NULL;
+    if (getaddrinfo(host, NULL, &hints, &result) != 0) return false;
+    bool ok = result && inet_ntop(AF_INET,
+        &((struct sockaddr_in *)result->ai_addr)->sin_addr, out, out_size);
+    freeaddrinfo(result);
+    return ok && !uploader_should_cancel();
+}
+
 static uploader_lease_acquire_fn_t s_lease_acquire = NULL;
 static uploader_lease_release_fn_t s_lease_release = NULL;
 
@@ -449,7 +467,8 @@ int uploader_enabled_backends(const upload_backend_t **out, int max_out)
 
 bool uploader_lease_take(uint32_t timeout_ms)
 {
-    return s_lease_acquire ? s_lease_acquire(timeout_ms) : true;
+    return !uploader_should_cancel() &&
+           (s_lease_acquire ? s_lease_acquire(timeout_ms) : true);
 }
 
 void uploader_lease_give(void)
@@ -520,8 +539,14 @@ void uploader_on_day_invalidated(const char *day_folder)
     if (!s_initialised) return;
     uint32_t day = day_to_num(day_folder);
     if (!day) return;
-    ESP_LOGI(TAG, "day %s invalidated", day_folder);
+    ESP_LOGI(TAG, "day %s invalidation pending", day_folder);
     upload_sched_notify_invalidate(day);
+}
+
+void uploader_set_invalidation_hooks(uploader_invalidation_next_fn_t next,
+                                      uploader_invalidation_ack_fn_t ack)
+{
+    upload_sched_set_invalidation_hooks(next, ack);
 }
 
 void uploader_request_scan(void)

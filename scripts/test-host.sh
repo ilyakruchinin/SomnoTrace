@@ -19,3 +19,11 @@ python3 scripts/sd_mount_fallback_contract_test.py
 python3 scripts/backend_recording_test.py
 python3 scripts/therapy_lifecycle_race_contract_test.py
 python3 scripts/therapy_gate_behavior_test.py
+python3 scripts/storage_export_fault_test.py
+python3 scripts/edf_rebuild_behavior_test.py
+python3 scripts/pending_export_behavior_test.py
+python3 scripts/pending_export_service_test.py
+python3 scripts/upload_invalidation_behavior_test.py
+python3 scripts/backend_realtime_test.py
+python3 scripts/uploader_ox_lease_contract_test.py
+python3 scripts/fork_backend_reconciliation_test.py

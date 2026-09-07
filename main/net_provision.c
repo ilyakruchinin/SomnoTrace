@@ -2305,6 +2305,12 @@ static void uploader_lease_release(void)
     sd_storage_lease_release(SD_LEASE_UPLOAD);
 }
 
+
+static bool uploader_recording_requested(void)
+{
+    return sd_storage_recording_pending() || sd_storage_recording_active();
+}
+
 /* Recursively delete a directory and all its contents. */
 static void recursive_delete(const char *path)
 {
@@ -3271,6 +3277,7 @@ static esp_err_t start_webserver(void)
     /* Let the uploader participate in storage arbitration so it never reads a
      * day folder while a rebuild is replacing it. */
     uploader_set_lease_fns(uploader_lease_acquire, uploader_lease_release);
+    uploader_set_cancel_fn(uploader_recording_requested);
     /* Periodic upload scans yield to a live therapy recording; event-driven
      * uploads still run, since they matter more than a housekeeping scan. */
     upload_sched_set_busy_fn(sd_storage_recording_active);

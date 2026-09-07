@@ -69,9 +69,13 @@ esp_err_t upload_sched_init(void);
 /* Trigger 1: an export finished for this day (numeric YYYYMMDD). */
 void upload_sched_notify_export(uint32_t day);
 
-/* The day's exported files were replaced (rebuild / recreate), so whatever
- * was uploaded before is stale.  Drops the day's state and re-uploads. */
+/* The day's exported files were replaced. Wake durable-token polling; the
+ * event is only a nudge and may be dropped without losing persisted work. */
 void upload_sched_notify_invalidate(uint32_t day);
+
+/* App hooks are immutable after scheduler startup; see uploader.h. */
+void upload_sched_set_invalidation_hooks(uploader_invalidation_next_fn_t next,
+                                         uploader_invalidation_ack_fn_t ack);
 
 /* Trigger 3: rescan now, or clear all state and re-upload from scratch. */
 void upload_sched_request_scan(void);

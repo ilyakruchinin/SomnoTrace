@@ -89,8 +89,18 @@ void session_writer_recover(void);
 void session_writer_enable_deferred_export(void);
 
 /* Days still awaiting an automatic export rebuild, as a JSON array of
- * {day, attempts, needs_attention}.  Caller frees. */
+ * {day, attempts, needs_attention, reason}.  Caller frees. */
 esp_err_t session_writer_pending_export_json(char **out_json);
+
+/* Durable rebuilt-day handoff, polled by the upload scheduler. Token is an
+ * opaque marker key plus publication nonce (provide at least 128 bytes). Both calls use
+ * a zero-wait EXPORT transaction. The scheduler must durably invalidate the
+ * day index before acknowledging, and must never wait here holding another
+ * task's EXPORT lease. A failed acknowledgement leaves retryable intent. */
+bool session_writer_next_upload_invalidation(uint32_t *day, char *token, size_t token_len);
+esp_err_t session_writer_ack_upload_invalidation(uint32_t day, const char *token);
+/* Persist before retiring the shared rebuild publication sentinel. */
+esp_err_t session_writer_mark_upload_invalidation(const char *day);
 
 /* Check whether an _SNC ValueChange notification has been received since
  * the last call.  Returns true and stores the new value in *out_value
