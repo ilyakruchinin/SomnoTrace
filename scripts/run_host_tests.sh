@@ -104,6 +104,10 @@ run_test controller_diagnostics_test -DCONTROLLER_DIAGNOSTICS_HOST_TEST -I"$SHIM
 run_test touch_observation_test -I"$SHIM" -I"$MAIN_DIR" \
     scripts/touch_observation_test.c "$MAIN_DIR/touch_observation.c"
 run_test live_flow_plot_test -I"$SHIM" -I"$MAIN_DIR" scripts/live_flow_plot_test.c
+run_test first_run_setup_test -I"$SHIM" -I"$MAIN_DIR" \
+    scripts/first_run_setup_test.c "$MAIN_DIR/first_run_setup_model.c"
+run_test timezone_catalog_test -DTIMEZONE_CATALOG_HOST_TEST -I"$SHIM" -I"$MAIN_DIR" \
+    scripts/timezone_catalog_test.c "$MAIN_DIR/timezone_catalog.c"
 
 # edf_gen_test #includes the real edf_gen.c and needs a real cJSON.
 # Include order matters: the real cJSON.h must shadow the shim in $SHIM.

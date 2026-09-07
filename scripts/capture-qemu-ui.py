@@ -17,7 +17,7 @@ SCREEN_SCENARIOS = {
     "home": (0, (330, 563)),
     "manage": (2, (694, 563)),
 }
-INTERACTION_SCENARIOS = ('logs', 'logs-paused', 'logs-debug', 'logs-search-keyboard', 'logs-filtered', 'logs-empty', 'logs-disconnected', 'logs-recovered', 'logs-save-progress', 'logs-save-complete', 'logs-clear-confirm', 'logs-levels-none', 'logs-keyboard-edits')
+INTERACTION_SCENARIOS = ('setup-wifi', 'logs', 'logs-paused', 'logs-debug', 'logs-search-keyboard', 'logs-filtered', 'logs-empty', 'logs-disconnected', 'logs-recovered', 'logs-save-progress', 'logs-save-complete', 'logs-clear-confirm', 'logs-levels-none', 'logs-keyboard-edits')
 FATAL_MARKERS = (
     "Guru Meditation Error",
     "assert failed",

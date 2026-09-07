@@ -4,6 +4,7 @@
 
 #include "bsp_display.h"
 #include "device_settings.h"
+#include "first_run_setup.h"
 #include "log_stream.h"
 #include "touch_logs_qemu.h"
 #include "nvs_writer.h"
@@ -16,7 +17,36 @@
 
 static const char *TAG = "somnotrace_qemu";
 
+static void seed_finished_setup_preview(void)
+{
+    nvs_writer_init();
+    esp_err_t err = first_run_setup_load();
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        /* QEMU's flash image is disposable.  Recover an incompatible retained
+         * setup record so screenshots never depend on a previous preview. */
+        ESP_LOGW(TAG, "resetting incompatible QEMU setup state: %s",
+                 esp_err_to_name(err));
+        ESP_ERROR_CHECK(first_run_setup_reset());
+    }
 
+    const first_run_setup_observed_t observed = {
+        .established_installation = false,
+        .wifi_configured = true,
+        .time_configured = true,
+        .airsense_paired = true,
+        .card_present = true,
+        .alerts_configured = true,
+        .uploads_configured = true,
+    };
+    ESP_ERROR_CHECK(first_run_setup_reconcile(&observed));
+
+    first_run_setup_snapshot_t snapshot;
+    first_run_setup_snapshot(&snapshot);
+    ESP_ERROR_CHECK(first_run_setup_is_finished(&snapshot.state)
+                        ? ESP_OK
+                        : ESP_ERR_INVALID_STATE);
+    ESP_LOGI(TAG, "deterministic setup preview ready (finished)");
+}
 
 void app_main(void)
 {
@@ -32,6 +62,11 @@ void app_main(void)
     /* Exercise the same bounded retained feed as hardware so the native Logs
      * screen is a live acceptance surface rather than a disconnected mock. */
     log_stream_init();
+
+    /* Resolve setup before constructing the shell: the normal QEMU target is
+     * a deterministic post-setup product preview, not a retained wizard from
+     * whichever flash image happened to run last. */
+    seed_finished_setup_preview();
 
     ESP_ERROR_CHECK(bsp_display_init());
     device_settings_t settings;

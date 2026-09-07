@@ -240,7 +240,7 @@ static lv_obj_t *lv_obj_get_parent(lv_obj_t *o) {(void)o;return NULL;}
 static void lv_point_transform(lv_point_t *v,int a,int z,lv_point_t *p) {(void)v;(void)a;(void)z;(void)p;}
 static void _lv_indev_scroll_throw_handler(_lv_indev_proc_t *p) {(void)p;}
 static bool s_backlight=true,s_backlight_known=true,s_backlight_requested=true;
-static bool s_wake_gesture_pending,s_touch_was_pressed,s_backlight_force_on,s_temporarily_awake;
+static bool s_wake_gesture_pending,s_touch_was_pressed,s_backlight_force_on,s_setup_backlight_force_on,s_temporarily_awake;
 static struct {bool therapy,notice_critical;} s_state;
 static bool screen_wake_input_available(void) {return true;}
 static uint32_t s_touch_seen_visibility,s_touch_seen_continuity,s_backlight_revision,s_touch_read_errors,s_backlight_write_errors;

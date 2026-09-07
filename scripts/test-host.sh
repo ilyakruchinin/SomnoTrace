@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+TEST_DIR="$(mktemp -d /tmp/somnotrace-feature-host.XXXXXX)"
+trap 'rm -rf "${TEST_DIR}"' EXIT
 cd "$(dirname "$0")/.."
 python3 scripts/therapy_alert_ack_contract_test.py
 python3 scripts/clock_snapshot_contract_test.py
@@ -49,5 +51,18 @@ python3 scripts/log_stream_resilience_contract_test.py
 python3 scripts/logs_touch_ui_contract_test.py
 
 python3 scripts/touch_logs_ui_contract_test.py
+
+
+python3 scripts/first_run_setup_contract_test.py
+
+python3 scripts/first_run_setup_ui_contract_test.py
+
+python3 scripts/first_run_setup_runtime_contract_test.py
+
+python3 scripts/first_run_setup_lifecycle_contract_test.py
+
+python3 scripts/timezone_catalog_contract_test.py
+
+python3 scripts/netprov_scan_contract_test.py
 
 echo "All synthetic host tests passed"
