@@ -8,6 +8,7 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 SERVICE = (ROOT / "main/touch_history.c").read_text(encoding="utf-8")
 HEADER = (ROOT / "main/touch_history.h").read_text(encoding="utf-8")
+UI = (ROOT / "main/touch_history_ui.c").read_text(encoding="utf-8")
 
 
 def require(source: str, pattern: str, label: str) -> None:
@@ -41,6 +42,16 @@ require(
     r"history_aggregate_value.*?else\s*\{.*?aggregate->minimum.*?"
     r"aggregate->maximum",
     "raw downsampling retains both signed extrema",
+)
+require(
+    UI,
+    r"const bool envelope\s*=\s*"
+    r"ui->signal\s*==\s*TOUCH_HISTORY_SIGNAL_FLOW\s*&&\s*"
+    r"ui->overview\.aggregation\s*==\s*TOUCH_HISTORY_AGGREGATION_ENVELOPE\s*;",
+    "raw and sidecar envelopes share min-max drawing",
+)
+assert "!ui->overview.source_raw" not in UI, (
+    "raw source identity must not suppress its downsampled envelope"
 )
 
 print("history Flow envelope contracts passed")

@@ -112,4 +112,19 @@ python3 scripts/history_service_cache_test.py
 
 python3 scripts/history_flow_envelope_contract_test.py
 
+
+python3 scripts/history_progressive_test.py
+
+python3 scripts/touch_history_stress_test.py
+
+python3 scripts/history_responsiveness_contract_test.py
+
+python3 scripts/touch_history_ui_contract_test.py
+
+python3 scripts/clinical_ui_language_contract_test.py
+
+python3 scripts/touch_history_controller_contract_test.py
+
+python3 scripts/touch_history_integration_contract_test.py
+
 echo "All synthetic host tests passed"

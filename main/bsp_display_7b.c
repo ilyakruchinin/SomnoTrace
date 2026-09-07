@@ -47,6 +47,8 @@
 #include "sd_storage.h"
 #include "somnotrace_fonts.h"
 #include "therapy_alert.h"
+#include "touch_history_controller.h"
+#include "touch_history_ui.h"
 #include "touch_logs_controller.h"
 #include "uploader.h"
 
@@ -364,6 +366,11 @@ static lv_obj_t *s_pages[3];
 static lv_obj_t *s_nav_buttons[3];
 static lv_obj_t *s_nav_labels[3];
 static int s_active_page = -1;
+static lv_obj_t *s_history_host;
+static touch_history_ui_t *s_history_ui;
+static touch_history_controller_t *s_history_controller;
+static uint32_t s_history_rendered_revision = UINT32_MAX;
+static bool s_history_apply_scheduled;
 static lv_obj_t *s_manage_scrolls[MANAGE_SECTION_COUNT];
 static lv_obj_t *s_manage_sections[MANAGE_SECTION_COUNT];
 static lv_obj_t *s_manage_buttons[MANAGE_SECTION_COUNT];
@@ -1094,7 +1101,7 @@ static unsigned estimated_airsense_nights(uint64_t free_bytes)
 
 static void set_active_page(int page)
 {
-    if (page < 0 || page >= 3 || page == 1) return;
+    if (page < 0 || page >= 3) return;
     portENTER_CRITICAL(&s_state_lock);
     int previous_page = s_active_page;
     portEXIT_CRITICAL(&s_state_lock);
@@ -1111,8 +1118,10 @@ static void set_active_page(int page)
     if (previous_page == 2) {
         teardown_rendered_manage_destination();
     }
+    if (previous_page == 1 && s_history_controller)
+        (void)touch_history_controller_set_active(
+            s_history_controller, false);
     for (int i = 0; i < 3; ++i) {
-        if (i == 1) continue;
         bool selected = i == page;
         set_hidden(s_pages[i], !selected);
         set_destination_surface(s_nav_buttons[i],
@@ -1139,6 +1148,13 @@ static void set_active_page(int page)
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
     ESP_LOGI(TAG, "emulated touch selected page %u", (unsigned)page);
 #endif
+    if (page == 1 && s_history_controller) {
+        esp_err_t result = touch_history_controller_set_active(
+            s_history_controller, true);
+        if (result != ESP_OK)
+            ESP_LOGW(TAG, "activate rich History: %s", esp_err_to_name(result));
+        __atomic_store_n(&s_history_apply_scheduled, true, __ATOMIC_RELEASE);
+    }
 }
 
 static void nav_cb(lv_event_t *event)
@@ -1183,6 +1199,34 @@ static void status_tray_open_cb(lv_event_t *event)
     if (s_touch_services_ready) start_storage_refresh();
     lv_obj_clear_flag(s_status_scrim, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(s_status_tray, LV_OBJ_FLAG_HIDDEN);
+}
+
+
+static void history_controller_changed(void *context)
+{
+    (void)context;
+    /* This callback also runs on the History worker. It only schedules a
+     * future LVGL-thread apply; task notification index 0 is deliberately not
+     * used because the RGB driver owns it for its VSYNC handshake. */
+    __atomic_store_n(&s_history_apply_scheduled, true, __ATOMIC_RELEASE);
+}
+
+
+static void apply_history_controller_if_needed(void)
+{
+    if (!s_history_controller || !s_history_ui || s_active_page != 1) return;
+    bool scheduled = __atomic_exchange_n(
+        &s_history_apply_scheduled, false, __ATOMIC_ACQ_REL);
+    uint32_t revision = touch_history_controller_revision(s_history_controller);
+    if (!scheduled && revision == s_history_rendered_revision) return;
+    esp_err_t result = touch_history_controller_apply(
+        s_history_controller, s_history_ui);
+    if (result == ESP_OK) {
+        s_history_rendered_revision = revision;
+    } else {
+        __atomic_store_n(&s_history_apply_scheduled, true, __ATOMIC_RELEASE);
+        ESP_LOGW(TAG, "apply rich History UI: %s", esp_err_to_name(result));
+    }
 }
 
 
@@ -1568,6 +1612,31 @@ static void build_home_page(lv_obj_t *home)
     lv_obj_set_style_text_color(s_therapy_button_label, lv_color_hex(COLOR_BASE), 0);
 }
 
+static void build_history_page(lv_obj_t *history)
+{
+    s_history_host = make_plain_container(
+        history, UI_PANEL_X, UI_PANEL_Y,
+        TOUCH_HISTORY_UI_WIDTH, TOUCH_HISTORY_UI_HEIGHT);
+    if (!s_history_controller) {
+        make_label(s_history_host, "History is unavailable", 24, 24, 500,
+                   FONT_SCREEN_TITLE, COLOR_FAULT);
+        return;
+    }
+    const touch_history_ui_config_t config = {
+        .on_intent = touch_history_controller_handle_intent,
+        .intent_context = s_history_controller,
+    };
+    esp_err_t result = touch_history_ui_create(
+        s_history_host, &config, &s_history_ui);
+    if (result != ESP_OK) {
+        make_label(s_history_host, "History could not allocate its view",
+                   24, 24, 620, FONT_SCREEN_TITLE, COLOR_FAULT);
+        ESP_LOGE(TAG, "create rich History UI: %s", esp_err_to_name(result));
+        return;
+    }
+    s_history_apply_scheduled = true;
+}
+
 
 static void clear_manage_section_pointers(int section)
 {
@@ -1873,13 +1942,13 @@ static void build_ui(void)
     layout_status_capsule();
 
     for (int i = 0; i < 3; ++i) {
-        if (i == 1) continue;
         s_pages[i] = make_plain_container(screen, 0, UI_CONTENT_Y,
                                            1024, UI_CONTENT_H);
         lv_obj_set_style_bg_color(s_pages[i], lv_color_hex(COLOR_BASE), 0);
         lv_obj_set_style_bg_opa(s_pages[i], LV_OPA_TRANSP, 0);
     }
     build_home_page(s_pages[0]);
+    build_history_page(s_pages[1]);
     build_manage_page(s_pages[2]);
 
     lv_obj_t *nav = make_plain_container(screen, 0, UI_CONTENT_Y + UI_CONTENT_H,
@@ -1887,7 +1956,6 @@ static void build_ui(void)
     lv_obj_set_style_bg_opa(nav, LV_OPA_TRANSP, 0);
     static const char *nav_names[] = { "Home", "History", "Manage" };
     for (int i = 0; i < 3; ++i) {
-        if (i == 1) continue;
         s_nav_buttons[i] = make_destination_button(
             nav, UI_NAV_PILL_X + i * UI_NAV_PILL_STEP, UI_NAV_PILL_Y,
             UI_NAV_PILL_W, UI_NAV_PILL_H, nav_names[i], COLOR_CAPSULE,
@@ -2364,6 +2432,7 @@ static void update_ui(void)
         plotted_flow_live = flow_live;
         if (chart_dirty) lv_obj_invalidate(s_chart);
     }
+    if (active_tab == 1) apply_history_controller_if_needed();
 
     if (now_ticks - last_text_update < pdMS_TO_TICKS(500)) return;
     last_text_update = now_ticks;
@@ -3043,6 +3112,18 @@ esp_err_t bsp_display_init(void)
 
     s_lvgl_lock = xSemaphoreCreateRecursiveMutex();
     ESP_RETURN_ON_FALSE(s_lvgl_lock, ESP_ERR_NO_MEM, TAG, "create LVGL mutex");
+    const touch_history_controller_config_t history_config = {
+        .changed = history_controller_changed,
+        .route_card = NULL,
+        .context = NULL,
+        .usage_target_minutes = 240,
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+        .deterministic_preview = true,
+#endif
+    };
+    ESP_RETURN_ON_ERROR(
+        touch_history_controller_create(&history_config, &s_history_controller),
+        TAG, "create rich History controller");
     size_t internal_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     size_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     UBaseType_t build_stack_before = uxTaskGetStackHighWaterMark(NULL);
@@ -3293,9 +3374,19 @@ bool bsp_display_set_therapy_active(bool active)
         s_state.flow_version++;
         s_state.flow_sample_us = 0;
     }
+    bool therapy_finished = changed && !active;
     portEXIT_CRITICAL(&s_state_lock);
     if (changed) bsp_display_restart_idle_timeout();
     bsp_display_apply_backlight_policy(false);
+    /* Finalisation changes the all-days index. Inactive History is marked
+     * stale for its next entry; visible History reloads asynchronously now. */
+    if (therapy_finished && s_history_controller) {
+        esp_err_t result = touch_history_controller_refresh(
+            s_history_controller);
+        if (result != ESP_OK)
+            ESP_LOGW(TAG, "refresh History after therapy: %s",
+                     esp_err_to_name(result));
+    }
     return true;
 }
 
@@ -3784,13 +3875,15 @@ void bsp_display_qemu_seed_demo(void)
     s_state.flow_version++;
     s_state.flow_sample_us = esp_timer_get_time();
     portEXIT_CRITICAL(&s_state_lock);
+    if (s_history_controller)
+        (void)touch_history_controller_refresh(s_history_controller);
 #endif
 }
 
 void bsp_display_qemu_set_tab(uint8_t tab)
 {
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
-    if (tab >= 3 || tab == 1) return;
+    if (tab >= 3) return;
     /* The display task owns LVGL. Queue navigation into that task so preview
      * input never mutates the object tree from a service callback. */
     portENTER_CRITICAL(&s_state_lock);
