@@ -2120,3 +2120,24 @@ esp_err_t bsp_display_qemu_start_setup_preview(void)
 {
     return ESP_ERR_NOT_SUPPORTED;
 }
+
+void bsp_display_enable_touch_services(bool as11_ready, bool oximeter_ready)
+{
+    /* The compact non-touch target has no local service controls. */
+    (void)as11_ready;
+    (void)oximeter_ready;
+}
+
+void bsp_display_restart_idle_timeout(void)
+{
+    /* The compact profile has no local touch surface, so automatic idle sleep
+     * remains disabled there. Keep the cross-board settings API harmless. */
+}
+
+void bsp_display_push_metrics(float pressure_cmh2o, float respiratory_rate,
+                              float flow_limitation)
+{
+    (void)pressure_cmh2o;
+    (void)respiratory_rate;
+    (void)flow_limitation;
+}

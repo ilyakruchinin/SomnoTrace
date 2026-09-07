@@ -1,0 +1,31 @@
+#pragma once
+
+#include "lvgl.h"
+
+LV_FONT_DECLARE(somnotrace_space_grotesk_medium_13);
+LV_FONT_DECLARE(somnotrace_space_grotesk_medium_15);
+LV_FONT_DECLARE(somnotrace_space_grotesk_medium_17);
+LV_FONT_DECLARE(somnotrace_space_grotesk_medium_19);
+LV_FONT_DECLARE(somnotrace_space_grotesk_medium_23);
+LV_FONT_DECLARE(somnotrace_space_grotesk_medium_29);
+LV_FONT_DECLARE(somnotrace_space_grotesk_medium_34);
+
+LV_FONT_DECLARE(somnotrace_space_grotesk_semibold_13);
+LV_FONT_DECLARE(somnotrace_space_grotesk_semibold_15);
+LV_FONT_DECLARE(somnotrace_space_grotesk_semibold_17);
+LV_FONT_DECLARE(somnotrace_space_grotesk_semibold_19);
+LV_FONT_DECLARE(somnotrace_space_grotesk_semibold_23);
+LV_FONT_DECLARE(somnotrace_space_grotesk_semibold_29);
+LV_FONT_DECLARE(somnotrace_space_grotesk_semibold_32);
+LV_FONT_DECLARE(somnotrace_space_grotesk_semibold_34);
+
+LV_FONT_DECLARE(somnotrace_ibm_plex_mono_medium_11);
+LV_FONT_DECLARE(somnotrace_ibm_plex_mono_medium_13);
+LV_FONT_DECLARE(somnotrace_ibm_plex_mono_medium_15);
+
+LV_FONT_DECLARE(somnotrace_ibm_plex_mono_semibold_11);
+LV_FONT_DECLARE(somnotrace_ibm_plex_mono_semibold_13);
+LV_FONT_DECLARE(somnotrace_ibm_plex_mono_semibold_15);
+LV_FONT_DECLARE(somnotrace_ibm_plex_mono_semibold_26);
+LV_FONT_DECLARE(somnotrace_ibm_plex_mono_semibold_29);
+LV_FONT_DECLARE(somnotrace_ibm_plex_mono_semibold_34);

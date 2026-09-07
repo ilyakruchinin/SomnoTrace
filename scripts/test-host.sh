@@ -31,3 +31,12 @@ python3 scripts/fork_backend_reconciliation_test.py
 ./scripts/test-platform4.sh
 
 ./scripts/test-platform5.sh
+
+python3 scripts/font_asset_contract_test.py
+PLATFORM6_TEST_DIR=$(mktemp -d)
+cc -std=c11 -Wall -Wextra -Werror -I main scripts/live_flow_plot_test.c -o "$PLATFORM6_TEST_DIR/flow"
+"$PLATFORM6_TEST_DIR/flow"
+rm -rf "$PLATFORM6_TEST_DIR"
+python3 scripts/live_flow_units_contract_test.py
+python3 scripts/storage_status_memory_contract_test.py
+python3 scripts/screen_timeout_contract_test.py

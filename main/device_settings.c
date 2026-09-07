@@ -45,14 +45,18 @@ static const char *TAG = "dev_settings";
 #define NVS_KEY_BAT_ENABLED  "bat_en"
 #define NVS_KEY_WAKE_TOUCH   "wake_tch"
 #define NVS_KEY_WAKE_SEC     "wake_sec"
+#define NVS_KEY_SCREEN_TIMEOUT "scr_tmo"
+#define NVS_KEY_LEGACY_LCD_THERAPY "lcd_thr"
 
 /* Brightness stored in tenth-percent units: 1=0.1%, 200=20.0%
  * Discrete steps: 0.1, 0.2, 0.5, 1, 2, 5, 10, 20 (roughly 2x each) */
 #if CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B || \
     (CONFIG_SOMNOTRACE_BOARD_QEMU && !CONFIG_SOMNOTRACE_QEMU_DISPLAY_154)
-#define DEFAULT_BRIGHTNESS       200 /* Full steady brightness on 7B. */
+#define DEFAULT_BRIGHTNESS       200 /* 100% on the 7-inch target. */
+#define DEFAULT_SCREEN_TIMEOUT_S 300
 #else
 #define DEFAULT_BRIGHTNESS       100 /* 10.0% */
+#define DEFAULT_SCREEN_TIMEOUT_S 0
 #endif
 #define MIN_BRIGHTNESS           1   /* 0.1% */
 #define MAX_BRIGHTNESS           200 /* 20.0% */
@@ -125,6 +129,21 @@ static bool lcd_rotation_is_valid(int degrees)
     }
 }
 
+static bool screen_timeout_is_valid(int seconds)
+{
+    switch (seconds) {
+        case 0:
+        case 60:
+        case 120:
+        case 300:
+        case 900:
+        case 1800:
+            return true;
+        default:
+            return false;
+    }
+}
+
 
 esp_err_t device_settings_load(device_settings_t *cfg)
 {
@@ -137,6 +156,7 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     cfg->backlight_mode = DEFAULT_BACKLIGHT_MODE;
     cfg->alert_volume = DEFAULT_ALERT_VOLUME;
     cfg->lcd_rotation = DEFAULT_LCD_ROTATION;
+    cfg->screen_timeout_s = DEFAULT_SCREEN_TIMEOUT_S;
     cfg->battery_enabled = DEFAULT_BAT_ENABLED;
     cfg->wake_on_touch = DEFAULT_WAKE_ON_TOUCH;
     cfg->wake_timeout_sec = DEFAULT_WAKE_TIMEOUT_SEC;
@@ -159,14 +179,32 @@ esp_err_t device_settings_load(device_settings_t *cfg)
         cfg->brightness = (u8val < MIN_BRIGHTNESS) ? MIN_BRIGHTNESS :
                           (u8val > MAX_BRIGHTNESS) ? MAX_BRIGHTNESS : u8val;
     }
-    if (nvs_get_u8(h, NVS_KEY_THE_SCREEN, &u8val) == ESP_OK) {
+    esp_err_t therapy_screen_err = nvs_get_u8(h, NVS_KEY_THE_SCREEN, &u8val);
+    if (therapy_screen_err == ESP_OK) {
         if (u8val <= THERAPY_SCREEN_STATUS) {
             cfg->therapy_screen = (therapy_screen_t)u8val;
         }
     }
-    if (nvs_get_u8(h, NVS_KEY_BACKLIGHT, &u8val) == ESP_OK) {
+    esp_err_t backlight_mode_err = nvs_get_u8(h, NVS_KEY_BACKLIGHT, &u8val);
+    if (backlight_mode_err == ESP_OK) {
         if (u8val <= BACKLIGHT_MODE_ALWAYS_OFF) {
             cfg->backlight_mode = (backlight_mode_t)u8val;
+        }
+    }
+    if (therapy_screen_err == ESP_ERR_NVS_NOT_FOUND ||
+        backlight_mode_err == ESP_ERR_NVS_NOT_FOUND) {
+        uint8_t legacy_mode;
+        if (nvs_get_u8(h, NVS_KEY_LEGACY_LCD_THERAPY, &legacy_mode) == ESP_OK &&
+            legacy_mode <= 3) {
+            if (therapy_screen_err == ESP_ERR_NVS_NOT_FOUND) {
+                cfg->therapy_screen = legacy_mode == 3 ?
+                                      THERAPY_SCREEN_INFO : THERAPY_SCREEN_GRAPH;
+            }
+            if (backlight_mode_err == ESP_ERR_NVS_NOT_FOUND) {
+                cfg->backlight_mode = legacy_mode == 1 ? BACKLIGHT_MODE_OFF_THRP :
+                                      legacy_mode == 2 ? BACKLIGHT_MODE_ALWAYS_OFF :
+                                                         BACKLIGHT_MODE_ON;
+            }
         }
     }
     if (nvs_get_u8(h, NVS_KEY_ALERT_VOL, &u8val) == ESP_OK) {
@@ -194,6 +232,11 @@ esp_err_t device_settings_load(device_settings_t *cfg)
         cfg->lcd_rotation = lcd_rotation_is_valid(rotation) ?
                             rotation : DEFAULT_LCD_ROTATION;
     }
+    uint16_t screen_timeout_s;
+    if (nvs_get_u16(h, NVS_KEY_SCREEN_TIMEOUT, &screen_timeout_s) == ESP_OK) {
+        cfg->screen_timeout_s = screen_timeout_is_valid(screen_timeout_s) ?
+                                screen_timeout_s : DEFAULT_SCREEN_TIMEOUT_S;
+    }
 
     nvs_close(h);
     nvs_writer_unlock();
@@ -201,10 +244,11 @@ esp_err_t device_settings_load(device_settings_t *cfg)
     s_settings = *cfg;
     s_settings_revision++;
     settings_unlock();
-    ESP_LOGI(TAG, "loaded: brightness=%u (%.1f%%), thr_screen=%u, bkl_mode=%u, alert_vol=%u, lcd_rot=%u, bat_en=%d, wake_tch=%d, wake_sec=%u",
+    ESP_LOGI(TAG, "loaded: brightness=%u (%.1f%%), thr_screen=%u, bkl_mode=%u, alert_vol=%u, lcd_rot=%u, screen_tmo=%us, bat_en=%d, wake_tch=%d, wake_sec=%u",
              cfg->brightness, cfg->brightness / 10.0,
              cfg->therapy_screen, cfg->backlight_mode, cfg->alert_volume,
-             (unsigned)cfg->lcd_rotation, cfg->battery_enabled,
+             (unsigned)cfg->lcd_rotation, (unsigned)cfg->screen_timeout_s,
+             cfg->battery_enabled,
              cfg->wake_on_touch, cfg->wake_timeout_sec);
     return ESP_OK;
 }
@@ -229,6 +273,8 @@ static esp_err_t do_device_settings_save(void *arg)
         ret = nvs_set_u8(h, NVS_KEY_ALERT_VOL, cfg.alert_volume);
     if (ret == ESP_OK)
         ret = nvs_set_u16(h, NVS_KEY_LCD_ROTATION, cfg.lcd_rotation);
+    if (ret == ESP_OK)
+        ret = nvs_set_u16(h, NVS_KEY_SCREEN_TIMEOUT, cfg.screen_timeout_s);
     if (ret == ESP_OK)
         ret = nvs_set_u8(h, NVS_KEY_BAT_ENABLED,
                          cfg.battery_enabled ? 1 : 0);
@@ -271,10 +317,11 @@ esp_err_t device_settings_save_current(void)
     xSemaphoreGive(s_save_mutex);
 
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "saved: brightness=%u (%.1f%%), thr_screen=%u, bkl_mode=%u, alert_vol=%u, lcd_rot=%u, bat_en=%d, wake_tch=%d, wake_sec=%u",
+        ESP_LOGI(TAG, "saved: brightness=%u (%.1f%%), thr_screen=%u, bkl_mode=%u, alert_vol=%u, lcd_rot=%u, screen_tmo=%us, bat_en=%d, wake_tch=%d, wake_sec=%u",
                  persisted.brightness, persisted.brightness / 10.0,
                  persisted.therapy_screen, persisted.backlight_mode,
                  persisted.alert_volume, (unsigned)persisted.lcd_rotation,
+                 (unsigned)persisted.screen_timeout_s,
                  persisted.battery_enabled, persisted.wake_on_touch,
                  persisted.wake_timeout_sec);
     }
@@ -284,6 +331,7 @@ esp_err_t device_settings_save_current(void)
 esp_err_t device_settings_save(const device_settings_t *cfg)
 {
     if (!cfg) return ESP_ERR_INVALID_ARG;
+    if (!screen_timeout_is_valid(cfg->screen_timeout_s)) return ESP_ERR_INVALID_ARG;
 
     /* This is an explicit full-structure replacement. Interactive callers
      * that already used a field setter should call save_current() instead. */
@@ -365,6 +413,18 @@ esp_err_t device_settings_set_lcd_rotation(uint16_t degrees)
     return ESP_OK;
 }
 
+esp_err_t device_settings_set_screen_timeout_s(uint16_t seconds)
+{
+    if (!screen_timeout_is_valid(seconds)) return ESP_ERR_INVALID_ARG;
+    settings_lock();
+    s_settings.screen_timeout_s = seconds;
+    s_settings_revision++;
+    bsp_display_restart_idle_timeout();
+    bsp_display_apply_backlight_policy(false);
+    settings_unlock();
+    return ESP_OK;
+}
+
 bool device_settings_battery_enabled(void)
 {
     device_settings_t settings;
@@ -397,6 +457,7 @@ esp_err_t device_settings_get_json(char **out_json)
     cJSON_AddNumberToObject(root, "backlight_mode", (int)settings.backlight_mode);
     cJSON_AddNumberToObject(root, "alert_volume", settings.alert_volume);
     cJSON_AddNumberToObject(root, "lcd_rotation", settings.lcd_rotation);
+    cJSON_AddNumberToObject(root, "screen_timeout_s", settings.screen_timeout_s);
     cJSON_AddBoolToObject(root, "battery_enabled", settings.battery_enabled);
     cJSON_AddBoolToObject(root, "wake_on_touch", settings.wake_on_touch);
     cJSON_AddNumberToObject(root, "wake_timeout_sec", settings.wake_timeout_sec);
@@ -418,6 +479,7 @@ esp_err_t device_settings_save_json(const char *json_str)
 
     settings_lock();
     device_settings_t cfg = s_settings;
+    bool screen_timeout_present = false;
 
     cJSON *v;
     if ((v = cJSON_GetObjectItem(root, "brightness")) && cJSON_IsNumber(v)) {
@@ -449,6 +511,18 @@ esp_err_t device_settings_save_json(const char *json_str)
         cfg.lcd_rotation = lcd_rotation_is_valid(val) ?
                            (uint16_t)val : DEFAULT_LCD_ROTATION;
     }
+    v = cJSON_GetObjectItem(root, "screen_timeout_s");
+    if (v) {
+        int val = v->valueint;
+        if (!cJSON_IsNumber(v) || v->valuedouble != (double)val ||
+            !screen_timeout_is_valid(val)) {
+            settings_unlock();
+            cJSON_Delete(root);
+            return ESP_ERR_INVALID_ARG;
+        }
+        cfg.screen_timeout_s = (uint16_t)val;
+        screen_timeout_present = true;
+    }
     if ((v = cJSON_GetObjectItem(root, "battery_enabled")) && cJSON_IsBool(v)) {
         cfg.battery_enabled = cJSON_IsTrue(v);
     }
@@ -469,6 +543,7 @@ esp_err_t device_settings_save_json(const char *json_str)
     bsp_display_set_brightness(cfg.brightness);
     bsp_audio_set_volume(cfg.alert_volume);
     bsp_display_set_rotation(cfg.lcd_rotation);
+    if (screen_timeout_present) bsp_display_restart_idle_timeout();
     if (!cfg.battery_enabled) {
         bsp_display_set_battery(-1, false, false);
     }

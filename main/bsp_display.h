@@ -66,6 +66,7 @@ bool bsp_display_therapy_safe_maintenance_should_abort(void);
 /* Short atomic OTA boot-selection reservation; cancel after SDK commit returns. */
 bool bsp_display_try_reserve_maintenance_commit(void);
 void bsp_display_end_therapy_safe_maintenance(void);
+/* Live flow is expressed in litres per minute. */
 void bsp_display_push_flow(float flow_lpm);
 /* Preserve absent 25 Hz positions without synthesizing physiological values. */
 void bsp_display_push_flow_gap(uint32_t samples);
@@ -118,3 +119,7 @@ void bsp_display_set_sd_ready(bool ready);
 void bsp_display_qemu_seed_demo(void);
 void bsp_display_qemu_set_tab(uint8_t tab);
 esp_err_t bsp_display_qemu_start_setup_preview(void);
+
+void bsp_display_enable_touch_services(bool as11_ready, bool oximeter_ready);
+void bsp_display_restart_idle_timeout(void);
+void bsp_display_set_setup_callback(void (*callback)(void));

@@ -9,3 +9,10 @@ The compact profile uses its actual renderer and a virtual panel adapter. UART `
 Linked checkouts mount their absolute Git common directory read-only in the toolchain container. Firmware outputs stay local to each worktree. `scripts/test-platform5.sh` tests both profiles and artifact rejection without a firmware build.
 
 All preview data is simulated. QEMU cannot validate physical BLE, storage, touch-controller recovery, RGB timing, panel tearing or backlight electronics. Each topic requires fresh captures after its own build; integration screenshots do not validate an extracted topic.
+
+Home arrives with the native shell and elapsed-time flow presentation. Capture
+active Home with `scripts/capture-qemu-ui.py --screen home`, stopped therapy
+with `--screen home-idle`, or the status tray with `--screen status`.
+`scripts/test-qemu-touch.py` checks Screen off, the black framebuffer and a
+wake press directly over the Screen off control, rejecting a leaked second action.
+These commands retain the selected build identity with the resulting images.
