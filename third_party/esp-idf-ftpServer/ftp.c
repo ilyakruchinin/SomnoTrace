@@ -102,6 +102,13 @@ static void stoupper (char *str) {
 	}
 }
 
+/* SomnoTrace may invalidate derived History caches after imports. */
+extern void ftp_storage_changed(void) __attribute__((weak));
+static bool ftp_file_writing;
+static void ftp_notify_write(void) {
+	if (ftp_storage_changed) ftp_storage_changed();
+}
+
 // ==== File functions =========================================
 
 //--------------------------------------------------------------
@@ -112,7 +119,9 @@ static bool ftp_open_file (const char *path, const char *mode) {
 	strcat(fullname, path);
 	ESP_LOGI(FTP_TAG, "ftp_open_file: fullname=[%s]", fullname);
 	//ftp_data.fp = fopen(path, mode);
+	ftp_file_writing = strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+');
 	ftp_data.fp = fopen(fullname, mode);
+	if (ftp_file_writing) ftp_notify_write();
 	if (ftp_data.fp == NULL) {
 		ESP_LOGE(FTP_TAG, "ftp_open_file: open fail [%s]", fullname);
 		return false;
@@ -125,6 +134,8 @@ static bool ftp_open_file (const char *path, const char *mode) {
 static void ftp_close_files_dir (void) {
 	if (ftp_data.e_open == E_FTP_FILE_OPEN) {
 		fclose(ftp_data.fp);
+		if (ftp_file_writing) ftp_notify_write();
+		ftp_file_writing = false;
 		ftp_data.fp = NULL;
 	}
 	else if (ftp_data.e_open == E_FTP_DIR_OPEN) {
@@ -139,6 +150,8 @@ static void ftp_close_filesystem_on_error (void) {
 	ftp_close_files_dir();
 	if (ftp_data.fp) {
 		fclose(ftp_data.fp);
+		if (ftp_file_writing) ftp_notify_write();
+		ftp_file_writing = false;
 		ftp_data.fp = NULL;
 	}
 	if (ftp_data.dp) {
@@ -167,7 +180,9 @@ static ftp_result_t ftp_read_file (char *filebuf, uint32_t desiredsize, uint32_t
 //-----------------------------------------------------------------
 static ftp_result_t ftp_write_file (char *filebuf, uint32_t size) {
 	ftp_result_t result = E_FTP_RESULT_FAILED;
+	ftp_notify_write();
 	uint32_t actualsize = fwrite(filebuf, 1, size, ftp_data.fp);
+	ftp_notify_write();
 	if (actualsize == size) {
 		result = E_FTP_RESULT_OK;
 	} else {
@@ -985,6 +1000,7 @@ static void ftp_process_cmd (void) {
 
 				//if (unlink(ftp_path) == 0) {
 				if (unlink(fullname) == 0) {
+					ftp_notify_write();
 					vTaskDelay(20 / portTICK_PERIOD_MS);
 					ftp_send_reply(250, NULL);
 				}
@@ -1002,6 +1018,7 @@ static void ftp_process_cmd (void) {
 
 				//if (rmdir(ftp_path) == 0) {
 				if (rmdir(fullname) == 0) {
+					ftp_notify_write();
 					vTaskDelay(20 / portTICK_PERIOD_MS);
 					ftp_send_reply(250, NULL);
 				}
@@ -1019,6 +1036,7 @@ static void ftp_process_cmd (void) {
 
 				//if (mkdir(ftp_path, 0755) == 0) {
 				if (mkdir(fullname, 0755) == 0) {
+					ftp_notify_write();
 					vTaskDelay(20 / portTICK_PERIOD_MS);
 					ftp_send_reply(250, NULL);
 				}
@@ -1054,6 +1072,7 @@ static void ftp_process_cmd (void) {
 
 			//if (rename((char *)ftp_data.dBuffer, ftp_path) == 0) {
 			if (rename(fullname, fullname2) == 0) {
+				ftp_notify_write();
 				ftp_send_reply(250, NULL);
 			} else {
 				ftp_send_reply(550, NULL);

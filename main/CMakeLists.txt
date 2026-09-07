@@ -71,6 +71,7 @@ idf_component_register(SRCS ${SOMNOTRACE_MAIN_SRC} "firmware_target.c" ${SOMNOTR
                            "psram_task.c" "session_graph.c" "nvs_writer.c"
                            "as11_time.c"
                            "crash_diag.c"
+                           "touch_history.c" "history_cache.c" "history_flow_cache.c"
                            "oximeter.c" "oximeter_oxyii.c" "oximeter_legacy.c" "oximeter_store.c" "oximetry_vld3.c" "oximetry_canonical.c" "oximetry_http.c"
                        INCLUDE_DIRS "."
                        REQUIRES esp_lcd driver esp_wifi esp_netif esp_event nvs_flash esp_http_server json esp_app_format
