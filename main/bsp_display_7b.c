@@ -22,7 +22,12 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+#include "board_qemu.h"
+#include "esp_lcd_qemu_rgb.h"
+#else
 #include "esp_lcd_panel_rgb.h"
+#endif
 #define FLOW_POINTS 300
 #define UI_UPDATE_MS 50
 #define TOUCH_FAILURE_THRESHOLD 3
@@ -59,8 +64,13 @@ typedef struct {
 
 static const char *TAG = "display_7b";
 
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+#define UI_BOARD_NAME "ESP32-S3 QEMU UI preview"
+#define UI_TOUCH_STATUS "QEMU pointer ready"
+#else
 #define UI_BOARD_NAME "Waveshare ESP32-S3 Touch LCD 7B"
 #define UI_TOUCH_STATUS (s_touch ? "GT911 ready" : "not detected")
+#endif
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static ui_state_t s_state;
 /* Protected by s_state_lock together with s_state.therapy. Start waiters force
@@ -94,6 +104,9 @@ static uint32_t s_touch_read_errors;
 static uint8_t s_touch_consecutive_errors;
 static uint32_t s_backlight_write_errors;
 static int64_t s_backlight_retry_after_us;
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+static bool s_qemu_first_frame_published;
+#endif
 static lv_coord_t s_last_touch_x;
 static lv_coord_t s_last_touch_y;
 static lv_obj_t *s_title_label, *s_status_label, *s_metrics_label, *s_notice_label;
@@ -103,10 +116,14 @@ void bsp_display_restart_idle_timeout(void);
 static void wake_timer_cb(void *arg);
 static bool screen_wake_input_available(void)
 {
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    return true;
+#else
     touch_observation_t touch;
     waveshare_7b_touch_snapshot(&touch);
     return touch.preventive_recovery ||
            touch_observation_healthy(&touch, esp_timer_get_time());
+#endif
 }
 static bool lock_lvgl(TickType_t timeout)
 {
@@ -116,6 +133,7 @@ static void unlock_lvgl(void)
 {
     xSemaphoreGiveRecursive(s_lvgl_lock);
 }
+#if !CONFIG_SOMNOTRACE_BOARD_QEMU
 static bool IRAM_ATTR on_frame_complete(esp_lcd_panel_handle_t panel,
                               const esp_lcd_rgb_panel_event_data_t *event,
                               void *ctx)
@@ -160,10 +178,12 @@ static void submit_rgb_frame(lv_disp_drv_t *drv, lv_color_t *pixels)
     }
     controller_diagnostics_record(CONTROLLER_PANEL_HANDOFF, ESP_OK);
 }
+#endif
 static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
                      lv_color_t *pixels)
 {
     (void)area;
+#if !CONFIG_SOMNOTRACE_BOARD_QEMU
     /* In double-buffered direct mode LVGL renders only dirty areas, but the
      * RGB peripheral still needs the address of the complete finished frame.
      * Submit that framebuffer once, after LVGL has drawn every dirty region. */
@@ -172,12 +192,56 @@ static void flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
         return;
     }
     submit_rgb_frame(drv, pixels);
+#else
+    /* LVGL composes dirty regions into one persistent direct-mode buffer.
+     * Espressif's virtual panel blocks once per submitted rectangle, so skip
+     * intermediate dirty-area callbacks and publish the completed buffer in
+     * one host-side copy. This keeps redraw work partial without multiplying
+     * QEMU's display wait by the number of invalidated objects. */
+    if (!lv_disp_flush_is_last(drv)) {
+        lv_disp_flush_ready(drv);
+        return;
+    }
+    esp_err_t submitted = esp_lcd_panel_draw_bitmap(
+        (esp_lcd_panel_handle_t)drv->user_data,
+        0, 0, WAVESHARE_7B_H_RES, WAVESHARE_7B_V_RES, pixels);
+    controller_diagnostics_record(CONTROLLER_PANEL_SUBMIT, submitted);
+    if (submitted != ESP_OK) {
+        s_flush_timeouts++;
+        ESP_LOGE(TAG, "RGB frame submission failed: %s",
+                 esp_err_to_name(submitted));
+        lv_disp_flush_ready(drv);
+        return;
+    }
+#endif
     /* Hardware has positively retired the previous framebuffer at this point. */
     if (lv_disp_flush_is_last(drv)) s_flush_count++;
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    if (lv_disp_flush_is_last(drv) && !s_qemu_first_frame_published) {
+        s_qemu_first_frame_published = true;
+        ESP_LOGI(TAG, "QEMU UI first frame published");
+    }
+#endif
     lv_disp_flush_ready(drv);
 }
 static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    uint16_t x = 0;
+    uint16_t y = 0;
+    bool pressed = false;
+    board_qemu_touch_read(&x, &y, &pressed);
+    controller_diagnostics_record(CONTROLLER_TOUCH_READ, ESP_OK);
+    s_last_touch_x = x < WAVESHARE_7B_H_RES ? x : WAVESHARE_7B_H_RES - 1;
+    s_last_touch_y = y < WAVESHARE_7B_V_RES ? y : WAVESHARE_7B_V_RES - 1;
+    data->point.x = s_last_touch_x;
+    data->point.y = s_last_touch_y;
+    data->state = pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+    if (pressed && !s_touch_was_pressed) {
+        ESP_LOGI(TAG, "emulated touch at %u,%u", (unsigned)x, (unsigned)y);
+    }
+    (void)drv;
+#else
     (void)drv;
     touch_observation_t touch;
     waveshare_7b_touch_snapshot(&touch);
@@ -234,6 +298,7 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
     }
     if (touch_became_unavailable)
         bsp_display_set_notice("Touch unavailable - recovering controls");
+#endif
     bool pressed_now = data->state == LV_INDEV_STATE_PRESSED;
     if (pressed_now) {
         int64_t now_us = esp_timer_get_time();
@@ -255,6 +320,10 @@ static void wake_overlay_cb(lv_event_t *event)
          * cannot also activate the button that happens to be underneath it. */
         lv_indev_t *indev = lv_indev_get_act();
         if (indev) lv_indev_wait_release(indev);
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+        bsp_display_restart_idle_timeout();
+        bsp_display_set_backlight(true);
+#endif
         /* Hardware wake comes from the board worker. A delayed overlay event
          * must not create another ON demand after a newer OFF request. */
     }
@@ -297,7 +366,11 @@ static void build_ui(void)
      * there would only force two needless full-screen redraws. QEMU has no
      * physical lamp to disable; make the same state visibly black so emulator
      * acceptance can observe the command as well as its wake-only shield. */
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    lv_obj_set_style_bg_opa(s_wake_overlay, LV_OPA_COVER, 0);
+#else
     lv_obj_set_style_bg_opa(s_wake_overlay, LV_OPA_TRANSP, 0);
+#endif
     lv_obj_set_style_border_width(s_wake_overlay, 0, 0);
     lv_obj_set_style_radius(s_wake_overlay, 0, 0);
     lv_obj_clear_flag(s_wake_overlay, LV_OBJ_FLAG_SCROLLABLE);
@@ -363,6 +436,7 @@ static void lvgl_task(void *arg)
         }
     }
 }
+#if !CONFIG_SOMNOTRACE_BOARD_QEMU
 typedef struct {
     SemaphoreHandle_t done;
     esp_err_t result;
@@ -420,10 +494,15 @@ static esp_err_t init_panel_on_render_core(esp_lcd_panel_handle_t *panel,
     }
     return ctx.result;
 }
+#endif
 
 esp_err_t bsp_display_init(void)
 {
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    controller_diagnostics_init(true);
+#else
     controller_diagnostics_init(false);
+#endif
     memset(&s_state, 0, sizeof(s_state));
     strcpy(s_state.title, "SomnoTrace");
     strcpy(s_state.status, "Initializing display...");
@@ -447,28 +526,48 @@ esp_err_t bsp_display_init(void)
     s_backlight_retry_after_us = 0;
     portEXIT_CRITICAL(&s_state_lock);
 
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    esp_err_t display_init_result = waveshare_7b_init(&s_panel, &s_touch);
+    if (display_init_result == ESP_OK)
+        controller_diagnostics_record(CONTROLLER_TOUCH_INIT, ESP_OK);
+#else
     /* ESP-IDF installs the RGB DMA EOF interrupt on the core which allocates
      * the panel. Keep that PSRAM-to-bounce-buffer copy on core 1 beside LVGL,
      * so it preempts framebuffer rendering instead of racing it from core 0. */
     esp_err_t display_init_result = init_panel_on_render_core(&s_panel, &s_touch);
+#endif
     controller_diagnostics_record(CONTROLLER_PANEL_INIT, display_init_result);
     ESP_RETURN_ON_ERROR(display_init_result, TAG, "initialize display on render core");
+#if !CONFIG_SOMNOTRACE_BOARD_QEMU
     esp_err_t touch_start = waveshare_7b_start_touch();
     if (touch_start != ESP_OK)
         ESP_LOGE(TAG, "touch observation worker unavailable: %s", esp_err_to_name(touch_start));
+#endif
 
     /* With an RGB bounce buffer, frame-buffer handoff completion is reported
      * by on_frame_buf_complete. Waiting for it prevents LVGL from drawing into
      * a buffer that the panel is still scanning out. */
+#if !CONFIG_SOMNOTRACE_BOARD_QEMU
     esp_lcd_rgb_panel_event_callbacks_t callbacks = {
         .on_frame_buf_complete = on_frame_complete,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_rgb_panel_register_event_callbacks(s_panel,
                                                                   &callbacks, NULL),
                         TAG, "register display VSYNC");
+#endif
 
     lv_init();
     void *fb1 = NULL, *fb2 = NULL;
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    /* The virtual device reserves four bytes per pixel even in RGB565 mode.
+     * Keep its first half free as the conventional panel framebuffer and use
+     * the second half as LVGL's persistent full-frame composition buffer. */
+    void *qemu_vram = NULL;
+    ESP_RETURN_ON_ERROR(esp_lcd_rgb_qemu_get_frame_buffer(s_panel, &qemu_vram),
+                        TAG, "get QEMU framebuffer");
+    fb1 = (lv_color_t *)qemu_vram +
+          WAVESHARE_7B_H_RES * WAVESHARE_7B_V_RES;
+#else
     ESP_RETURN_ON_ERROR(esp_lcd_rgb_panel_get_frame_buffer(s_panel, 2, &fb1, &fb2),
                         TAG, "get RGB framebuffers");
     /* IDF starts scanout from its first buffer. LVGL's first render must use
@@ -476,6 +575,7 @@ esp_err_t bsp_display_init(void)
     void *boot_scanout = fb1;
     fb1 = fb2;
     fb2 = boot_scanout;
+#endif
     static lv_disp_draw_buf_t draw_buffer;
     lv_disp_draw_buf_init(&draw_buffer, fb1, fb2,
                           WAVESHARE_7B_H_RES * WAVESHARE_7B_V_RES);
@@ -503,6 +603,9 @@ esp_err_t bsp_display_init(void)
         touch_driver.read_cb = touch_read_cb;
         touch_driver.user_data = s_touch;
         lv_indev_drv_register(&touch_driver);
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+        ESP_LOGI(TAG, "QEMU pointer registered as LVGL touch input");
+#endif
     }
 
     s_lvgl_lock = xSemaphoreCreateRecursiveMutex();
@@ -548,7 +651,11 @@ esp_err_t bsp_display_init(void)
     /* Start at the exact steady/full-on endpoint. Persisted hardware PWM
      * dimming is applied by main once NVS is available. */
     waveshare_7b_set_brightness(100);
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    ESP_LOGI(TAG, "native 1024x600 QEMU dashboard initialized");
+#else
     ESP_LOGI(TAG, "native 1024x600 touch dashboard initialized");
+#endif
     return ESP_OK;
 }
 void bsp_display_show_number(uint32_t value)
@@ -888,7 +995,9 @@ void bsp_display_set_brightness(uint8_t tenth_percent)
     s_brightness = tenth_percent;
     bool backlight = s_backlight;
     portEXIT_CRITICAL(&s_state_lock);
+#if !CONFIG_SOMNOTRACE_BOARD_QEMU
     waveshare_7b_recovery_brightness(physical_brightness(tenth_percent));
+#endif
     if (backlight) {
         /* The original 1.54-inch target stores 1..200 as tenths of a percent.
          * On the 7B that same byte spans 1..100% hardware brightness. The
@@ -929,9 +1038,12 @@ bool bsp_display_toggle_backlight(void)
 static void apply_pending_backlight_locked(void)
 {
     int64_t now_us = esp_timer_get_time();
+#if !CONFIG_SOMNOTRACE_BOARD_QEMU
     touch_observation_t touch;
     waveshare_7b_touch_snapshot(&touch);
+#endif
     portENTER_CRITICAL(&s_state_lock);
+#if !CONFIG_SOMNOTRACE_BOARD_QEMU
     if (touch.visibility_requests != s_touch_seen_visibility) {
         s_touch_seen_visibility = touch.visibility_requests;
         s_backlight_requested = true;
@@ -940,6 +1052,7 @@ static void apply_pending_backlight_locked(void)
         s_last_touch_activity_us = now_us;
         ++s_backlight_revision;
     }
+#endif
     bool requested = s_backlight_requested;
     bool current = s_backlight;
     bool known = s_backlight_known;
@@ -975,8 +1088,12 @@ static void apply_pending_backlight_locked(void)
             waveshare_7b_set_brightness(physical_brightness(brightness));
     }
     esp_err_t backlight_result;
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    backlight_result = waveshare_7b_set_backlight(requested);
+#else
     backlight_result = requested ? waveshare_7b_reassert_visible()
                                  : waveshare_7b_set_backlight(false);
+#endif
     if (backlight_result == ESP_OK && brightness_result != ESP_OK)
         backlight_result = brightness_result;
     if (backlight_result != ESP_OK) {
@@ -1126,4 +1243,18 @@ void bsp_display_set_rotation(uint16_t degrees)
         ESP_LOGW(TAG, "rotation %u ignored: the 7B dashboard is landscape-native",
                  (unsigned)degrees);
     }
+}
+
+void bsp_display_qemu_seed_demo(void)
+{
+}
+
+void bsp_display_qemu_set_tab(uint8_t tab)
+{
+    (void)tab;
+}
+
+esp_err_t bsp_display_qemu_start_setup_preview(void)
+{
+    return ESP_ERR_NOT_SUPPORTED;
 }

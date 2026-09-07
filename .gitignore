@@ -35,3 +35,10 @@ __pycache__/
 *.pyc
 
 .host-deps/
+
+build-*/
+sdkconfig.7b
+sdkconfig.qemu*
+!sdkconfig.qemu*.defaults
+.qemu/
+__pycache__/

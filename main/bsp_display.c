@@ -29,25 +29,34 @@
 #include <math.h>
 #include <time.h>
 
+#include "sdkconfig.h"
 #include "bsp_display.h"
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_lcd_panel_ops.h"
+#include "font_roboto.h"
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+#include "board_qemu_154.h"
+#else
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
-#include "esp_lcd_panel_ops.h"
-#include "font_roboto.h"
 #include "esp_wifi.h"
 #include "driver/ledc.h"
+#endif
 #include "device_settings.h"
 #include "psram_task.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
+#define LCD_H_RES           240
+#define LCD_V_RES           240
+
+#if !CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
 #define LCD_PIN_SCLK        38
 #define LCD_PIN_MOSI        39
 #define LCD_PIN_DC          45
@@ -55,8 +64,6 @@
 #define LCD_PIN_RST         40
 #define LCD_PIN_BL          46
 
-#define LCD_H_RES           240
-#define LCD_V_RES           240
 #define LCD_PIXEL_CLOCK_HZ  (15000000)  /* 15 MHz target (80 MHz APB / 6 = 13.33 MHz, 75 ns cycle; ST7789 spec: >=66 ns) */
 #define LCD_SPI_HOST        SPI2_HOST
 #define LCD_CMD_BITS        8
@@ -69,6 +76,8 @@
 #define BL_LEDC_FREQ_HZ     5000
 #define BL_LEDC_RESOLUTION  LEDC_TIMER_10_BIT  /* 0-1023 duty */
 #define BL_DUTY_MAX         ((1 << 10) - 1)    /* 1023 */
+
+#endif
 
 static uint8_t s_brightness = 100;  /* current brightness (tenth-percent: 1=0.1%, 200=20%) */
 static bool s_backlight_on = true;  /* backlight hardware state */
@@ -91,7 +100,9 @@ static void display_task(void *arg);
 static void apply_panel_rotation(uint16_t degrees);
 
 static esp_lcd_panel_handle_t s_panel = NULL;
+#if !CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
 static esp_lcd_panel_io_handle_t s_io = NULL;
+#endif
 static uint16_t *s_fb = NULL;
 static bool s_wifi_connected = false;
 static bool s_as11_paired = false;
@@ -104,10 +115,12 @@ static uint16_t s_pending_rotation_deg = 0;       /* requested rotation (valid w
  * Two buffers are used so the DMA of one strip overlaps the CPU copy of the
  * next (pipelining). A counting semaphore tracks completed transfers so a
  * buffer is never reused while its DMA is still in flight. */
+#if !CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
 #define LCD_STRIP_ROWS 40
 #define LCD_STRIP_BUFS 2
 static uint16_t *s_strip[LCD_STRIP_BUFS] = { NULL, NULL };
 static SemaphoreHandle_t s_flush_done = NULL;
+#endif
 static volatile bool s_flush_stuck = false;
 static TaskHandle_t s_display_task = NULL;
 
@@ -161,6 +174,18 @@ static unsigned s_therapy_start_claims;
 static unsigned s_as11_notifications_pending;
 static bool s_therapy_safe_maintenance;
 
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+/* Scene changes use the public state APIs. Suppress intermediate renders and
+ * acknowledge only a final scene snapshot after its virtual-panel flush. */
+static bool s_qemu_scene_seeding;
+static uint32_t s_qemu_scene_generation;
+static uint8_t s_qemu_scene;
+static const char *const s_qemu_scene_names[] = {
+    "status", "flow", "info", "notice",
+};
+#define QEMU_DEMO_WALL_TIME 1788698040  /* 2026-09-06 12:34 UTC */
+#define QEMU_DEMO_NOW_US (42 * 60 * 1000000LL + 1)
+#endif
 /* Status-screen content (copied from callers) */
 static char s_status_title[STATUS_TITLE_LEN];
 static char s_status_lines[MAX_STATUS_LINES][STATUS_LINE_LEN];
@@ -485,6 +510,7 @@ void bsp_display_set_therapy_start_time(int64_t start_us)
 
 /* ── Framebuffer → panel blit ───────────────────────────────────────── */
 
+#if !CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
 static bool IRAM_ATTR lcd_color_done_cb(esp_lcd_panel_io_handle_t io,
                                         esp_lcd_panel_io_event_data_t *edata,
                                         void *user_ctx)
@@ -494,6 +520,7 @@ static bool IRAM_ATTR lcd_color_done_cb(esp_lcd_panel_io_handle_t io,
     if (s_flush_done) xSemaphoreGiveFromISR(s_flush_done, &hp);
     return hp == pdTRUE;
 }
+#endif
 
 /* Push the entire PSRAM framebuffer to the LCD in horizontal strips.
  *
@@ -510,6 +537,7 @@ static bool IRAM_ATTR lcd_color_done_cb(esp_lcd_panel_io_handle_t io,
  * Called from display_task only. */
 static void lcd_panel_hw_recover(void)
 {
+#if !CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
     if (!s_panel) return;
 
     /* Wait briefly for any in-flight SPI DMA transactions to finish before
@@ -529,6 +557,7 @@ static void lcd_panel_hw_recover(void)
     }
     esp_lcd_panel_disp_on_off(s_panel, true);
     ESP_LOGI(TAG, "panel hardware reset + re-init (rot=%u)", (unsigned)s_rotation);
+#endif
 }
 
 /* Apply the hardware portion of the requested rotation.
@@ -545,6 +574,11 @@ static void lcd_panel_hw_recover(void)
  */
 static void apply_panel_rotation(uint16_t degrees)
 {
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+    /* The virtual panel does not implement mirror/swap. The transport rotates
+     * the original framebuffer in software when it converts RGB565. */
+    (void)degrees;
+#else
     if (!s_panel) return;
     bool quarter_turn = false;
 
@@ -562,6 +596,7 @@ static void apply_panel_rotation(uint16_t degrees)
 
     esp_lcd_panel_swap_xy(s_panel, quarter_turn);
     esp_lcd_panel_mirror(s_panel, quarter_turn, false);
+#endif
 }
 
 void bsp_display_set_rotation(uint16_t degrees)
@@ -582,6 +617,9 @@ void bsp_display_set_rotation(uint16_t degrees)
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
         s_pending_rotation_deg = degrees;
         s_rotation_pending = true;
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+        ++s_qemu_scene_generation;
+#endif
         xSemaphoreGive(s_state_mutex);
     } else {
         /* Init-time path (no task yet): apply directly. */
@@ -597,6 +635,12 @@ static void lcd_flush(void)
 {
     if (!s_panel || !s_fb) return;
 
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool backlight_on = s_backlight_on;
+    xSemaphoreGive(s_state_mutex);
+    ESP_ERROR_CHECK(board_qemu_154_flush(s_panel, s_fb, s_rotation, backlight_on));
+#else
     if (!s_strip[0] || !s_strip[1] || !s_flush_done) {
         ESP_LOGE(TAG, "LCD strip transport unavailable; frame skipped");
         return;
@@ -656,6 +700,7 @@ static void lcd_flush(void)
         }
         inflight = 0;
     }
+#endif
 }
 
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
@@ -922,12 +967,14 @@ static void display_buffers_free(void)
     s_flow_yf = NULL;
     if (s_state_mutex) vSemaphoreDelete(s_state_mutex);
     s_state_mutex = NULL;
+#if !CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
     for (int i = 0; i < LCD_STRIP_BUFS; ++i) {
         heap_caps_free(s_strip[i]);
         s_strip[i] = NULL;
     }
     if (s_flush_done) vSemaphoreDelete(s_flush_done);
     s_flush_done = NULL;
+#endif
 }
 static esp_err_t display_buffers_init(void)
 {
@@ -941,6 +988,7 @@ static esp_err_t display_buffers_init(void)
     s_flow_yf = heap_caps_malloc(LCD_H_RES * sizeof(float), MALLOC_CAP_SPIRAM);
     if (!s_flow_buf || !s_flow_local || !s_flow_yf) goto no_mem;
 
+#if !CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
     for (int i = 0; i < LCD_STRIP_BUFS; ++i) {
         s_strip[i] = heap_caps_malloc(LCD_H_RES * LCD_STRIP_ROWS * sizeof(uint16_t),
                                       MALLOC_CAP_DMA);
@@ -948,6 +996,7 @@ static esp_err_t display_buffers_init(void)
     }
     s_flush_done = xSemaphoreCreateCounting(LCD_STRIP_BUFS, 0);
     if (!s_flush_done) goto no_mem;
+#endif
     s_state_mutex = xSemaphoreCreateMutex();
     if (!s_state_mutex) goto no_mem;
     return ESP_OK;
@@ -962,6 +1011,9 @@ esp_err_t bsp_display_init(void)
 {
     esp_err_t err = display_buffers_init();
     if (err != ESP_OK) return err;
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+    ESP_ERROR_CHECK(board_qemu_154_init(&s_panel));
+#else
     /* The project's default log level is DEBUG; spi_master emits several DEBUG
      * lines per DMA transaction. At the LCD's transfer rate that is a real CPU
      * and I/O drain, so quiet it down to WARN regardless of the global level. */
@@ -1027,6 +1079,7 @@ esp_err_t bsp_display_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, LCD_INVERT_COLOR));
     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, 0, 0));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
+#endif
 
     /* Start the single-owner render task after every resource exists. Only this
      * task ever touches the framebuffer or the LCD panel. */
@@ -1034,10 +1087,12 @@ esp_err_t bsp_display_init(void)
     if (!s_display_task) {
         esp_lcd_panel_del(s_panel);
         s_panel = NULL;
+#if !CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
         esp_lcd_panel_io_del(s_io);
         s_io = NULL;
         spi_bus_free(LCD_SPI_HOST);
         ledc_stop(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, 0);
+#endif
         display_buffers_free();
         ESP_LOGE(TAG, "display task allocation failed");
         return ESP_ERR_NO_MEM;
@@ -1052,7 +1107,11 @@ esp_err_t bsp_display_init(void)
         esp_timer_start_periodic(s_display_supervisor_timer, 3000000); /* 3s */
     }
 
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+    ESP_LOGI(TAG, "original 240x240 renderer initialised on QEMU RGB panel");
+#else
     ESP_LOGI(TAG, "ST7789 display initialised");
+#endif
     return ESP_OK;
 }
 
@@ -1105,16 +1164,28 @@ void bsp_display_set_brightness(uint8_t percent)
     if (percent < 1) percent = 1;
     if (percent > 200) percent = 200;
     s_brightness = percent;
+#if !CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
     if (s_backlight_on) {
         /* percent is in tenth-percent units (1=0.1%), so divide by 1000 */
         uint32_t duty = (uint32_t)(percent) * BL_DUTY_MAX / 1000;
         ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, duty);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL);
     }
+#endif
 }
 
 void bsp_display_set_backlight(bool on)
 {
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+    if (s_state_mutex) xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (on != s_backlight_on) {
+        s_backlight_on = on;
+        ++s_qemu_scene_generation;
+        s_status_dirty = true;
+    }
+    if (s_state_mutex) xSemaphoreGive(s_state_mutex);
+    if (s_display_task) xTaskNotifyGive(s_display_task);
+#else
     if (on == s_backlight_on) return;
     s_backlight_on = on;
     if (on) {
@@ -1125,6 +1196,7 @@ void bsp_display_set_backlight(bool on)
         ledc_set_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, 0);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL);
     }
+#endif
 }
 
 bool bsp_display_toggle_backlight(void)
@@ -1331,10 +1403,14 @@ static void fb_draw_wifi_indicator(int x, int y, bool connected)
         return; // Not connected, don't draw indicator
     }
 
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+    int rssi = -55;  /* deterministic fixture; never starts or queries Wi-Fi */
+#else
     int rssi = -128;
     if (esp_wifi_sta_get_rssi(&rssi) != ESP_OK) {
         return; // Not connected, don't draw indicator
     }
+#endif
 
     int active_bars = 0;
     if (rssi >= -60) active_bars = 4;
@@ -1594,7 +1670,11 @@ static void render_info(void)
     /* Calculate elapsed time from TherapyStart (monotonic) */
     int hours = 0, mins = 0;
     if (start_us > 0) {
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+        int64_t elapsed_us = QEMU_DEMO_NOW_US - start_us;
+#else
         int64_t elapsed_us = esp_timer_get_time() - start_us;
+#endif
         if (elapsed_us < 0) elapsed_us = 0;
         int64_t elapsed_sec = elapsed_us / 1000000;
         hours = (int)(elapsed_sec / 3600);
@@ -1741,10 +1821,18 @@ static void render_status(void)
     fb_clear(bg);
 
     /* Clock display (top-left) */
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+    time_t now = QEMU_DEMO_WALL_TIME;
+#else
     time_t now = time(NULL);
+#endif
     if (now > 1700000000) {  /* only show if NTP-synced (after ~Nov 2023) */
         struct tm tm_info;
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+        gmtime_r(&now, &tm_info);
+#else
         localtime_r(&now, &tm_info);
+#endif
         char time_str[16];
         strftime(time_str, sizeof(time_str), "%H:%M", &tm_info);
         fb_draw_string_aa(6, 9, &roboto_body, time_str, rgb565(200, 210, 225));
@@ -1854,12 +1942,23 @@ static void display_task(void *arg)
         uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(STATUS_FRAME_MS));
 
         xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+        if (s_qemu_scene_seeding) {
+            xSemaphoreGive(s_state_mutex);
+            continue;
+        }
+#endif
         disp_mode_t mode = s_mode;
         bool dirty = s_status_dirty;
         s_status_dirty = false;
         bool rot_pending = s_rotation_pending;
         uint16_t rot_deg = s_pending_rotation_deg;
         s_rotation_pending = false;
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+        uint32_t scene_generation = s_qemu_scene_generation;
+        uint8_t scene = s_qemu_scene;
+        bool backlight_on = s_backlight_on;
+#endif
         xSemaphoreGive(s_state_mutex);
 
         /* Apply deferred rotation before any render/flush so the SPI panel
@@ -1919,6 +2018,23 @@ static void display_task(void *arg)
 
         last_mode = mode;
 
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+        static uint32_t rendered_generation;
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        bool scene_complete = scene_generation != 0 &&
+            scene_generation == s_qemu_scene_generation && !s_qemu_scene_seeding;
+        xSemaphoreGive(s_state_mutex);
+        if (scene_complete && rendered_generation != scene_generation) {
+            ESP_LOGI(TAG, "QEMU 1.54 scene ready: %u (%s)",
+                     (unsigned)scene, s_qemu_scene_names[scene]);
+            ESP_LOGI(TAG, "QEMU 1.54 frame ready: scene=%u rotation=%u backlight=%s",
+                     (unsigned)scene, (unsigned)s_rotation, backlight_on ? "on" : "off");
+            if (rendered_generation == 0)
+                ESP_LOGI(TAG, "240x240 original-board UI preview ready");
+            rendered_generation = scene_generation;
+        }
+#endif
+
         /* One-shot high-water mark after the first render to verify the
          * 4 KB PSRAM stack is sufficient for the rendering + SPI blit path. */
         static bool hwm_logged = false;
@@ -1931,8 +2047,76 @@ static void display_task(void *arg)
     }
 }
 
-
 void bsp_display_set_sd_ready(bool ready)
 {
     (void)ready;
+}
+
+void bsp_display_qemu_seed_demo(void)
+{
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+    bsp_display_qemu_set_tab(0);
+#endif
+}
+void bsp_display_qemu_set_tab(uint8_t tab)
+{
+#if CONFIG_SOMNOTRACE_QEMU_DISPLAY_154
+    /* These are capture scenes, not touchscreen tabs: the compact firmware
+     * has no local navigation surface. UART selects the same existing views. */
+    if (!s_state_mutex || tab >= sizeof(s_qemu_scene_names) / sizeof(s_qemu_scene_names[0]))
+        return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_qemu_scene_seeding = true;
+    xSemaphoreGive(s_state_mutex);
+
+    bsp_display_set_therapy_active(false);
+    bsp_display_set_notice(NULL);
+    bsp_display_set_wifi_connected(tab != 3);
+    bsp_display_set_as11_paired(tab != 3);
+    bsp_display_set_battery(tab == 3 ? 18 : 82, false, true);
+    bsp_display_set_rotation(0);
+    bsp_display_set_brightness(100);
+    bsp_display_set_backlight(true);
+
+    if (tab == 1 || tab == 2) {
+        device_settings_set_therapy_screen(tab == 1 ? THERAPY_SCREEN_GRAPH : THERAPY_SCREEN_INFO);
+        bsp_display_set_therapy_active(true);
+        /* Positive origin lets the real runtime renderer display 0:42 even
+         * though this fixture starts immediately after guest boot. */
+        bsp_display_set_therapy_start_time(1);
+        if (tab == 1) {
+            for (int i = 0; i < FLOW_BUF_SIZE; ++i) {
+                if ((i >= 78 && i < 91) || (i >= 168 && i < 177)) {
+                    bsp_display_push_flow_gap(1);
+                } else {
+                    float phase = i * 0.10f;
+                    bsp_display_push_flow(48.0f * sinf(phase) + 9.0f * sinf(phase * 2.0f));
+                }
+            }
+        } else {
+            bsp_display_push_leak(2.4f);
+            bsp_display_push_leak(3.6f);
+            bsp_display_push_leak(4.8f);
+        }
+    } else {
+        const char *const ready[] = {"AirSense paired", "Waiting for therapy", "Simulated data"};
+        const char *const disconnected[] = {"Wi-Fi disconnected", "AirSense not paired", "Simulated data"};
+        bsp_display_show_lines("SomnoTrace", tab == 3 ? disconnected : ready, 3);
+        if (tab == 3) bsp_display_set_notice("Check connection");
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    s_qemu_scene = tab;
+    ++s_qemu_scene_generation;
+    s_qemu_scene_seeding = false;
+    s_status_dirty = true;
+    xSemaphoreGive(s_state_mutex);
+    if (s_display_task) xTaskNotifyGive(s_display_task);
+#else
+    (void)tab;
+#endif
+}
+esp_err_t bsp_display_qemu_start_setup_preview(void)
+{
+    return ESP_ERR_NOT_SUPPORTED;
 }

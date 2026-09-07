@@ -113,3 +113,8 @@ void bsp_display_set_critical_notice(const char *text);
 
 /* Storage publishes readiness; the compact screen has no separate SD badge. */
 void bsp_display_set_sd_ready(bool ready);
+
+/* Deterministic QEMU previews of the original renderer. */
+void bsp_display_qemu_seed_demo(void);
+void bsp_display_qemu_set_tab(uint8_t tab);
+esp_err_t bsp_display_qemu_start_setup_preview(void);

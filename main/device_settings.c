@@ -48,7 +48,8 @@ static const char *TAG = "dev_settings";
 
 /* Brightness stored in tenth-percent units: 1=0.1%, 200=20.0%
  * Discrete steps: 0.1, 0.2, 0.5, 1, 2, 5, 10, 20 (roughly 2x each) */
-#if CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B
+#if CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B || \
+    (CONFIG_SOMNOTRACE_BOARD_QEMU && !CONFIG_SOMNOTRACE_QEMU_DISPLAY_154)
 #define DEFAULT_BRIGHTNESS       200 /* Full steady brightness on 7B. */
 #else
 #define DEFAULT_BRIGHTNESS       100 /* 10.0% */

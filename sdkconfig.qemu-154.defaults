@@ -1,0 +1,4 @@
+# Original 1.54-inch UI preview on QEMU's real 240x240 RGB565 framebuffer.
+# Layer after sdkconfig.defaults and sdkconfig.qemu.defaults.
+CONFIG_SOMNOTRACE_BOARD_QEMU=y
+CONFIG_SOMNOTRACE_QEMU_DISPLAY_154=y

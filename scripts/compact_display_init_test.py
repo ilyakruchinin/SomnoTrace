@@ -223,7 +223,7 @@ with tempfile.TemporaryDirectory(prefix="somno-compact-init-") as directory:
     ])
     fixture = path / "test.c"
     fixture.write_text(PRELUDE + production + TEST)
-    for compact in (0,):
+    for compact in (0, 1):
         binary = path / f"test-{compact}"
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
                         "-Wno-unused-function", "-Wno-unused-variable",

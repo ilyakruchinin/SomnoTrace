@@ -29,3 +29,6 @@ python3 scripts/uploader_ox_lease_contract_test.py
 python3 scripts/fork_backend_reconciliation_test.py
 
 ./scripts/test-platform4.sh
+
+./scripts/test-platform5.sh
+python3 scripts/qemu_variant_test.py

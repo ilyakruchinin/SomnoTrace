@@ -333,3 +333,8 @@ SomnoTrace is an independent open-source project and is **not affiliated with, e
 The physical 1024×600 Waveshare ESP32-S3-Touch-LCD-7B is selected with
 `scripts/build-7b.sh`. See [wiring and display behavior](docs/hardware/waveshare-7b.md).
 The original 240×240 board remains the default build.
+
+### QEMU previews
+
+Build and run either display profile with `scripts/build-qemu.sh --board 7b|154`
+and `scripts/run-qemu-ui.sh --board 7b|154`. See [QEMU validation and captures](docs/qemu-ui.md).
