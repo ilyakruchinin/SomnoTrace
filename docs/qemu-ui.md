@@ -16,3 +16,12 @@ with `--screen home-idle`, or the status tray with `--screen status`.
 `scripts/test-qemu-touch.py` checks Screen off, the black framebuffer and a
 wake press directly over the Screen off control, rejecting a leaked second action.
 These commands retain the selected build identity with the resulting images.
+
+## Retained Logs
+
+Open Manage to view Logs; this extracted stage has no other Manage destinations.
+The synthetic feed exercises pause, search, filtering, paging, clear/retry and
+save progress through the native controller. Run
+`python3 scripts/test-qemu-logs.py` after building this exact checkout, or capture
+`--interaction-state logs` with `scripts/capture-qemu-ui.py`.
+QEMU save and disconnect fixtures do not establish physical card persistence.

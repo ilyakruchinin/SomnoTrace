@@ -40,3 +40,17 @@ rm -rf "$PLATFORM6_TEST_DIR"
 python3 scripts/live_flow_units_contract_test.py
 python3 scripts/storage_status_memory_contract_test.py
 python3 scripts/screen_timeout_contract_test.py
+
+python3 scripts/log_stream_retained_contract_test.py
+
+python3 scripts/logs_retained_behavior_test.py
+
+python3 scripts/log_stream_recent_contract_test.py
+
+python3 scripts/log_stream_resilience_contract_test.py
+
+python3 scripts/logs_touch_ui_contract_test.py
+
+python3 scripts/touch_logs_ui_contract_test.py
+
+echo "All synthetic host tests passed"

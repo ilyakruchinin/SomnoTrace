@@ -17,7 +17,7 @@ elseif(CONFIG_SOMNOTRACE_BOARD_QEMU)
             "bsp_display.c"
             "bsp_audio_7b.c")
     else()
-        set(SOMNOTRACE_MAIN_SRC "main_qemu.c")
+        set(SOMNOTRACE_MAIN_SRC "main_qemu.c" "touch_logs_qemu.c")
         set(SOMNOTRACE_BSP_SRCS
             "board_qemu.c"
             "bsp_power_7b.c"
@@ -30,22 +30,11 @@ endif()
 
 if(CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B OR
    (CONFIG_SOMNOTRACE_BOARD_QEMU AND NOT CONFIG_SOMNOTRACE_QEMU_DISPLAY_154))
-    list(APPEND SOMNOTRACE_BSP_SRCS "touch_observation.c" "controller_diagnostics.c")
-endif()
-
-
-if(CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B OR
-   (CONFIG_SOMNOTRACE_BOARD_QEMU AND NOT CONFIG_SOMNOTRACE_QEMU_DISPLAY_154))
     list(APPEND SOMNOTRACE_BSP_SRCS
-        "../assets/fonts/generated/somnotrace_ibm_plex_mono_medium_11.c"
-        "../assets/fonts/generated/somnotrace_ibm_plex_mono_medium_13.c"
-        "../assets/fonts/generated/somnotrace_ibm_plex_mono_medium_15.c"
-        "../assets/fonts/generated/somnotrace_ibm_plex_mono_semibold_11.c"
-        "../assets/fonts/generated/somnotrace_ibm_plex_mono_semibold_13.c"
-        "../assets/fonts/generated/somnotrace_ibm_plex_mono_semibold_15.c"
-        "../assets/fonts/generated/somnotrace_ibm_plex_mono_semibold_26.c"
-        "../assets/fonts/generated/somnotrace_ibm_plex_mono_semibold_29.c"
-        "../assets/fonts/generated/somnotrace_ibm_plex_mono_semibold_34.c"
+        "touch_observation.c"
+        "controller_diagnostics.c"
+        "touch_logs_ui.c"
+        "touch_logs_controller.c"
         "../assets/fonts/generated/somnotrace_space_grotesk_medium_13.c"
         "../assets/fonts/generated/somnotrace_space_grotesk_medium_15.c"
         "../assets/fonts/generated/somnotrace_space_grotesk_medium_17.c"
@@ -61,7 +50,15 @@ if(CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B OR
         "../assets/fonts/generated/somnotrace_space_grotesk_semibold_29.c"
         "../assets/fonts/generated/somnotrace_space_grotesk_semibold_32.c"
         "../assets/fonts/generated/somnotrace_space_grotesk_semibold_34.c"
-    )
+        "../assets/fonts/generated/somnotrace_ibm_plex_mono_medium_11.c"
+        "../assets/fonts/generated/somnotrace_ibm_plex_mono_medium_13.c"
+        "../assets/fonts/generated/somnotrace_ibm_plex_mono_medium_15.c"
+        "../assets/fonts/generated/somnotrace_ibm_plex_mono_semibold_11.c"
+        "../assets/fonts/generated/somnotrace_ibm_plex_mono_semibold_13.c"
+        "../assets/fonts/generated/somnotrace_ibm_plex_mono_semibold_15.c"
+        "../assets/fonts/generated/somnotrace_ibm_plex_mono_semibold_26.c"
+        "../assets/fonts/generated/somnotrace_ibm_plex_mono_semibold_29.c"
+        "../assets/fonts/generated/somnotrace_ibm_plex_mono_semibold_34.c")
 endif()
 
 idf_component_register(SRCS ${SOMNOTRACE_MAIN_SRC} "firmware_target.c" ${SOMNOTRACE_BSP_SRCS} "net_provision.c" "as11_ble.c"
@@ -74,9 +71,11 @@ idf_component_register(SRCS ${SOMNOTRACE_MAIN_SRC} "firmware_target.c" ${SOMNOTR
                        INCLUDE_DIRS "."
                        REQUIRES esp_lcd driver esp_wifi esp_netif esp_event nvs_flash esp_http_server json esp_app_format
                                 bt mbedtls esp_rom fatfs sdmmc esp-idf-ftpServer uploader esp_http_client
-                                esp_driver_i2c esp_driver_i2s esp_adc app_update espcoredump esp_https_ota therapy_alert esp_coex ${SOMNOTRACE_DISPLAY_REQUIRES})
+                                esp_driver_i2c esp_driver_i2s esp_adc app_update espcoredump esp_https_ota therapy_alert esp_coex
+                                ${SOMNOTRACE_DISPLAY_REQUIRES})
 
-# Retain board identity even when OTA services are not linked.
+# Keep board identity even in compact previews that never link OTA services.
+# Compiler-level 'used' alone cannot pull an unreferenced archive member in.
 target_link_libraries(${COMPONENT_LIB} INTERFACE "-u somnotrace_firmware_target")
 
 # Download zones.json (IANA-to-POSIX timezone database) if not present.

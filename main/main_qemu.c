@@ -5,6 +5,7 @@
 #include "bsp_display.h"
 #include "device_settings.h"
 #include "log_stream.h"
+#include "touch_logs_qemu.h"
 #include "nvs_writer.h"
 #include "psram_task.h"
 #include "esp_log.h"
@@ -28,6 +29,9 @@ void app_main(void)
 
     ESP_ERROR_CHECK(psram_task_init());
 
+    /* Exercise the same bounded retained feed as hardware so the native Logs
+     * screen is a live acceptance surface rather than a disconnected mock. */
+    log_stream_init();
 
     ESP_ERROR_CHECK(bsp_display_init());
     device_settings_t settings;
@@ -49,6 +53,7 @@ void app_main(void)
      * the preview never displays a moving circular-buffer seam. */
     float phase = 300.0f * 0.06f;
     while (true) {
+        if ((iteration % 20) == 0) touch_logs_qemu_tick();
         float flow = 36.0f * sinf(phase) + 7.0f * sinf(phase * 2.3f);
         bsp_display_push_flow(flow);
         if ((iteration % 20) == 0) {
