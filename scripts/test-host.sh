@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+TEST_DIR="$(mktemp -d /tmp/somnotrace-feature-host.XXXXXX)"
+trap 'rm -rf "${TEST_DIR}"' EXIT
 cd "$(dirname "$0")/.."
+python3 scripts/gen_tz_db.py
 python3 scripts/therapy_alert_ack_contract_test.py
 python3 scripts/clock_snapshot_contract_test.py
 python3 scripts/capacity_snapshot_behavior_test.py
@@ -52,5 +55,30 @@ python3 scripts/log_stream_resilience_contract_test.py
 python3 scripts/logs_touch_ui_contract_test.py
 
 python3 scripts/touch_logs_ui_contract_test.py
+
+
+cc -std=c11 -Wall -Wextra \
+    -I scripts/test_include -I main \
+    scripts/first_run_setup_test.c main/first_run_setup_model.c \
+    -o "${TEST_DIR}/first_run_setup_test"
+"${TEST_DIR}/first_run_setup_test"
+
+cc -std=c11 -Wall -Wextra -DTIMEZONE_CATALOG_HOST_TEST \
+    -I scripts/test_include -I main \
+    scripts/timezone_catalog_test.c main/timezone_catalog.c \
+    -o "${TEST_DIR}/timezone_catalog_test"
+"${TEST_DIR}/timezone_catalog_test"
+
+python3 scripts/first_run_setup_contract_test.py
+
+python3 scripts/first_run_setup_ui_contract_test.py
+
+python3 scripts/first_run_setup_runtime_contract_test.py
+
+python3 scripts/first_run_setup_lifecycle_contract_test.py
+
+python3 scripts/timezone_catalog_contract_test.py
+
+python3 scripts/netprov_scan_contract_test.py
 
 echo "All synthetic host tests passed"

@@ -32,6 +32,9 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "first_run_setup.h"
+#include "first_run_setup_controller.h"
+#include "first_run_setup_ui.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -271,7 +274,10 @@ static bool s_wake_gesture_pending;
 static uint32_t s_touch_seen_visibility;
 static uint32_t s_touch_seen_continuity;
 static uint32_t s_backlight_revision;
+/* SoftAP and first-run setup may overlap. Keep their visibility claims
+ * independent so either owner can finish without hiding the other. */
 static bool s_backlight_force_on;
+static bool s_setup_backlight_force_on;
 static bool s_temporarily_awake;
 static esp_timer_handle_t s_wake_timer;
 static bool s_touch_was_pressed;
@@ -286,12 +292,15 @@ static uint32_t s_backlight_write_errors;
 static int64_t s_backlight_retry_after_us;
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
 static bool s_qemu_first_frame_published;
+static bool s_qemu_setup_preview_requested;
 #endif
 static lv_coord_t s_last_touch_x;
 static lv_coord_t s_last_touch_y;
 static bool s_touch_services_ready;
 static bool s_as11_service_ready;
 static bool s_ox_service_ready;
+static bool s_first_run_setup_active;
+static uint32_t s_first_run_setup_seen_generation;
 /* User-confirmed prerequisite for the AirSense application-layer pairing
  * flow. The machine must enter its own pairing mode before SomnoTrace scans;
  * doing these in the opposite order can display a code but fail the final
@@ -1760,7 +1769,12 @@ static void build_manage_page(lv_obj_t *manage)
 }
 
 #if CONFIG_SOMNOTRACE_BOARD_QEMU
-
+static void qemu_setup_preview_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_PRESSED) return;
+    s_qemu_setup_preview_requested = true;
+    ESP_LOGI(TAG, "QEMU first-run setup preview requested");
+}
 #endif
 
 static void build_ui(void)
@@ -1818,6 +1832,23 @@ static void build_ui(void)
                                FONT_BUTTON_COMPACT, 0);
     if (!screen_wake_input_available())
         lv_obj_add_state(header_screen_off, LV_STATE_DISABLED);
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    /* A transparent emulator-only hit target over the deterministic clock
+     * opens a fresh setup acceptance run.  A plain object is used instead of
+     * relying on label hit-testing, which differs between LVGL/QEMU builds.
+     * There is no production affordance and the default finished-shell
+     * preview remains unchanged until this target is deliberately tapped. */
+    lv_obj_t *setup_preview_hotspot = lv_obj_create(header);
+    lv_obj_set_pos(setup_preview_hotspot, 8, 0);
+    lv_obj_set_size(setup_preview_hotspot, 112, UI_HEADER_H);
+    lv_obj_set_style_bg_opa(setup_preview_hotspot, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(setup_preview_hotspot, 0, 0);
+    lv_obj_set_style_pad_all(setup_preview_hotspot, 0, 0);
+    lv_obj_clear_flag(setup_preview_hotspot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(setup_preview_hotspot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(setup_preview_hotspot, qemu_setup_preview_cb,
+                        LV_EVENT_PRESSED, NULL);
+#endif
     /* This only reveals a navigation overlay, so respond on touch-down like
      * the bottom navigation instead of waiting for a complete tap/release. */
     s_status_capsule = make_destination_button(
@@ -1980,6 +2011,12 @@ static void build_ui(void)
      * they become active. */
     lv_obj_move_foreground(s_status_scrim);
     lv_obj_move_foreground(s_status_tray);
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    /* Keep the emulator-only selector reachable even while the deterministic
+     * startup notice overlaps the clock. It is a screen child, so the real
+     * setup surface on lv_layer_top() still replaces it completely. */
+    lv_obj_move_foreground(setup_preview_hotspot);
+#endif
 
     set_manage_section(MANAGE_LOGS);
     set_active_page(0);
@@ -2113,7 +2150,8 @@ static bool request_idle_sleep_if_due(const device_settings_t *settings,
                    now_us - s_last_touch_activity_us >=
                        (int64_t)effective_timeout_s * 1000000LL;
     if (s_backlight && s_backlight_requested && !s_state.notice_critical &&
-        !s_backlight_force_on && !s_temporarily_awake && elapsed) {
+        !s_backlight_force_on && !s_setup_backlight_force_on &&
+        !s_temporarily_awake && elapsed) {
         s_backlight_requested = false;
         s_last_off_request_us = esp_timer_get_time();
         ++s_backlight_revision;
@@ -2140,6 +2178,52 @@ static void update_ui(void)
     bool backlight;
     TickType_t now_ticks = xTaskGetTickCount();
     int64_t now_us = esp_timer_get_time();
+
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    if (s_qemu_setup_preview_requested &&
+        !bsp_display_first_run_setup_active()) {
+        s_qemu_setup_preview_requested = false;
+        esp_err_t preview = bsp_display_qemu_start_setup_preview();
+        if (preview != ESP_OK) {
+            ESP_LOGE(TAG, "could not open QEMU setup preview: %s",
+                     esp_err_to_name(preview));
+        } else {
+            return;
+        }
+    }
+#endif
+
+    /* The setup surface is an opaque, navigation-free top layer.  Only the
+     * display task copies controller state into LVGL, and only when its
+     * generation changes, so a slow Wi-Fi/BLE worker can never stall touch or
+     * trigger periodic full-pane rebuilds. */
+    if (bsp_display_first_run_setup_active()) {
+        first_run_setup_ui_live_t live;
+        uint32_t generation = 0;
+        if (first_run_setup_controller_snapshot(&live, &generation) &&
+            generation != s_first_run_setup_seen_generation) {
+            esp_err_t update = first_run_setup_ui_update(&live);
+            if (update == ESP_OK)
+                s_first_run_setup_seen_generation = generation;
+            else
+                ESP_LOGE(TAG, "setup UI update failed: %s",
+                         esp_err_to_name(update));
+        }
+        if (first_run_setup_controller_take_finished()) {
+            first_run_setup_ui_destroy();
+            first_run_setup_controller_stop();
+            s_first_run_setup_seen_generation = 0;
+            portENTER_CRITICAL(&s_state_lock);
+            s_first_run_setup_active = false;
+            s_setup_backlight_force_on = false;
+            portEXIT_CRITICAL(&s_state_lock);
+            bsp_display_apply_backlight_policy(false);
+            lv_obj_invalidate(lv_scr_act());
+            ESP_LOGI(TAG, "first-run setup finished; normal shell revealed");
+        } else {
+            return;
+        }
+    }
 
     bool refresh_services = last_service_snapshot == 0 ||
                             now_ticks - last_service_snapshot >= pdMS_TO_TICKS(250);
@@ -2856,6 +2940,7 @@ esp_err_t bsp_display_init(void)
     portENTER_CRITICAL(&s_state_lock);
     s_touch_was_pressed = false;
     s_backlight_force_on = false;
+    s_setup_backlight_force_on = false;
     s_temporarily_awake = false;
     s_backlight_known = true;
     s_wake_gesture_pending = false;
@@ -3031,6 +3116,61 @@ void bsp_display_enable_touch_services(bool as11_ready, bool oximeter_ready)
     start_storage_refresh();
 }
 
+esp_err_t bsp_display_start_first_run_setup(esp_err_t initial_card_result)
+{
+    first_run_setup_snapshot_t durable;
+    first_run_setup_snapshot(&durable);
+    if (!durable.schema_compatible) return durable.last_storage_result;
+    if (first_run_setup_is_finished(&durable.state)) return ESP_OK;
+    if (bsp_display_first_run_setup_active()) return ESP_OK;
+
+    esp_err_t result = first_run_setup_controller_start(initial_card_result);
+    if (result != ESP_OK) return result;
+    const first_run_setup_ui_controller_t *callbacks =
+        first_run_setup_controller_callbacks();
+    if (!callbacks) {
+        first_run_setup_controller_stop();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (!lock_lvgl(pdMS_TO_TICKS(2000))) {
+        first_run_setup_controller_stop();
+        return ESP_ERR_TIMEOUT;
+    }
+    result = first_run_setup_ui_create(lv_layer_top(), callbacks);
+    if (result == ESP_OK) {
+        first_run_setup_ui_live_t live;
+        uint32_t generation = 0;
+        if (first_run_setup_controller_snapshot(&live, &generation)) {
+            result = first_run_setup_ui_update(&live);
+            if (result == ESP_OK)
+                s_first_run_setup_seen_generation = generation;
+        }
+    }
+    if (result == ESP_OK) result = first_run_setup_ui_show();
+    if (result == ESP_OK) {
+        /* Setup is a bedside interaction surface and must not disappear under
+         * the ordinary standby timeout while the owner is completing it. */
+        portENTER_CRITICAL(&s_state_lock);
+        s_first_run_setup_active = true;
+        s_setup_backlight_force_on = true;
+        portEXIT_CRITICAL(&s_state_lock);
+        bsp_display_set_backlight(true);
+    } else {
+        first_run_setup_ui_destroy();
+        first_run_setup_controller_stop();
+    }
+    unlock_lvgl();
+    return result;
+}
+
+bool bsp_display_first_run_setup_active(void)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    bool active = s_first_run_setup_active;
+    portEXIT_CRITICAL(&s_state_lock);
+    return active;
+}
 
 void bsp_display_show_number(uint32_t value)
 {
@@ -3402,7 +3542,8 @@ void bsp_display_set_backlight(bool on)
 bool bsp_display_toggle_backlight(void)
 {
     portENTER_CRITICAL(&s_state_lock);
-    bool on = s_backlight_force_on || !s_backlight_requested;
+    bool on = s_backlight_force_on || s_setup_backlight_force_on ||
+              !s_backlight_requested;
     portEXIT_CRITICAL(&s_state_lock);
     bsp_display_set_backlight(on);
     return on;
@@ -3547,7 +3688,7 @@ void bsp_display_apply_backlight_policy(bool force_on)
         return;
     }
     portENTER_CRITICAL(&s_state_lock);
-    bool forced = s_backlight_force_on;
+    bool forced = s_backlight_force_on || s_setup_backlight_force_on;
     bool temporarily_awake = s_temporarily_awake;
     portEXIT_CRITICAL(&s_state_lock);
     if (forced || temporarily_awake) {
@@ -3660,6 +3801,20 @@ void bsp_display_qemu_set_tab(uint8_t tab)
 #endif
 }
 
+esp_err_t bsp_display_qemu_start_setup_preview(void)
+{
+#if CONFIG_SOMNOTRACE_BOARD_QEMU
+    if (bsp_display_first_run_setup_active()) return ESP_OK;
+    esp_err_t result = first_run_setup_reset();
+    if (result != ESP_OK) return result;
+    result = bsp_display_start_first_run_setup(ESP_OK);
+    if (result == ESP_OK)
+        ESP_LOGI(TAG, "QEMU setup preview ready; simulated services only");
+    return result;
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
 
 void bsp_display_set_rotation(uint16_t degrees)
 {
@@ -3667,9 +3822,4 @@ void bsp_display_set_rotation(uint16_t degrees)
         ESP_LOGW(TAG, "rotation %u ignored: the 7B dashboard is landscape-native",
                  (unsigned)degrees);
     }
-}
-
-esp_err_t bsp_display_qemu_start_setup_preview(void)
-{
-    return ESP_ERR_NOT_SUPPORTED;
 }

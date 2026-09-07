@@ -30,16 +30,21 @@
 #include "uploader.h"
 #include "upload_sched.h"
 #include "therapy_alert.h"
+#include "lwip/inet.h"
+#include "esp_mac.h"
 #include "edf_gen.h"
 #include "as11_time.h"
 #include "sd_storage.h"
-#include "ff.h"
 #include "log_stream.h"
 #include "device_settings.h"
 #include "session_graph.h"
 #include "session_writer.h"
 #include "oximetry_http.h"
+#if CONFIG_SOMNOTRACE_BOARD_WAVESHARE_7B
+#include "board_waveshare_7b.h"
+#endif
 
+#include <inttypes.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -57,6 +62,8 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_system.h"
+#include "lwip/sockets.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -76,9 +83,9 @@
 
 static const char *TAG = "netprov";
 
-/* One global claim covers every firmware update and controlled restart.  Some
- * owners continue in background tasks and can originate outside httpd, so the
- * claim is public and atomically acquired before any worker is scheduled. */
+/* OTA and ordinary restart requests share the public lifecycle claim declared
+ * in net_provision.h.  The response helper is defined with the OTA handlers. */
+
 static portMUX_TYPE s_lifecycle_claim_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_lifecycle_claimed;
 static const char *s_lifecycle_claim_owner;
@@ -128,6 +135,7 @@ static const char *lifecycle_claim_owner(void)
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
 #define MAX_STA_RETRY       3
+#define NETPROV_SCAN_MAX_RAW_APS 64
 
 /* Failed reconnects to the current SSID before falling back to a full
  * scan across every configured network.  Without this the driver retries
@@ -156,6 +164,30 @@ static bool s_link_cfg_valid = false;
 
 static esp_netif_t *s_netif_sta = NULL;
 static esp_netif_t *s_netif_ap = NULL;
+
+/* A binary semaphore is intentional: a request reserves the radio in its
+ * caller and the scan worker releases it.  A FreeRTOS mutex cannot be handed
+ * between tasks.  Connect/failover and portal mode transitions use the same
+ * gate so esp_wifi mode changes can never overlap a user scan. */
+static SemaphoreHandle_t s_radio_gate = NULL;
+static SemaphoreHandle_t s_scan_mutex = NULL;
+static netprov_scan_snapshot_t s_scan_snapshot = {
+    .state = NETPROV_SCAN_BLOCKED,
+    .blocked_by = NETPROV_SCAN_BLOCK_NOT_INITIALIZED,
+    .result = ESP_ERR_INVALID_STATE,
+};
+
+static bool user_scan_running(void)
+{
+    if (!s_scan_mutex) return false;
+    /* Event-loop callbacks must not wait behind UI/HTTP work.  If the state
+     * is being changed right now, conservatively defer reconnect to the link
+     * supervisor rather than collide with a just-reserved scan. */
+    if (xSemaphoreTake(s_scan_mutex, 0) != pdTRUE) return true;
+    bool running = s_scan_snapshot.state == NETPROV_SCAN_RUNNING;
+    xSemaphoreGive(s_scan_mutex);
+    return running;
+}
 
 /* ------------------------------------------------------------------ */
 /*  NVS config storage                                                */
@@ -274,10 +306,14 @@ void netprov_get_mdns_name(char *out, size_t out_len)
 
 esp_err_t netprov_set_mdns_name(const char *name)
 {
-    if (!name || name[0] == '\0') return ESP_ERR_INVALID_ARG;
+    if (!name || !name[0] || strlen(name) > NETPROV_HOSTNAME_MAXLEN || name[0] == '-' || name[strlen(name)-1] == '-') return ESP_ERR_INVALID_ARG;
+    for (const char *p = name; *p; ++p)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '-')) return ESP_ERR_INVALID_ARG;
     esp_err_t err = nvs_writer_run(do_save_mdns_name, (void *)name);
     if (err == ESP_OK) {
         strlcpy(s_mdns_name, name, sizeof(s_mdns_name));
+        mdns_hostname_set(name); /* returns invalid-state before mDNS starts */
+        if (s_netif_sta) esp_netif_set_hostname(s_netif_sta, name);
     }
     return err;
 }
@@ -335,7 +371,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             bsp_display_set_wifi_connected(false);
             s_reconnect_tries = 0;
             ESP_LOGW(TAG, "Wi-Fi link lost, reconnecting...");
-            esp_wifi_connect();
+            if (user_scan_running()) {
+                ESP_LOGI(TAG, "deferring reconnect until user scan completes");
+                s_rescan_requested = true;
+            } else {
+                esp_wifi_connect();
+            }
         } else if (s_connecting) {
             if (s_retry_num < MAX_STA_RETRY) {
                 s_retry_num++;
@@ -349,7 +390,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
              * only ever retries the single SSID in the driver config, so retrying
              * forever strands us on a network that has gone away while another
              * configured network sits available.  Escalate to a full rescan. */
-            if (++s_reconnect_tries < RECONNECT_TRIES_BEFORE_RESCAN) {
+            if (user_scan_running()) {
+                ESP_LOGI(TAG, "deferring reconnect until user scan completes");
+                s_rescan_requested = true;
+            } else if (++s_reconnect_tries < RECONNECT_TRIES_BEFORE_RESCAN) {
                 ESP_LOGI(TAG, "reconnect failed (%d/%d), retrying same SSID",
                          s_reconnect_tries, RECONNECT_TRIES_BEFORE_RESCAN);
                 esp_wifi_connect();
@@ -405,7 +449,11 @@ void netprov_get_link(netprov_link_t *out)
 
 bool netprov_is_link_up(void)
 {
-    return s_connected;
+    if (!s_link_mutex) return false;
+    xSemaphoreTake(s_link_mutex, portMAX_DELAY);
+    bool connected = s_connected;
+    xSemaphoreGive(s_link_mutex);
+    return connected;
 }
 
 /* ------------------------------------------------------------------ */
@@ -457,6 +505,24 @@ esp_err_t netprov_init(void)
 {
     s_link_mutex = xSemaphoreCreateMutex();
     if (!s_link_mutex) return ESP_ERR_NO_MEM;
+    s_scan_mutex = xSemaphoreCreateMutex();
+    s_radio_gate = xSemaphoreCreateBinary();
+    if (!s_scan_mutex || !s_radio_gate) {
+        if (s_scan_mutex) vSemaphoreDelete(s_scan_mutex);
+        if (s_radio_gate) vSemaphoreDelete(s_radio_gate);
+        vSemaphoreDelete(s_link_mutex);
+        s_scan_mutex = NULL;
+        s_radio_gate = NULL;
+        s_link_mutex = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    xSemaphoreGive(s_radio_gate);
+
+    xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
+    memset(&s_scan_snapshot, 0, sizeof(s_scan_snapshot));
+    s_scan_snapshot.state = NETPROV_SCAN_IDLE;
+    s_scan_snapshot.result = ESP_OK;
+    xSemaphoreGive(s_scan_mutex);
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -545,8 +611,10 @@ static esp_err_t try_single_ssid(const char *ssid, const char *pass,
     return result;
 }
 
-esp_err_t netprov_try_connect(const struct netprov_config *cfg,
-                               char *ip_out, int timeout_ms)
+
+
+static esp_err_t try_connect_radio_locked(const struct netprov_config *cfg,
+                                          char *ip_out, int timeout_ms)
 {
     if (s_portal_mode) return ESP_FAIL;
     link_mark_down();
@@ -605,7 +673,9 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
                     best_rec = records[j];
                 }
             }
-            if (best_rssi > -128) {
+            /* An unseen saved SSID may be hidden. Try it without a BSSID
+             * hint in its proper fallback slot rather than silently dropping it. */
+            {
                 cands[n_cands].slot = i;
                 cands[n_cands].rssi = best_rssi;
                 cands[n_cands].rec = best_rec;
@@ -636,14 +706,8 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
         return ESP_FAIL;
     }
 
-    /* Sort by RSSI descending (bubble, small N) */
-    for (int i = 0; i < n_cands - 1; i++) {
-        for (int j = i + 1; j < n_cands; j++) {
-            if (cands[j].rssi > cands[i].rssi) {
-                cand_t t = cands[i]; cands[i] = cands[j]; cands[j] = t;
-            }
-        }
-    }
+    /* Candidates were built in saved slot order. RSSI selects only the best
+     * BSSID within each SSID; priority is independent of signal strength. */
 
     if (s_portal_mode) return ESP_FAIL;
 
@@ -657,7 +721,7 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
         for (int attempt = 1; attempt <= MAX_STA_RETRY; attempt++) {
             esp_err_t err = try_single_ssid(cfg->wifi[slot].ssid,
                                             cfg->wifi[slot].pass,
-                                            &cands[i].rec,
+                                            cands[i].rssi > -128 ? &cands[i].rec : NULL,
                                             ip_out, timeout_ms);
             if (err == ESP_OK) return ESP_OK;
             if (attempt < MAX_STA_RETRY) {
@@ -670,6 +734,16 @@ esp_err_t netprov_try_connect(const struct netprov_config *cfg,
 
     ESP_LOGW(TAG, "all candidates exhausted");
     return ESP_FAIL;
+}
+
+esp_err_t netprov_try_connect(const struct netprov_config *cfg,
+                              char *ip_out, int timeout_ms)
+{
+    if (!s_radio_gate) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_radio_gate, portMAX_DELAY);
+    esp_err_t result = try_connect_radio_locked(cfg, ip_out, timeout_ms);
+    xSemaphoreGive(s_radio_gate);
+    return result;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1140,14 +1214,69 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 /* ------------------------------------------------------------------ */
 /*  Async WiFi scan (non-blocking to avoid socket exhaustion)         */
 /* ------------------------------------------------------------------ */
-static volatile bool s_scan_running = false;
-static volatile bool s_scan_done = false;
-static char *s_scan_json = NULL;   /* cached JSON result */
-static SemaphoreHandle_t s_scan_mutex = NULL;
+static uint32_t s_browser_delivered_scan_generation;
+static uint32_t s_browser_wait_scan_generation;
+
+static int scan_ap_rssi_desc(const void *a, const void *b)
+{
+    const netprov_scan_ap_t *left = a;
+    const netprov_scan_ap_t *right = b;
+    return (int)right->rssi - (int)left->rssi;
+}
+
+static void scan_publish(uint32_t generation, netprov_scan_state_t state,
+                         netprov_scan_block_t blocked_by, esp_err_t result,
+                         const netprov_scan_ap_t *aps, size_t count)
+{
+    if (count > NETPROV_SCAN_MAX_APS) count = NETPROV_SCAN_MAX_APS;
+    xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
+    memset(&s_scan_snapshot, 0, sizeof(s_scan_snapshot));
+    s_scan_snapshot.state = state;
+    s_scan_snapshot.blocked_by = blocked_by;
+    s_scan_snapshot.result = result;
+    s_scan_snapshot.generation = generation;
+    s_scan_snapshot.count = count;
+    if (aps && count)
+        memcpy(s_scan_snapshot.aps, aps, count * sizeof(*aps));
+    xSemaphoreGive(s_scan_mutex);
+}
+
+void netprov_scan_get_snapshot(netprov_scan_snapshot_t *out)
+{
+    if (!out) return;
+    if (!s_scan_mutex) {
+        memset(out, 0, sizeof(*out));
+        out->state = NETPROV_SCAN_BLOCKED;
+        out->blocked_by = NETPROV_SCAN_BLOCK_NOT_INITIALIZED;
+        out->result = ESP_ERR_INVALID_STATE;
+        return;
+    }
+    xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
+    *out = s_scan_snapshot;
+    xSemaphoreGive(s_scan_mutex);
+}
 
 static void wifi_scan_task(void *arg)
 {
+    (void)arg;
+    uint32_t generation;
+    xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
+    generation = s_scan_snapshot.generation;
+    xSemaphoreGive(s_scan_mutex);
+
+    /* The request checked this before reserving the radio, but therapy can
+     * start between the touch/HTTP callback and this worker being scheduled. */
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active()) {
+        scan_publish(generation, NETPROV_SCAN_BLOCKED,
+                     NETPROV_SCAN_BLOCK_RECORDING, ESP_ERR_INVALID_STATE,
+                     NULL, 0);
+        xSemaphoreGive(s_radio_gate);
+        psram_task_delete(NULL);
+        return;
+    }
+
     ESP_LOGI(TAG, "wifi scan starting");
+    esp_err_t err;
     if (s_portal_mode) {
         /* SoftAP: BLE is disconnected, so custom active scan params are safe.
          * ~20ms per channel × 13 channels ≈ 300ms total. */
@@ -1157,82 +1286,224 @@ static void wifi_scan_task(void *arg)
             .scan_time.active.min = 0,
             .scan_time.active.max = 20,
         };
-        esp_wifi_scan_start(&fast_cfg, true);
+        err = esp_wifi_scan_start(&fast_cfg, true);
     } else {
         /* STA: BLE may be active — pass NULL to let the driver use
          * BT-coexistence-safe defaults. */
-        esp_wifi_scan_start(NULL, true);
+        err = esp_wifi_scan_start(NULL, true);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi scan failed to start: %s", esp_err_to_name(err));
+        /* Defensive even when start failed: discard any list retained by a
+         * prior interrupted driver scan before releasing radio ownership. */
+        esp_wifi_clear_ap_list();
+        scan_publish(generation, NETPROV_SCAN_ERROR, NETPROV_SCAN_BLOCK_NONE,
+                     err, NULL, 0);
+        xSemaphoreGive(s_radio_gate);
+        psram_task_delete(NULL);
+        return;
     }
     ESP_LOGI(TAG, "wifi scan complete");
 
     uint16_t ap_count = 0;
-    esp_wifi_scan_get_ap_num(&ap_count);
-    if (ap_count > 20) ap_count = 20;
+    err = esp_wifi_scan_get_ap_num(&ap_count);
+    if (err != ESP_OK) {
+        esp_wifi_clear_ap_list();
+        scan_publish(generation, NETPROV_SCAN_ERROR, NETPROV_SCAN_BLOCK_NONE,
+                     err, NULL, 0);
+        xSemaphoreGive(s_radio_gate);
+        psram_task_delete(NULL);
+        return;
+    }
+    /* Fetch more than the public result limit so duplicate BSSIDs do not
+     * crowd out distinct SSIDs before deduplication. */
+    if (ap_count > NETPROV_SCAN_MAX_RAW_APS)
+        ap_count = NETPROV_SCAN_MAX_RAW_APS;
 
-    wifi_ap_record_t *records = heap_caps_calloc(ap_count, sizeof(wifi_ap_record_t), MALLOC_CAP_SPIRAM);
-    if (!records) records = calloc(ap_count, sizeof(wifi_ap_record_t));
-    cJSON *arr = cJSON_CreateArray();
-    if (records && ap_count) {
-        esp_wifi_scan_get_ap_records(&ap_count, records);
-        for (int i = 0; i < ap_count; i++) {
-            if (records[i].ssid[0] == '\0') continue;
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddStringToObject(o, "ssid", (char *)records[i].ssid);
-            cJSON_AddNumberToObject(o, "rssi", records[i].rssi);
-            cJSON_AddBoolToObject(o, "lock", records[i].authmode != WIFI_AUTH_OPEN);
-            cJSON_AddItemToArray(arr, o);
+    wifi_ap_record_t *records = NULL;
+    if (ap_count) {
+        records = heap_caps_calloc(ap_count, sizeof(*records), MALLOC_CAP_SPIRAM);
+        if (!records) records = calloc(ap_count, sizeof(*records));
+        if (!records) {
+            esp_wifi_clear_ap_list();
+            scan_publish(generation, NETPROV_SCAN_ERROR,
+                         NETPROV_SCAN_BLOCK_NONE, ESP_ERR_NO_MEM, NULL, 0);
+            xSemaphoreGive(s_radio_gate);
+            psram_task_delete(NULL);
+            return;
         }
+        err = esp_wifi_scan_get_ap_records(&ap_count, records);
+        if (err != ESP_OK) {
+            free(records);
+            esp_wifi_clear_ap_list();
+            scan_publish(generation, NETPROV_SCAN_ERROR,
+                         NETPROV_SCAN_BLOCK_NONE, err, NULL, 0);
+            xSemaphoreGive(s_radio_gate);
+            psram_task_delete(NULL);
+            return;
+        }
+    } else {
+        /* get_ap_records() is what normally releases the driver's result
+         * list; an empty scan still needs an explicit release. */
+        esp_wifi_clear_ap_list();
+    }
+
+    netprov_scan_ap_t aps[NETPROV_SCAN_MAX_APS] = {0};
+    size_t result_count = 0;
+    for (uint16_t i = 0; i < ap_count; ++i) {
+        size_t ssid_len = strnlen((const char *)records[i].ssid,
+                                  NETPROV_SSID_MAXLEN);
+        if (!ssid_len) continue;
+
+        size_t existing = result_count;
+        for (size_t j = 0; j < result_count; ++j) {
+            if (strlen(aps[j].ssid) == ssid_len &&
+                memcmp(aps[j].ssid, records[i].ssid, ssid_len) == 0) {
+                existing = j;
+                break;
+            }
+        }
+        if (existing < result_count) {
+            if (records[i].rssi > aps[existing].rssi) {
+                aps[existing].rssi = records[i].rssi;
+                aps[existing].secure = records[i].authmode != WIFI_AUTH_OPEN;
+            }
+            continue;
+        }
+        if (result_count >= NETPROV_SCAN_MAX_APS) continue;
+        memcpy(aps[result_count].ssid, records[i].ssid, ssid_len);
+        aps[result_count].ssid[ssid_len] = '\0';
+        aps[result_count].rssi = records[i].rssi;
+        aps[result_count].secure = records[i].authmode != WIFI_AUTH_OPEN;
+        ++result_count;
     }
     free(records);
+    qsort(aps, result_count, sizeof(aps[0]), scan_ap_rssi_desc);
 
-    char *json = cJSON_PrintUnformatted(arr);
-    cJSON_Delete(arr);
-
-    if (s_scan_mutex) xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
-    if (s_scan_json) cJSON_free(s_scan_json);
-    s_scan_json = json;
-    s_scan_done = true;
-    s_scan_running = false;
-    if (s_scan_mutex) xSemaphoreGive(s_scan_mutex);
-
+    scan_publish(generation, NETPROV_SCAN_READY, NETPROV_SCAN_BLOCK_NONE,
+                 ESP_OK, aps, result_count);
+    xSemaphoreGive(s_radio_gate);
     psram_task_delete(NULL);
+}
+
+esp_err_t netprov_scan_request(void)
+{
+    if (!s_scan_mutex || !s_radio_gate) return ESP_ERR_INVALID_STATE;
+
+    xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
+    if (s_scan_snapshot.state == NETPROV_SCAN_RUNNING) {
+        xSemaphoreGive(s_scan_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint32_t generation = s_scan_snapshot.generation + 1;
+    if (generation == 0) generation = 1;
+    if (bsp_display_is_therapy_active() || sd_storage_recording_active()) {
+        memset(&s_scan_snapshot, 0, sizeof(s_scan_snapshot));
+        s_scan_snapshot.state = NETPROV_SCAN_BLOCKED;
+        s_scan_snapshot.blocked_by = NETPROV_SCAN_BLOCK_RECORDING;
+        s_scan_snapshot.result = ESP_ERR_INVALID_STATE;
+        s_scan_snapshot.generation = generation;
+        xSemaphoreGive(s_scan_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* A foreground scan is meaningful only on a stable STA link or the APSTA
+     * provisioning portal.  In the disconnected state the supervisor may be
+     * between asynchronous reconnect events even when the gate is momentarily
+     * free; let that recovery finish instead of provoking WIFI_STATE errors. */
+    if (!s_portal_mode && !netprov_is_link_up()) {
+        memset(&s_scan_snapshot, 0, sizeof(s_scan_snapshot));
+        s_scan_snapshot.state = NETPROV_SCAN_BLOCKED;
+        s_scan_snapshot.blocked_by = NETPROV_SCAN_BLOCK_RADIO_BUSY;
+        s_scan_snapshot.result = ESP_ERR_INVALID_STATE;
+        s_scan_snapshot.generation = generation;
+        xSemaphoreGive(s_scan_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_radio_gate, 0) != pdTRUE) {
+        memset(&s_scan_snapshot, 0, sizeof(s_scan_snapshot));
+        s_scan_snapshot.state = NETPROV_SCAN_BLOCKED;
+        s_scan_snapshot.blocked_by = NETPROV_SCAN_BLOCK_RADIO_BUSY;
+        s_scan_snapshot.result = ESP_ERR_TIMEOUT;
+        s_scan_snapshot.generation = generation;
+        xSemaphoreGive(s_scan_mutex);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    memset(&s_scan_snapshot, 0, sizeof(s_scan_snapshot));
+    s_scan_snapshot.state = NETPROV_SCAN_RUNNING;
+    s_scan_snapshot.result = ESP_OK;
+    s_scan_snapshot.generation = generation;
+    xSemaphoreGive(s_scan_mutex);
+
+    if (!psram_task_create(wifi_scan_task, "wifi_scan", 5120, NULL, 3,
+                           tskNO_AFFINITY, NULL, NULL)) {
+        scan_publish(generation, NETPROV_SCAN_ERROR, NETPROV_SCAN_BLOCK_NONE,
+                     ESP_ERR_NO_MEM, NULL, 0);
+        xSemaphoreGive(s_radio_gate);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 static esp_err_t scan_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
 
-    if (!s_scan_mutex) s_scan_mutex = xSemaphoreCreateMutex();
-
-    /* If a scan is running, tell the client to poll */
-    if (s_scan_running) {
+    netprov_scan_snapshot_t snapshot;
+    netprov_scan_get_snapshot(&snapshot);
+    if (snapshot.state == NETPROV_SCAN_RUNNING) {
+        s_browser_wait_scan_generation = snapshot.generation;
         httpd_resp_send(req, "{\"scanning\":true}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
 
-    /* If we have cached results, return them */
-    if (s_scan_done && s_scan_json) {
-        xSemaphoreTake(s_scan_mutex, portMAX_DELAY);
-        char *cached = s_scan_json;
-        s_scan_json = NULL;
-        s_scan_done = false;
-        xSemaphoreGive(s_scan_mutex);
-        httpd_resp_send(req, cached, HTTPD_RESP_USE_STRLEN);
-        cJSON_free(cached);
+    /* Preserve the browser's existing polling contract without consuming the
+     * public snapshot: each completed generation is returned once to /scan;
+     * the next explicit browser request starts a fresh generation. */
+    if (snapshot.state == NETPROV_SCAN_READY &&
+        snapshot.generation == s_browser_wait_scan_generation &&
+        snapshot.generation != s_browser_delivered_scan_generation) {
+        cJSON *arr = cJSON_CreateArray();
+        if (!arr) {
+            httpd_resp_send(req, "[]", HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
+        for (size_t i = 0; i < snapshot.count; ++i) {
+            cJSON *item = cJSON_CreateObject();
+            if (!item) continue;
+            cJSON_AddStringToObject(item, "ssid", snapshot.aps[i].ssid);
+            cJSON_AddNumberToObject(item, "rssi", snapshot.aps[i].rssi);
+            cJSON_AddBoolToObject(item, "lock", snapshot.aps[i].secure);
+            cJSON_AddItemToArray(arr, item);
+        }
+        char *json = cJSON_PrintUnformatted(arr);
+        cJSON_Delete(arr);
+        s_browser_delivered_scan_generation = snapshot.generation;
+        httpd_resp_send(req, json ? json : "[]", HTTPD_RESP_USE_STRLEN);
+        if (json) cJSON_free(json);
         return ESP_OK;
     }
 
-    /* Start a new scan in a background task */
-    s_scan_running = true;
-    s_scan_done = false;
-    BaseType_t ret = (psram_task_create(wifi_scan_task, "wifi_scan", 4096, NULL, 3, tskNO_AFFINITY, NULL, NULL) != NULL) ? pdPASS : pdFAIL;
-    if (ret != pdPASS) {
-        s_scan_running = false;
+    if ((snapshot.state == NETPROV_SCAN_ERROR ||
+         snapshot.state == NETPROV_SCAN_BLOCKED) &&
+        snapshot.generation == s_browser_wait_scan_generation &&
+        snapshot.generation != s_browser_delivered_scan_generation) {
+        s_browser_delivered_scan_generation = snapshot.generation;
         httpd_resp_send(req, "[]", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
 
-    httpd_resp_send(req, "{\"scanning\":true}", HTTPD_RESP_USE_STRLEN);
+    esp_err_t err = netprov_scan_request();
+    if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+        netprov_scan_get_snapshot(&snapshot);
+        if (snapshot.state == NETPROV_SCAN_RUNNING) {
+            s_browser_wait_scan_generation = snapshot.generation;
+            httpd_resp_send(req, "{\"scanning\":true}", HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
+    }
+    httpd_resp_send(req, "[]", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -3571,6 +3842,13 @@ void netprov_dns_task(void *arg)
 /* ------------------------------------------------------------------ */
 esp_err_t netprov_start_portal(const struct netprov_config *cfg, char *ap_ip_out)
 {
+    if (!s_radio_gate) return ESP_ERR_INVALID_STATE;
+    /* Do not wait behind a potentially long connect attempt on the main task.
+     * Its caller already retries the portal request; returning busy also keeps
+     * a scan's mode and result ownership intact. */
+    if (xSemaphoreTake(s_radio_gate, 0) != pdTRUE)
+        return ESP_ERR_INVALID_STATE;
+
     s_portal_mode = true;
     s_connecting = false;
     link_mark_down();
@@ -3588,9 +3866,14 @@ esp_err_t netprov_start_portal(const struct netprov_config *cfg, char *ap_ip_out
     };
     memcpy(ap_cfg.ap.ssid, s_ap_ssid, ap_cfg.ap.ssid_len);
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err == ESP_OK) err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    if (err == ESP_OK) err = esp_wifi_start();
+    if (err != ESP_OK) {
+        s_portal_mode = false;
+        xSemaphoreGive(s_radio_gate);
+        return err;
+    }
 
     esp_netif_ip_info_t ip_info;
     esp_netif_get_ip_info(s_netif_ap, &ip_info);
@@ -3602,6 +3885,7 @@ esp_err_t netprov_start_portal(const struct netprov_config *cfg, char *ap_ip_out
     ESP_LOGI(TAG, "SoftAP '%s' up at " IPSTR, s_ap_ssid, IP2STR(&ip_info.ip));
 
     psram_task_create(netprov_dns_task, "dns", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    xSemaphoreGive(s_radio_gate);
     return start_webserver();
 }
 

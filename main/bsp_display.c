@@ -86,6 +86,7 @@ static esp_timer_handle_t s_wake_timer = NULL;
 static bool s_temporarily_awake = false;
 
 static const char *TAG = "bsp_display";
+static void (*s_setup_callback)(void) = NULL;
 
 /* Forward declarations */
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b);
@@ -2140,4 +2141,23 @@ void bsp_display_push_metrics(float pressure_cmh2o, float respiratory_rate,
     (void)pressure_cmh2o;
     (void)respiratory_rate;
     (void)flow_limitation;
+}
+
+esp_err_t bsp_display_start_first_run_setup(esp_err_t initial_card_result)
+{
+    (void)initial_card_result;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+bool bsp_display_first_run_setup_active(void)
+{
+    return false;
+}
+
+void bsp_display_set_setup_callback(void (*callback)(void))
+{
+    /* The 1.54-inch target enters setup with its physical BOOT button. Keep
+     * the hook for a uniform BSP contract and future touch revisions. */
+    s_setup_callback = callback;
+    (void)s_setup_callback;
 }

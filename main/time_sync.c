@@ -235,6 +235,7 @@ static esp_err_t do_set_ntp_server(void *arg)
 
 esp_err_t time_sync_set_ntp_server(const char *server)
 {
+    if (server && (strlen(server) >= NTP_SRV_MAX || strpbrk(server, " /\\:@?#\r\n"))) return ESP_ERR_INVALID_ARG;
     /* Delegate the flash write so callers on a PSRAM stack (httpd) are safe. */
     esp_err_t err = nvs_writer_run(do_set_ntp_server, (void *)server);
     if (err == ESP_OK) {

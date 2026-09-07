@@ -25,3 +25,11 @@ save progress through the native controller. Run
 `python3 scripts/test-qemu-logs.py` after building this exact checkout, or capture
 `--interaction-state logs` with `scripts/capture-qemu-ui.py`.
 QEMU save and disconnect fixtures do not establish physical card persistence.
+
+## First-run setup
+
+Tap the QEMU clock or capture `--interaction-state setup-wifi` to open a fresh
+simulated setup run. Normal emulator boot seeds finished setup so ordinary
+captures remain deterministic. Setup owns its worker, durable state and native
+screen independently of the later Manage configuration and maintenance views.
+The host runner generates `main/zones.json` before timezone catalogue tests.

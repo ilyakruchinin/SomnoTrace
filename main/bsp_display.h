@@ -122,4 +122,10 @@ esp_err_t bsp_display_qemu_start_setup_preview(void);
 
 void bsp_display_enable_touch_services(bool as11_ready, bool oximeter_ready);
 void bsp_display_restart_idle_timeout(void);
+
+esp_err_t bsp_display_start_first_run_setup(esp_err_t initial_card_result);
+
+bool bsp_display_first_run_setup_active(void);
+
+/* Request setup through the board-appropriate input surface. */
 void bsp_display_set_setup_callback(void (*callback)(void));

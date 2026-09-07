@@ -314,3 +314,9 @@ and `scripts/run-qemu-ui.sh --board 7b|154`. See [QEMU validation and captures](
 The 7B native Home screen adds bedside typography, live flow and fresh scalar
 metrics, status details, and Screen off with wake-only touch. Display timeout
 settings are available through the existing web portal.
+
+On first boot, tap **Start setup** on the touchscreen. The checklist walks
+through Wi-Fi, time and clock, AirSense, microSD, alerts, and uploads. Enable
+AirSense pairing before entering its four-digit code, confirm the card is
+ready, then finish on **Ready** to open Home. The web dashboard remains
+available at `http://somnotrace.local`.

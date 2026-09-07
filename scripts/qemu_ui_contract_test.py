@@ -22,8 +22,8 @@ for marker in ('WAVESHARE_7B_H_RES','WAVESHARE_7B_V_RES','QEMU_RGB_TOUCH_POSITIO
     assert marker in board,marker
 for path in ('main/main_qemu.c','main/main_qemu_154.c'):
     demo=source(path)
-    forbidden_features = ('first_run_setup','touch_history','touch_maintenance')
-    if path.endswith('_154.c'): forbidden_features += ('touch_logs',)
+    forbidden_features = ('touch_history','touch_maintenance')
+    if path.endswith('_154.c'): forbidden_features += ('first_run_setup','touch_logs')
     for forbidden in forbidden_features + ('as11_ble_init','net_provision_init','sd_storage_init'):
         assert forbidden not in demo,(path,forbidden)
 setup=source('scripts/setup-qemu-macos.sh')
