@@ -312,10 +312,16 @@ esp_err_t edf_convert_snt_to_edf(const char *snt_path, const char *edf_path,
             if (snt2) fclose(snt2);
             return ESP_FAIL;
         }
+        esp_err_t written = ESP_OK;
         if (edf_write_header(edf, patient_id, recording_id,
                              start_date, start_time,
-                             0, record_dur, "EDF", sig, n_signals) < 0 ||
-            edf_finalize_atomic_file(edf, tmp_path, edf_path) != ESP_OK) {
+                             0, record_dur, "EDF", sig, n_signals) < 0) {
+            edf_discard_atomic_file(edf, tmp_path);
+            written = ESP_FAIL;
+        } else {
+            written = edf_finalize_atomic_file(edf, tmp_path, edf_path);
+        }
+        if (written != ESP_OK) {
             ESP_LOGE(TAG, "cannot write %s: %s", edf_path, strerror(errno));
             free(spr); free(sig);
             fclose(snt);

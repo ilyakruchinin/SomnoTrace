@@ -143,7 +143,9 @@ upload_day_t *upload_index_day_at(int i);
 
 /* Forget one day entirely: deletes its state file and drops it from the
  * index, so every group in it is re-uploaded.  Used when a day's export is
- * regenerated (rebuild-day) and the files on the card have been replaced. */
+ * regenerated (rebuild-day) and the files on the card have been replaced.
+ * Returns failure and retains RAM state if deletion fails; an already absent
+ * state file is success. Caller owns storage access and scheduler serialization. */
 esp_err_t upload_index_forget_day(uint32_t day);
 
 /* ── Persistence ──────────────────────────────────────────────────── */
@@ -164,7 +166,7 @@ esp_err_t upload_index_save_all(void);
 uint64_t upload_index_bundle_ok_fp(int slot);
 
 /* Record that the bundle at fingerprint fp uploaded successfully. */
-void upload_index_set_bundle_ok(int slot, uint64_t fp);
+esp_err_t upload_index_set_bundle_ok(int slot, uint64_t fp);
 
 /* ── Aggregates for the progress API ────────────────────────────────── */
 

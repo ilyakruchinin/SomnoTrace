@@ -48,6 +48,7 @@ static const char *TAG = "up_sched";
 
 #define SCAN_INTERVAL_MS      600000   /* 10 min self-healing scan          */
 #define FIRST_SCAN_DELAY_MS    60000   /* let Wi-Fi/NTP settle after boot   */
+#define INVALIDATION_POLL_MS    1000   /* queue loss/restart never loses work */
 #define FAILS_BEFORE_SWITCH        2   /* then move to the next backend     */
 #define LEASE_WAIT_MS           5000
 
@@ -107,9 +108,12 @@ typedef struct {
 
 static QueueHandle_t s_queue;
 static TaskHandle_t  s_task;
-static SemaphoreHandle_t s_lock;      /* guards s_rt + s_status for the API */
+static SemaphoreHandle_t s_lock;      /* guards API-visible runtime snapshots + status */
 
 static upload_sched_busy_fn_t s_busy_fn;
+static uploader_invalidation_next_fn_t s_invalidation_next;
+static uploader_invalidation_ack_fn_t s_invalidation_ack;
+static int64_t s_next_invalidation_poll_us;
 
 /* "Test connection" probe claim (#214.1), guarded by s_lock like s_rt.  The
  * timestamp is not decoration: it is what stops a probe that never released
@@ -121,9 +125,11 @@ static int64_t s_probe_since_us;
 
 static int64_t s_next_scan_us;
 static bool    s_scanning;
-static int s_progress_max_days;
-static int s_summary_pending;
 static char    s_status[64] = "Starting up";
+static int     s_progress_max_days;
+/* Updated only by the scheduler after a leased reconciliation pass. Status
+ * readers must never walk or mutate the card merely to render a badge. */
+static int     s_summary_pending;
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -289,10 +295,10 @@ static void refresh_index_progress_cache(void)
 }
 
 static void ox_mark_day_failed(upload_ox_ref_t *refs, int n_refs, int slot,
-                               const char *day)
+                               const char *day, const bool *newly_ok)
 {
     for (int i = 0; i < n_refs; i++) {
-        if (strcmp(refs[i].day, day) != 0) continue;
+        if (!newly_ok[i] || strcmp(refs[i].day, day) != 0) continue;
         if (upload_ox_status(&refs[i], slot) == UG_OK)
             upload_ox_mark(&refs[i], slot, UG_FAILED, NULL);
     }
@@ -304,6 +310,12 @@ static void ox_mark_day_failed(upload_ox_ref_t *refs, int n_refs, int slot,
 static bool run_backend(backend_rt_t *r, int max_days)
 {
     const upload_backend_t *be = r->be;
+    if (uploader_should_cancel()) return false;
+    if (be->prepare && be->prepare() != UPLOAD_OK) {
+        if (be->session_end) be->session_end();
+        if (!uploader_should_cancel()) cooldown_enter(r, "cannot prepare connection", false);
+        return false;
+    }
 
     /* Which days still have pending groups for this backend? Newest first,
      * which is the order the index already keeps. */
@@ -326,6 +338,14 @@ static bool run_backend(backend_rt_t *r, int max_days)
         }
     }
 
+    /* Protect only the card-backed discovery pass. Network setup and transfer
+     * finalization must not hold the SD lease. */
+    if (!uploader_lease_take(LEASE_WAIT_MS)) {
+        if (be->session_end) be->session_end();
+        ESP_LOGI(TAG, "%s: storage busy, deferring", be->id);
+        return false;
+    }
+
     /* Bundle changes on every export (STR.edf is cumulative), so a changed
      * bundle alone is reason enough to connect for SMB. */
     upload_bundle_ref_t bundle;
@@ -333,9 +353,22 @@ static bool run_backend(backend_rt_t *r, int max_days)
     bool bundle_changed = have_bundle &&
                           (upload_index_bundle_ok_fp(r->slot) != bundle.fp);
     upload_ox_ref_t *ox_refs = heap_caps_malloc(sizeof(upload_ox_ref_t) * UPLOAD_OX_MAX_UNITS, MALLOC_CAP_SPIRAM);
-    if (!ox_refs) { set_be_state(r, SB_IDLE); return false; }
+    if (!ox_refs) {
+        uploader_lease_give();
+        if (be->session_end) be->session_end();
+        set_be_state(r, SB_IDLE);
+        return false;
+    }
     int n_ox = upload_ox_reconcile(ox_refs, UPLOAD_OX_MAX_UNITS, max_days);
+    if (n_ox < 0 || uploader_should_cancel()) {
+        free(ox_refs);
+        uploader_lease_give();
+        if (be->session_end) be->session_end();
+        set_be_state(r, SB_IDLE);
+        return false;
+    }
     int ox_pending = upload_ox_pending(ox_refs, n_ox, r->slot);
+    uploader_lease_give();
 
     if (n_days == 0 && !bundle_changed && ox_pending == 0) {
         free(ox_refs);
@@ -343,6 +376,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
         xSemaphoreTake(s_lock, portMAX_DELAY);
         r->cur_day[0] = '\0';
         xSemaphoreGive(s_lock);
+        if (be->session_end) be->session_end();
         return false;
     }
     if (!have_bundle && (n_days > 0 || bundle_changed)) {
@@ -350,6 +384,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
          * packages are self-contained and may upload before any EDF exists. */
         free(ox_refs);
         set_be_state(r, SB_IDLE);
+        if (be->session_end) be->session_end();
         return false;
     }
 
@@ -363,6 +398,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
                      "next session upload", be->id);
             free(ox_refs);
             set_be_state(r, SB_IDLE);
+            if (be->session_end) be->session_end();
             return false;
         }
 
@@ -384,6 +420,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
                      "them to — nothing to do", be->id);
             free(ox_refs);
             set_be_state(r, SB_IDLE);
+            if (be->session_end) be->session_end();
             return false;
         }
         days[n_days++] = attach;
@@ -409,7 +446,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
 
     upload_result_t res = be->session_begin ? be->session_begin() : UPLOAD_OK;
     if (res != UPLOAD_OK) {
-        cooldown_enter(r, res == UPLOAD_ERR_PERMANENT ? "auth/config rejected"
+        if (!uploader_should_cancel()) cooldown_enter(r, res == UPLOAD_ERR_PERMANENT ? "auth/config rejected"
                                                       : "cannot connect",
                        res == UPLOAD_ERR_PERMANENT);
         if (be->session_end) be->session_end();
@@ -433,7 +470,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
         return false;
     }
 
-    for (int di = 0; di < n_days && fails < FAILS_BEFORE_SWITCH; di++) {
+    for (int di = 0; di < n_days && !uploader_should_cancel() && fails < FAILS_BEFORE_SWITCH; di++) {
         char daystr[12];
         snprintf(daystr, sizeof(daystr), "%08u", (unsigned)days[di]);
         /* Read by the progress endpoint on the httpd task. */
@@ -458,6 +495,10 @@ static bool run_backend(backend_rt_t *r, int max_days)
         }
 
         int n_refs = upload_scan_day_groups(daystr, refs, UPLOAD_MAX_GROUPS_PER_DAY);
+        if (n_refs < 0 || uploader_should_cancel()) {
+            uploader_lease_give();
+            break;
+        }
         if (n_refs == 0) {
             /* Files disappeared since the last scan; the next scan will drop
              * the day from the index. */
@@ -476,7 +517,8 @@ static bool run_backend(backend_rt_t *r, int max_days)
         }
 
         bool day_any = false;
-        for (int gi = 0; gi < n_refs && fails < FAILS_BEFORE_SWITCH; gi++) {
+        bool newly_ok[UPLOAD_MAX_GROUPS_PER_DAY] = {0};
+        for (int gi = 0; gi < n_refs && !uploader_should_cancel() && fails < FAILS_BEFORE_SWITCH; gi++) {
             upload_group_t *g = upload_index_group(d, refs[gi].prefix_sec, false);
             if (!g || g->be[r->slot].status == UG_OK) continue;
 
@@ -487,12 +529,11 @@ static bool run_backend(backend_rt_t *r, int max_days)
             if (res == UPLOAD_OK) {
                 /* Only now is the unit durable-good: every file landed. */
                 g->be[r->slot].status = UG_OK;
+                newly_ok[g - d->groups] = true;
                 day_any = true;
                 any_ok = true;
                 xSemaphoreTake(s_lock, portMAX_DELAY);
                 r->cur_unit++;
-                xSemaphoreGive(s_lock);
-                xSemaphoreTake(s_lock, portMAX_DELAY);
                 r->last_ok_s = now_s();
                 xSemaphoreGive(s_lock);
             } else {
@@ -512,7 +553,7 @@ static bool run_backend(backend_rt_t *r, int max_days)
          * inside the import) or when it changed (SMB). */
         bool bundle_ok = true;
         bool bundle_pushed = false;
-        if (day_any || bundle_changed) {
+        if (!uploader_should_cancel() && (day_any || bundle_changed)) {
             res = be->put_bundle ? be->put_bundle(daystr, &bundle, bundle_changed)
                                  : UPLOAD_OK;
             bundle_pushed = true;
@@ -529,7 +570,8 @@ static bool run_backend(backend_rt_t *r, int max_days)
          * (shq_wait_import can take up to 60s) does not block session exports. */
         uploader_lease_give();
 
-        res = be->day_end ? be->day_end(daystr, day_any) : UPLOAD_OK;
+        res = uploader_should_cancel() ? UPLOAD_CANCELLED :
+              (be->day_end ? be->day_end(daystr, day_any) : UPLOAD_OK);
         if (res != UPLOAD_OK) {
             /* Finalisation failed (e.g. SleepHQ process_files): the files may
              * be there but the import is not processed, so do not claim the
@@ -537,15 +579,27 @@ static bool run_backend(backend_rt_t *r, int max_days)
             ESP_LOGW(TAG, "%s: finalise failed for %s — day stays pending",
                      be->id, daystr);
             for (int g = 0; g < d->n_groups; g++) {
-                if (d->groups[g].be[r->slot].status == UG_OK)
-                    d->groups[g].be[r->slot].status = UG_PENDING;
+                if (newly_ok[g]) d->groups[g].be[r->slot].status = UG_PENDING;
             }
             bundle_ok = false;
             fails++;
             set_be_error(r, "remote finalise failed");
         }
 
-        upload_index_save_day(d);
+        bool day_state_saved = false;
+        if (uploader_lease_take(LEASE_WAIT_MS)) {
+            day_state_saved = upload_index_save_day(d) == ESP_OK;
+            uploader_lease_give();
+        }
+        if (!day_state_saved) {
+            for (int g = 0; g < d->n_groups; g++) {
+                if (newly_ok[g]) d->groups[g].be[r->slot].status = UG_PENDING;
+            }
+            d->dirty = true;
+            bundle_ok = false;
+            fails++;
+            set_be_error(r, "upload state save failed");
+        }
 
         /* The bundle counts as delivered only once a day that carried it also
          * finalised cleanly (for SleepHQ that means its import was processed). */
@@ -555,17 +609,21 @@ static bool run_backend(backend_rt_t *r, int max_days)
     /* Oximetry packages are self-contained and are tracked independently from
      * EDF groups. A backend connection is reused, but each noon-day gets its
      * own transport scope so SleepHQ can create one O2 import per day. */
-    if (ox_pending > 0 && be->put_oximetry) {
+    if (!uploader_should_cancel() && ox_pending > 0 && be->put_oximetry) {
         char ox_day[12] = {0};
+        bool newly_ok[UPLOAD_OX_MAX_UNITS] = {0};
         bool ox_day_any = false;
-        for (int oi = 0; oi < n_ox && fails < FAILS_BEFORE_SWITCH; oi++) {
+        for (int oi = 0; oi < n_ox && !uploader_should_cancel() && fails < FAILS_BEFORE_SWITCH; oi++) {
             if (upload_ox_status(&ox_refs[oi], r->slot) == UG_OK) continue;
             if (strcmp(ox_day, ox_refs[oi].day) != 0) {
                 if (ox_day_any && (be->ox_day_end || be->day_end)) {
-                    res = be->ox_day_end ? be->ox_day_end(ox_day, true) :
-                          be->day_end(ox_day, true);
+                    res = uploader_should_cancel() ? UPLOAD_CANCELLED :
+                          (be->ox_day_end ? be->ox_day_end(ox_day, true) : be->day_end(ox_day, true));
                     if (res != UPLOAD_OK) {
-                        ox_mark_day_failed(ox_refs, n_ox, r->slot, ox_day);
+                        if (uploader_lease_take(LEASE_WAIT_MS)) {
+                            ox_mark_day_failed(ox_refs, n_ox, r->slot, ox_day, newly_ok);
+                            uploader_lease_give();
+                        }
                         fails++;
                         set_be_error(r, "oximetry finalise failed");
                     }
@@ -592,16 +650,15 @@ static bool run_backend(backend_rt_t *r, int max_days)
                 continue;
             }
             res = be->put_oximetry(&ox_refs[oi]);
-            uploader_lease_give();
             upload_ox_mark(&ox_refs[oi], r->slot,
                            res == UPLOAD_OK ? UG_OK : UG_FAILED, NULL);
+            uploader_lease_give();
             if (res == UPLOAD_OK) {
+                newly_ok[oi] = true;
                 ox_day_any = true;
                 any_ok = true;
                 xSemaphoreTake(s_lock, portMAX_DELAY);
                 r->cur_unit++;
-                xSemaphoreGive(s_lock);
-                xSemaphoreTake(s_lock, portMAX_DELAY);
                 r->last_ok_s = now_s();
                 xSemaphoreGive(s_lock);
             } else {
@@ -611,10 +668,13 @@ static bool run_backend(backend_rt_t *r, int max_days)
             }
         }
         if (ox_day_any && ox_day[0] && (be->ox_day_end || be->day_end)) {
-            res = be->ox_day_end ? be->ox_day_end(ox_day, true) :
-                  be->day_end(ox_day, true);
+            res = uploader_should_cancel() ? UPLOAD_CANCELLED :
+                  (be->ox_day_end ? be->ox_day_end(ox_day, true) : be->day_end(ox_day, true));
             if (res != UPLOAD_OK) {
-                ox_mark_day_failed(ox_refs, n_ox, r->slot, ox_day);
+                if (uploader_lease_take(LEASE_WAIT_MS)) {
+                    ox_mark_day_failed(ox_refs, n_ox, r->slot, ox_day, newly_ok);
+                    uploader_lease_give();
+                }
                 fails++;
                 set_be_error(r, "oximetry finalise failed");
             }
@@ -624,16 +684,27 @@ static bool run_backend(backend_rt_t *r, int max_days)
     free(refs);
     free(ox_refs);
     if (be->session_end) be->session_end();
-
     if (bundle_committed) {
-        upload_index_set_bundle_ok(r->slot, bundle.fp);
+        if (uploader_lease_take(LEASE_WAIT_MS)) {
+            esp_err_t saved = upload_index_set_bundle_ok(r->slot, bundle.fp);
+            uploader_lease_give();
+            if (saved != ESP_OK) bundle_committed = false;
+        } else {
+            bundle_committed = false;
+        }
+        if (!bundle_committed) {
+            fails++;
+            set_be_error(r, "bundle state save deferred");
+        }
     }
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     r->cur_day[0] = '\0';
     xSemaphoreGive(s_lock);
 
-    if (fails > 0) {
+    if (uploader_should_cancel()) {
+        set_be_state(r, SB_IDLE);
+    } else if (fails > 0) {
         if (r->state != SB_COOLDOWN)
             cooldown_enter(r, r->err[0] ? r->err : "upload failed", false);
     } else if (!any_ok && !bundle_committed) {
@@ -749,19 +820,36 @@ static void run_pass(void)
 
 /* ── Task ─────────────────────────────────────────────────────────── */
 
-/* Reconcile one day's exported files against the index.  Holds the storage
- * lease: the reconcile walks the card with opendir()/readdir(), and without
- * the lease it can run while sd_storage_format() is calling f_mkfs on the same
- * volume, which corrupts the SDMMC driver and panics this task. */
-static void reconcile_day_leased(uint32_t day)
+/* One bounded metadata transaction per scheduler boundary. No backend owns
+ * index pointers here. Storage callbacks take their own short EXPORT gate;
+ * the index mutation takes a separate zero-wait UPLOAD gate. Exact tokens
+ * keep a newer publication safe between those transactions. */
+static bool service_pending_invalidation(void)
 {
-    if (!uploader_lease_take(LEASE_WAIT_MS)) {
-        ESP_LOGD(TAG, "reconcile deferred: storage busy");
-        return;
-    }
-    upload_scan_reconcile_day(day);
-    refresh_index_progress_cache();
+    if (!s_invalidation_next || !s_invalidation_ack || uploader_should_cancel())
+        return false;
+    uint32_t day = 0;
+    char token[UPLOADER_INVALIDATION_TOKEN_CAP] = {0};
+    if (!s_invalidation_next(&day, token, sizeof(token))) return false;
+    if (!day || !token[0] || !memchr(token, '\0', sizeof(token))) return false;
+    if (!uploader_lease_take(0)) return false;
+    esp_err_t ret = uploader_should_cancel() ? ESP_ERR_INVALID_STATE
+                                             : upload_index_forget_day(day);
     uploader_lease_give();
+    if (ret != ESP_OK || uploader_should_cancel()) return false;
+    ret = s_invalidation_ack(day, token);
+    if (ret != ESP_OK) return false;  /* durable owner retains this token */
+    refresh_index_progress_cache();
+    set_next_scan(0);  /* same filenames must be discovered as new groups */
+    return true;
+}
+
+static void poll_pending_invalidation(void)
+{
+    if (!s_invalidation_next || !s_invalidation_ack ||
+        now_us() < s_next_invalidation_poll_us) return;
+    service_pending_invalidation();
+    s_next_invalidation_poll_us = now_us() + (int64_t)INVALIDATION_POLL_MS * 1000;
 }
 
 static void do_scan(void)
@@ -822,8 +910,12 @@ static void sched_task(void *arg)
     set_status("Waiting for first scan");
 
     while (1) {
-        /* Sleep until the next scan or the earliest cooldown expiry. */
+        poll_pending_invalidation();
+        /* A poll-only wake must not start a network/upload scan. */
         int64_t wake_us = s_next_scan_us;
+        if (s_invalidation_next && s_invalidation_ack &&
+            s_next_invalidation_poll_us < wake_us)
+            wake_us = s_next_invalidation_poll_us;
         for (int i = 0; i < s_n_rt; i++) {
             if (s_rt[i].state == SB_COOLDOWN && s_rt[i].retry_at_us > 0 &&
                 s_rt[i].retry_at_us < wake_us) {
@@ -840,17 +932,11 @@ static void sched_task(void *arg)
         if (got) {
             switch (ev.type) {
             case EV_EXPORT:
-                ESP_LOGI(TAG, "export complete for %08u", (unsigned)ev.day);
-                reconcile_day_leased(ev.day);
-                run_pass();
-                break;
-
             case EV_INVALIDATE:
-                ESP_LOGI(TAG, "day %08u invalidated — will re-upload",
-                         (unsigned)ev.day);
-                upload_index_forget_day(ev.day);
-                reconcile_day_leased(ev.day);
-                run_pass();
+                /* Persisted work, not this lossy queue, authorizes invalidation.
+                 * Run it at the next safe boundary before any transfer. */
+                s_next_invalidation_poll_us = 0;
+                set_next_scan(0);
                 break;
 
             case EV_RESET:
@@ -878,7 +964,12 @@ static void sched_task(void *arg)
             continue;
         }
 
-        /* Timed out: either a scan is due or a cooldown expired. */
+        /* A durable-token polling deadline is independent of network work. */
+        bool run_due = false;
+        for (int i = 0; i < s_n_rt; i++) {
+            if (s_rt[i].state == SB_COOLDOWN && s_rt[i].retry_at_us > 0 &&
+                now_us() >= s_rt[i].retry_at_us) run_due = true;
+        }
         if (now_us() >= s_next_scan_us) {
             if (s_busy_fn && s_busy_fn()) {
                 /* A therapy recording has priority over a housekeeping scan;
@@ -888,13 +979,25 @@ static void sched_task(void *arg)
                 set_next_scan(now_us() + (int64_t)SCAN_INTERVAL_MS * 1000);
             } else {
                 do_scan();
+                run_due = true;
             }
         }
-        run_pass();
+        if (run_due) run_pass();
     }
 }
 
 /* ── Public API ───────────────────────────────────────────────────── */
+
+void upload_sched_set_invalidation_hooks(uploader_invalidation_next_fn_t next,
+                                         uploader_invalidation_ack_fn_t ack)
+{
+    if (s_task) {
+        ESP_LOGE(TAG, "invalidation hooks must be registered before scheduler startup");
+        return;
+    }
+    s_invalidation_next = next;
+    s_invalidation_ack = ack;
+}
 
 esp_err_t upload_sched_init(void)
 {
@@ -902,7 +1005,12 @@ esp_err_t upload_sched_init(void)
 
     s_lock = xSemaphoreCreateMutex();
     s_queue = xQueueCreate(SCHED_QUEUE_LEN, sizeof(sched_ev_t));
-    upload_ox_init();
+    if (uploader_lease_take(LEASE_WAIT_MS)) {
+        upload_ox_init();
+        uploader_lease_give();
+    } else {
+        ESP_LOGW(TAG, "O2 upload state init deferred: storage busy");
+    }
     if (!s_lock || !s_queue) return ESP_ERR_NO_MEM;
 
     /* Pre-create runtime slots so the progress API can report a backend

@@ -58,6 +58,7 @@
 
 typedef enum {
     UPLOAD_OK = 0,          /* transferred, or deliberately skipped         */
+    UPLOAD_CANCELLED,       /* recording admission requested; leave pending */
     UPLOAD_NOT_CONFIGURED,  /* backend has no valid config — skipped        */
     UPLOAD_ERR_TRANSIENT,   /* timeout / unreachable / 5xx — retry later    */
     UPLOAD_ERR_PERMANENT,   /* auth rejected / 4xx — retry, but surface it  */
@@ -89,6 +90,9 @@ typedef struct {
 
     /* Check if this backend has valid configuration (config keys in NVS). */
     bool (*is_configured)(void);
+
+    /* Resolve names before taking any SD lease. No card access here. */
+    upload_result_t (*prepare)(void);
 
     /* Open the connection: TCP/SMB session or TLS + auth. */
     upload_result_t (*session_begin)(void);
@@ -168,17 +172,35 @@ struct uploader_config_s {
  * Call once at boot after nvs_flash_init() and sd_storage_init(). */
 esp_err_t uploader_init(void);
 
-/* ── Event triggers ───────────────────────────────────────────────────
- * All are safe to call from any task; they only post to the scheduler. */
+/* Durable export invalidation handoff. Register before uploader_init().
+ * The app owns persisted work and stable generation tokens (not RAM queue
+ * entries). next returns one pending day/token without consuming it; ack
+ * retires only that exact token and returns failure if it cannot do so.
+ * Both callbacks run on the scheduler outside its storage lease and must
+ * use bounded, nonblocking storage admission of their own. They must not
+ * perform network work or wait for this scheduler. The scheduler takes a
+ * separate zero-wait lease to delete old index state, releases it, then ack's.
+ * A reset at any boundary repeats invalidation safely before acknowledgement. */
+#define UPLOADER_INVALIDATION_TOKEN_CAP 128
+typedef bool (*uploader_invalidation_next_fn_t)(uint32_t *day, char *token,
+                                               size_t token_cap);
+typedef esp_err_t (*uploader_invalidation_ack_fn_t)(uint32_t day, const char *token);
+void uploader_set_invalidation_hooks(uploader_invalidation_next_fn_t next,
+                                      uploader_invalidation_ack_fn_t ack);
 
-/* An export finished for this noon-day.  The day is rescanned and only the
- * groups that are new (or previously failed) are uploaded — unlike the old
- * day-level tracker, an already-uploaded session is not re-sent. */
+/* ── Event triggers ───────────────────────────────────────────────────
+ * All are safe to call from any task; they only nudge the scheduler.
+ * Persist invalidation work before posting. A full queue or restart is
+ * repaired by periodic polling of the durable handoff, not by queue replay. */
+
+/* An export finished for this noon-day. Rescan after servicing the persisted
+ * invalidation token, so changed samples under existing filenames are offered
+ * again as well as new groups. Delivery is intentionally at least once. */
 void uploader_on_export_complete(const char *day_folder);
 
-/* This day's exported files were replaced (rebuild-day / recreate-edfs), so
- * whatever a backend holds for it is stale.  Drops the day's tracking state
- * so every group in it is uploaded again. */
+/* This day's exported files were replaced (rebuild-day / recreate-edfs).
+ * Nudge the durable handoff; the event itself never authorizes deletion or
+ * acknowledgement. The persisted day token causes every group to be offered. */
 void uploader_on_day_invalidated(const char *day_folder);
 
 /* Ask for an immediate reconciliation of the card against the tracking state
@@ -203,6 +225,13 @@ esp_err_t uploader_save_config(const uploader_config_t *cfg);
 typedef esp_err_t (*uploader_nvs_task_fn_t)(void *arg);
 typedef esp_err_t (*uploader_nvs_exec_fn_t)(uploader_nvs_task_fn_t fn, void *arg);
 void uploader_set_nvs_executor(uploader_nvs_exec_fn_t exec);
+
+/* Nonblocking recording-intent predicate, injected by the app. */
+typedef bool (*uploader_cancel_fn_t)(void);
+void uploader_set_cancel_fn(uploader_cancel_fn_t fn);
+bool uploader_should_cancel(void);
+/* Resolve to a numeric IPv4 address, only before storage admission. */
+bool uploader_resolve_host(const char *host, char *out, size_t out_size);
 
 /* Storage-lease hooks (injected for the same reason as the NVS executor:
  * this component does not depend on the app).

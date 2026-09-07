@@ -1389,6 +1389,7 @@ esp_err_t edf_gen_summary_json(const char *noon_day, char **out_json)
 
     cJSON_AddStringToObject(root, "day", noon_day);
     cJSON_AddNumberToObject(root, "sessions", ctx->n_session_entries);
+    cJSON_AddNumberToObject(root, "mask_off_count", ctx->n_session_entries);
     cJSON_AddNumberToObject(root, "usage_min", (double)usage_min);
 
     /* Indices (events/hr): raw × 0.01. -1 sentinel → null. */
@@ -1833,4 +1834,3 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
     free(str_sigs);
     return ESP_OK;
 }
-

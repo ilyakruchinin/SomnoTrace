@@ -34,7 +34,7 @@ def function_body(source: str, name: str) -> str:
 snapshot = function_body(SCHED, "upload_sched_progress_snapshot")
 refresh = function_body(SCHED, "refresh_index_progress_cache")
 init = function_body(SCHED, "upload_sched_init")
-invalidate = function_body(SCHED, "reconcile_day_leased")
+invalidate = function_body(SCHED, "service_pending_invalidation")
 scan = function_body(SCHED, "do_scan")
 run_pass = function_body(SCHED, "run_pass")
 sched_task = function_body(SCHED, "sched_task")

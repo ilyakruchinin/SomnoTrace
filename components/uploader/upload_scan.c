@@ -23,6 +23,7 @@
  */
 
 #include "upload_scan.h"
+#include "uploader.h"
 #include "upload_paths.h"
 
 #include <stdio.h>
@@ -88,6 +89,7 @@ int upload_scan_days(uint32_t *out_days, int max_out)
     int n = 0;
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL && n < max_out) {
+        if (uploader_should_cancel()) { closedir(d); return -1; }
         if (ent->d_name[0] == '.') continue;
         if (strlen(ent->d_name) != 8) continue;
         bool digits = true;
@@ -124,6 +126,7 @@ int upload_scan_day_groups(const char *day, upload_group_ref_t *out, int max_out
     int n_groups = 0;
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
+        if (uploader_should_cancel()) { closedir(d); return -1; }
         const char *nm = ent->d_name;
         size_t len = strlen(nm);
         if (len < 23 || len >= UPLOAD_FILENAME_LEN) continue;
@@ -206,7 +209,7 @@ static uint64_t fold_fp(uint64_t fp, const char *name, const char *path,
         if (!buf) buf = malloc(FP_CHUNK);
         if (buf) {
             size_t n;
-            while ((n = fread(buf, 1, FP_CHUNK, f)) > 0) {
+            while (!uploader_should_cancel() && (n = fread(buf, 1, FP_CHUNK, f)) > 0) {
                 crc = esp_rom_crc32_le(crc, buf, n);
             }
             free(buf);
@@ -233,6 +236,7 @@ bool upload_scan_bundle(upload_bundle_ref_t *out)
 
     bool have_str = false;
     for (int i = 0; root_names[i]; i++) {
+        if (uploader_should_cancel()) return false;
         char path[100];
         snprintf(path, sizeof(path), "%s/%s", SD_SDCARD_DIR, root_names[i]);
         struct stat st;
@@ -252,6 +256,7 @@ bool upload_scan_bundle(upload_bundle_ref_t *out)
     if (d) {
         struct dirent *ent;
         while ((ent = readdir(d)) != NULL) {
+            if (uploader_should_cancel()) { closedir(d); return false; }
             if (ent->d_name[0] == '.') continue;
             if (out->n_files >= UPLOAD_BUNDLE_MAX_FILES) break;
 
@@ -299,11 +304,12 @@ int upload_scan_reconcile_day(uint32_t day)
     if (!refs) return 0;
 
     int n = upload_scan_day_groups(daystr, refs, UPLOAD_MAX_GROUPS_PER_DAY);
+    if (n < 0 || uploader_should_cancel()) { free(refs); return -1; }
     if (n == 0) {
         /* Day folder gone or empty: forget it so state does not linger. */
         if (upload_index_day(day, false)) {
             ESP_LOGI(TAG, "day %s has no EDF groups — dropping state", daystr);
-            upload_index_forget_day(day);
+            if (upload_index_forget_day(day) != ESP_OK) { free(refs); return -1; }
         }
         free(refs);
         return 0;
@@ -369,6 +375,7 @@ int upload_scan_reconcile_all(int max_days, const int *slots, int n_slots)
     if (!days) return 0;
 
     int n_days = upload_scan_days(days, UPLOAD_MAX_DAYS_CAP);
+    if (n_days < 0 || uploader_should_cancel()) { free(days); return -1; }
 
     /* Only days that actually contain groups consume a window slot.  A folder
      * with no EDF files still gets reconciled (which drops any stale state for
@@ -376,7 +383,9 @@ int upload_scan_reconcile_all(int max_days, const int *slots, int n_slots)
      * of empty folders silently shrinks how much history is kept in sync. */
     int i = 0, with_data = 0, empty = 0;
     for (; i < n_days && with_data < max_days; i++) {
-        if (upload_scan_reconcile_day(days[i]) > 0) with_data++;
+        int count = upload_scan_reconcile_day(days[i]);
+        if (count < 0 || uploader_should_cancel()) { free(days); return -1; }
+        if (count > 0) with_data++;
         else empty++;
     }
 
@@ -384,7 +393,11 @@ int upload_scan_reconcile_all(int max_days, const int *slots, int n_slots)
      * progress denominator stay bounded. */
     int beyond = 0;
     for (; i < n_days; i++) {
-        if (upload_index_day(days[i], false)) upload_index_forget_day(days[i]);
+        if (uploader_should_cancel()) { free(days); return -1; }
+        if (upload_index_day(days[i], false) && upload_index_forget_day(days[i]) != ESP_OK) {
+            free(days);
+            return -1;
+        }
         beyond++;
     }
 
@@ -404,7 +417,7 @@ int upload_scan_reconcile_all(int max_days, const int *slots, int n_slots)
                 if (days[k] == d->day) { found = true; break; }
             }
             if (!found) {
-                upload_index_forget_day(d->day);
+                if (upload_index_forget_day(d->day) != ESP_OK) { free(days); return -1; }
                 orphaned++;
             }
         }

@@ -79,7 +79,7 @@
  *                    already NTP-timestamped and needs no adjustment.
  */
 /* Build a per-noon-day JSON summary (AHI/indices, usage, leak/pressure/EPAP/
- * resp-rate percentiles, session count) from that day's Summary spool, in
+ * resp-rate percentiles, session and mask-off counts) from that day's Summary spool, in
  * physical units matching STR.edf/OSCAR. On success returns ESP_OK and sets
  * *out_json to a malloc'd string (caller frees). Returns ESP_ERR_NOT_FOUND if
  * the day has no spool. noon_day is "YYYYMMDD". */
@@ -119,24 +119,25 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
  *
  * Generates every session of that day into a staging directory, and only
  * swaps it into place once all of them succeeded — so a partial failure
- * leaves the previous good export untouched.  Then runs the shared pass
- * once.  Takes the storage export lease for the whole operation, so it
+ * leaves the previous good export untouched. The shared pass also finishes
+ * in staging before publication.  Takes the storage export lease for the whole operation, so it
  * cannot run concurrently with another export, an upload of the same day,
  * or a destructive action.
  *
  * day_folder is "YYYYMMDD" (noon-based).  Returns ESP_OK only if the day
  * was fully rebuilt and published — the caller may then queue it for
  * upload. */
+/* Raw data is intact but this EDF profile cannot faithfully encode its gaps.
+ * Caller must retain durable export intent and avoid publishing/uploading it. */
+#define EDF_GEN_ERR_POSITION_GAPS (0x7e01)
+
 esp_err_t edf_gen_rebuild_day(const char *day_folder);
 
 /* Boot check: was a day rebuild interrupted while publishing?
  *
- * Publication deletes the live day and moves the staged files into place, so
- * a reset in that window leaves the day incomplete.  Returns true and fills
- * out_day (8 chars + NUL) when such a day is found, consuming the marker so
- * the caller owns the retry.  Call once at boot, before anything reads the
+ * Publication retains the prior day until the new day is installed; shared
+ * artifacts still require several file replacements, so reset can interrupt it.  Returns true and fills
+ * out_day (8 chars + NUL) when such a day is found. The marker is retained until
+ * a successful rebuild. Call once at boot, before anything reads the
  * export tree. */
 bool edf_gen_take_interrupted_rebuild(char *out_day, size_t out_len);
-
-/* Continuous EDF cannot represent positioned missing data; retain raw sources. */
-#define EDF_GEN_ERR_POSITION_GAPS (0x7e01)

@@ -161,6 +161,8 @@ void app_main(void)
     bsp_power_battery_monitor_start();
 
     /* 4. Initialise networking stack (includes NVS init). */
+    uploader_set_invalidation_hooks(session_writer_next_upload_invalidation,
+                                    session_writer_ack_upload_invalidation);
     ESP_ERROR_CHECK(netprov_init());
 
     /* 4a. Load device settings (brightness, LCD therapy mode) and apply.

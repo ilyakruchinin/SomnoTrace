@@ -22,8 +22,39 @@
  */
 
 #include "edf_header.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "edf_hdr";
+static esp_err_t s_source_error;
+static TaskHandle_t s_source_owner;
+
+static void source_error(esp_err_t err)
+{
+    if (__atomic_load_n(&s_source_owner, __ATOMIC_ACQUIRE) ==
+            xTaskGetCurrentTaskHandle() && s_source_error == ESP_OK) {
+        s_source_error = err;
+    }
+}
+
+void edf_source_error_begin(void)
+{
+    s_source_error = ESP_OK;
+    __atomic_store_n(&s_source_owner, xTaskGetCurrentTaskHandle(),
+                     __ATOMIC_RELEASE);
+}
+
+esp_err_t edf_source_error_end(void)
+{
+    TaskHandle_t current = xTaskGetCurrentTaskHandle();
+    esp_err_t result =
+        __atomic_load_n(&s_source_owner, __ATOMIC_ACQUIRE) == current
+            ? s_source_error : ESP_OK;
+    if (__atomic_load_n(&s_source_owner, __ATOMIC_ACQUIRE) == current) {
+        __atomic_store_n(&s_source_owner, NULL, __ATOMIC_RELEASE);
+    }
+    return result;
+}
 
 /* ════════════════════════════════════════════════════════════════════
  *  CRC functions
@@ -89,19 +120,45 @@ FILE *edf_open_atomic_file(const char *path, char *tmp_path, size_t tmp_path_len
     return fopen(tmp_path, "wb");
 }
 
+esp_err_t edf_publish_atomic_path(const char *tmp_path, const char *path)
+{
+    char backup[700];
+    int n = snprintf(backup, sizeof(backup), "%s.bak", path);
+    if (n < 0 || n >= (int)sizeof(backup)) {
+        errno = ENAMETOOLONG;
+        return ESP_FAIL;
+    }
+    struct stat st;
+    bool exists = stat(path, &st) == 0;
+    if (!exists && errno != ENOENT) return ESP_FAIL;
+    if (!exists) {
+        if (rename(backup, path) == 0) exists = true;
+        else if (errno != ENOENT) return ESP_FAIL;
+    }
+    if (exists) {
+        if (unlink(backup) != 0 && errno != ENOENT) return ESP_FAIL;
+        if (rename(path, backup) != 0) return ESP_FAIL;
+    }
+    if (rename(tmp_path, path) != 0) {
+        int first_error = errno;
+        if (exists) (void)rename(backup, path);
+        errno = first_error;
+        return ESP_FAIL;
+    }
+    if (exists) (void)unlink(backup);
+    return ESP_OK;
+}
+
 esp_err_t edf_finalize_atomic_file(FILE *f, const char *tmp_path, const char *path)
 {
     int saved_errno = 0;
-    if (fflush(f) != 0 || fsync(fileno(f)) != 0 || fclose(f) != 0) {
-        saved_errno = errno;
-        unlink(tmp_path);
-        errno = saved_errno;
-        return ESP_FAIL;
-    }
-    /* FATFS does not support rename-over-existing — remove target first. */
-    unlink(path);
-    if (rename(tmp_path, path) != 0) {
-        saved_errno = errno;
+    if (fflush(f) != 0) saved_errno = errno ? errno : EIO;
+    if (!saved_errno && fsync(fileno(f)) != 0)
+        saved_errno = errno ? errno : EIO;
+    if (fclose(f) != 0 && !saved_errno) saved_errno = errno ? errno : EIO;
+    if (!saved_errno && edf_publish_atomic_path(tmp_path, path) != ESP_OK)
+        saved_errno = errno ? errno : EIO;
+    if (saved_errno) {
         unlink(tmp_path);
         errno = saved_errno;
         return ESP_FAIL;
@@ -111,23 +168,42 @@ esp_err_t edf_finalize_atomic_file(FILE *f, const char *tmp_path, const char *pa
 
 void edf_discard_atomic_file(FILE *f, const char *tmp_path)
 {
+    int first_error = errno;
     if (f) fclose(f);
     if (tmp_path) unlink(tmp_path);
+    errno = first_error;
 }
 
 cJSON *edf_read_json_file(const char *path)
 {
-    FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc(fsize + 1);
-    if (!buf) { fclose(f); return NULL; }
-    size_t rd = fread(buf, 1, fsize, f);
-    buf[rd] = '\0';
-    fclose(f);
-    cJSON *json = cJSON_Parse(buf);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        if (errno != ENOENT) source_error(ESP_FAIL);
+        return NULL;
+    }
+    long size = -1;
+    if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+    char *buf = NULL;
+    if (size <= 0 || size > 1024 * 1024 || fseek(f, 0, SEEK_SET) != 0) {
+        source_error(ESP_FAIL);
+    } else {
+        buf = malloc((size_t)size + 1);
+        if (!buf) source_error(ESP_ERR_NO_MEM);
+        else if (fread(buf, 1, (size_t)size, f) != (size_t)size) {
+            source_error(ESP_FAIL);
+            free(buf);
+            buf = NULL;
+        } else {
+            buf[size] = '\0';
+        }
+    }
+    if (fclose(f) != 0) {
+        source_error(ESP_FAIL);
+        free(buf);
+        buf = NULL;
+    }
+    cJSON *json = buf ? cJSON_Parse(buf) : NULL;
+    if (buf && !json) source_error(ESP_FAIL);
     free(buf);
     return json;
 }
@@ -135,33 +211,50 @@ cJSON *edf_read_json_file(const char *path)
 esp_err_t edf_write_json_file(const char *path, const cJSON *json)
 {
     char *str = cJSON_Print(json);
-    if (!str) return ESP_FAIL;
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        free(str);
-        return ESP_FAIL;
+    if (!str) {
+        source_error(ESP_ERR_NO_MEM);
+        return ESP_ERR_NO_MEM;
     }
-    fputs(str, f);
-    fputc('\n', f);
-    fclose(f);
+    char tmp[700];
+    FILE *f = edf_open_atomic_file(path, tmp, sizeof(tmp));
+    esp_err_t ret = ESP_FAIL;
+    if (f) {
+        if (!edf_write_all(f, str, strlen(str))) edf_discard_atomic_file(f, tmp);
+        else ret = edf_finalize_atomic_file(f, tmp, path);
+    }
     free(str);
-    return ESP_OK;
+    if (ret != ESP_OK) source_error(ret);
+    return ret;
 }
 
 uint8_t *edf_read_bin_file(const char *path, size_t *out_len)
 {
+    if (out_len) *out_len = 0;
     FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (fsize <= 0) { fclose(f); return NULL; }
-    uint8_t *buf = malloc(fsize);
-    if (!buf) { fclose(f); return NULL; }
-    size_t rd = fread(buf, 1, fsize, f);
-    fclose(f);
-    if (rd != (size_t)fsize) { free(buf); return NULL; }
-    *out_len = (size_t)fsize;
+    if (!f) {
+        if (errno != ENOENT) source_error(ESP_FAIL);
+        return NULL;
+    }
+    long size = -1;
+    if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+    uint8_t *buf = NULL;
+    if (size < 0 || size > 1024 * 1024 || fseek(f, 0, SEEK_SET) != 0) {
+        source_error(ESP_FAIL);
+    } else if (size > 0) {
+        buf = malloc((size_t)size);
+        if (!buf) source_error(ESP_ERR_NO_MEM);
+        else if (fread(buf, 1, (size_t)size, f) != (size_t)size) {
+            source_error(ESP_FAIL);
+            free(buf);
+            buf = NULL;
+        }
+    }
+    if (fclose(f) != 0) {
+        source_error(ESP_FAIL);
+        free(buf);
+        buf = NULL;
+    }
+    if (buf && out_len) *out_len = (size_t)size;
     return buf;
 }
 

@@ -27,6 +27,7 @@
 #include "edf_waveform.h"
 #include "edf_annotations.h"
 #include "edf_summary.h"
+#include "session_writer.h"
 
 static const char *TAG = "edf_gen";
 
@@ -154,6 +155,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         sd_storage_lease_release(SD_LEASE_EXPORT);
         return ESP_ERR_INVALID_ARG;
     }
+    edf_source_error_begin();
     if (flags & EDF_GEN_PER_SESSION) {
         esp_err_t valid = validate_positioned_sources(session_dir, session_id);
         if (valid != ESP_OK) {
@@ -161,6 +163,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                      session_id, valid == EDF_GEN_ERR_POSITION_GAPS
                          ? "positioned_gaps_require_discontinuous_export"
                          : esp_err_to_name(valid));
+            (void)edf_source_error_end();
             sd_storage_lease_release(SD_LEASE_EXPORT);
             return valid;
         }
@@ -642,9 +645,15 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
      * below (cJSON_AddItemReferenceToObject does not transfer ownership). */
     if ((flags & EDF_GEN_SHARED) && settings) {
         cJSON *cs_root = cJSON_CreateObject();
-        cJSON_AddItemReferenceToObject(cs_root, "FlowGenerator", settings);
-        char *settings_str = cJSON_PrintUnformatted(cs_root);
-        cJSON_Delete(cs_root);
+        char *settings_str = NULL;
+        if (!cs_root) {
+            errors++;
+        } else {
+            cJSON_AddItemReferenceToObject(cs_root, "FlowGenerator", settings);
+            settings_str = cJSON_PrintUnformatted(cs_root);
+            cJSON_Delete(cs_root);
+            if (!settings_str) errors++;
+        }
         if (settings_str) {
             /* cJSON drops ".0" for integer-valued doubles (e.g. 7.0 → 7),
              * but AS11 preserves it for pressure/temperature fields.
@@ -654,7 +663,8 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                 "StartPressure", "MaxPressure", "MinPressure",
                 "SetPressure", "HeatedTubeTemperature", NULL
             };
-            for (int fi = 0; float_fields[fi]; fi++) {
+            bool settings_encode_ok = true;
+            for (int fi = 0; float_fields[fi] && settings_encode_ok; fi++) {
                 char pattern[64];
                 snprintf(pattern, sizeof(pattern), "\"%s\":", float_fields[fi]);
                 size_t plen = strlen(pattern);
@@ -680,6 +690,10 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                                     settings_str + insert_pos, tail_len);
                             settings_str[insert_pos] = '.';
                             settings_str[insert_pos + 1] = '0';
+                        } else {
+                            errors++;
+                            settings_encode_ok = false;
+                            break;
                         }
                         p = settings_str + insert_pos + 2;
                     } else {
@@ -687,6 +701,12 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                     }
                 }
             }
+            if (!settings_encode_ok) {
+                free(settings_str);
+                settings_str = NULL;
+            }
+        }
+        if (settings_str) {
             size_t slen = strlen(settings_str);
             char cs_path[300];
             char cs_crc_path[300];
@@ -754,8 +774,10 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
 
     ESP_LOGI(TAG, "=== EDF GENERATION DONE (%d errors) ===", errors);
 
+    esp_err_t source_result = edf_source_error_end();
     sd_storage_lease_release(SD_LEASE_EXPORT);
-    return errors > 0 ? ESP_FAIL : ESP_OK;
+    return source_result != ESP_OK ? source_result :
+           (errors > 0 ? ESP_FAIL : ESP_OK);
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -777,18 +799,10 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
 #define REBUILD_MAX_SESSIONS  64
 #define REBUILD_STAGING_DIR   SD_MOUNT_POINT "/SDCARD/.rebuild"
 
-/* Publish sentinel.
- *
- * Staging is failure-safe, but publication is not atomic: the live day is
- * deleted and the staged files are moved in one by one, and the shared
- * STR/Identification pass runs after that swap.  A reset in that window
- * leaves a day that looks published but is incomplete.
- *
- * The sentinel names the day currently being published and is removed only
- * after the whole rebuild succeeds.  A sentinel found at boot therefore means
- * "this day's export was interrupted", and the day is re-queued for an
- * automatic rebuild.  It is written outside the day folder because the day
- * folder itself is deleted during publication. */
+/* Publish sentinel. All conversion completes in staging before this is
+ * persisted. Same-volume directory publication plus several shared files is
+ * not one atomic filesystem operation; retain this durable intent until all
+ * installation steps succeed so a reset never reports an incomplete day done. */
 #define REBUILD_SENTINEL      SD_SDCARD_DIR "/.rebuilding"
 
 typedef struct {
@@ -832,8 +846,7 @@ static esp_err_t rebuild_move_dir(const char *src, const char *dst)
         char from[656], to[656];
         snprintf(from, sizeof(from), "%s/%s", src, ent->d_name);
         snprintf(to, sizeof(to), "%s/%s", dst, ent->d_name);
-        unlink(to);
-        if (rename(from, to) != 0) {
+        if (edf_publish_atomic_path(from, to) != ESP_OK) {
             ESP_LOGE(TAG, "rebuild: publish failed for %s: %s",
                      ent->d_name, strerror(errno));
             ret = ESP_FAIL;
@@ -845,35 +858,36 @@ static esp_err_t rebuild_move_dir(const char *src, const char *dst)
 }
 
 /* Read one session manifest into a rebuild descriptor. */
-static bool rebuild_read_manifest(const char *day_path, const char *fname,
+static esp_err_t rebuild_read_manifest(const char *day_path, const char *fname,
                                   rebuild_session_t *out)
 {
     const char *suffix = "_session.json";
     size_t slen = strlen(suffix), flen = strlen(fname);
-    if (flen <= slen || strcmp(fname + flen - slen, suffix) != 0) return false;
+    if (flen <= slen || strcmp(fname + flen - slen, suffix) != 0) return ESP_FAIL;
 
     size_t prefix_len = flen - slen;
-    if (prefix_len == 0 || prefix_len >= sizeof(out->session_id)) return false;
+    if (prefix_len == 0 || prefix_len >= sizeof(out->session_id)) return ESP_FAIL;
 
     char json_path[656];
     snprintf(json_path, sizeof(json_path), "%s/%s", day_path, fname);
     FILE *f = fopen(json_path, "r");
-    if (!f) return false;
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > 16384) { fclose(f); return false; }
+    if (!f) return ESP_FAIL;
+    long size = -1;
+    if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return ESP_FAIL; }
+    if (size <= 0 || size > 16384) { fclose(f); return ESP_FAIL; }
     char *buf = malloc(size + 1);
-    if (!buf) { fclose(f); return false; }
+    if (!buf) { fclose(f); return ESP_ERR_NO_MEM; }
     size_t rd = fread(buf, 1, size, f);
-    fclose(f);
+    int close_ret = fclose(f);
+    if (rd != (size_t)size || close_ret != 0) { free(buf); return ESP_FAIL; }
     buf[rd] = '\0';
 
     cJSON *j = cJSON_Parse(buf);
     free(buf);
     if (!j) {
-        ESP_LOGW(TAG, "rebuild: %s is not valid JSON, skipping", fname);
-        return false;
+        ESP_LOGW(TAG, "rebuild: %s is not valid JSON; refusing partial day", fname);
+        return ESP_FAIL;
     }
 
     bool ok = false;
@@ -891,8 +905,7 @@ static bool rebuild_read_manifest(const char *day_path, const char *fname,
 
             /* An unusable drift estimate is still better than 0 (which would
              * put every spool-sourced timestamp ~7-8 min out), but say so. */
-            /* Sessions rebuilt from a crash have partially damaged raw data by
-             * definition; the day rebuild treats their failures differently. */
+            /* State does not classify I/O/OOM failures as damaged source. */
             cJSON *jst = cJSON_GetObjectItem(j, "state");
             out->interrupted = (jst && cJSON_IsString(jst) &&
                                 strcmp(jst->valuestring, "interrupted") == 0);
@@ -912,7 +925,7 @@ static bool rebuild_read_manifest(const char *day_path, const char *fname,
         }
     }
     cJSON_Delete(j);
-    return ok;
+    return ok ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t edf_gen_rebuild_day(const char *day_folder)
@@ -941,15 +954,27 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
 
     int n = 0;
     bool truncated = false;
+    esp_err_t scan_error = ESP_OK;
     DIR *d = opendir(day_path);
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL) {
-            if (ent->d_type != DT_REG) continue;
+    if (!d) scan_error = errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    else {
+        while (1) {
+            errno = 0;
+            struct dirent *ent = readdir(d);
+            if (!ent) { if (errno) scan_error = ESP_FAIL; break; }
+            size_t len = strlen(ent->d_name);
+            if (len <= 13 || strcmp(ent->d_name + len - 13, "_session.json")) continue;
             if (n >= REBUILD_MAX_SESSIONS) { truncated = true; break; }
-            if (rebuild_read_manifest(day_path, ent->d_name, &sessions[n])) n++;
+            scan_error = rebuild_read_manifest(day_path, ent->d_name, &sessions[n]);
+            if (scan_error != ESP_OK) break;
+            n++;
         }
-        closedir(d);
+        if (closedir(d) != 0 && scan_error == ESP_OK) scan_error = ESP_FAIL;
+    }
+    if (scan_error != ESP_OK) {
+        free(sessions);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return scan_error;
     }
 
     if (truncated) {
@@ -986,7 +1011,6 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
     mkdir(REBUILD_STAGING_DIR, 0775);
 
     esp_err_t ret = ESP_OK;
-    int degraded = 0;
     for (int i = 0; i < n; i++) {
         ESP_LOGI(TAG, "rebuild %s: session %d/%d: %s",
                  day_folder, i + 1, n, sessions[i].session_id);
@@ -997,26 +1021,25 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
                                          sessions[i].clock_drift_ms,
                                          EDF_GEN_PER_SESSION);
         if (r != ESP_OK) {
-            if (sessions[i].interrupted) {
-                /* A crash-recovered fragment can be damaged in ways no amount
-                 * of retrying will fix.  Letting it veto the rebuild would
-                 * lose the whole night — every healthy session included — which
-                 * is a far worse outcome than exporting the night without this
-                 * one fragment.  Loud, not silent: the skipped session is named
-                 * here and counted in the completion line. */
-                ESP_LOGE(TAG, "rebuild %s: interrupted session %s could not be "
-                         "exported (%s) — SKIPPING it and continuing with the "
-                         "rest of the day", day_folder,
-                         sessions[i].session_id, esp_err_to_name(r));
-                degraded++;
-                continue;
-            }
+            /* A terminal-state label is not evidence of source damage. Until
+             * a validator identifies a specific irreparable source defect,
+             * all conversion failures abort and discard the entire staging
+             * tree, including any earlier outputs from this session. */
             ESP_LOGE(TAG, "rebuild %s: session %s failed (%s) — aborting, "
                      "existing export left untouched", day_folder,
                      sessions[i].session_id, esp_err_to_name(r));
             ret = r;
             break;
         }
+    }
+
+    /* Shared conversion is also fallible (OOM, read/write/fsync). Complete
+     * it in staging before changing any live day or shared artifact. */
+    if (ret == ESP_OK) {
+        const rebuild_session_t *newest = &sessions[n - 1];
+        ret = edf_gen_generate_ex(REBUILD_STAGING_DIR, day_path, newest->session_id,
+                                  newest->start_epoch_ms, newest->end_epoch_ms,
+                                  newest->clock_drift_ms, EDF_GEN_SHARED);
     }
 
     if (ret != ESP_OK) {
@@ -1046,68 +1069,71 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
     mkdir(SD_SDCARD_DIR, 0775);
     mkdir(SD_SDCARD_DATALOG, 0775);
 
-    /* Mark the day as mid-publication before anything is destroyed, so an
-     * interruption from here on is detectable on the next boot. */
-    {
-        FILE *sf = fopen(REBUILD_SENTINEL, "w");
-        if (sf) {
-            fprintf(sf, "%s\n", day_folder);
-            fflush(sf);
-            fsync(fileno(sf));
-            fclose(sf);
-        } else {
-            ESP_LOGW(TAG, "rebuild %s: could not write publish sentinel — an "
-                     "interrupted publish will not self-heal", day_folder);
-        }
-    }
-
-    rebuild_rmtree(live_day);
-    ret = rebuild_move_dir(staged_day, live_day);
+    /* Durable publication intent is mandatory before changing live output. */
+    char sentinel_tmp[400];
+    FILE *sf = edf_open_atomic_file(REBUILD_SENTINEL, sentinel_tmp, sizeof(sentinel_tmp));
+    if (!sf) ret = ESP_FAIL;
+    else if (fprintf(sf, "%s\n", day_folder) < 0) {
+        edf_discard_atomic_file(sf, sentinel_tmp); ret = ESP_FAIL;
+    } else ret = edf_finalize_atomic_file(sf, sentinel_tmp, REBUILD_SENTINEL);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "rebuild %s: publish failed — day may be incomplete, "
-                 "re-run the rebuild", day_folder);
         rebuild_rmtree(REBUILD_STAGING_DIR);
         free(sessions);
         sd_storage_lease_release(SD_LEASE_EXPORT);
         return ret;
     }
-    rebuild_rmtree(REBUILD_STAGING_DIR);
 
-    /* ── Pass 2: shared artifacts, exactly once ──
-     * STR.edf is multi-day and cumulative, and its current-day record is
-     * synthesised from the session given here — so it must be the newest
-     * session of the day, not an arbitrary one.  Identification and
-     * CurrentSettings likewise come from the newest session's captured data. */
-    const rebuild_session_t *newest = &sessions[n - 1];
-    esp_err_t shared = edf_gen_generate_ex(SD_SDCARD_DIR, day_path,
-                                          newest->session_id,
-                                          newest->start_epoch_ms,
-                                          newest->end_epoch_ms,
-                                          newest->clock_drift_ms,
-                                          EDF_GEN_SHARED);
-    if (shared != ESP_OK) {
-        /* The day's per-session files are published and correct; only the
-         * cumulative/shared files are stale.  Report it without claiming the
-         * rebuild succeeded. */
-        ESP_LOGE(TAG, "rebuild %s: shared pass (STR/Identification) failed",
-                 day_folder);
+    /* Keep a recoverable prior day until the replacement directory is in
+     * place. Same-volume FAT rename needs physical power-cut validation. */
+    char prior_day[420];
+    snprintf(prior_day, sizeof(prior_day), "%s/.previous-%s", SD_SDCARD_DATALOG, day_folder);
+    bool had_live = stat(live_day, &st) == 0;
+    if (!had_live && errno != ENOENT) ret = ESP_FAIL;
+    if (ret == ESP_OK && !had_live) {
+        if (rename(prior_day, live_day) == 0) had_live = true;
+        else if (errno != ENOENT) ret = ESP_FAIL;
+    }
+    if (ret == ESP_OK && had_live) {
+        rebuild_rmtree(prior_day);
+        if (rename(live_day, prior_day) != 0) ret = ESP_FAIL;
+    }
+    bool installed = false;
+    if (ret == ESP_OK) {
+        if (rename(staged_day, live_day) != 0) ret = ESP_FAIL;
+        else installed = true;
+    }
+    if (ret == ESP_OK) {
+        char staged_settings[400], live_settings[400];
+        snprintf(staged_settings, sizeof(staged_settings), "%s/SETTINGS", REBUILD_STAGING_DIR);
+        snprintf(live_settings, sizeof(live_settings), "%s/SETTINGS", SD_SDCARD_DIR);
+        ret = rebuild_move_dir(staged_settings, live_settings);
+        if (ret == ESP_OK) ret = rebuild_move_dir(REBUILD_STAGING_DIR, SD_SDCARD_DIR);
+    }
+    if (ret != ESP_OK) {
+        if (installed) rebuild_rmtree(live_day);
+        if (had_live) (void)rename(prior_day, live_day);
+        /* Any earlier shared-file replacements remain individually complete;
+         * the durable sentinel prevents declaring the mixed day complete. */
+        rebuild_rmtree(REBUILD_STAGING_DIR);
         free(sessions);
         sd_storage_lease_release(SD_LEASE_EXPORT);
-        return shared;
+        return ret;
     }
+    rebuild_rmtree(prior_day);
+    rebuild_rmtree(REBUILD_STAGING_DIR);
 
-    /* Fully published, including the shared pass: the day is consistent, so
-     * retire the sentinel.  Every failure path above deliberately leaves it in
-     * place so the day is rebuilt again. */
+    /* Every caller, including manual rebuilds, transfers to durable uploader
+     * invalidation before retiring the rebuild sentinel. A queue wakeup is
+     * insufficient: it can be rejected or lost at reboot. */
+    ret = session_writer_mark_upload_invalidation(day_folder);
+    if (ret != ESP_OK) {
+        free(sessions);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return ret; /* keep sentinel so failed handoff is repaired at boot */
+    }
     unlink(REBUILD_SENTINEL);
 
-    if (degraded > 0) {
-        ESP_LOGW(TAG, "=== REBUILD DAY %s COMPLETE (%d sessions, %d skipped as "
-                 "unexportable) ===", day_folder, n - degraded, degraded);
-    } else {
-        ESP_LOGI(TAG, "=== REBUILD DAY %s COMPLETE (%d sessions) ===",
-                 day_folder, n);
-    }
+    ESP_LOGI(TAG, "=== REBUILD DAY %s COMPLETE (%d sessions) ===", day_folder, n);
     free(sessions);
     sd_storage_lease_release(SD_LEASE_EXPORT);
     return ESP_OK;
@@ -1135,11 +1161,9 @@ bool edf_gen_take_interrupted_rebuild(char *out_day, size_t out_len)
         if (buf[i] < '0' || buf[i] > '9') valid = false;
     }
 
-    /* Consume it either way: a malformed sentinel would otherwise be reported
-     * on every boot for ever. */
-    unlink(REBUILD_SENTINEL);
+    /* Keep this durable intent until a complete rebuild succeeds. */
     if (!valid) {
-        ESP_LOGW(TAG, "discarding malformed publish sentinel");
+        ESP_LOGW(TAG, "retaining malformed publish sentinel for inspection");
         return false;
     }
 

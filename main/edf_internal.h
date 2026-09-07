@@ -59,8 +59,15 @@ void edf_write_field(char *buf, int width, const char *text);
 bool edf_write_all(FILE *f, const void *data, size_t len);
 
 FILE *edf_open_atomic_file(const char *path, char *tmp_path, size_t tmp_path_len);
+esp_err_t edf_publish_atomic_path(const char *tmp_path, const char *path);
 esp_err_t edf_finalize_atomic_file(FILE *f, const char *tmp_path, const char *path);
 void edf_discard_atomic_file(FILE *f, const char *tmp_path);
+
+/* Per-export source fault latch. Helpers record I/O/OOM/parse failures only
+ * for the task that began the export, so concurrent summary reads cannot
+ * poison its result. */
+void edf_source_error_begin(void);
+esp_err_t edf_source_error_end(void);
 
 cJSON *edf_read_json_file(const char *path);
 esp_err_t edf_write_json_file(const char *path, const cJSON *json);

@@ -21,6 +21,7 @@
  */
 
 #include "upload_ox.h"
+#include "uploader.h"
 #include "upload_paths.h"
 
 #include <dirent.h>
@@ -101,7 +102,7 @@ static uint64_t file_fp(uint64_t h, const char *name, const char *path)
     FILE *f = fopen(path, "rb");
     if (!f) return h;
     uint8_t buf[1024]; uint32_t crc = 0; size_t nr;
-    while ((nr = fread(buf, 1, sizeof(buf), f)) > 0) crc = esp_rom_crc32_le(crc, buf, nr);
+    while (!uploader_should_cancel() && (nr = fread(buf, 1, sizeof(buf), f)) > 0) crc = esp_rom_crc32_le(crc, buf, nr);
     fclose(f);
     h ^= crc; h *= 1099511628211ULL;
     return h;
@@ -244,6 +245,7 @@ static int scan_day(const char *day, upload_ox_ref_t *out, int max_out)
     DIR *d = opendir(day_path); if (!d) return 0;
     int n = 0; struct dirent *e;
     while ((e = readdir(d)) && n < max_out) {
+        if (uploader_should_cancel()) { closedir(d); return -1; }
         if (!safe_component(e->d_name, UPLOAD_OX_ID_LEN)) continue;
         char root[UPLOAD_OX_PATH_LEN]; if (!join2(root, sizeof(root), day_path, e->d_name)) continue;
         char pointer[UPLOAD_OX_PATH_LEN]; if (!join2(pointer, sizeof(pointer), root, "recording.json")) continue;
@@ -284,6 +286,7 @@ static int scan_day(const char *day, upload_ox_ref_t *out, int max_out)
             r->fingerprint = file_fp(r->fingerprint, all[i], local);
         }
         cJSON_Delete(p);
+        if (uploader_should_cancel()) { closedir(d); return -1; }
         if (r->n_files >= 2) n++;
     }
     closedir(d); return n;
@@ -304,7 +307,7 @@ int upload_ox_scan(upload_ox_ref_t *out, int max_out)
 
     int nd = 0;
     struct dirent *e;
-    while ((e = readdir(root)) != NULL) {
+    while (!uploader_should_cancel() && (e = readdir(root)) != NULL) {
         if (!valid_day(e->d_name)) continue;
 
         if (nd < UPLOAD_MAX_DAYS_CAP) {
@@ -332,10 +335,13 @@ int upload_ox_scan(upload_ox_ref_t *out, int max_out)
         }
     }
     closedir(root);
+    if (uploader_should_cancel()) { free(days); return -1; }
 
     int n = 0;
     for (int i = 0; i < nd && n < max_out; i++) {
-        n += scan_day(days[i], &out[n], max_out - n);
+        int got = scan_day(days[i], &out[n], max_out - n);
+        if (got < 0 || uploader_should_cancel()) { free(days); return -1; }
+        n += got;
     }
     free(days);
     return n;
@@ -344,6 +350,7 @@ int upload_ox_scan(upload_ox_ref_t *out, int max_out)
 int upload_ox_reconcile(upload_ox_ref_t *out, int max_out, int max_days)
 {
     int n = upload_ox_scan(out, max_out);
+    if (n < 0 || uploader_should_cancel()) return -1;
     if (max_days < 1) max_days = 1;
     int kept = 0, days_seen = 0; char last_day[12] = {0};
     for (int i = 0; i < n; i++) {

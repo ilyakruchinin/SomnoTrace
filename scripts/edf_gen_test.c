@@ -77,6 +77,11 @@ bool sd_storage_lease_acquire(sd_lease_t role, uint32_t timeout_ms)
     return true;
 }
 void sd_storage_lease_release(sd_lease_t role) { (void)role; }
+esp_err_t session_writer_mark_upload_invalidation(const char *day)
+{
+    (void)day;
+    return ESP_OK;
+}
 
 /* ── tiny harness ───────────────────────────────────────────────────── */
 static int g_fails;            /* failures inside the current test */
@@ -1083,4 +1088,3 @@ int main(void)
            n_pass, n_fail, n_xfail, n_xpass);
     return n_fail ? 1 : 0;
 }
-

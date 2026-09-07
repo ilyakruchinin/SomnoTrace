@@ -85,6 +85,8 @@ assert finish.find("storage_finalize(s, cmd)") < finish.find(
     "xQueueSend(s_post_q"
 ) < finish.rfind("free(s)")
 finalize = function_body(WRITER, "storage_finalize")
+assert finalize.index("pending_export_mark_session(s->session_id, export_day)") < finalize.index("write_manifest(s, state)")
+assert "pending_export_ack_session(job.session_id)" in post
 assert "storage_finish_and_dispatch(finished, &cmd)" in worker
 
 # Producer/event paths pin active->fill, preventing a BATCH/EVENT from landing
