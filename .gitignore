@@ -1,0 +1,35 @@
+# --- ESP-IDF build output ---
+/build/
+sdkconfig
+sdkconfig.old
+
+# --- Build artifacts / flashable images ---
+/dist/
+
+# --- ESP-IDF managed components (pulled from the registry on build) ---
+/managed_components/
+dependencies.lock
+
+# --- Generated timezone database (fetched at build time) ---
+/main/zones.json
+
+# --- AI agent scratch / idea-sharing folder (local only, never committed) ---
+/.ai/
+
+# --- Private agent guidance (kept at repo root for tool discovery, not shared) ---
+/AGENTS.md
+
+# --- Editor / IDE / OS ---
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# --- Python (tooling venvs, if any) ---
+.venv/
+__pycache__/
+*.pyc

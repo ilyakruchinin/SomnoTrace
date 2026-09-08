@@ -1,0 +1,31 @@
+#
+# SomnoTrace - Custom 16MB Partition Table layout with OTA and end-of-flash NVS
+# Copyright (C) 2026 Ilya Kruchinin <https://github.com/ilyakruchinin>
+#
+# This file is part of SomnoTrace.
+#
+# SomnoTrace is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# SomnoTrace is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+# A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <https://www.gnu.org/licenses/>.
+#
+# ADDITIONAL TERM (GPLv3 Section 7(b)): Redistributions must preserve the
+# attribution "Based on SomnoTrace, originally created by Ilya Kruchinin
+# (https://github.com/ilyakruchinin)." See the NOTICE file for details.
+#
+
+# Name,     Type, SubType, Offset,   Size,     Flags
+otadata,    data, ota,     0x9000,   0x2000,
+phy_init,   data, phy,     0xb000,   0x1000,
+app0,       app,  ota_0,   0x10000,  0x400000,
+app1,       app,  ota_1,   0x410000, 0x400000,
+storage,    data, spiffs,  0x810000, 0x7A0000,
+coredump,   data, coredump,0xFB0000, 0x10000,
+nvs,        data, nvs,     0xFC0000, 0x40000,

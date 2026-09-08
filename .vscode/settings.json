@@ -1,0 +1,15 @@
+{
+  "files.associations": {
+    "*.h": "c",
+    "sdkconfig.defaults": "properties"
+  },
+  "C_Cpp.intelliSenseEngine": "default",
+  "search.exclude": {
+    "build/**": true,
+    "managed_components/**": true,
+    "dist/**": true
+  },
+  "kiroAgent.enableCodebaseIndexing": true,
+  "kiroAgent.notifications.agent.actionRequired": false,
+  "workbench.colorTheme": "Monokai Dimmed"
+}

@@ -1,0 +1,285 @@
+# SomnoTrace default project configuration.
+# These defaults seed the generated (git-ignored) sdkconfig. Set the target
+# with: ./scripts/idf.sh set-target esp32s3
+
+# Target chip
+CONFIG_IDF_TARGET="esp32s3"
+
+# CPU: run at 240 MHz for faster BLE notification processing
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Main task stack: recovery + cJSON + SDMMC VFS operations.
+# 10240 gives ample headroom for crash recovery of interrupted sessions.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
+
+# System event task (sys_evt) stack: default 2304 is too small for Wi-Fi/IP event handlers
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3584
+
+# -O2 rather than debug -Og.  Recovers IRAM/DRAM from unoptimized copies
+# without the -Os inlining that turns snprintf into -Werror=format-truncation.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Wi-Fi IRAM copies cost ~15–25 KB of IRAM for a modest CPU win.  Prefer
+# reclaiming that RAM; Wi-Fi still runs from flash.
+# CONFIG_ESP_WIFI_IRAM_OPT is not set
+# CONFIG_ESP_WIFI_RX_IRAM_OPT is not set
+
+# Fewer always-resident Wi-Fi buffers.  SoftAP portal + STA uploads do not
+# need the IDF defaults (32 cache TX, static RX mgmt).
+CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUFFER=y
+# CONFIG_ESP_WIFI_STATIC_RX_MGMT_BUFFER is not set
+
+# BLE controller: two connections (AS11 + O2 Ring).  Defaults (MAX_ACT=6,
+# 100-entry scan/adv caches, DTM, unused ATT prepare writes) waste RAM.
+CONFIG_BT_CTRL_BLE_MAX_ACT=4
+CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=16
+CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=16
+CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10
+# CONFIG_BT_CTRL_DTM_ENABLE is not set
+# CONFIG_BT_CTRL_BLE_SECURITY_ENABLE is not set
+CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=4
+CONFIG_BT_NIMBLE_MAX_BONDS=1
+CONFIG_BT_NIMBLE_MAX_CCCDS=4
+# NimBLE host stack: central GAP discovery and GATT notify event headroom.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=6144
+# Keep CONFIG_BT_CTRL_BLE_MASTER at the IDF default (required for central).
+# CONFIG_BT_CTRL_BLE_SECURITY_ENABLE / DTM are unused and stay off above.
+
+# PSRAM: ESP32-S3R8 has 8 MB octal SPI RAM. The app runs Wi-Fi + BLE + SD/FATFS
+# + HTTP + a 240x240 LCD framebuffer concurrently, which exhausts the ~290 KB
+# internal RAM. Push as much as possible to PSRAM, keeping only small
+# DMA-critical allocations internal.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# Threshold below which malloc() prefers internal RAM; at/above it, PSRAM is
+# preferred (with automatic fallback either way, so malloc never fails on this
+# alone).  Lowered 16384 -> 4096 -> 1024 to push the 1-4 KB allocation band
+# (HTTP header/body buffers, cJSON aggregates, misc driver/lib buffers) into
+# PSRAM and free internal RAM.  Only tiny (<1 KB) allocations stay internal.
+# NOTE: CONFIG_SPI_FLASH_AUTO_SUSPEND does NOT make it safe for tasks that
+# do flash erase/write (NVS commit) to have PSRAM stacks —
+# esp_ota_get_running_partition() → spi_flash_cache2phys() still freezes
+# caches.  Such work is funnelled through the internal-stack nvs_writer task
+# so the httpd worker (PSRAM stack) never calls flash-write directly.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384
+
+# Allow zero-initialized BSS to be placed in PSRAM.  This moves large static
+# arrays (e.g. s_evt_q_storage, s_cfg_mtx_buf) out of internal RAM.  Variables
+# that must be in internal RAM (DMA buffers, FreeRTOS primitives created via
+# xxxStatic) should use EXT_RAM_BSS_ATTR selectively or remain in .bss by
+# being initialised (non-zero).  Requires CONFIG_SPIRAM_USE_MALLOC=y.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+# Flash: 16 MB, recommended for OTA + EDF staging. Adjust to your module.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# Flash auto-suspend: keeps the SPI cache (and PSRAM cache) enabled during
+# flash erase/write operations.  Without this, any task with a PSRAM stack
+# that calls NVS or LittleFS APIs crashes with
+# "assert esp_task_stack_is_sane_cache_disabled()" because the cache is
+# disabled mid-operation.  With this enabled, the flash op is suspended
+# when the cache needs access, and PSRAM remains reachable throughout.
+# Our XMC flash (mfr 0x20) supports suspend per SFDP; the IDF checks at
+# runtime.  Even if a chip lacks suspend, the cache stays enabled (the op
+# just blocks longer) — no crash.
+CONFIG_SPI_FLASH_AUTO_SUSPEND=y
+
+# Custom partition table (OTA + 16MB)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# Use the native USB Serial/JTAG for console/logging (USB-C).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Push Wi-Fi and lwIP heap allocations to PSRAM. By default every Wi-Fi
+# dynamic RX/TX buffer and every lwIP pbuf/TCP segment is allocated from
+# internal RAM; under concurrency (SleepHQ TLS upload + dashboard snt_download)
+# that exhausted internal SRAM and made the hardware-AES DMA bounce buffer
+# allocation fail ("esp-aes: Failed to allocate memory"). Allowing these to
+# come from PSRAM frees tens of KB of internal RAM. DMA-critical Wi-Fi buffers
+# still stay internal automatically; the driver copies PSRAM pbufs into a DMA
+# TX buffer at the boundary.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# Wi-Fi defaults — reduced buffer counts to save internal RAM while remaining
+# stable for SoftAP portal + STA uploads.
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=20
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_MGMT_SBUF_NUM=16
+CONFIG_ESP_WIFI_RX_BA_WIN=4
+CONFIG_ESP_WIFI_TX_BA_WIN=4
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+
+# HTTP server: enough URI handlers and header space for the portal
+# Mobile browsers send very long headers during captive-portal detection.
+# Cloudflare Access adds ~1051-char cookies + ~1000-char JWT header, so we
+# need at least ~2600 chars for proxy headers alone plus normal browser headers.
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=4096
+CONFIG_HTTPD_MAX_URI_LEN=512
+
+# WebSocket support for real-time log streaming (/api/logs/ws). Frames are
+# pushed via httpd_ws_send_frame_async from a forwarder task, so the single
+# httpd worker task is never blocked servicing the connection.
+CONFIG_HTTPD_WS_SUPPORT=y
+
+# BLE: NimBLE host.  We are a central (GATT client) for AirSense 11, but
+# ROLE_PERIPHERAL + GATT_SERVER must also be enabled so that NimBLE compiles
+# in ble_att_svr_rx_notify -- the ATT dispatch entry that generates
+# BLE_GAP_EVENT_NOTIFY_RX for incoming notifications.  Without it, the AS11's
+# responses are silently dropped at the ATT layer.  We never advertise.
+# See spec/0001-airsense11-ble-sync.md §4.4 and as11_ble.c file header.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
+# Use default memory allocation (allows PSRAM) instead of internal-only.
+# Internal RAM is exhausted by Wi-Fi + libsmb2 + certificate bundle,
+# causing ble_buf_alloc() to fail with "hci inits failed".
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_DEFAULT=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_GATT_SERVER=y
+
+# WiFi + BLE coexistence
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+CONFIG_ESP_WIFI_TASK_CORE_ID_0=y
+CONFIG_ESP_WIFI_TASK_CORE_ID=0
+CONFIG_BT_NIMBLE_PINNED_TO_CORE_CHOICE=y
+CONFIG_BT_NIMBLE_PINNED_TO_CORE=1
+# NimBLE msys1 / ACL buffer pool — two connections (AS11 + O2 Ring).
+# Raised from 24 to 32 to provide headroom for concurrent GATT traffic.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=32
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_SIZE=256
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=32
+# CONFIG_BT_NIMBLE_SECURITY_ENABLE is not set
+# CONFIG_BT_NIMBLE_DEBUG is not set
+# CONFIG_BT_NIMBLE_LOG_LEVEL_DEBUG is not set
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+CONFIG_LOG_TIMESTAMP_SOURCE_SYSTEM=y
+
+# SD card (SDMMC 4-bit mode on GPIO 13-18)
+# (SDMMC_MAX_BLK_LEN was removed in ESP-IDF v5.x; max block length is
+# determined at runtime from the card's CSD register.)
+
+# FatFS via VFS
+CONFIG_FATFS_VOLUME_COUNT=2
+CONFIG_FATFS_MAX_LFN=255
+CONFIG_FATFS_CODEPAGE_850=y
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_FS_LOCK=0
+CONFIG_FATFS_USE_LABEL=y
+CONFIG_FATFS_SECTOR_512=y
+
+# mbedTLS: hardware acceleration
+CONFIG_MBEDTLS_HARDWARE_AES=y
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+CONFIG_MBEDTLS_HARDWARE_MPI=y
+# Allow mbedTLS to allocate from PSRAM — the TLS handshake requires
+# 10-40 KB of heap during the connection, which would exhaust internal RAM
+# when WiFi + BLE + libsmb2 are all active.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# Dynamic buffer: allocate TLS in/out content buffers on demand and free
+# them after the handshake. This reduces per-connection memory footprint
+# and allows two concurrent TLS connections (e.g. SleepHQ upload + OTA).
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER_PEER_CRED=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+
+# Certificate bundle for HTTPS (SleepHQ upload) — common set only
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
+
+# mbedTLS: minimise features — TLS client only, reduce buffer sizes
+# CONFIG_MBEDTLS_TLS_SERVER is not set
+# IN_CONTENT_LEN must be the full TLS maximum (16384): some hosts
+# (release-assets.githubusercontent.com) send handshake records larger than
+# 4096, which fails with MBEDTLS_ERR_SSL_INVALID_RECORD (-0x7200).
+# MBEDTLS_DYNAMIC_BUFFER frees this again after the handshake.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+# CONFIG_MBEDTLS_SERVER_SSL_SESSION_TICKETS is not set
+# CONFIG_MBEDTLS_CLIENT_SSL_SESSION_TICKETS is not set
+# CONFIG_MBEDTLS_SSL_RENEGOTIATION is not set
+# CONFIG_MBEDTLS_X509_CRL_PARSE_C is not set
+# CONFIG_MBEDTLS_X509_CSR_PARSE_C is not set
+# CONFIG_MBEDTLS_PEM_WRITE_C is not set
+# CONFIG_MBEDTLS_PKCS7_C is not set
+# Disable unused ECP curves — keep only secp256r1, secp384r1, curve25519
+# CONFIG_MBEDTLS_ECP_DP_SECP192K1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP192R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP224K1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP224R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP256K1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_SECP521R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_BP256R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_BP384R1_ENABLED is not set
+# CONFIG_MBEDTLS_ECP_DP_BP512R1_ENABLED is not set
+# CONFIG_MBEDTLS_KEY_EXCHANGE_RSA is not set
+# CONFIG_MBEDTLS_KEY_EXCHANGE_ECDH_RSA is not set
+# CONFIG_MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA is not set
+# CONFIG_MBEDTLS_CMAC_C is not set
+# CONFIG_MBEDTLS_ERROR_STRINGS is not set
+
+# LWIP: reduce mailbox/PCB counts to save internal RAM
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=6
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=6
+CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE=4
+CONFIG_LWIP_MAX_SOCKETS=32
+CONFIG_LWIP_MAX_ACTIVE_TCP=28
+CONFIG_LWIP_MAX_LISTENING_TCP=8
+CONFIG_LWIP_MAX_UDP_PCBS=8
+CONFIG_LWIP_MAX_RAW_PCBS=4
+# TCP send buffer: larger buffer lets send() return quickly by copying data
+# into lwIP's buffer, while actual TX happens asynchronously between BLE
+# coexistence slots.  Default is ~5760 (4*MSS); 32KB allows a full 16KB
+# chunk plus headroom for ACK'd data.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+CONFIG_LWIP_TCP_WND_DEFAULT=11680
+
+# NTP time sync: parse DHCP option 42 for NTP servers, allow multiple servers
+# (DHCP-provided + fallback pools). SNTP poll mode re-syncs every hour.
+CONFIG_LWIP_DHCP_GET_NTP_SRV=y
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
+
+# Core dump: save to flash (ELF format) so crash diagnostics can be read
+# and logged on next boot.  Requires a `coredump` partition in partitions.csv.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_SHA256=y
+# Don't let the bootloader erase a partial/corrupt core dump before the
+# app can read it.  With CHECK_BOOT=y the bootloader was erasing
+# incomplete INT_WDT coredumps, leaving crash_diag with nothing to log.
+# CONFIG_ESP_COREDUMP_CHECK_BOOT is not set
+# Give the panic handler time to finish writing the core dump to flash
+# before rebooting.  The default 0 s caused incomplete/missing coredumps
+# on INT_WDT resets (the Aug 8 crash produced nothing recoverable).
+CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS=2
+# Stack-overflow detection: place a hardware watchpoint at each task's stack
+# end so an overflowing write faults at the offending instruction, naming the
+# task, instead of silently corrupting whatever the allocator placed next to
+# the stack.  The canary check (enabled by default) only samples at context
+# switches, so it reports damage long after the fact — which is exactly why
+# the 2026-08-09 INT_WDT left no usable evidence.
+#
+# This costs a debug watchpoint register and no measurable runtime overhead,
+# so it is left on permanently in production rather than in a separate
+# diagnostic build.
+CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y
+
+# Enable FreeRTOS trace facility so uxTaskGetSystemState() works — used by the
+# /api/heap endpoint to report per-task stack high-water marks.  Costs a small
+# amount of internal RAM per task for the trace buffer.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
