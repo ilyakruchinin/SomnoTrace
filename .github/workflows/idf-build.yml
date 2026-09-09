@@ -15,7 +15,7 @@ on:
       - "components/**"
       - "third_party/**"
       - "CMakeLists.txt"
-      - "sdkconfig.defaults"
+      - "sdkconfig*.defaults"
       - "partitions.csv"
       - "scripts/idf.sh"
       - "scripts/build-dist.sh"
@@ -27,7 +27,7 @@ on:
       - "components/**"
       - "third_party/**"
       - "CMakeLists.txt"
-      - "sdkconfig.defaults"
+      - "sdkconfig*.defaults"
       - "partitions.csv"
       - "scripts/idf.sh"
       - "scripts/build-dist.sh"
@@ -39,9 +39,50 @@ permissions:
   contents: read
 
 jobs:
+  discover:
+    # Emits one matrix leg per sdkconfig*.defaults the repo ships.
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: find
+        run: |
+          set -o pipefail
+          python3 - <<'PY' | tee -a "$GITHUB_OUTPUT"
+          import glob, json, os
+          base = "sdkconfig.defaults"
+          legs = []
+          if os.path.exists(base):
+              legs.append({"name": "default", "defaults": base})
+          for f in sorted(glob.glob("sdkconfig.*.defaults")):
+              if f == base:
+                  continue
+              # sdkconfig.<name>.defaults -> <name>
+              name = f[len("sdkconfig."):-len(".defaults")]
+              legs.append({"name": name,
+                           "defaults": f"{base};{f}" if os.path.exists(base) else f})
+          if not legs:
+              # No defaults file at all: still build once, with whatever the tree implies,
+              # rather than silently building nothing.
+              legs = [{"name": "default", "defaults": ""}]
+          print("matrix=" + json.dumps(legs))
+          PY
+
+      - name: Say what will be built
+        run: echo '${{ steps.find.outputs.matrix }}'
+
   idf-build:
+    needs: discover
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      # One board failing must not cancel the others: which boards break is the
+      # information this job exists to produce.
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.discover.outputs.matrix) }}
+    name: "idf-build (${{ matrix.config.name }})"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,27 +93,72 @@ jobs:
           # the firmware with a version that is not the firmware's.
           fetch-depth: 0
 
-      - name: Build firmware
+      - name: Build firmware (${{ matrix.config.name }})
         # The runner's default shell is `bash -e` WITHOUT pipefail, so a failing build piped into
         # tee would report the exit status of tee — the same fail-open that made a broken host suite
         # go green before it was caught (see host-tests.yml).
+        #
+        # ⚠️ SDKCONFIG IS PER-LEG ON PURPOSE. SDKCONFIG_DEFAULTS is only read when no sdkconfig
+        # exists yet; once one is written it wins, and a second leg would silently rebuild the
+        # first leg's board while reporting the second's name.
         run: |
           set -o pipefail
-          ./scripts/idf.sh build 2>&1 | tee idf-build.log
+          B="build-${{ matrix.config.name }}"
+          ARGS=(-B "$B" -D "SDKCONFIG=$B/sdkconfig")
+          if [ -n '${{ matrix.config.defaults }}' ]; then
+            ARGS+=(-D 'SDKCONFIG_DEFAULTS=${{ matrix.config.defaults }}')
+          fi
+          ./scripts/idf.sh "${ARGS[@]}" build 2>&1 | tee "idf-build-${{ matrix.config.name }}.log"
 
       - name: Confirm an image was actually produced
         # A build step can exit 0 having produced nothing if the toolchain is ever invoked wrongly.
         # Name the artifact and the version the log claims, so a green run says what it built.
         run: |
-          test -f build/somnotrace.bin || {
-            echo "::error::idf.py build exited 0 but build/somnotrace.bin does not exist"; exit 1; }
-          echo "image: $(stat -c '%n %s bytes' build/somnotrace.bin)"
-          grep -m1 'Firmware version:' idf-build.log || echo "::warning::no version line in the build log"
+          B="build-${{ matrix.config.name }}"
+          test -f "$B/somnotrace.bin" || {
+            echo "::error::idf.py build exited 0 but $B/somnotrace.bin does not exist"; exit 1; }
+          echo "image: $(stat -c '%n %s bytes' "$B/somnotrace.bin")"
+          grep -m1 'Firmware version:' "idf-build-${{ matrix.config.name }}.log" \
+            || echo "::warning::no version line in the build log"
+
+      - name: Confirm this leg built the board it claims
+        # A leg that silently falls back to the default board is worse than no leg: it reports a
+        # board as covered while compiling something else. Compare the resolved sdkconfig against
+        # the defaults this leg asked for, and fail loudly if a requested symbol did not take.
+        if: ${{ matrix.config.defaults != '' }}
+        run: |
+          B="build-${{ matrix.config.name }}"
+          # ⚠️ ONLY THIS PROJECT'S OWN SYMBOLS ARE ASSERTED. An earlier version required
+          # every symbol in the defaults file to appear verbatim in the resolved sdkconfig
+          # and failed the DEFAULT board of this repo: Kconfig legitimately drops a default
+          # whose dependencies are unmet, and CONFIG_BT_NIMBLE_PINNED_TO_CORE and
+          # CONFIG_MBEDTLS_DYNAMIC_BUFFER_PEER_CRED are two that do. Asserting IDF internals
+          # makes the gate fail on correct configurations, which is the failure this job
+          # exists to prevent, one level up.
+          #
+          # What must hold is narrower and is the thing worth checking: the board this leg
+          # claims is the board that got configured. CONFIG_SOMNOTRACE_* is ours, so a
+          # missing one means the leg fell back rather than that Kconfig disagreed.
+          miss=0; checked=0
+          IFS=';' read -ra FILES <<< '${{ matrix.config.defaults }}'
+          for f in "${FILES[@]}"; do
+            [ -f "$f" ] || continue
+            while read -r line; do
+              case "$line" in ''|'#'*) continue ;; esac
+              case "$line" in CONFIG_SOMNOTRACE_*) ;; *) continue ;; esac
+              key=${line%%=*}; val=${line#*=}
+              checked=$((checked + 1))
+              grep -qxF "$key=$val" "$B/sdkconfig" || {
+                echo "::error::$key=$val from $f did not take in $B/sdkconfig — this leg did not build the board it claims"; miss=1; }
+            done < "$f"
+          done
+          [ "$miss" = 0 ] || exit 1
+          echo "$checked CONFIG_SOMNOTRACE_* symbol(s) verified in $B/sdkconfig"
 
       - name: Upload the build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: idf-build-log
-          path: idf-build.log
+          name: idf-build-log-${{ matrix.config.name }}
+          path: idf-build-${{ matrix.config.name }}.log
           retention-days: 7
