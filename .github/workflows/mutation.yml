@@ -31,6 +31,26 @@ jobs:
         # Same dependency the host tests need; without it the harness SKIPS the two suites
         # that cover the exporter and correctly reports VOID rather than a kill count.
         run: |
+          # ⚠️ DROP THE RUNNER'S UNRELATED APT SOURCES FIRST. The ubuntu-latest image ships
+          # apt sources for Google Chrome and Microsoft that this project never installs from.
+          # When one of them serves a bad index, `apt-get update` exits 100 and the job dies
+          # before reaching a line of project code. Measured 2026-09-09: `Hash Sum mismatch`
+          # on dl.google.com/linux/chrome-stable reddened host-tests, lint and mutation
+          # together, and survived a re-run — an outage, not a flake.
+          #
+          # MATCHED BY CONTENT, NOT BY FILENAME. The first version of this named
+          # /etc/apt/sources.list.d/google-chrome.list, removed nothing, and failed exactly as
+          # before: the image's file names differ between runner releases and between the
+          # .list and deb822 .sources formats. A guessed name fails silently, which is the
+          # worst way for a workaround to be wrong. Grepping for the host cannot miss.
+          #
+          # Removed rather than swallowed with `|| true`, which would also hide a genuine
+          # failure to reach the Ubuntu archive — the one repository these jobs depend on.
+          for f in $(grep -rlE 'dl\.google\.com|packages\.microsoft\.com' \
+                       /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true); do
+              echo "removing apt source this project does not use: $f"
+              sudo rm -f "$f"
+          done
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends libcjson-dev
 

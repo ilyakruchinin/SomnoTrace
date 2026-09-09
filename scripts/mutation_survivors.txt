@@ -1,0 +1,56 @@
+# UNASSERTED survivors: mutants that RAN and that every host test still passed.
+# Committed on purpose. A gitignored copy would exist only on the machine that
+# produced it, and the useful property of this file is that a pull request which
+# weakens an assertion ADDS A LINE HERE, next to the change that caused it —
+# visible in review without anyone running the sweep.
+#
+# NOT a list of bugs, and not a to-do list. A survivor means the suite does not
+# distinguish this mutant from the original; whether that matters is a judgement
+# each one needs on its own. A mutant no input can kill belongs in
+# mutate_equivalent.txt instead, with the argument written down.
+#
+# Regenerate with:  python3 scripts/mutate_host.py --all --write-inventory
+# It REFUSES on a machine where any suite is skipped — see environment_is_complete().
+#
+# Format:  <path>:<line>:<operator>      # the line as it stands today
+
+main/edf_annotations.c:63:arithmetic:-→+             # strncpy(path, edf_path, sizeof(path) - 1);
+main/edf_annotations.c:64:arithmetic:-→+             # path[sizeof(path) - 1] = '\0';
+main/edf_annotations.c:68:arithmetic:*→/             # snt_event_t *ev_list = malloc(capacity * sizeof(snt_event_t));
+main/edf_annotations.c:83:logical:&&→||              # if (data_id && cJSON_IsString(data_id)) {
+main/edf_annotations.c:151:relational:<→<=           # for (size_t i = 0; i + 1 < count; i++) {
+main/edf_gen.c:111:logical:||→&&                     # if (!session_dir || !session_id || !out_root) return ESP_ERR_INVALID_A
+main/edf_gen.c:126:relational:<→<=                   # if (start_epoch_ms < 946684800000LL) {  /* < 2000-01-01T00:00:00Z */
+main/edf_gen.c:161:arithmetic:-→+                    # as11_time_noon_day(start_epoch_ms - clock_drift_ms, day_folder, sizeof
+main/edf_gen.c:245:relational:<→<=                   # if (zle_ntp > 0 && zle_ntp > start_epoch_ms && zle_ntp < end_epoch_ms)
+main/edf_gen.c:258:relational:>→>=                   # if (zle_ntp > 0) {
+main/edf_gen.c:269:relational:>→>=                   # if (maskon_as11 > 0) {
+main/edf_gen.c:270:arithmetic:+→-                    # int64_t maskon_ntp = maskon_as11 + clock_drift_ms;
+main/edf_gen.c:271:relational:<→<=                   # if (maskon_ntp > start_epoch_ms && maskon_ntp < end_epoch_ms) {
+main/edf_gen.c:309:relational:<=→<                   # if (end_ntp <= 0) {
+main/edf_gen.c:311:relational:>→>=                   # if (maskoff_as11 > 0) {
+main/edf_gen.c:312:arithmetic:+→-                    # end_ntp = maskoff_as11 + clock_drift_ms;
+main/edf_gen.c:316:relational:>→>=                   # if (end_ntp > 0) {
+main/edf_header.c:71:relational:>→>=                 # if (len > width) len = width;
+main/edf_header.c:84:relational:<→<=                 # if (written < 0 || (size_t)written >= tmp_path_len) {
+main/edf_header.c:125:arithmetic:+→-                 # char *buf = malloc(fsize + 1);
+main/edf_header.c:188:arithmetic:+→-                 # edf_write_field(hdr + 88, 80, recording_id);         /* recording ID *
+main/edf_header.c:189:arithmetic:+→-                 # edf_write_field(hdr + 168, 8, start_date);           /* start date */
+main/edf_waveform.c:32:relational:<=→<               # if (!f || channels_in_file <= 0) return UINT32_MAX;
+main/edf_waveform.c:35:relational:<→<=               # if (cur < 0) return UINT32_MAX;
+main/edf_waveform.c:38:relational:<→<=               # if (fseek(f, cur, SEEK_SET) != 0 || end < 0) return UINT32_MAX;
+main/edf_waveform.c:40:relational:<=→<               # if (end <= (long)sizeof(snt_header_t)) return 0;
+main/edf_waveform.c:61:logical:&&→||                 # if (events && cJSON_IsArray(events)) {
+main/edf_waveform.c:63:relational:<→<=               # for (int i = 0; i < n; i++) {
+main/edf_waveform.c:67:logical:||→&&                 # if (!label || !cJSON_IsString(label)) continue;
+main/edf_waveform.c:70:logical:&&→||                 # if (rt && cJSON_IsString(rt)) {
+main/edf_waveform.c:99:logical:&&→||                 # if (events && cJSON_IsArray(events)) {
+main/edf_waveform.c:101:relational:<→<=              # for (int i = 0; i < n; i++) {
+main/edf_waveform.c:105:logical:||→&&                # if (!label || !cJSON_IsString(label)) continue;
+main/edf_waveform.c:108:logical:&&→||                # if (rt && cJSON_IsString(rt)) {
+main/edf_waveform.c:135:logical:&&→||                # if (data_id && cJSON_IsString(data_id) &&
+main/edf_waveform.c:138:logical:&&→||                # if (events && cJSON_IsArray(events)) {
+main/edf_waveform.c:140:relational:<→<=              # for (int i = 0; i < n; i++) {
+main/edf_waveform.c:144:logical:&&→||                # if (val && cJSON_IsNumber(val) &&
+main/edf_waveform.c:148:logical:&&→||                # if (rt && cJSON_IsString(rt)) {
+main/edf_waveform.c:151:relational:>→>=              # if (as11_ms > 0)

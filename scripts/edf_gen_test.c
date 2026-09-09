@@ -1043,6 +1043,246 @@ static void test_str_pressure_settings_exact(void)
     cJSON_Delete(settings);
 }
 
+/* ── Identification.json / Identification.crc ────────────────────────────────
+ * edf_generate_identification_files() was the largest untested function in the
+ * exporter. The mutation harness picks it as edf_header.c's canary, empties its
+ * body, and every test still passed — so the harness refused a verdict on all
+ * 456 lines of that file rather than report a clean sweep it had not earned.
+ *
+ * These exist to make that verdict possible, so they pin behaviour a mutant
+ * would change rather than merely reaching the function: the CRC's byte order
+ * and length, the number->string coercion, the defaults for absent keys, and
+ * the one input/output key name that differs on purpose.
+ */
+static void ident_write_file(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "wb");
+    assert(f);
+    size_t n = strlen(text);
+    assert(fwrite(text, 1, n, f) == n);
+    assert(fclose(f) == 0);
+}
+
+static char *ident_slurp(const char *path, size_t *out_len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    assert(fseek(f, 0, SEEK_END) == 0);
+    long n = ftell(f);
+    assert(n >= 0);
+    assert(fseek(f, 0, SEEK_SET) == 0);
+    char *buf = malloc((size_t)n + 1);
+    assert(buf);
+    assert(fread(buf, 1, (size_t)n, f) == (size_t)n);
+    buf[n] = '\0';
+    fclose(f);
+    if (out_len) *out_len = (size_t)n;
+    return buf;
+}
+
+static void ident_make_dir(char *dst, size_t cap, const char *name)
+{
+    snprintf(dst, cap, "%s/%s", g_root, name);
+    mkdir(dst, 0777);
+}
+
+/* The full profile the AS11 expects, so the shape is pinned rather than sampled. */
+static const char *IDENT_FULL =
+    "{"
+    "\"UniversalIdentifier\":\"UID-1\","
+    "\"SerialNumber\":\"SN-2\","
+    "\"ProductCode\":37001,"
+    "\"ProductName\":\"AirSense 11\","
+    "\"ProductGeographicIdentifier\":\"EUR\","
+    "\"HardwareIdentifier\":\"HW-3\","
+    "\"BootloaderIdentifier\":\"BL-4\","
+    "\"ApplicationIdentifier\":\"APP-5\","
+    "\"ConfigurationIdentifier\":\"CFG-6\","
+    "\"PlatformIdentifier\":12,"
+    "\"VariantIdentifier\":34,"
+    "\"RegionIdentifier\":56,"
+    "\"ProfileVariantIdentifier\":\"PV-7\","
+    "\"DataVersionIdentifier\":78,"
+    "\"DataModelVersionIdentifier\":\"DM-8\""
+    "}";
+
+static cJSON *ident_profile(cJSON *root, const char *which)
+{
+    cJSON *fg = cJSON_GetObjectItem(root, "FlowGenerator");
+    assert(fg);
+    cJSON *profiles = cJSON_GetObjectItem(fg, "IdentificationProfiles");
+    assert(profiles);
+    cJSON *p = cJSON_GetObjectItem(profiles, which);
+    assert(p);
+    return p;
+}
+
+static void ident_expect_str(cJSON *obj, const char *key, const char *want)
+{
+    cJSON *j = cJSON_GetObjectItem(obj, key);
+    assert(j);
+    assert(cJSON_IsString(j));
+    assert(strcmp(j->valuestring, want) == 0);
+}
+
+static void test_crc32_matches_the_published_check_vector(void)
+{
+    /* CRC-32/ISO-HDLC (IEEE 802.3) has a published check value: the CRC of the
+     * nine bytes "123456789" is 0xCBF43926.
+     *
+     * Asserting against the constant rather than against another call of the same
+     * function is the entire point of this test. The Identification.crc test below
+     * compares the file's four bytes to edf_crc32_ieee() — so a mutation INSIDE the
+     * CRC changes both sides equally and survives, which is exactly what the
+     * mutation harness reported when this test did not exist: the loop bounds at
+     * lines 50 and 52 and the shift at line 56 all survived a suite that looked
+     * like it covered them. A test whose oracle is the code under test defends the
+     * bug instead of catching it. */
+    assert(edf_crc32_ieee((const uint8_t *)"123456789", 9) == 0xCBF43926u);
+    assert(edf_crc32_ieee((const uint8_t *)"", 0) == 0u);
+    assert(edf_crc32_ieee((const uint8_t *)"a", 1) == 0xE8B7BE43u);
+    /* Length is honoured, not strlen: a CRC over a prefix differs. */
+    assert(edf_crc32_ieee((const uint8_t *)"123456789", 8) != 0xCBF43926u);
+}
+
+static void test_identification_profile_shape(void)
+{
+    char dir[300], ident[400], out_path[400];
+    ident_make_dir(dir, sizeof(dir), "ident_shape");
+    snprintf(ident, sizeof(ident), "%s/identification.json", dir);
+    ident_write_file(ident, IDENT_FULL);
+
+    assert(edf_generate_identification_files(dir, ident) == ESP_OK);
+
+    snprintf(out_path, sizeof(out_path), "%s/Identification.json", dir);
+    char *out = ident_slurp(out_path, NULL);
+    assert(out);
+    cJSON *root = cJSON_Parse(out);
+    assert(root);
+
+    cJSON *product = ident_profile(root, "Product");
+    ident_expect_str(product, "UniversalIdentifier", "UID-1");
+    ident_expect_str(product, "SerialNumber", "SN-2");
+    ident_expect_str(product, "ProductName", "AirSense 11");
+    ident_expect_str(product, "ProductGeographicIdentifier", "EUR");
+    /* A numeric ProductCode is rendered as a STRING. The AS11 writes it either
+     * way and the profile always carries a string, so the coercion is load-bearing. */
+    ident_expect_str(product, "ProductCode", "37001");
+    /* Always blank, never copied from the source, even when the source has them. */
+    ident_expect_str(product, "SerialNumberVerificationCode", "");
+    ident_expect_str(product, "FdaUniqueDeviceIdentifier", "");
+
+    ident_expect_str(ident_profile(root, "Hardware"), "HardwareIdentifier", "HW-3");
+
+    cJSON *software = ident_profile(root, "Software");
+    ident_expect_str(software, "BootloaderIdentifier", "BL-4");
+    ident_expect_str(software, "ApplicationIdentifier", "APP-5");
+    ident_expect_str(software, "ConfigurationIdentifier", "CFG-6");
+    ident_expect_str(software, "DataModelVersionIdentifier", "DM-8");
+    /* THE KEY NAME CHANGES ON PURPOSE: the source says ProfileVARIANTIdentifier,
+     * the profile says ProfileVARIATIONIdentifier. It reads like a typo and it is
+     * not — pinned here so that "fixing" it breaks a test instead of a device. */
+    ident_expect_str(software, "ProfileVariationIdentifier", "PV-7");
+    assert(cJSON_GetObjectItem(software, "ProfileVariantIdentifier") == NULL);
+
+    /* These four stay NUMBERS. */
+    cJSON *plat = cJSON_GetObjectItem(software, "PlatformIdentifier");
+    assert(plat && cJSON_IsNumber(plat) && plat->valuedouble == 12);
+    cJSON *var = cJSON_GetObjectItem(software, "VariantIdentifier");
+    assert(var && cJSON_IsNumber(var) && var->valuedouble == 34);
+    cJSON *reg = cJSON_GetObjectItem(software, "RegionIdentifier");
+    assert(reg && cJSON_IsNumber(reg) && reg->valuedouble == 56);
+    cJSON *dv = cJSON_GetObjectItem(software, "DataVersionIdentifier");
+    assert(dv && cJSON_IsNumber(dv) && dv->valuedouble == 78);
+
+    cJSON_Delete(root);
+    free(out);
+}
+
+static void test_identification_crc_is_le_crc32_of_the_json(void)
+{
+    char dir[300], ident[400], json_path[400], crc_path[400];
+    ident_make_dir(dir, sizeof(dir), "ident_crc");
+    snprintf(ident, sizeof(ident), "%s/identification.json", dir);
+    ident_write_file(ident, IDENT_FULL);
+
+    assert(edf_generate_identification_files(dir, ident) == ESP_OK);
+
+    snprintf(json_path, sizeof(json_path), "%s/Identification.json", dir);
+    snprintf(crc_path, sizeof(crc_path), "%s/Identification.crc", dir);
+
+    size_t json_len = 0, crc_len = 0;
+    char *json = ident_slurp(json_path, &json_len);
+    unsigned char *crc_file = (unsigned char *)ident_slurp(crc_path, &crc_len);
+    assert(json && crc_file);
+
+    /* Exactly four bytes — not a text rendering, not a trailing newline. */
+    assert(crc_len == 4);
+
+    /* Little-endian, over the WHOLE json as written. Both halves of that matter:
+     * a byte-order flip and an off-by-one on the length are the two mutations a
+     * CRC written this way invites. */
+    uint32_t want = edf_crc32_ieee((const uint8_t *)json, json_len);
+    uint32_t got = (uint32_t)crc_file[0]
+                 | ((uint32_t)crc_file[1] << 8)
+                 | ((uint32_t)crc_file[2] << 16)
+                 | ((uint32_t)crc_file[3] << 24);
+    assert(got == want);
+    assert(got != edf_crc32_ieee((const uint8_t *)json, json_len - 1));
+
+    free(json);
+    free(crc_file);
+}
+
+static void test_identification_absent_fields_are_empty_or_zero(void)
+{
+    char dir[300], ident[400], out_path[400];
+    ident_make_dir(dir, sizeof(dir), "ident_sparse");
+    snprintf(ident, sizeof(ident), "%s/identification.json", dir);
+    ident_write_file(ident, "{\"SerialNumber\":\"ONLY\"}");
+
+    assert(edf_generate_identification_files(dir, ident) == ESP_OK);
+
+    snprintf(out_path, sizeof(out_path), "%s/Identification.json", dir);
+    char *out = ident_slurp(out_path, NULL);
+    assert(out);
+    cJSON *root = cJSON_Parse(out);
+    assert(root);
+
+    cJSON *product = ident_profile(root, "Product");
+    ident_expect_str(product, "SerialNumber", "ONLY");
+    /* Absent strings are present-and-empty, not absent and not null: the profile
+     * always carries every key. */
+    ident_expect_str(product, "UniversalIdentifier", "");
+    ident_expect_str(product, "ProductCode", "");
+    ident_expect_str(product, "ProductName", "");
+
+    cJSON *software = ident_profile(root, "Software");
+    cJSON *plat = cJSON_GetObjectItem(software, "PlatformIdentifier");
+    assert(plat && cJSON_IsNumber(plat) && plat->valuedouble == 0);
+    cJSON *dv = cJSON_GetObjectItem(software, "DataVersionIdentifier");
+    assert(dv && cJSON_IsNumber(dv) && dv->valuedouble == 0);
+
+    cJSON_Delete(root);
+    free(out);
+}
+
+static void test_identification_missing_source_is_refused(void)
+{
+    char dir[300], ident[400], json_path[400], crc_path[400];
+    ident_make_dir(dir, sizeof(dir), "ident_missing");
+    snprintf(ident, sizeof(ident), "%s/does-not-exist.json", dir);
+
+    assert(edf_generate_identification_files(dir, ident) == ESP_FAIL);
+
+    /* And it writes nothing at all: a refused generation must not leave a
+     * half-made profile behind for the next reader to trust. */
+    snprintf(json_path, sizeof(json_path), "%s/Identification.json", dir);
+    snprintf(crc_path, sizeof(crc_path), "%s/Identification.crc", dir);
+    assert(ident_slurp(json_path, NULL) == NULL);
+    assert(ident_slurp(crc_path, NULL) == NULL);
+}
+
 int main(void)
 {
     snprintf(g_root, sizeof(g_root), "%s/snt_edf_test_XXXXXX",
@@ -1075,6 +1315,17 @@ int main(void)
     run("the session's AS11 offset beats the device timezone",
         test_as11_offset_beats_device_timezone, NULL);
     run("STR pressure settings are exact cmH2O x 50", test_str_pressure_settings_exact, NULL);
+
+    run("crc32 matches the published CRC-32/ISO-HDLC check vector",
+        test_crc32_matches_the_published_check_vector, NULL);
+    run("Identification profile carries every key, with the deliberate rename",
+        test_identification_profile_shape, NULL);
+    run("Identification.crc is four bytes, little-endian crc32 of the json",
+        test_identification_crc_is_le_crc32_of_the_json, NULL);
+    run("absent identification fields become empty strings and zeroes",
+        test_identification_absent_fields_are_empty_or_zero, NULL);
+    run("a missing identification.json is refused and writes nothing",
+        test_identification_missing_source_is_refused, NULL);
 
     if (!getenv("KEEP_TEST_TREE")) rmtree(g_root);
     else printf("test tree kept at %s\n", g_root);

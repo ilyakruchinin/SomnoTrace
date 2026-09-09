@@ -1,0 +1,117 @@
+name: "Mutation sweep"
+# The SEARCHING half of the mutation setup, on a schedule rather than on every push.
+#
+# scripts/mutants.py — run by mutation.yml on every push — is the PINNING half: a fixed
+# set of mutants that must all die, 15/15 today, and a red result there means someone
+# broke a test that was working. This job is the other kind. scripts/mutate_host.py
+# generates mutants it has never seen, so its output is a REPORT and not a verdict:
+# it currently finds 40 unasserted survivors on a green tree. Wiring that as a gate
+# would mean a permanently red build, and a permanently red gate teaches people to
+# ignore CI — the same reasoning that made lint's style tier advisory.
+#
+# ⚠️ WHY THIS IS NOT ON EVERY PUSH. Measured on a developer machine: 391 seconds,
+# against 30 for mutants.py. The slowest per-push job in this repo is the IDF build
+# at roughly 200s, and the jobs run concurrently, so a 391s job would become the
+# critical path and roughly double the wait on every pull request — to deliver a
+# report that nobody is required to act on before merging. Weekly costs contributors
+# nothing and still surfaces a trend.
+#
+# It runs on Saturday evening UTC so the result is already waiting on Sunday, which
+# is historically the busiest merge day in this repo.
+on:
+  schedule:
+    - cron: "0 20 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libcjson
+        # The harness needs cJSON to build the two EDF suites. apt ships the header and
+        # the shared library and no cJSON.c, which scripts/mutate_host.py now handles by
+        # linking -lcjson; before that it silently skipped those suites and reported a
+        # smaller SCOPE than the suite it was measuring.
+        run: |
+          # ⚠️ DROP THE RUNNER'S UNRELATED APT SOURCES FIRST. The ubuntu-latest image ships
+          # apt sources for Google Chrome and Microsoft that this project never installs from.
+          # When one of them serves a bad index, `apt-get update` exits 100 and the job dies
+          # before reaching a line of project code. Measured 2026-09-09: `Hash Sum mismatch`
+          # on dl.google.com/linux/chrome-stable reddened host-tests, lint and mutation
+          # together, and survived a re-run — an outage, not a flake.
+          #
+          # MATCHED BY CONTENT, NOT BY FILENAME. The first version of this named
+          # /etc/apt/sources.list.d/google-chrome.list, removed nothing, and failed exactly as
+          # before: the image's file names differ between runner releases and between the
+          # .list and deb822 .sources formats. A guessed name fails silently, which is the
+          # worst way for a workaround to be wrong. Grepping for the host cannot miss.
+          #
+          # Removed rather than swallowed with `|| true`, which would also hide a genuine
+          # failure to reach the Ubuntu archive — the one repository these jobs depend on.
+          for f in $(grep -rlE 'dl\.google\.com|packages\.microsoft\.com' \
+                       /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true); do
+              echo "removing apt source this project does not use: $f"
+              sudo rm -f "$f"
+          done
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends libcjson-dev
+
+      - name: Sweep
+        run: |
+          set -o pipefail
+          python3 scripts/mutate_host.py --all 2>&1 | tee mutation-sweep.log
+
+      - name: Check the run actually measured something
+        # THE ONLY FAILING CONDITION. A survivor count is a report; a VOID is not.
+        # VOID means the harness could not detect a change it made on purpose — a
+        # canary that survived, or a baseline that does not pass — and every number
+        # in the log is then meaningless. Reporting that as a quiet success is how a
+        # mutation score becomes a comfort, so it fails loudly instead.
+        run: |
+          if grep -q '^ *VOID' mutation-sweep.log; then
+            echo "::error::the sweep reported VOID — it measured nothing, see the log"
+            grep -B2 '^ *VOID' mutation-sweep.log || true
+            exit 1
+          fi
+          grep -qE '[0-9]+ unasserted survivor\(s\)' mutation-sweep.log || {
+            echo "::error::no survivor-count line — the sweep did not run to completion"; exit 1; }
+
+      - name: Flag survivors that are not in the committed inventory
+        # scripts/mutation_survivors.txt is checked in, so the normal way a new survivor
+        # gets noticed is a line appearing in a pull request's diff. This is the backstop
+        # for the ones that arrive without a diff — a dependency bump, a compiler change,
+        # or a merge that nobody re-swept. A warning, not a failure: the count is a report.
+        if: always()
+        run: |
+          if grep -qE '^ *\+ NEW ' mutation-sweep.log; then
+            n=$(grep -cE '^ *\+ NEW ' mutation-sweep.log)
+            echo "::warning::$n survivor(s) not in scripts/mutation_survivors.txt — regenerate with: python3 scripts/mutate_host.py --all --write-inventory"
+            grep -E '^ *\+ NEW ' mutation-sweep.log
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Mutation sweep (advisory)"
+            echo '```'
+            grep -E '^SCOPE|^INVENTORY|^ *[+-] (NEW|was here)|^ *not seen|unasserted survivor\(s\)|^ *canary|^ *killed ' mutation-sweep.log || true
+            echo '```'
+            echo ""
+            echo "UNASSERTED means the mutant ran and every test still passed."
+            echo "This job never fails on that count — only on VOID, which means the run measured nothing."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the sweep log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-sweep-log
+          path: mutation-sweep.log
+          retention-days: 30

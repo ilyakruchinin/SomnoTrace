@@ -93,6 +93,65 @@ def target_path(entry: str) -> str:
     return entry[1:] if entry.startswith("#") else entry
 
 EQUIV_FILE = os.path.join(HERE, "mutate_equivalent.txt")
+SURVIVOR_FILE = os.path.join(HERE, "mutation_survivors.txt")
+
+
+def environment_is_complete() -> tuple[bool, str]:
+    """(may this run rewrite the inventory, and if not why not).
+
+    ⚠️ A NARROWER ENVIRONMENT SEES FEWER SURVIVORS. Without cJSON the two EDF suites are
+    skipped and this harness reports SCOPE 2 of 80 instead of 8; every survivor in the five
+    EDF modules simply is not found. Writing the inventory from that run would DELETE those
+    entries, and the diff would read exactly like someone had fixed them.
+
+    So the inventory may only be written where the whole suite builds. Refusing is the
+    feature: an inventory that quietly narrows is worse than no inventory, because it is
+    trusted."""
+    skipped = sorted(t for t in TESTS if sources_for(t) is None)
+    if skipped:
+        return False, "these suites could not be built: " + ", ".join(skipped)
+    if not shutil.which("gcov"):
+        return False, ("gcov is absent, so reach is unknown and every mutant is run and "
+                       "classified UNASSERTED rather than UNREACHED")
+    return True, ""
+
+
+def load_inventory() -> dict[str, str]:
+    out = {}
+    if os.path.exists(SURVIVOR_FILE):
+        for line in open(SURVIVOR_FILE, encoding="utf-8"):
+            key = line.split("#", 1)[0].strip()
+            if key:
+                out[key] = line.split("#", 1)[1].strip() if "#" in line else ""
+    return out
+
+
+def write_inventory(entries: dict[str, str]) -> None:
+    with open(SURVIVOR_FILE, "w", encoding="utf-8", newline="\n") as f:
+        f.write(
+            "# UNASSERTED survivors: mutants that RAN and that every host test still passed.\n"
+            "# Committed on purpose. A gitignored copy would exist only on the machine that\n"
+            "# produced it, and the useful property of this file is that a pull request which\n"
+            "# weakens an assertion ADDS A LINE HERE, next to the change that caused it —\n"
+            "# visible in review without anyone running the sweep.\n"
+            "#\n"
+            "# NOT a list of bugs, and not a to-do list. A survivor means the suite does not\n"
+            "# distinguish this mutant from the original; whether that matters is a judgement\n"
+            "# each one needs on its own. A mutant no input can kill belongs in\n"
+            "# mutate_equivalent.txt instead, with the argument written down.\n"
+            "#\n"
+            "# Regenerate with:  python3 scripts/mutate_host.py --all --write-inventory\n"
+            "# It REFUSES on a machine where any suite is skipped — see environment_is_complete().\n"
+            "#\n"
+            "# Format:  <path>:<line>:<operator>      # the line as it stands today\n"
+            "\n")
+        # path:line:operator — and the OPERATOR CONTAINS COLONS ("arithmetic:+→-"), so this
+        # splits from the left with maxsplit=2. rsplit here silently sorted by the wrong
+        # field and then crashed on int().
+        for key in sorted(entries, key=lambda k: (k.split(":", 2)[0], int(k.split(":", 2)[1]))):
+            src = entries[key]
+            f.write(f"{key}\n" if not src else f"{key:<52} # {src}\n")
+
 
 
 def find_cjson() -> str | None:
@@ -552,6 +611,9 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=25, help="max mutants per file")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--cjson", help="path to cJSON.c when it is not beside the project")
+    ap.add_argument("--write-inventory", action="store_true",
+                    help="rewrite scripts/mutation_survivors.txt from this run; needs --all, "
+                         "and refuses where any suite is skipped")
     a = ap.parse_args()
 
     global CJSON
@@ -597,6 +659,7 @@ def main() -> int:
 
     equivs = load_equivalents()
     total_surv = 0
+    all_surv: dict[str, str] = {}
     for t in targets:
         if not os.path.exists(t):
             print(f"\n{t}: not found"); return 3
@@ -627,10 +690,43 @@ def main() -> int:
             print(f"     ·  UNREACHED   {r['file']}:{ln}  {op}   {src}")
         if len(r["unreached"]) > 10:
             print(f"     ·  … and {len(r['unreached']) - 10} more unreached")
+        for ln, op, src in r["unasserted"]:
+            all_surv[f"{r['file']}:{ln}:{op}"] = src.strip()
         total_surv += len(r["unasserted"])
 
     print(f"\n{total_surv} unasserted survivor(s)")
     print("UNREACHED lines need a test that reaches them; UNASSERTED need a stronger assertion.")
+
+    complete, why = environment_is_complete()
+    if a.write_inventory:
+        if not a.all:
+            print("\nREFUSED: --write-inventory needs --all. A single file cannot rewrite the "
+                  "whole inventory\n         without deleting every entry it did not look at.")
+            return 4
+        if not complete:
+            print(f"\nREFUSED to write {os.path.relpath(SURVIVOR_FILE, ROOT)}: {why}")
+            print("         This run saw less than the full suite, so writing would delete "
+                  "entries it never\n         looked for — a diff that reads exactly like "
+                  "someone had fixed them.")
+            return 4
+        write_inventory(all_surv)
+        print(f"\nwrote {os.path.relpath(SURVIVOR_FILE, ROOT)} — {len(all_surv)} survivor(s)")
+    elif a.all and os.path.exists(SURVIVOR_FILE):
+        known = load_inventory()
+        added = sorted(set(all_surv) - set(known))
+        gone = sorted(set(known) - set(all_surv))
+        print(f"\nINVENTORY  {len(known)} known, {len(added)} new, {len(gone)} no longer found")
+        if not complete:
+            print(f"           ⚠️ comparison is UNRELIABLE here: {why}")
+            print("           Entries under 'no longer found' may simply not have been looked for.")
+        for k in added:
+            print(f"     + NEW       {k}   {all_surv[k]}")
+        for k in gone:
+            print(f"     - was here  {k}")
+        if added:
+            print("           A new survivor is an assertion that stopped distinguishing "
+                  "something.\n           Regenerate with --all --write-inventory once it is "
+                  "understood, not before.")
     return 1 if total_surv else 0
 
 
