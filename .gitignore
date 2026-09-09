@@ -1,5 +1,9 @@
 # --- ESP-IDF build output ---
-/build/
+# build*/ not build/: scripts/lint.sh builds each board configuration into its own
+# build-lint-N/, and idf-build.yml uses build-<board>/. An interrupted run would
+# otherwise leave them as untracked noise in git status.
+/build*/
+/.lint-compile-db.json
 sdkconfig
 sdkconfig.old
 
