@@ -1043,6 +1043,593 @@ static void test_str_pressure_settings_exact(void)
     cJSON_Delete(settings);
 }
 
+/* ── Identification.json / Identification.crc ────────────────────────────────
+ * edf_generate_identification_files() was the largest untested function in the
+ * exporter. The mutation harness picks it as edf_header.c's canary, empties its
+ * body, and every test still passed — so the harness refused a verdict on all
+ * 456 lines of that file rather than report a clean sweep it had not earned.
+ *
+ * These exist to make that verdict possible, so they pin behaviour a mutant
+ * would change rather than merely reaching the function: the CRC's byte order
+ * and length, the number->string coercion, the defaults for absent keys, and
+ * the one input/output key name that differs on purpose.
+ */
+static void ident_write_file(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "wb");
+    assert(f);
+    size_t n = strlen(text);
+    assert(fwrite(text, 1, n, f) == n);
+    assert(fclose(f) == 0);
+}
+
+static char *ident_slurp(const char *path, size_t *out_len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    assert(fseek(f, 0, SEEK_END) == 0);
+    long n = ftell(f);
+    assert(n >= 0);
+    assert(fseek(f, 0, SEEK_SET) == 0);
+    char *buf = malloc((size_t)n + 1);
+    assert(buf);
+    assert(fread(buf, 1, (size_t)n, f) == (size_t)n);
+    buf[n] = '\0';
+    fclose(f);
+    if (out_len) *out_len = (size_t)n;
+    return buf;
+}
+
+static void ident_make_dir(char *dst, size_t cap, const char *name)
+{
+    snprintf(dst, cap, "%s/%s", g_root, name);
+    mkdir(dst, 0777);
+}
+
+/* The full profile the AS11 expects, so the shape is pinned rather than sampled. */
+static const char *IDENT_FULL =
+    "{"
+    "\"UniversalIdentifier\":\"UID-1\","
+    "\"SerialNumber\":\"SN-2\","
+    "\"ProductCode\":37001,"
+    "\"ProductName\":\"AirSense 11\","
+    "\"ProductGeographicIdentifier\":\"EUR\","
+    "\"HardwareIdentifier\":\"HW-3\","
+    "\"BootloaderIdentifier\":\"BL-4\","
+    "\"ApplicationIdentifier\":\"APP-5\","
+    "\"ConfigurationIdentifier\":\"CFG-6\","
+    "\"PlatformIdentifier\":12,"
+    "\"VariantIdentifier\":34,"
+    "\"RegionIdentifier\":56,"
+    "\"ProfileVariantIdentifier\":\"PV-7\","
+    "\"DataVersionIdentifier\":78,"
+    "\"DataModelVersionIdentifier\":\"DM-8\""
+    "}";
+
+static cJSON *ident_profile(cJSON *root, const char *which)
+{
+    cJSON *fg = cJSON_GetObjectItem(root, "FlowGenerator");
+    assert(fg);
+    cJSON *profiles = cJSON_GetObjectItem(fg, "IdentificationProfiles");
+    assert(profiles);
+    cJSON *p = cJSON_GetObjectItem(profiles, which);
+    assert(p);
+    return p;
+}
+
+static void ident_expect_str(cJSON *obj, const char *key, const char *want)
+{
+    cJSON *j = cJSON_GetObjectItem(obj, key);
+    assert(j);
+    assert(cJSON_IsString(j));
+    assert(strcmp(j->valuestring, want) == 0);
+}
+
+static void test_crc32_matches_the_published_check_vector(void)
+{
+    /* CRC-32/ISO-HDLC (IEEE 802.3) has a published check value: the CRC of the
+     * nine bytes "123456789" is 0xCBF43926.
+     *
+     * Asserting against the constant rather than against another call of the same
+     * function is the entire point of this test. The Identification.crc test below
+     * compares the file's four bytes to edf_crc32_ieee() — so a mutation INSIDE the
+     * CRC changes both sides equally and survives, which is exactly what the
+     * mutation harness reported when this test did not exist: the loop bounds at
+     * lines 50 and 52 and the shift at line 56 all survived a suite that looked
+     * like it covered them. A test whose oracle is the code under test defends the
+     * bug instead of catching it. */
+    assert(edf_crc32_ieee((const uint8_t *)"123456789", 9) == 0xCBF43926u);
+    assert(edf_crc32_ieee((const uint8_t *)"", 0) == 0u);
+    assert(edf_crc32_ieee((const uint8_t *)"a", 1) == 0xE8B7BE43u);
+    /* Length is honoured, not strlen: a CRC over a prefix differs. */
+    assert(edf_crc32_ieee((const uint8_t *)"123456789", 8) != 0xCBF43926u);
+}
+
+static void test_identification_profile_shape(void)
+{
+    char dir[300], ident[400], out_path[400];
+    ident_make_dir(dir, sizeof(dir), "ident_shape");
+    snprintf(ident, sizeof(ident), "%s/identification.json", dir);
+    ident_write_file(ident, IDENT_FULL);
+
+    assert(edf_generate_identification_files(dir, ident) == ESP_OK);
+
+    snprintf(out_path, sizeof(out_path), "%s/Identification.json", dir);
+    char *out = ident_slurp(out_path, NULL);
+    assert(out);
+    cJSON *root = cJSON_Parse(out);
+    assert(root);
+
+    cJSON *product = ident_profile(root, "Product");
+    ident_expect_str(product, "UniversalIdentifier", "UID-1");
+    ident_expect_str(product, "SerialNumber", "SN-2");
+    ident_expect_str(product, "ProductName", "AirSense 11");
+    ident_expect_str(product, "ProductGeographicIdentifier", "EUR");
+    /* A numeric ProductCode is rendered as a STRING. The AS11 writes it either
+     * way and the profile always carries a string, so the coercion is load-bearing. */
+    ident_expect_str(product, "ProductCode", "37001");
+    /* Always blank, never copied from the source, even when the source has them. */
+    ident_expect_str(product, "SerialNumberVerificationCode", "");
+    ident_expect_str(product, "FdaUniqueDeviceIdentifier", "");
+
+    ident_expect_str(ident_profile(root, "Hardware"), "HardwareIdentifier", "HW-3");
+
+    cJSON *software = ident_profile(root, "Software");
+    ident_expect_str(software, "BootloaderIdentifier", "BL-4");
+    ident_expect_str(software, "ApplicationIdentifier", "APP-5");
+    ident_expect_str(software, "ConfigurationIdentifier", "CFG-6");
+    ident_expect_str(software, "DataModelVersionIdentifier", "DM-8");
+    /* THE KEY NAME CHANGES ON PURPOSE: the source says ProfileVARIANTIdentifier,
+     * the profile says ProfileVARIATIONIdentifier. It reads like a typo and it is
+     * not — pinned here so that "fixing" it breaks a test instead of a device. */
+    ident_expect_str(software, "ProfileVariationIdentifier", "PV-7");
+    assert(cJSON_GetObjectItem(software, "ProfileVariantIdentifier") == NULL);
+
+    /* These four stay NUMBERS. */
+    cJSON *plat = cJSON_GetObjectItem(software, "PlatformIdentifier");
+    assert(plat && cJSON_IsNumber(plat) && plat->valuedouble == 12);
+    cJSON *var = cJSON_GetObjectItem(software, "VariantIdentifier");
+    assert(var && cJSON_IsNumber(var) && var->valuedouble == 34);
+    cJSON *reg = cJSON_GetObjectItem(software, "RegionIdentifier");
+    assert(reg && cJSON_IsNumber(reg) && reg->valuedouble == 56);
+    cJSON *dv = cJSON_GetObjectItem(software, "DataVersionIdentifier");
+    assert(dv && cJSON_IsNumber(dv) && dv->valuedouble == 78);
+
+    cJSON_Delete(root);
+    free(out);
+}
+
+static void test_identification_crc_is_le_crc32_of_the_json(void)
+{
+    char dir[300], ident[400], json_path[400], crc_path[400];
+    ident_make_dir(dir, sizeof(dir), "ident_crc");
+    snprintf(ident, sizeof(ident), "%s/identification.json", dir);
+    ident_write_file(ident, IDENT_FULL);
+
+    assert(edf_generate_identification_files(dir, ident) == ESP_OK);
+
+    snprintf(json_path, sizeof(json_path), "%s/Identification.json", dir);
+    snprintf(crc_path, sizeof(crc_path), "%s/Identification.crc", dir);
+
+    size_t json_len = 0, crc_len = 0;
+    char *json = ident_slurp(json_path, &json_len);
+    unsigned char *crc_file = (unsigned char *)ident_slurp(crc_path, &crc_len);
+    assert(json && crc_file);
+
+    /* Exactly four bytes — not a text rendering, not a trailing newline. */
+    assert(crc_len == 4);
+
+    /* Little-endian, over the WHOLE json as written. Both halves of that matter:
+     * a byte-order flip and an off-by-one on the length are the two mutations a
+     * CRC written this way invites. */
+    uint32_t want = edf_crc32_ieee((const uint8_t *)json, json_len);
+    uint32_t got = (uint32_t)crc_file[0]
+                 | ((uint32_t)crc_file[1] << 8)
+                 | ((uint32_t)crc_file[2] << 16)
+                 | ((uint32_t)crc_file[3] << 24);
+    assert(got == want);
+    assert(got != edf_crc32_ieee((const uint8_t *)json, json_len - 1));
+
+    free(json);
+    free(crc_file);
+}
+
+static void test_identification_absent_fields_are_empty_or_zero(void)
+{
+    char dir[300], ident[400], out_path[400];
+    ident_make_dir(dir, sizeof(dir), "ident_sparse");
+    snprintf(ident, sizeof(ident), "%s/identification.json", dir);
+    ident_write_file(ident, "{\"SerialNumber\":\"ONLY\"}");
+
+    assert(edf_generate_identification_files(dir, ident) == ESP_OK);
+
+    snprintf(out_path, sizeof(out_path), "%s/Identification.json", dir);
+    char *out = ident_slurp(out_path, NULL);
+    assert(out);
+    cJSON *root = cJSON_Parse(out);
+    assert(root);
+
+    cJSON *product = ident_profile(root, "Product");
+    ident_expect_str(product, "SerialNumber", "ONLY");
+    /* Absent strings are present-and-empty, not absent and not null: the profile
+     * always carries every key. */
+    ident_expect_str(product, "UniversalIdentifier", "");
+    ident_expect_str(product, "ProductCode", "");
+    ident_expect_str(product, "ProductName", "");
+
+    cJSON *software = ident_profile(root, "Software");
+    cJSON *plat = cJSON_GetObjectItem(software, "PlatformIdentifier");
+    assert(plat && cJSON_IsNumber(plat) && plat->valuedouble == 0);
+    cJSON *dv = cJSON_GetObjectItem(software, "DataVersionIdentifier");
+    assert(dv && cJSON_IsNumber(dv) && dv->valuedouble == 0);
+
+    cJSON_Delete(root);
+    free(out);
+}
+
+static void test_identification_missing_source_is_refused(void)
+{
+    char dir[300], ident[400], json_path[400], crc_path[400];
+    ident_make_dir(dir, sizeof(dir), "ident_missing");
+    snprintf(ident, sizeof(ident), "%s/does-not-exist.json", dir);
+
+    assert(edf_generate_identification_files(dir, ident) == ESP_FAIL);
+
+    /* And it writes nothing at all: a refused generation must not leave a
+     * half-made profile behind for the next reader to trust. */
+    snprintf(json_path, sizeof(json_path), "%s/Identification.json", dir);
+    snprintf(crc_path, sizeof(crc_path), "%s/Identification.crc", dir);
+    assert(ident_slurp(json_path, NULL) == NULL);
+    assert(ident_slurp(crc_path, NULL) == NULL);
+}
+
+/* ── edf_waveform: the guards in the event-file readers ──────────────────────
+ * Eighteen of the harness's thirty-three survivors lived in these three
+ * functions, all of them the same shape: a guard whose false branch nothing
+ * exercised. `events && cJSON_IsArray(events)` flipped to `||` still returns
+ * the right answer on every well-formed file, because a well-formed file always
+ * has an array there. The tests below are therefore all MALFORMED input — the
+ * only input that tells the two versions apart.
+ *
+ * Two of the mutants matter beyond the score. Dropping the IsString check on a
+ * label reaches strcmp(NULL, ...) and dropping it on reportTime reaches the
+ * ISO-8601 parser with a NULL pointer, both from a file the device wrote after
+ * a crash or a partial flush.
+ */
+static void wf_write(const char *path, const char *jsonl)
+{
+    FILE *f = fopen(path, "wb");
+    assert(f);
+    assert(fputs(jsonl, f) >= 0);
+    assert(fclose(f) == 0);
+}
+
+static const char *wf_path(char *dst, size_t cap, const char *name)
+{
+    snprintf(dst, cap, "%s/%s", g_root, name);
+    return dst;
+}
+
+/* ---- snt_available_samples -------------------------------------------------- */
+
+static void test_wf_available_samples_guards(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_avail.snt");
+
+    /* A file holding exactly the header and nothing else: no samples, and that
+     * is a 0, not an error. */
+    FILE *f = fopen(p, "wb");
+    assert(f);
+    snt_header_t h;
+    memset(&h, 0, sizeof(h));
+    assert(fwrite(&h, 1, sizeof(h), f) == sizeof(h));
+    assert(fclose(f) == 0);
+    f = fopen(p, "rb");
+    assert(f);
+    assert(snt_available_samples(f, 2) == 0);
+
+    /* CHANNELS ZERO IS REFUSED, not divided by. `channels_in_file <= 0` weakened
+     * to `< 0` lets a zero through to `data_bytes / frame` with frame == 0. */
+    assert(snt_available_samples(f, 0) == UINT32_MAX);
+    assert(snt_available_samples(f, -1) == UINT32_MAX);
+    assert(snt_available_samples(NULL, 2) == UINT32_MAX);
+    assert(fclose(f) == 0);
+
+    /* An EMPTY file is 0 samples. end == 0 here, so a guard written `end <= 0`
+     * instead of `end < 0` reports UINT32_MAX — an error where there is none. */
+    f = fopen(p, "wb"); assert(f); assert(fclose(f) == 0);
+    f = fopen(p, "rb"); assert(f);
+    assert(snt_available_samples(f, 2) == 0);
+    assert(fclose(f) == 0);
+
+    /* Header plus three whole frames of two channels, read from the START of the
+     * file: ftell is 0 there, so `cur < 0` weakened to `<= 0` would refuse a
+     * perfectly ordinary call. */
+    f = fopen(p, "wb");
+    assert(f);
+    assert(fwrite(&h, 1, sizeof(h), f) == sizeof(h));
+    int16_t frames[6] = { 1, 2, 3, 4, 5, 6 };
+    assert(fwrite(frames, sizeof(int16_t), 6, f) == 6);
+    assert(fclose(f) == 0);
+    f = fopen(p, "rb");
+    assert(f);
+    assert(ftell(f) == 0);
+    assert(snt_available_samples(f, 2) == 3);
+    assert(fclose(f) == 0);
+}
+
+/* ---- edf_find_mask_on_time / edf_find_mask_off_time -------------------------- */
+
+static void test_wf_mask_times_are_found(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_mask_ok.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T22:10:00.000\"}]}}\n"
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T06:20:00.000\"}]}}\n");
+    int64_t on = edf_find_mask_on_time(p);
+    int64_t off = edf_find_mask_off_time(p);
+    assert(on > 0);
+    assert(off > on);
+    /* MaskOff takes the LAST one in the file, MaskOn the first — asserted as an
+     * ordering rather than a constant so the test does not pin a timezone. */
+    assert(off - on == 8 * 3600 * 1000 + 10 * 60 * 1000);
+}
+
+static void test_wf_mask_on_last_wins_is_first_wins(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_mask_first.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n"
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T23:00:00.000\"}]}}\n");
+    int64_t a = edf_find_mask_on_time(p);
+    wf_path(p, sizeof(p), "wf_mask_one.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    /* MaskOn returns on the FIRST match; a second one later must not move it. */
+    assert(a == edf_find_mask_on_time(p));
+}
+
+static void test_wf_mask_off_takes_the_last(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_maskoff_last.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T05:00:00.000\"}]}}\n"
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T06:00:00.000\"}]}}\n");
+    int64_t last = edf_find_mask_off_time(p);
+    wf_path(p, sizeof(p), "wf_maskoff_one.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T06:00:00.000\"}]}}\n");
+    /* MaskOff keeps scanning and reports the last — the session ends when the
+     * mask last came off, not the first time it did. */
+    assert(last == edf_find_mask_off_time(p));
+}
+
+static void test_wf_events_must_be_an_array(void)
+{
+    char p[400];
+    /* "events" as an OBJECT. cJSON_GetArraySize counts an object's children too,
+     * so a mutant that drops the IsArray half of the guard walks into it and
+     * finds the MaskOn inside. */
+    wf_path(p, sizeof(p), "wf_events_obj.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":{\"x\":{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}}}}\n");
+    assert(edf_find_mask_on_time(p) == -1);
+
+    wf_path(p, sizeof(p), "wf_events_obj_off.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":{\"x\":{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T06:00:00.000\"}}}}\n");
+    assert(edf_find_mask_off_time(p) == -1);
+}
+
+static void test_wf_a_non_string_label_is_skipped(void)
+{
+    char p[400];
+    /* A numeric "event". The guard is `!label || !cJSON_IsString(label)`; turn
+     * that `||` into `&&` and a number reaches strcmp(label->valuestring, ...)
+     * with valuestring NULL. */
+    wf_path(p, sizeof(p), "wf_label_num.jsonl");
+    wf_write(p, "{\"params\":{\"events\":[{\"event\":123,"
+                "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    assert(edf_find_mask_on_time(p) == -1);
+    assert(edf_find_mask_off_time(p) == -1);
+}
+
+static void test_wf_a_non_string_report_time_is_skipped(void)
+{
+    char p[400];
+    /* A numeric "reportTime" behind a matching label. Dropping the IsString half
+     * of `rt && cJSON_IsString(rt)` hands a NULL to the ISO-8601 parser. */
+    wf_path(p, sizeof(p), "wf_rt_num.jsonl");
+    wf_write(p, "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+                "\"reportTime\":99999}]}}\n");
+    assert(edf_find_mask_on_time(p) == -1);
+
+    wf_path(p, sizeof(p), "wf_rt_num_off.jsonl");
+    wf_write(p, "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+                "\"reportTime\":99999}]}}\n");
+    assert(edf_find_mask_off_time(p) == -1);
+}
+
+/* ---- edf_find_zle_edge_time --------------------------------------------------- */
+
+static void test_wf_zle_only_reads_zle_records(void)
+{
+    char p[400];
+    /* dataId is present but is not _ZLE. The guard is
+     * `data_id && cJSON_IsString(data_id) && strcmp(...) == 0`; turning the
+     * first && into || makes it `data_id || (IsString && strcmp == 0)`, so ANY
+     * record with a dataId is treated as a ZLE record. */
+    wf_path(p, sizeof(p), "wf_zle_other.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"OTHER\",\"events\":[{\"value\":1,"
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+}
+
+static void test_wf_zle_value_must_be_a_number(void)
+{
+    char p[400];
+    /* "value" as a STRING. `val && cJSON_IsNumber(val) && ...` with the first
+     * && turned into || accepts it, because val is merely non-NULL. */
+    wf_path(p, sizeof(p), "wf_zle_valstr.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":\"1\","
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+}
+
+static void test_wf_zle_falls_back_to_ntp_when_report_time_is_unusable(void)
+{
+    char p[400];
+    /* A numeric reportTime is not a string, so the AS11 path is skipped and the
+     * ntpTimeMs fallback answers. Dropping the IsString check parses NULL. */
+    wf_path(p, sizeof(p), "wf_zle_ntp.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
+        "\"reportTime\":7,\"ntpTimeMs\":1756000000000}]}}\n");
+    assert(edf_find_zle_edge_time(p, 1, 0) == 1756000000000LL);
+}
+
+static void test_wf_zle_clock_drift_is_added_to_the_as11_time(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_zle_drift.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    int64_t zero = edf_find_zle_edge_time(p, 1, 0);
+    int64_t plus = edf_find_zle_edge_time(p, 1, 4321);
+    assert(zero > 0);
+    assert(plus - zero == 4321);
+}
+
+/* Round two: the guards that a single malformed record cannot separate.
+ *
+ * `rt && cJSON_IsString(rt)` weakened to `||` still yields -1 on a file whose
+ * only MaskOn has a numeric reportTime, because the parser hands back a failure
+ * for the NULL valuestring and -1 is what the caller would have returned anyway.
+ * The two versions diverge only when a USABLE record follows a broken one:
+ * MaskOn returns on its first match, so the mutant returns -1 and never reaches
+ * the good line; MaskOff keeps the last, so the mutant overwrites a good time
+ * with -1. Each therefore needs the bad record on the side its function cares
+ * about. */
+
+static void test_wf_mask_on_survives_a_broken_record_before_a_good_one(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_on_bad_then_good.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\",\"reportTime\":99999}]}}\n"
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    int64_t got = edf_find_mask_on_time(p);
+    wf_path(p, sizeof(p), "wf_on_good_only.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOn\","
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    assert(got > 0);
+    assert(got == edf_find_mask_on_time(p));
+}
+
+static void test_wf_mask_off_survives_a_broken_record_after_a_good_one(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_off_good_then_bad.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T06:00:00.000\"}]}}\n"
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\",\"reportTime\":99999}]}}\n");
+    int64_t got = edf_find_mask_off_time(p);
+    wf_path(p, sizeof(p), "wf_off_good_only.jsonl");
+    wf_write(p,
+        "{\"params\":{\"events\":[{\"event\":\"MaskOff\","
+        "\"reportTime\":\"2026-09-02T06:00:00.000\"}]}}\n");
+    assert(got > 0);
+    assert(got == edf_find_mask_off_time(p));
+}
+
+static void test_wf_zle_events_must_be_an_array(void)
+{
+    char p[400];
+    /* The same object-shaped events as the MaskOn case, but inside a _ZLE
+     * record — a separate copy of the guard, and it needed its own test. */
+    wf_path(p, sizeof(p), "wf_zle_events_obj.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":{\"x\":{\"value\":1,"
+        "\"ntpTimeMs\":1756000000000}}}}\n");
+    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+}
+
+static void test_wf_zle_rejects_a_zero_ntp_time(void)
+{
+    char p[400];
+    /* ntpTimeMs of 0 is not a time, it is an unset field. `cand > 0` weakened to
+     * `>= 0` accepts it and reports the epoch as a ZLE edge. */
+    wf_path(p, sizeof(p), "wf_zle_ntp_zero.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
+        "\"ntpTimeMs\":0}]}}\n");
+    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+}
+
+static void test_wf_zle_an_epoch_report_time_is_not_a_time(void)
+{
+    char p[400];
+    /* A reportTime that parses to 0 must not become `0 + drift`. `as11_ms > 0`
+     * weakened to `>= 0` turns an unset timestamp into a real-looking edge
+     * exactly one drift away from the epoch. The ntpTimeMs here is what the
+     * function SHOULD fall back to, so the assertion names the right answer
+     * rather than merely rejecting the wrong one. */
+    wf_path(p, sizeof(p), "wf_zle_epoch.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
+        "\"reportTime\":\"1970-01-01T00:00:00.000\","
+        "\"ntpTimeMs\":1756000000000}]}}\n");
+    assert(edf_find_zle_edge_time(p, 1, 60000) == 1756000000000LL);
+}
+
+static void test_wf_zle_a_drift_cancelled_time_is_not_a_time(void)
+{
+    char p[400], q[400];
+    /* THE ONE CASE WHERE cand IS EXACTLY ZERO. `cand < 0` weakened to `<= 0`
+     * makes a drift that happens to cancel the AS11 timestamp fall through to
+     * the ntpTimeMs fallback — so a computed zero silently becomes a different
+     * clock's answer instead of being rejected.
+     *
+     * The drift is derived at run time rather than hard-coded, because the AS11
+     * time depends on the host timezone and pinning it would make this test a
+     * clock test. */
+    wf_path(p, sizeof(p), "wf_zle_drift_probe.jsonl");
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
+        "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
+    int64_t as11 = edf_find_zle_edge_time(p, 1, 0);
+    assert(as11 > 0);
+
+    wf_path(q, sizeof(q), "wf_zle_cancel.jsonl");
+    wf_write(q,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
+        "\"reportTime\":\"2026-09-01T22:00:00.000\","
+        "\"ntpTimeMs\":1756000000000}]}}\n");
+    /* as11 + (-as11) == 0, which is not a time. The ntp value must NOT rescue it:
+     * the AS11 path answered, and it answered zero. */
+    assert(edf_find_zle_edge_time(q, 1, -as11) == -1);
+}
+
 int main(void)
 {
     snprintf(g_root, sizeof(g_root), "%s/snt_edf_test_XXXXXX",
@@ -1075,6 +1662,46 @@ int main(void)
     run("the session's AS11 offset beats the device timezone",
         test_as11_offset_beats_device_timezone, NULL);
     run("STR pressure settings are exact cmH2O x 50", test_str_pressure_settings_exact, NULL);
+
+    run("crc32 matches the published CRC-32/ISO-HDLC check vector",
+        test_crc32_matches_the_published_check_vector, NULL);
+    run("Identification profile carries every key, with the deliberate rename",
+        test_identification_profile_shape, NULL);
+    run("Identification.crc is four bytes, little-endian crc32 of the json",
+        test_identification_crc_is_le_crc32_of_the_json, NULL);
+    run("absent identification fields become empty strings and zeroes",
+        test_identification_absent_fields_are_empty_or_zero, NULL);
+    run("a missing identification.json is refused and writes nothing",
+        test_identification_missing_source_is_refused, NULL);
+
+    run("snt_available_samples refuses 0 channels and an empty file is 0",
+        test_wf_available_samples_guards, NULL);
+    run("MaskOn and MaskOff are read from the event file",
+        test_wf_mask_times_are_found, NULL);
+    run("MaskOn takes the first match", test_wf_mask_on_last_wins_is_first_wins, NULL);
+    run("MaskOff takes the last match", test_wf_mask_off_takes_the_last, NULL);
+    run("an events object is not an events array", test_wf_events_must_be_an_array, NULL);
+    run("a non-string event label is skipped", test_wf_a_non_string_label_is_skipped, NULL);
+    run("a non-string reportTime is skipped",
+        test_wf_a_non_string_report_time_is_skipped, NULL);
+    run("_ZLE search ignores other dataIds", test_wf_zle_only_reads_zle_records, NULL);
+    run("_ZLE value must be a number", test_wf_zle_value_must_be_a_number, NULL);
+    run("_ZLE falls back to ntpTimeMs",
+        test_wf_zle_falls_back_to_ntp_when_report_time_is_unusable, NULL);
+    run("_ZLE adds the clock drift to the AS11 time",
+        test_wf_zle_clock_drift_is_added_to_the_as11_time, NULL);
+
+    run("MaskOn skips a broken record and finds the next",
+        test_wf_mask_on_survives_a_broken_record_before_a_good_one, NULL);
+    run("MaskOff is not overwritten by a broken later record",
+        test_wf_mask_off_survives_a_broken_record_after_a_good_one, NULL);
+    run("_ZLE events object is not an array", test_wf_zle_events_must_be_an_array, NULL);
+    run("_ZLE rejects a zero ntpTimeMs", test_wf_zle_rejects_a_zero_ntp_time, NULL);
+    run("_ZLE epoch reportTime falls through to ntp",
+        test_wf_zle_an_epoch_report_time_is_not_a_time, NULL);
+
+    run("_ZLE rejects an AS11 time cancelled by the drift",
+        test_wf_zle_a_drift_cancelled_time_is_not_a_time, NULL);
 
     if (!getenv("KEEP_TEST_TREE")) rmtree(g_root);
     else printf("test tree kept at %s\n", g_root);

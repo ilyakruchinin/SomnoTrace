@@ -57,6 +57,37 @@ CC=${CC:-gcc}
 CFLAGS="-std=gnu11 -Wall -Wno-unused-function -O1 -g"
 SHIM=scripts/test_include
 
+# ── AddressSanitizer + UndefinedBehaviorSanitizer ────────────────────────────────
+# WHY. Three mutants in edf_header.c survived a green suite by corrupting memory
+# quietly: malloc(fsize + 1) -> (fsize - 1), and edf_write_field(hdr + 88, ...) ->
+# (hdr - 88), which writes 80 bytes BEFORE a 256-byte stack array. Nothing asserted
+# them because nothing crashed -- a heap chunk has slack and a stack write lands on
+# other locals. Under -fsanitize=address the same mutant dies immediately with
+# "stack-buffer-overflow ... in memset".
+#
+# For a firmware project this is the cheap half of the bargain: the host suite runs
+# the SAME C the device runs, on a machine with a MMU and a sanitizer, so the class
+# of bug that is hardest to see on an ESP32-S3 is the class this catches for free.
+#
+# Measured before switching on: the suite already passes clean under both
+# sanitizers, so this reds nothing today. Set SNT_NO_SANITIZE=1 to opt out, and a
+# toolchain without them degrades to a plain build with a note rather than failing
+# -- absence of a sanitizer is not absence of a gate.
+SANITIZE=""
+if [ -z "${SNT_NO_SANITIZE:-}" ]; then
+    printf 'int main(void){return 0;}\n' > "$OUT/.sancheck.c"
+    if $CC -fsanitize=address,undefined -o "$OUT/.sancheck" "$OUT/.sancheck.c" 2>/dev/null; then
+        SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
+        CFLAGS="$CFLAGS $SANITIZE"
+        echo "sanitizers: address,undefined"
+    else
+        echo "sanitizers: UNAVAILABLE in $CC — building without them"
+    fi
+    rm -f "$OUT/.sancheck" "$OUT/.sancheck.c"
+else
+    echo "sanitizers: disabled by SNT_NO_SANITIZE"
+fi
+
 failed=0
 ran=0
 skipped=0
@@ -83,6 +114,23 @@ run_test() {
         # Name the failing test(s) even when quiet: a failure nobody can
         # attribute to a test teaches nothing (mutants.py reads these lines).
         grep -E '^ *(FAILED|XPASS|FAIL)\b' "$log" | head -8 | sed 's/^/    /'
+        [ $QUIET = 1 ] || cat "$log"
+    fi
+}
+
+# run_check <name> <command...> — for a check that is not a compiled C test.
+# Shares the counters so one summary line still covers everything that ran.
+run_check() {
+    local name=$1; shift
+    known="$known $name"
+    if [ -n "$ONLY" ] && [ "$ONLY" != "$name" ]; then return; fi
+    ran=$((ran + 1))
+    local log="$OUT/$name.log"
+    if "$@" > "$log" 2>&1; then
+        echo "### $name: PASS  ($(tail -1 "$log"))"
+    else
+        echo "### $name: FAIL"
+        failed=$((failed + 1))
         [ $QUIET = 1 ] || cat "$log"
     fi
 }
@@ -117,6 +165,17 @@ if [ -n "$CJ_INC" ]; then
     # upstream's EDF pipeline property suite (54ae598)
     run_test edf_properties_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
         scripts/edf_properties_test.c "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
+fi
+
+# The mutation harness's TEXTUAL layer has nothing else to catch a mistake in it. Every
+# other part is checked by running — a badly formed mutant fails to compile and is counted
+# stillborn — but a mutant generated on the wrong part of a line still builds and still
+# passes, which is precisely how operators inside trailing comments produced survivors that
+# no test could ever kill. Needs no compiler, so it runs wherever python3 does.
+if command -v python3 >/dev/null 2>&1; then
+    run_check mutate_host_self_test python3 scripts/mutate_host.py --self-test
+else
+    skip_test mutate_host_self_test "no python3"
 fi
 
 # Roster check: a test file that exists but is not wired in here would never

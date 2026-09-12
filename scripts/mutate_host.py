@@ -93,6 +93,65 @@ def target_path(entry: str) -> str:
     return entry[1:] if entry.startswith("#") else entry
 
 EQUIV_FILE = os.path.join(HERE, "mutate_equivalent.txt")
+SURVIVOR_FILE = os.path.join(HERE, "mutation_survivors.txt")
+
+
+def environment_is_complete() -> tuple[bool, str]:
+    """(may this run rewrite the inventory, and if not why not).
+
+    ⚠️ A NARROWER ENVIRONMENT SEES FEWER SURVIVORS. Without cJSON the two EDF suites are
+    skipped and this harness reports SCOPE 2 of 80 instead of 8; every survivor in the five
+    EDF modules simply is not found. Writing the inventory from that run would DELETE those
+    entries, and the diff would read exactly like someone had fixed them.
+
+    So the inventory may only be written where the whole suite builds. Refusing is the
+    feature: an inventory that quietly narrows is worse than no inventory, because it is
+    trusted."""
+    skipped = sorted(t for t in TESTS if sources_for(t) is None)
+    if skipped:
+        return False, "these suites could not be built: " + ", ".join(skipped)
+    if not shutil.which("gcov"):
+        return False, ("gcov is absent, so reach is unknown and every mutant is run and "
+                       "classified UNASSERTED rather than UNREACHED")
+    return True, ""
+
+
+def load_inventory() -> dict[str, str]:
+    out = {}
+    if os.path.exists(SURVIVOR_FILE):
+        for line in open(SURVIVOR_FILE, encoding="utf-8"):
+            key = line.split("#", 1)[0].strip()
+            if key:
+                out[key] = line.split("#", 1)[1].strip() if "#" in line else ""
+    return out
+
+
+def write_inventory(entries: dict[str, str]) -> None:
+    with open(SURVIVOR_FILE, "w", encoding="utf-8", newline="\n") as f:
+        f.write(
+            "# UNASSERTED survivors: mutants that RAN and that every host test still passed.\n"
+            "# Committed on purpose. A gitignored copy would exist only on the machine that\n"
+            "# produced it, and the useful property of this file is that a pull request which\n"
+            "# weakens an assertion ADDS A LINE HERE, next to the change that caused it —\n"
+            "# visible in review without anyone running the sweep.\n"
+            "#\n"
+            "# NOT a list of bugs, and not a to-do list. A survivor means the suite does not\n"
+            "# distinguish this mutant from the original; whether that matters is a judgement\n"
+            "# each one needs on its own. A mutant no input can kill belongs in\n"
+            "# mutate_equivalent.txt instead, with the argument written down.\n"
+            "#\n"
+            "# Regenerate with:  python3 scripts/mutate_host.py --all --write-inventory\n"
+            "# It REFUSES on a machine where any suite is skipped — see environment_is_complete().\n"
+            "#\n"
+            "# Format:  <path>:<line>:<operator>      # the line as it stands today\n"
+            "\n")
+        # path:line:operator — and the OPERATOR CONTAINS COLONS ("arithmetic:+→-"), so this
+        # splits from the left with maxsplit=2. rsplit here silently sorted by the wrong
+        # field and then crashed on int().
+        for key in sorted(entries, key=lambda k: (k.split(":", 2)[0], int(k.split(":", 2)[1]))):
+            src = entries[key]
+            f.write(f"{key}\n" if not src else f"{key:<52} # {src}\n")
+
 
 
 def find_cjson() -> str | None:
@@ -153,6 +212,35 @@ def find_cjson_system() -> str | None:
 CJSON_SYS = find_cjson_system()
 
 
+def sanitizer_flags() -> list[str]:
+    """-fsanitize flags when this toolchain has them, else nothing.
+
+    The harness must build the way scripts/run_host_tests.sh builds, or its verdict is
+    about a different program. It matters more here than there: a mutation that corrupts
+    memory rather than changing an answer survives a suite that only checks answers.
+    Three did in edf_header.c -- a malloc one element short, and a header field written
+    88 bytes BEFORE a stack array -- and all three die under AddressSanitizer.
+
+    Probed once, by compiling. Asking the compiler is cheaper than maintaining a list of
+    which versions support what, and it cannot be wrong."""
+    if os.environ.get("SNT_NO_SANITIZE"):
+        return []
+    d = tempfile.mkdtemp(prefix="sancheck-")
+    try:
+        src = os.path.join(d, "t.c")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write("int main(void){return 0;}\n")
+        r = subprocess.run(["gcc", "-fsanitize=address,undefined",
+                            "-o", os.path.join(d, "t"), src],
+                           capture_output=True)
+        return ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if r.returncode == 0 else []
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+SANITIZE = sanitizer_flags()
+
+
 def sources_for(test: str) -> list[str] | None:
     out = []
     for s in TESTS[test]:
@@ -175,6 +263,7 @@ def build(test: str, outdir: str, coverage: bool = False) -> str | None:
         return None
     exe = os.path.join(outdir, test)
     cmd = ["gcc", "-O0", "-o", exe, os.path.join(HERE, test + ".c"), *src]
+    cmd += SANITIZE
     if coverage:
         cmd += ["--coverage"]
     # Header order depends on what the test links, and it has to.
@@ -333,6 +422,24 @@ OPS: list[tuple[str, str, str]] = [
 
 SKIP_LINE = re.compile(r'^\s*(//|/\*|\*|#include|#pragma)')
 
+# Where a TRAILING comment starts. SKIP_LINE above only catches a comment that begins a
+# line, so an operator inside `x = y;  /* >= 0 here */` was fair game and got mutated —
+# producing a byte-identical program that every test passes, reported as a survivor.
+# Measured on this tree: 392 lines across 22 files in main/ carry a mutable operator in a
+# trailing comment and could each generate one of these.
+#
+# Taking the FIRST /* or // as the boundary is deliberately conservative. A line like
+# `a /* note */ + b` stops being mutated after the comment, so the count can only go down,
+# never wrong: a mutant not generated costs a little coverage, a mutant that cannot fail
+# costs the reader's trust in every other line of the report.
+_COMMENT_START = re.compile(r'/\*|//')
+
+
+def code_of(line: str) -> str:
+    """The part of a source line before any trailing comment."""
+    m = _COMMENT_START.search(line)
+    return line[:m.start()] if m else line
+
 
 def load_equivalents() -> set[str]:
     out = set()
@@ -352,9 +459,13 @@ def gen_mutants(path: str, limit: int) -> list[tuple[int, str, str, str]]:
     for i, line in enumerate(lines, 1):
         if SKIP_LINE.match(line) or '"' in line:
             continue          # string literals: a changed message is not a behaviour change
+        code = code_of(line)
         for a, b, name in OPS:
-            if a in line:
-                out.append((i, f"{name}:{a.strip()}→{b.strip()}", line, line.replace(a, b, 1)))
+            if a in code:
+                # Rebuild the line so the comment survives byte-for-byte: only the code
+                # half is edited, and only its first occurrence, exactly as before.
+                mutated = code.replace(a, b, 1) + line[len(code):]
+                out.append((i, f"{name}:{a.strip()}→{b.strip()}", line, mutated))
                 break
         if len(out) >= limit:
             break
@@ -368,6 +479,63 @@ def gen_mutants(path: str, limit: int) -> list[tuple[int, str, str, str]]:
 # or void, and many split their parameters across lines.
 _DEF = re.compile(r'^[A-Za-z_][A-Za-z0-9_ \t\*]*\b(\w+)\s*\(')
 _NOT_A_DEF = re.compile(r'^\s*(if|for|while|switch|return|else|do|typedef|struct|enum|union)\b')
+
+
+def self_test() -> int:
+    """Assertions on the textual layer — the part with no compiler to catch it.
+
+    Everything else here is checked by running: a bad mutant fails to build and is counted
+    stillborn. gen_mutants has no such backstop, because a mutant it generates wrongly still
+    compiles — that is exactly how the trailing-comment bug produced survivors nobody could
+    kill. So this is the piece that needs pinning."""
+    fails = []
+
+    def eq(what, got, want):
+        if got != want:
+            fails.append(f"{what}: got {got!r}, want {want!r}")
+
+    eq("code_of: no comment", code_of("    if (a >= b) {\n"), "    if (a >= b) {\n")
+    eq("code_of: block comment", code_of("    x = 1;  /* >= 0 */\n"), "    x = 1;  ")
+    eq("code_of: line comment", code_of("    x = 1;  // >= 0\n"), "    x = 1;  ")
+    eq("code_of: whole-line comment", code_of("  /* >= */\n"), "  ")
+
+    d = tempfile.mkdtemp(prefix="selftest-")
+    try:
+        p = os.path.join(d, "t.c")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("int f(int a, int b)\n"                  # 1
+                    "{\n"                                     # 2
+                    "    int n = a - 1;     /* >= 0 always */\n"  # 3
+                    "    if (a > b) return 1;\n"              # 4
+                    "    return 0;\n"                         # 5
+                    "}\n")                                    # 6
+        got = gen_mutants(p, 100)
+        lines_hit = sorted(m[0] for m in got)
+
+        # Line 3's only >= is inside the comment; its CODE has a '-', which is a real
+        # operator, so line 3 is still mutated -- on the minus, not on the comment.
+        m3 = [m for m in got if m[0] == 3]
+        eq("line 3 produces one mutant", len(m3), 1)
+        if m3:
+            eq("line 3 mutates the code operator", m3[0][1], "arithmetic:-→+")
+            eq("line 3 keeps its comment", m3[0][3].endswith("/* >= 0 always */\n"), True)
+        m4 = [m for m in got if m[0] == 4]
+        eq("line 4 mutates the comparison", m4[0][1] if m4 else None, "relational:>→>=")
+        eq("no mutant on a brace-only line", 2 in lines_hit, False)
+
+        # A line whose ONLY operator lives in the comment must yield nothing at all.
+        p2 = os.path.join(d, "u.c")
+        with open(p2, "w", encoding="utf-8") as f:
+            f.write("void g(void)\n{\n    step();      /* runs when n >= 2 */\n}\n")
+        eq("comment-only operator generates no mutant",
+           [m[0] for m in gen_mutants(p2, 100)], [])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    for f in fails:
+        print(f"  FAIL {f}")
+    print(f"mutate_host self-test: {'PASS' if not fails else str(len(fails)) + ' FAILED'}")
+    return 1 if fails else 0
 
 
 def canary_for(path: str, lines: list[str]) -> tuple[int, str, str] | None:
@@ -552,11 +720,19 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=25, help="max mutants per file")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--cjson", help="path to cJSON.c when it is not beside the project")
+    ap.add_argument("--self-test", action="store_true",
+                    help="check the textual mutation layer and exit; no compiler needed")
+    ap.add_argument("--write-inventory", action="store_true",
+                    help="rewrite scripts/mutation_survivors.txt from this run; needs --all, "
+                         "and refuses where any suite is skipped")
     a = ap.parse_args()
 
     global CJSON
     if a.cjson:
         CJSON = a.cjson
+
+    if a.self_test:
+        return self_test()
 
     if not shutil.which("gcc"):
         print("gcc not found", file=sys.stderr)
@@ -564,6 +740,9 @@ def main() -> int:
     outdir = tempfile.mkdtemp(prefix="snt-mutate-")
     print("cJSON: " + (CJSON or (f"-lcjson from {CJSON_SYS}" if CJSON_SYS else
                                  "<not found — tests needing it are SKIPPED, not failed>")))
+    print("SANITIZE: " + (" ".join(SANITIZE) if SANITIZE else
+                          "<none — a mutant that corrupts memory instead of changing an "
+                          "answer may survive>"))
 
     if a.selftest:
         return selftest(outdir)
@@ -597,6 +776,7 @@ def main() -> int:
 
     equivs = load_equivalents()
     total_surv = 0
+    all_surv: dict[str, str] = {}
     for t in targets:
         if not os.path.exists(t):
             print(f"\n{t}: not found"); return 3
@@ -627,10 +807,43 @@ def main() -> int:
             print(f"     ·  UNREACHED   {r['file']}:{ln}  {op}   {src}")
         if len(r["unreached"]) > 10:
             print(f"     ·  … and {len(r['unreached']) - 10} more unreached")
+        for ln, op, src in r["unasserted"]:
+            all_surv[f"{r['file']}:{ln}:{op}"] = src.strip()
         total_surv += len(r["unasserted"])
 
     print(f"\n{total_surv} unasserted survivor(s)")
     print("UNREACHED lines need a test that reaches them; UNASSERTED need a stronger assertion.")
+
+    complete, why = environment_is_complete()
+    if a.write_inventory:
+        if not a.all:
+            print("\nREFUSED: --write-inventory needs --all. A single file cannot rewrite the "
+                  "whole inventory\n         without deleting every entry it did not look at.")
+            return 4
+        if not complete:
+            print(f"\nREFUSED to write {os.path.relpath(SURVIVOR_FILE, ROOT)}: {why}")
+            print("         This run saw less than the full suite, so writing would delete "
+                  "entries it never\n         looked for — a diff that reads exactly like "
+                  "someone had fixed them.")
+            return 4
+        write_inventory(all_surv)
+        print(f"\nwrote {os.path.relpath(SURVIVOR_FILE, ROOT)} — {len(all_surv)} survivor(s)")
+    elif a.all and os.path.exists(SURVIVOR_FILE):
+        known = load_inventory()
+        added = sorted(set(all_surv) - set(known))
+        gone = sorted(set(known) - set(all_surv))
+        print(f"\nINVENTORY  {len(known)} known, {len(added)} new, {len(gone)} no longer found")
+        if not complete:
+            print(f"           ⚠️ comparison is UNRELIABLE here: {why}")
+            print("           Entries under 'no longer found' may simply not have been looked for.")
+        for k in added:
+            print(f"     + NEW       {k}   {all_surv[k]}")
+        for k in gone:
+            print(f"     - was here  {k}")
+        if added:
+            print("           A new survivor is an assertion that stopped distinguishing "
+                  "something.\n           Regenerate with --all --write-inventory once it is "
+                  "understood, not before.")
     return 1 if total_surv else 0
 
 

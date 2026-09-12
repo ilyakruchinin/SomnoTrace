@@ -33,3 +33,37 @@ main/as11_time.c:326:relational:<→<=       # parse_iso8601: the two sscanf for
 main/as11_time.c:330:relational:<→<=       # ...and the retry can never return 6 when the first returned < 6, so the
 #   inner `if (n < 6) return -1` fires whenever reached. (The retry block is dead code; a finding
 #   for upstream, not a test gap.)
+
+# edf_write_field's clamp. `len > width` vs `len >= width`: at len == width the mutant
+# assigns width to a variable that already holds width. Every other value takes the same
+# branch in both. The assignment is a no-op, so no input can separate them.
+main/edf_header.c:71:relational:>→>=
+# edf_open_atomic_file's snprintf guard. `written < 0` vs `written <= 0`: they differ only
+# at written == 0, and the format is "%s.tmp", so snprintf returns at least 4 for every
+# path including "". Zero is unreachable, so the extra case the mutant adds is never taken.
+main/edf_header.c:84:relational:<→<=
+
+# edf_waveform.c — the six that no input can separate, after eleven of the eighteen
+# survivors in this file were killed by the tests added alongside these entries.
+#
+# snt_available_samples: `end <= sizeof(snt_header_t)` vs `<`. At end == sizeof the mutant
+# skips the early return, computes data_bytes = 0, and 0 / frame is 0 — the same value the
+# early return provides.
+main/edf_waveform.c:40:relational:<=→<
+# The three event loops: `i < n` vs `i <= n`. cJSON_GetArrayItem(events, n) returns NULL for
+# an out-of-range index and the next statement is `if (!ev) continue;`, so the extra
+# iteration does nothing and cannot be observed.
+main/edf_waveform.c:63:relational:<→<=
+main/edf_waveform.c:101:relational:<→<=
+main/edf_waveform.c:140:relational:<→<=
+# edf_find_zle_edge_time's reportTime guard: `rt && cJSON_IsString(rt)` vs `||`. With a
+# non-string rt the mutant enters and parses rt->valuestring, which is NULL for a number;
+# the parser returns a non-positive value, so `as11_ms > 0` fails and cand stays -1 —
+# exactly where the original leaves it by skipping the block. The ntpTimeMs fallback then
+# answers in both. Demonstrated by the "_ZLE falls back to ntpTimeMs" test, which passes
+# unchanged under this mutant.
+main/edf_waveform.c:148:logical:&&→||
+# The ntp guard: `ntp && cJSON_IsNumber(ntp)` vs `||`. A non-number ntpTimeMs has
+# valuedouble 0, so the mutant sets cand = 0 and the following `cand > 0` rejects it —
+# the same outcome as never entering.
+main/edf_waveform.c:156:logical:&&→||

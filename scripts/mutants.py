@@ -132,6 +132,19 @@ MUTANTS = [
      "if (as11_time_get_offset(&off)) {",
      "if (!as11_time_get_offset(&off)) {",
      "offset used only when it is absent — the two branches swapped"),
+    # WAS CLASSIFIED EQUIVALENT AND WAS NOT. The old note said "a 0-channel file is
+    # refused by the channel-map / channel-count check before it gets here" — true of
+    # the CALLER, edf_convert_snt_to_edf, which never passes 0. It was never true of
+    # snt_available_samples itself, which divides by `channels_in_file * 2`. The guard
+    # was unreachable through the only path that existed, and unreachable is not
+    # equivalent: a second caller, or a refactor of the first, meets a division by zero.
+    # A direct unit test now reaches it, the suite kills the mutant, and mutants.py
+    # reported the claim REFUTED — which is the mechanism working, so the claim moved
+    # here rather than the test being weakened.
+    ("zero-channels-divides", "edf_waveform.c",
+     "if (!f || channels_in_file <= 0) return UINT32_MAX;",
+     "if (!f || channels_in_file < 0) return UINT32_MAX;",
+     "0 channels reaches `data_bytes / (channels * 2)` — a division by zero"),
 ]
 
 # Survivors that were measured, read, and judged unable to change behaviour.
@@ -139,10 +152,6 @@ MUTANTS = [
 # is still run, and a mutant here that the suite KILLS is reported as REFUTED,
 # which means this comment is what needs fixing, not the test.
 EQUIVALENT = [
-    ("eq-zero-channels", "edf_waveform.c",
-     "if (!f || channels_in_file <= 0) return UINT32_MAX;",
-     "if (!f || channels_in_file < 0) return UINT32_MAX;",
-     "a 0-channel file is refused by the channel-map / channel-count check before it gets here"),
     ("eq-header-only", "edf_waveform.c",
      "if (end <= (long)sizeof(snt_header_t)) return 0;",
      "if (end < (long)sizeof(snt_header_t)) return 0;",
