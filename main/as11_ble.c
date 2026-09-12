@@ -39,6 +39,8 @@
  */
 
 #include "as11_ble.h"
+#include "as11_reconnect.h"
+#include "as11_adv.h"
 #include "session_writer.h"
 #include "bsp_display.h"
 #include "time_sync.h"
@@ -899,23 +901,17 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             ESP_LOGD(TAG, "Scan report from %s: parse failed (rc=%d), "
                      "trying manual AD parse", addr_str, rc);
             memset(&f, 0, sizeof(f));
-            for (int off = 0; off + 1 < raw_len; ) {
-                uint8_t ad_len = raw[off];
-                if (ad_len == 0 || off + 1 + ad_len > raw_len) break;
-                uint8_t ad_type = raw[off + 1];
-                const uint8_t *ad_data = raw + off + 2;
-                int ad_data_len = ad_len - 1;
-                if (ad_type == 0x09 || ad_type == 0x08) {
-                    /* Complete or Shortened Local Name */
-                    f.name = ad_data;
-                    f.name_len = ad_data_len;
-                } else if (ad_type == 0x03 || ad_type == 0x02) {
-                    /* Complete or Incomplete 16-bit Service UUID list */
-                    f.uuids16 = (void *)ad_data;
-                    f.num_uuids16 = ad_data_len / 2;
-                }
-                off += 1 + ad_len;
-            }
+            as11_adv_fields_t sal;
+            as11_adv_salvage(raw, raw_len, &sal);
+            f.name        = sal.name;
+            f.name_len    = (uint8_t)sal.name_len;
+            /* The cast stays HERE rather than inside as11_adv_salvage(): a
+             * UUID list begins at an arbitrary offset in the payload and so
+             * carries no alignment guarantee, and the salvage parser returns
+             * bytes precisely so that the one place assuming otherwise is
+             * visible. Unchanged from what shipped. */
+            f.uuids16     = (const ble_uuid16_t *)sal.uuids16;
+            f.num_uuids16 = (uint8_t)sal.num_uuids16;
         }
 
         bool match = false;
@@ -2005,19 +2001,23 @@ static void reconnect_task(void *arg)
 
         set_state(AS11_STATUS_CONNECTING);
 
-        /* Two-phase retry:
-         * Phase 1 — fast: 3 attempts with 2-4s backoff for transient disconnect
-         *   (AS11 needs a few seconds to restart advertising).
-         * Phase 2 — slow: 60s backoff between attempts for when the AS11 is off
-         *   at boot and turned on later (with 30s BLE connect timeout, giving a
-         *   ~90s overall cycle).  Without this, a single failed
-         *   reconnect_task at boot means the ST never connects to the AS11
-         *   until manually rebooted. */
+        /* Two-phase retry. The SCHEDULE lives in as11_reconnect.c, which has no
+         * ESP-IDF dependency and is covered by scripts/as11_reconnect_test.c;
+         * this loop owns only the radio work and the abort checks.
+         * Phase 1 — fast: AS11_RECONNECT_FAST_ATTEMPTS tries, 4s then 6s, for a
+         *   transient disconnect (the AS11 needs a few seconds to restart
+         *   advertising).
+         * Phase 2 — slow: AS11_RECONNECT_SLOW_DELAY_S between attempts for when
+         *   the AS11 is off at boot and turned on later (with the 30s BLE connect
+         *   timeout, a ~90s cycle).  Without this, a single failed reconnect_task
+         *   at boot means the ST never connects to the AS11 until manually
+         *   rebooted. */
         bool connected = false;
-        for (int attempt = 1; attempt <= 3 && !connected; attempt++) {
-            if (attempt > 1) {
-                int delay_s = attempt * 2;
-                ESP_LOGI(TAG, "reconnect: retry %d/3 in %ds", attempt, delay_s);
+        for (int attempt = 1; attempt <= AS11_RECONNECT_FAST_ATTEMPTS && !connected; attempt++) {
+            int delay_s = as11_reconnect_delay_s(attempt);
+            if (delay_s > 0) {
+                ESP_LOGI(TAG, "reconnect: retry %d/%d in %ds",
+                         attempt, AS11_RECONNECT_FAST_ATTEMPTS, delay_s);
                 vTaskDelay(pdMS_TO_TICKS(delay_s * 1000));
             }
             if (!s_pair_cache.valid || s_manual_disconnect) {
@@ -2031,8 +2031,8 @@ static void reconnect_task(void *arg)
                 connected = true;
                 break;
             }
-            ESP_LOGW(TAG, "reconnect: connect/discover attempt %d/3 failed: %s",
-                     attempt, as11_ble_get_error());
+            ESP_LOGW(TAG, "reconnect: connect/discover attempt %d/%d failed: %s",
+                     attempt, AS11_RECONNECT_FAST_ATTEMPTS, as11_ble_get_error());
             if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
                 ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
                 s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -2051,8 +2051,12 @@ static void reconnect_task(void *arg)
                 return;
             }
             slow_attempt++;
-            ESP_LOGI(TAG, "reconnect: waiting 60s before slow retry %d...", slow_attempt);
-            for (int i = 0; i < 60; i++) {
+            /* The same schedule function, continuing the attempt count past the
+             * fast phase — so both phases read their timing from one place. */
+            int wait_s = as11_reconnect_delay_s(AS11_RECONNECT_FAST_ATTEMPTS + slow_attempt);
+            ESP_LOGI(TAG, "reconnect: waiting %ds before slow retry %d...",
+                     wait_s, slow_attempt);
+            for (int i = 0; i < wait_s; i++) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 if (!s_pair_cache.valid || s_manual_disconnect) break;
             }

@@ -33,3 +33,9 @@ main/as11_time.c:326:relational:<→<=       # parse_iso8601: the two sscanf for
 main/as11_time.c:330:relational:<→<=       # ...and the retry can never return 6 when the first returned < 6, so the
 #   inner `if (n < 6) return -1` fires whenever reached. (The retry block is dead code; a finding
 #   for upstream, not a test gap.)
+
+# as11_adv_salvage's guard. With len == 0 and data != NULL the mutant skips the early
+# return, but the loop it falls into is `for (off = 0; off + 1 < len; )` — 1 < 0 is false,
+# so the body never runs and `out` was already memset to zero above. Every field of every
+# result is identical for every input; there is no observation that separates them.
+main/as11_adv.c:35:relational:<=→<

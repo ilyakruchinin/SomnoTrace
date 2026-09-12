@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "bsp_power.c" "bsp_display.c" "net_provision.c" "as11_ble.c"
+idf_component_register(SRCS "main.c" "bsp_power.c" "bsp_display.c" "net_provision.c" "as11_ble.c" "as11_reconnect.c" "as11_adv.c"
                            "sd_storage.c" "session_writer.c" "time_sync.c"
                            "post_therapy.c" "edf_gen.c" "edf_header.c" "edf_waveform.c" "edf_annotations.c" "edf_summary.c" "log_stream.c" "device_settings.c"
                            "psram_task.c" "bsp_audio.c" "bsp_i2c.c" "bsp_touch.c" "session_graph.c" "nvs_writer.c"

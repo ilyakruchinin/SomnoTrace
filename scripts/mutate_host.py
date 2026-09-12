@@ -85,6 +85,8 @@ TESTS = {
     "edf_properties_test":  ["main/as11_time.c", "main/edf_data_dict.h", "@cjson",
                              "#main/edf_summary.c"],
     "vld3_decoder_test":    ["main/oximetry_vld3.c"],
+    "as11_reconnect_test":  ["main/as11_reconnect.c"],
+    "as11_adv_test":        ["main/as11_adv.c"],
 }
 
 
