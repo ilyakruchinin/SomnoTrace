@@ -154,7 +154,7 @@ typedef struct __attribute__((packed)) {
 /* A StreamData discontinuity at least this long is not compensated — the
  * session is split so the gap is never rendered as continuous samples. */
 #ifndef SW_SPLIT_GAP_MS
-#define SW_SPLIT_GAP_MS         10000    /* 10 s: >= 50 missing notifications */
+#define SW_SPLIT_GAP_MS         10000    /* 10 s */
 #endif
 
 /* Ignore a repeated TherapyStart this soon after a session started; it is
@@ -2078,10 +2078,10 @@ void session_writer_on_stream_data_raw(const char *json, int len)
     stream_batch_t *b = s->fill;
 
     /* ── Missing-packet compensation ───────────────────────────────
-     * Short gaps (< 10 s / < 50 notifications) hold the previous value,
+     * Short gaps (< SW_SPLIT_GAP_MS) hold the previous value,
      * absorbing AirSense 11 internal SD card write latency (cluster allocation,
      * directory updates, flash erase/write stalls) without losing 25 Hz waveform
-     * phase. Long gaps (>= 10 s) are true radio dropouts and are NOT padded:
+     * phase. Long gaps (>= SW_SPLIT_GAP_MS) are true radio dropouts and are NOT padded:
      * fabricated physiological data would manufacture artificial apneas in
      * clinical scoring (OSCAR / SleepHQ). Beyond SW_SPLIT_GAP_MS the session
      * is split. */
@@ -2092,7 +2092,7 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         if (gap < 0) gap += 86400000;
         if (gap > 280) {
             int missing = (int)((gap - 100) / 200);
-            if (missing > 0 && missing < 50) {
+            if (missing > 0 && gap < SW_SPLIT_GAP_MS) {
                 ESP_LOGW(TAG, "StreamData gap: %lldms (%d missing notifications), "
                          "inserting compensation", (long long)gap, missing);
                 s->gap_events++;
@@ -2138,7 +2138,7 @@ void session_writer_on_stream_data_raw(const char *json, int len)
                         s->pld_countdown--;
                     }
                 }
-            } else if (missing >= 50) {
+            } else if (gap >= SW_SPLIT_GAP_MS) {
                 /* Uncompensated discontinuity — record it honestly. */
                 int64_t offset_ms = s->start_epoch_ms > 0
                     ? (esp_timer_get_time() - s->start_time_us) / 1000 : 0;
@@ -2148,7 +2148,7 @@ void session_writer_on_stream_data_raw(const char *json, int len)
                 s->gap_long_last_ms = offset_ms;
                 ESP_LOGW(TAG, "long StreamData gap: %lld ms (%d notifications) — "
                          "not compensated", (long long)gap, missing);
-                if (gap >= SW_SPLIT_GAP_MS) want_split = true;
+                want_split = true;
             }
         }
     }
