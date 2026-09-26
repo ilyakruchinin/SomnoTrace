@@ -36,6 +36,7 @@
 #include "upload_sched.h"
 #include "log_stream.h"
 #include "oxyii_codec.h"
+#include "oximetry_time.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -214,27 +215,6 @@ static void oxyii_time_payload(uint8_t *out8)
     out8[5] = tm.tm_min;
     out8[6] = tm.tm_sec;
     out8[7] = 0x00;
-}
-
-static int64_t oxyii_filename_epoch_ms(const char *name)
-{
-    if (!name || strlen(name) < 14) return 0;
-    for (int i = 0; i < 14; i++)
-        if (name[i] < '0' || name[i] > '9') return 0;
-    struct tm tm = {0};
-    int year, mon, day, hour, min, sec;
-    if (sscanf(name, "%4d%2d%2d%2d%2d%2d", &year, &mon, &day,
-               &hour, &min, &sec) != 6)
-        return 0;
-    tm.tm_year = year - 1900;
-    tm.tm_mon = mon - 1;
-    tm.tm_mday = day;
-    tm.tm_hour = hour;
-    tm.tm_min = min;
-    tm.tm_sec = sec;
-    tm.tm_isdst = -1;
-    time_t t = mktime(&tm);
-    return t == (time_t)-1 ? 0 : (int64_t)t * 1000;
 }
 
 /* ── READ_FILE_START payload (20 bytes) ────────────────────────────── */
@@ -1095,7 +1075,7 @@ static esp_err_t oxyii_convert_stored(const char *name)
     snprintf(source_path, sizeof(source_path), SD_OXYMETRY_DIR "/files/%s/%s.bin",
              s_serial, name);
     esp_err_t conversion = oximetry_canonical_convert_format_a(
-        s_serial, name, source_path, oxyii_filename_epoch_ms(name));
+        s_serial, name, source_path, oximetry_filename_epoch_ms(name));
     if (conversion != ESP_OK) {
         ESP_LOGW(TAG, "canonical conversion pending for '%s': %s", name,
                  esp_err_to_name(conversion));

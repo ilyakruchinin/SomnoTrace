@@ -101,6 +101,20 @@ MUTANTS = [
      "AS11-side noon put on the previous day"),
     # The OxyII codec.  The first is #177 itself — the bug that shipped and
     # was fixed in 14bea1b with nothing to hold the fix.
+    # Recording-name time.  The first is the OxyII driver's old parser, which had
+    # no range: a ring whose clock was never set filed its night under 2000.
+    ("oximetry-time-no-year-floor", "oximetry_time.c",
+     "year < 2015",
+     "year < 1970",
+     "a recording named from an unset ring clock (2000-01-01) is accepted and filed under that day"),
+    ("oximetry-time-no-calendar", "oximetry_time.c",
+     "if (day > days_in_month(year, mon))",
+     "if (day > 31)",
+     "30 Feb is accepted and silently becomes 2 Mar"),
+    ("oximetry-time-no-leap", "oximetry_time.c",
+     "return mon == 2 && leap ? 29 : dim[mon - 1];",
+     "return dim[mon - 1];",
+     "29 Feb of a leap year is refused and that night never converts"),
     ("oxyii-auth-ts-shift", "oxyii_codec.c",
      "(ts >> (i * 8))",
      "(ts >> i)",

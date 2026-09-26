@@ -150,6 +150,7 @@ run_test as11_events_test  -I"$SHIM" -I"$MAIN_DIR" scripts/as11_events_test.c "$
 run_test vld3_decoder_test -I"$SHIM" -I"$MAIN_DIR" scripts/vld3_decoder_test.c "$MAIN_DIR/oximetry_vld3.c"
 run_test oxyii_trailer_test -I"$SHIM" -I"$MAIN_DIR" scripts/oxyii_trailer_test.c "$MAIN_DIR/oxyii_trailer.c"
 run_test oxyii_codec_test -I"$SHIM" -I"$MAIN_DIR" scripts/oxyii_codec_test.c "$MAIN_DIR/oxyii_codec.c"
+run_test oximetry_time_test -I"$SHIM" -I"$MAIN_DIR" scripts/oximetry_time_test.c "$MAIN_DIR/oximetry_time.c"
 run_test session_gap_test -I"$SHIM" -I"$MAIN_DIR" scripts/session_gap_test.c
 run_test legacy_file_list_test -I"$SHIM" -I"$MAIN_DIR" scripts/legacy_file_list_test.c "$MAIN_DIR/legacy_file_list.c"
 run_test upload_park_test -I"$UPLOADER_DIR" scripts/upload_park_test.c

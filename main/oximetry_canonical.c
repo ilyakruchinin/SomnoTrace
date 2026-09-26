@@ -24,6 +24,7 @@
 #include "oximetry_canonical.h"
 #include "oxyii_trailer.h"
 #include "oximetry_vld3.h"
+#include "oximetry_time.h"
 #include "sd_storage.h"
 #include "somno_ml.h"
 #include "time_sync.h"
@@ -237,33 +238,9 @@ static bool day_for_epoch(int64_t epoch_ms, char out[9])
     return strlen(out) == 8;
 }
 
-static int64_t civil_epoch_ms(int year, int mon, int day, int hour, int min, int sec)
-{
-    if (year < 2015 || year > 2099 || mon < 1 || mon > 12 || day < 1 || day > 31 ||
-        hour < 0 || hour > 23 || min < 0 || min > 59 || sec < 0 || sec > 59)
-        return 0;
-    struct tm tm = {0};
-    tm.tm_year = year - 1900; tm.tm_mon = mon - 1; tm.tm_mday = day;
-    tm.tm_hour = hour; tm.tm_min = min; tm.tm_sec = sec; tm.tm_isdst = -1;
-    time_t t = mktime(&tm);
-    if (t == (time_t)-1) return 0;
-    struct tm check;
-    if (!localtime_r(&t, &check) || check.tm_year != tm.tm_year || check.tm_mon != tm.tm_mon ||
-        check.tm_mday != tm.tm_mday || check.tm_hour != tm.tm_hour ||
-        check.tm_min != tm.tm_min || check.tm_sec != tm.tm_sec)
-        return 0;
-    return (int64_t)t * 1000;
-}
+/* The civil-time parsers live in oximetry_time.c, shared with the OxyII
+ * driver and host-tested by scripts/oximetry_time_test.c. */
 
-static int64_t filename_epoch_ms(const char *name)
-{
-    if (!name || strlen(name) < 14) return 0;
-    for (int i = 0; i < 14; i++) if (name[i] < '0' || name[i] > '9') return 0;
-    int year, mon, day, hour, min, sec;
-    if (sscanf(name, "%4d%2d%2d%2d%2d%2d", &year, &mon, &day,
-               &hour, &min, &sec) != 6) return 0;
-    return civil_epoch_ms(year, mon, day, hour, min, sec);
-}
 
 static bool copy_file_crc(const char *src, const char *dst, uint32_t *out_crc,
                           uint64_t *out_size)
@@ -513,10 +490,10 @@ static bool select_vld3_time(const ox_vld3_header_t *header,
     if (!header || !out) return false;
     memset(out, 0, sizeof(*out));
     if (header->datetime_valid) {
-        out->header_ms = civil_epoch_ms(header->year, header->month, header->day,
+        out->header_ms = oximetry_civil_epoch_ms(header->year, header->month, header->day,
                                         header->hour, header->minute, header->second);
     }
-    out->filename_ms = filename_epoch_ms(recording_id);
+    out->filename_ms = oximetry_filename_epoch_ms(recording_id);
     if (time_is_usable()) {
         int64_t latest = (int64_t)time(NULL) * 1000 + 24LL * 60 * 60 * 1000;
         if (out->header_ms > latest) out->header_ms = 0;
@@ -1002,6 +979,9 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
         return ESP_ERR_INVALID_ARG;
     if (oximetry_canonical_ensure_dirs() != ESP_OK) return ESP_FAIL;
 
+    /* 0 is what every filename parser returns for "not a time".  day_for_epoch()
+     * would label it 1970-01-01 and the timeline would start there. */
+    if (start_utc_ms <= 0) return ESP_ERR_INVALID_ARG;
     char day[9];
     if (!day_for_epoch(start_utc_ms, day)) return ESP_ERR_INVALID_ARG;
 
@@ -1188,7 +1168,7 @@ esp_err_t oximetry_canonical_migrate_legacy(const char *device_id)
         char name[OXIMETRY_CANONICAL_MAX_COMPONENT];
         if (len - 4 >= sizeof(name)) continue;
         memcpy(name, e->d_name, len - 4); name[len - 4] = '\0';
-        int64_t start = filename_epoch_ms(name);
+        int64_t start = oximetry_filename_epoch_ms(name);
         if (!start) continue;
         char source[OXIMETRY_CANONICAL_MAX_PATH];
         if (!path_join2(source, sizeof(source), dir, e->d_name)) continue;
