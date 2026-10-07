@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install libcjson
+      - name: Install libcjson and mbedTLS
         # Same dependency the host tests need; without it the harness SKIPS the two suites
         # that cover the exporter and correctly reports VOID rather than a kill count.
         run: |
@@ -52,7 +52,7 @@ jobs:
               sudo rm -f "$f"
           done
           sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends libcjson-dev
+          sudo apt-get install -y --no-install-recommends libcjson-dev libmbedtls-dev
 
       - name: Run the mutation check
         run: |

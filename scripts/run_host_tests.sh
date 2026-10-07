@@ -156,6 +156,14 @@ run_test upload_park_test -I"$UPLOADER_DIR" scripts/upload_park_test.c
 run_test as11_reconnect_test -I"$SHIM" -I"$MAIN_DIR" scripts/as11_reconnect_test.c "$MAIN_DIR/as11_reconnect.c"
 run_test as11_adv_test       -I"$SHIM" -I"$MAIN_DIR" scripts/as11_adv_test.c "$MAIN_DIR/as11_adv.c"
 
+# Web password core (PBKDF2, session tokens, Basic/Origin parsing, rate
+# limiter).  Links the system mbedTLS: apt install libmbedtls-dev.
+if [ -f /usr/include/mbedtls/md.h ]; then
+    run_test web_auth_test -I"$MAIN_DIR" scripts/web_auth_test.c "$MAIN_DIR/web_auth_core.c" -lmbedcrypto
+else
+    skip_test web_auth_test "no mbedTLS (apt install libmbedtls-dev)"
+fi
+
 # edf_gen_test #includes the real edf_gen.c and needs a real cJSON.
 # Include order matters: the real cJSON.h must shadow the shim in $SHIM.
 if [ -n "${CJSON_DIR:-}" ]; then

@@ -288,5 +288,17 @@ shellcheck --severity=style -f gcc "${sh_files[@]}" 2>/dev/null \
 
 rm -f .lint-compile-db.json
 
+# The web password is default-deny only while every route goes through web_auth_register():
+# one direct httpd_register_uri_handler() elsewhere is an endpoint that ignores the password.
+printf '\n▸ web routes — registered through web_auth only\n'
+direct=$(grep -rn --include='*.c' 'httpd_register_uri_handler' main components | grep -v '^main/web_auth\.c:' || true)
+if [ -n "$direct" ]; then
+    printf '%s\n' "$direct" | sed 's/^/  /'
+    printf '  use web_auth_register() (or web_auth_register_public() for public content)\n'
+    rc=1
+else
+    printf '  ok\n'
+fi
+
 printf '\n%s\n' "$([ $rc -eq 0 ] && echo 'lint: blocking tier clean' || echo 'lint: BLOCKING TIER FAILED')"
 exit $rc

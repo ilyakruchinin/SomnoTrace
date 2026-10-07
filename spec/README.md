@@ -37,6 +37,7 @@ code.
 - `0011-web-api-endpoints.md` — HTTP REST and SSE data contracts for telemetry and configuration. _(Proposed)_
 - `0012-battery-monitoring-and-power-management.md` — battery ADC sampling, OCV estimation, calibration state machine, dynamic CC/CV slew rate, and power latch. _(Implemented)_
 - `0013-mqtt-home-assistant-integration.md` — lightweight pub/sub state telemetry, Home Assistant Auto-Discovery, and remote controls. _(Proposed)_
+- `0014-web-interface-password.md` — optional password for the web interface and its API: sessions, Basic auth, rate limiting. _(Implemented)_
 
 > Draft stubs are placeholders to guide structure; flesh them out as the design
 > firms up.

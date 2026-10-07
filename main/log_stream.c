@@ -46,6 +46,7 @@
 #include "uploader.h"
 #include "as11_ble.h"
 #include "oximeter.h"
+#include "web_auth.h"
 
 static const char *TAG = "log_stream";
 
@@ -1084,35 +1085,35 @@ void log_stream_register_handlers(httpd_handle_t server)
         .method  = HTTP_GET,
         .handler = logs_recent_handler,
     };
-    httpd_register_uri_handler(server, &recent);
+    web_auth_register(server, &recent);
 
     httpd_uri_t download = {
         .uri     = "/api/logs/download",
         .method  = HTTP_GET,
         .handler = logs_download_handler,
     };
-    httpd_register_uri_handler(server, &download);
+    web_auth_register(server, &download);
 
     httpd_uri_t level_get = {
         .uri     = "/api/logs/level",
         .method  = HTTP_GET,
         .handler = logs_level_handler,
     };
-    httpd_register_uri_handler(server, &level_get);
+    web_auth_register(server, &level_get);
 
     httpd_uri_t level_post = {
         .uri     = "/api/logs/level",
         .method  = HTTP_POST,
         .handler = logs_level_handler,
     };
-    httpd_register_uri_handler(server, &level_post);
+    web_auth_register(server, &level_post);
 
     httpd_uri_t history = {
         .uri     = "/api/logs/history",
         .method  = HTTP_GET,
         .handler = logs_history_handler,
     };
-    httpd_register_uri_handler(server, &history);
+    web_auth_register(server, &history);
 
     httpd_uri_t ws = {
         .uri        = "/api/ws",
@@ -1120,7 +1121,7 @@ void log_stream_register_handlers(httpd_handle_t server)
         .handler    = logs_ws_handler,
         .is_websocket = true,
     };
-    httpd_register_uri_handler(server, &ws);
+    web_auth_register(server, &ws);
 
     ESP_LOGI(TAG, "registered /api/ws and /api/logs/{recent,download,history,level}");
 }

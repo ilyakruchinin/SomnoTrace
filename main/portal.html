@@ -176,6 +176,13 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .status-msg.success{color:var(--success)}
 .status-msg.error{color:var(--danger)}
 
+/* ── Login Overlay (web password) ──────────────────────────────── */
+.auth-overlay{position:fixed;inset:0;z-index:1000;display:none;align-items:center;justify-content:center;background:var(--bg);padding:16px}
+.auth-overlay.show{display:flex}
+.auth-box{width:100%;max-width:360px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;padding:24px;box-shadow:0 4px 20px rgba(0,0,0,0.35)}
+.auth-box img{display:block;height:36px;margin:0 auto 18px}
+.auth-box .btn{width:100%;margin-top:12px}
+
 /* ── Save Footer (Sticky Action Bar) ───────────────────────────── */
 .save-footer{position:sticky;bottom:16px;z-index:50;padding:14px 18px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.35);display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:12px;transition:all .3s cubic-bezier(0.16,1,0.3,1)}
 .save-footer.dirty{border-color:var(--primary);box-shadow:0 8px 30px rgba(59,130,246,0.25);transform:translateY(-2px)}
@@ -425,6 +432,23 @@ body.fixed-height .logs-container{height:calc(100dvh - 145px);min-height:340px}
 <script src="/uplot.js"></script>
 </head>
 <body>
+
+<!-- Login screen, shown only when a web password is set -->
+<div id="auth-overlay" class="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+<form class="auth-box" onsubmit="doLogin();return false">
+<img src="/logo.svg" alt="SomnoTrace">
+<label id="auth-title" for="auth-login-pw">Password</label>
+<input type="text" name="username" value="somnotrace" autocomplete="username" hidden>
+<div class="pw-wrap">
+<input type="password" id="auth-login-pw" class="form-control" autocomplete="current-password" maxlength="64" required>
+<button type="button" class="pw-toggle" onclick="togglePw('auth-login-pw')" aria-label="Toggle password visibility">
+<svg viewBox="0 0 24 24" class="eye-open"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
+</button>
+</div>
+<button type="submit" class="btn btn-primary" id="auth-login-btn">Sign in</button>
+<p id="auth-login-msg" class="status-msg error" role="alert"></p>
+</form>
+</div>
 
 <header>
 <a href="#" class="brand">
@@ -1008,6 +1032,43 @@ MQTT &amp; Home Assistant
 </div>
 </div>
 
+<!-- Web interface password -->
+<div class="card sta-only" id="auth-card">
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M18 8h-1V6A5 5 0 0 0 7 6v2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2zm-6 9a2 2 0 1 1 2-2 2 2 0 0 1-2 2zm3.1-9H8.9V6a3.1 3.1 0 0 1 6.2 0z"/></svg>
+Web Interface Password
+</div>
+<div style="display:flex;align-items:center;gap:8px;font-size:0.85rem">
+<span style="color:var(--text-muted)">Status:</span>
+<span id="auth-badge" class="badge badge-gray" style="font-size:0.75rem">Off</span>
+</div>
+<p class="card-desc">Optional. When set, this web interface and its API ask for the password. Home Assistant and other API clients send it with HTTP Basic authentication (any user name). A forgotten password can only be cleared by erasing the device's settings over USB.</p>
+<p class="card-desc">The connection is plain HTTP: this keeps other people on your network out, but choose a password you use nowhere else.</p>
+<form onsubmit="submitAuthPassword(false);return false">
+<input type="text" name="username" value="somnotrace" autocomplete="username" hidden>
+<div class="form-group" id="auth-current-group" style="display:none;margin-top:12px">
+<label for="auth-current">Current password</label>
+<input type="password" id="auth-current" class="form-control" autocomplete="current-password" maxlength="64">
+</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+<div class="form-group">
+<label for="auth-new">New password</label>
+<input type="password" id="auth-new" class="form-control" autocomplete="new-password" maxlength="64" placeholder="8–64 characters">
+</div>
+<div class="form-group">
+<label for="auth-confirm">Repeat new password</label>
+<input type="password" id="auth-confirm" class="form-control" autocomplete="new-password" maxlength="64">
+</div>
+</div>
+<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px">
+<button type="submit" class="btn btn-sm" id="auth-set-btn">Set password</button>
+<button type="button" class="btn btn-danger btn-sm" id="auth-remove-btn" style="display:none" onclick="submitAuthPassword(true)">Remove password</button>
+<button type="button" class="btn btn-outline btn-sm" id="auth-logout-btn" style="display:none" onclick="doLogout()">Sign out on all devices</button>
+</div>
+<p id="auth-status" class="status-msg" role="status"></p>
+</form>
+</div>
+
 <!-- Sticky Floating Save & Reboot Bar -->
 <div id="save-footer" class="save-footer">
 <div class="save-info">
@@ -1295,6 +1356,115 @@ var PORTAL_MODE = (location.hostname === '192.168.4.1' ||
                    location.hostname.indexOf('ubuntu') !== -1);
 var PW_SENTINEL_WIFI = '\u2588UNCHANGED\u2588';
 var PW_SENTINEL_UPLOAD = '***';
+
+/* ── Web password ──────────────────────────────────────────────── */
+var authEnabled = false;
+var authLocked = false;   /* login screen is up: stop background traffic */
+
+/* Any same-origin 401 means the session is gone (expired, signed out
+ * elsewhere, password changed): bring up the login screen.  The auth
+ * endpoints report their own errors. */
+(function() {
+  var origFetch = window.fetch.bind(window);
+  window.fetch = function(input, init) {
+    return origFetch(input, init).then(function(r) {
+      var u = typeof input === 'string' ? input : (input && input.url) || '';
+      if (r.status === 401 && u.charAt(0) === '/' && u.indexOf('/api/auth/') !== 0) showLogin();
+      return r;
+    });
+  };
+})();
+
+function showLogin() {
+  if (authLocked) return;
+  authLocked = true;
+  if (appWs) { try { appWs.close(); } catch (e) {} }
+  document.getElementById('auth-overlay').classList.add('show');
+  var pw = document.getElementById('auth-login-pw');
+  pw.value = '';
+  setTimeout(function() { pw.focus(); }, 50);
+}
+
+function retryAfterText(r) {
+  var s = parseInt(r.headers.get('Retry-After') || '0', 10);
+  return 'Too many wrong attempts. Try again in ' + (s > 0 ? s + ' s' : 'a moment') + '.';
+}
+
+function doLogin() {
+  var pw = document.getElementById('auth-login-pw');
+  var msg = document.getElementById('auth-login-msg');
+  var btn = document.getElementById('auth-login-btn');
+  msg.textContent = '';
+  btn.disabled = true;
+  fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                             body: JSON.stringify({ password: pw.value }) })
+    .then(function(r) {
+      if (r.ok) { location.reload(); return; }
+      btn.disabled = false;
+      pw.value = '';
+      pw.focus();
+      msg.textContent = r.status === 429 ? retryAfterText(r)
+                      : r.status === 401 ? 'Wrong password.'
+                      : 'Sign-in failed (HTTP ' + r.status + ').';
+    })
+    .catch(function() { btn.disabled = false; msg.textContent = 'Device not reachable.'; });
+}
+
+function doLogout() {
+  if (!confirm('Sign out this and every other browser? API clients using Basic authentication are not affected.')) return;
+  fetch('/api/auth/logout', { method: 'POST' }).finally(function() { location.reload(); });
+}
+
+function renderAuthCard() {
+  fetch('/api/auth/status', { cache: 'no-store' }).then(function(r) { return r.json(); }).then(function(a) {
+    authEnabled = !!a.enabled;
+    var badge = document.getElementById('auth-badge');
+    badge.textContent = authEnabled ? 'On' : 'Off';
+    badge.className = 'badge ' + (authEnabled ? 'badge-green' : 'badge-gray');
+    document.getElementById('auth-current-group').style.display = authEnabled ? '' : 'none';
+    document.getElementById('auth-remove-btn').style.display = authEnabled ? '' : 'none';
+    document.getElementById('auth-logout-btn').style.display = authEnabled ? '' : 'none';
+    document.getElementById('auth-set-btn').textContent = authEnabled ? 'Change password' : 'Set password';
+  }).catch(function() {});
+}
+
+function authCardMsg(text, cls) {
+  var st = document.getElementById('auth-status');
+  st.className = 'status-msg' + (cls ? ' ' + cls : '');
+  st.textContent = text;
+}
+
+function submitAuthPassword(remove) {
+  var cur = document.getElementById('auth-current');
+  var npw = document.getElementById('auth-new');
+  var rpt = document.getElementById('auth-confirm');
+  authCardMsg('');
+  var newVal = remove ? '' : npw.value;
+  if (!remove) {
+    var bytes = new TextEncoder().encode(newVal).length;
+    if (bytes < 8 || bytes > 64) { authCardMsg('The password must be 8 to 64 characters.', 'error'); return; }
+    if (newVal !== rpt.value) { authCardMsg('The two new passwords do not match.', 'error'); return; }
+  }
+  if (authEnabled && !cur.value) { authCardMsg('Enter the current password.', 'error'); return; }
+  if (remove && !confirm('Remove the password? Anyone on your network can then open this web interface again.')) return;
+  fetch('/api/auth/password', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ current: cur.value, new: newVal }) })
+    .then(function(r) {
+      if (r.ok) {
+        cur.value = npw.value = rpt.value = '';
+        authCardMsg(remove ? 'Password removed.' : 'Password saved. Other browsers must sign in again.', 'success');
+        renderAuthCard();
+        return;
+      }
+      return r.json().catch(function() { return {}; }).then(function(d) {
+        authCardMsg(r.status === 429 ? retryAfterText(r)
+                  : d.error === 'wrong_password' ? 'The current password is wrong.'
+                  : d.error === 'weak_password' ? 'The password must be 8 to 64 characters, without control characters.'
+                  : 'Saving failed (HTTP ' + r.status + ').', 'error');
+      });
+    })
+    .catch(function() { authCardMsg('Device not reachable.', 'error'); });
+}
 
 /* ── Theme ─────────────────────────────────────────────────────── */
 var settingsLoaded = false;
@@ -3370,7 +3540,7 @@ function loadLogHistory() {
 }
 
 function connectWs() {
-  if (appWs) return;
+  if (appWs || authLocked) return;
   wsEvicted = false;
   setLogConnStatus('connecting');
 
@@ -6454,6 +6624,18 @@ function loadSomnostageCredit() {
 
 window.onload = function() {
   setTheme(localStorage.getItem('somnotrace_theme') || 'night');
+  /* With a web password set, show nothing but the login screen until the
+   * session is valid; otherwise every request below would just get 401. */
+  fetch('/api/auth/status', { cache: 'no-store' }).then(function(r) { return r.json(); })
+    .then(function(a) {
+      authEnabled = !!a.enabled;
+      if (a.enabled && !a.authenticated) showLogin();
+      else appStart();
+    })
+    .catch(appStart);
+};
+
+function appStart() {
   var savedClamp = localStorage.getItem('somnotrace_clamp_cpap');
   dashClampToCpap = savedClamp === null ? true : savedClamp === '1';
   var clampCb = document.getElementById('dash-clamp-cpap');
@@ -6495,7 +6677,8 @@ window.onload = function() {
     updateDateDisplayLabel(todayIso);
   }
   if ('serviceWorker' in navigator) setTimeout(function() { navigator.serviceWorker.register('/sw.js'); }, 3000);
-};
+  if (!PORTAL_MODE) renderAuthCard();
+}
 </script>
 </body>
 </html>

@@ -27,6 +27,18 @@ Any standard JSON-RPC command sent to this endpoint is automatically encrypted b
 
 ---
 
+### Web interface password
+
+If a password is set for the web interface (**Settings → Web Interface Password**), the bridge requires it too. Send it with HTTP Basic authentication; the user name is ignored:
+
+```bash
+curl -u somnotrace:YOUR-PASSWORD -X POST http://somnotrace.local/api/ble/passthrough ...
+```
+
+Without credentials the bridge answers `401 Unauthorized`. See [spec 0014](../spec/0014-web-interface-password.md).
+
+---
+
 ## Example Commands (`curl`)
 
 ### 1. Query Device Identity (`Get`)
