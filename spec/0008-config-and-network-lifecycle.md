@@ -176,6 +176,8 @@ update as needed.
 - The SoftAP portal is intentionally **open/unauthenticated** (chosen for the
   lowest-friction onboarding); exposure is bounded by the entry conditions, the
   deliberate 5 s BOOT hold, and the **10-minute idle timeout** (4.5).
+  If the optional web interface password (`0014`) is set, the portal requires
+  it as well: the open AP must not become a way around the password.
 - This device handles personal medical data; never log secrets or patient data.
 
 ## 7. Decisions

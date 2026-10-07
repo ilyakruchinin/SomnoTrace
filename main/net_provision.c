@@ -62,6 +62,7 @@
 #include "nvs.h"
 #include "esp_http_server.h"
 #include "nvs_writer.h"
+#include "web_auth.h"
 #include "esp_app_desc.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
@@ -928,6 +929,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    /* The page may hold a login form: never let another site frame it. */
+    httpd_resp_set_hdr(req, "X-Frame-Options", "DENY");
+    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
     httpd_resp_set_hdr(req, "Connection", "close");
     /* PORTAL_HTML_LEN is (_binary_portal_html_end - _binary_portal_html_start): the two
      * linker symbols ESP-IDF's EMBED_FILES generates at the ends of ONE embedded blob.
@@ -985,11 +989,12 @@ static esp_err_t sw_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/javascript");
     httpd_resp_set_hdr(req, "Connection", "close");
-    const char sw[] =
-        "const CACHE_NAME = 'somnotrace-v3';\n"
+    static const char sw[] =
+        "const CACHE_NAME = 'somnotrace-v4';\n"
+        "const SHELL = ['/', '/manifest.json', '/uplot.js', '/uplot.css', '/logo.svg', '/favicon.svg'];\n"
         "self.addEventListener('install', e => {\n"
         "  self.skipWaiting();\n"
-        "  e.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(['/', '/manifest.json', '/uplot.js', '/uplot.css', '/logo.svg', '/favicon.svg'])));\n"
+        "  e.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(SHELL)));\n"
         "});\n"
         "self.addEventListener('activate', e => {\n"
         "  e.waitUntil(caches.keys().then(keys => Promise.all(\n"
@@ -997,19 +1002,24 @@ static esp_err_t sw_get_handler(httpd_req_t *req)
         "  )).then(() => self.clients.claim()));\n"
         "});\n"
         "self.addEventListener('fetch', e => {\n"
-        "  if (e.request.url.includes('/api/') || e.request.url.includes('/scan') || e.request.url.includes('/save')) {\n"
-        "    e.respondWith(fetch(e.request));\n"
-        "  } else {\n"
-        "    /* Network-first: always fetch fresh when the device is reachable,\n"
-        "       fall back to cache only when offline. */\n"
-        "    e.respondWith(\n"
-        "      fetch(e.request).then(res => {\n"
+        "  /* Only the public app shell is ever cached: therapy data, files and\n"
+        "     API answers must not outlive a logout in the browser's cache. */\n"
+        "  const url = new URL(e.request.url);\n"
+        "  if (e.request.method !== 'GET' || url.origin !== self.location.origin ||\n"
+        "      !SHELL.includes(url.pathname)) {\n"
+        "    return;\n"
+        "  }\n"
+        "  /* Network-first: always fetch fresh when the device is reachable,\n"
+        "     fall back to cache only when offline. */\n"
+        "  e.respondWith(\n"
+        "    fetch(e.request).then(res => {\n"
+        "      if (res.ok) {\n"
         "        const copy = res.clone();\n"
         "        caches.open(CACHE_NAME).then(c => c.put(e.request, copy)).catch(() => {});\n"
-        "        return res;\n"
-        "      }).catch(() => caches.match(e.request))\n"
-        "    );\n"
-        "  }\n"
+        "      }\n"
+        "      return res;\n"
+        "    }).catch(() => caches.match(e.request))\n"
+        "  );\n"
         "});\n";
     httpd_resp_send(req, sw, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -3432,16 +3442,17 @@ static esp_err_t actions_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Every route is password-protected unless registered with reg_public()
+ * (see web_auth.h).  Only content that is safe for anyone on the network
+ * belongs there. */
 static inline esp_err_t reg_uri(httpd_handle_t handle, const httpd_uri_t *uri_handler)
 {
-    esp_err_t err = httpd_register_uri_handler(handle, uri_handler);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "failed to register URI '%s' (method %d): %s",
-                 uri_handler ? uri_handler->uri : "NULL",
-                 uri_handler ? (int)uri_handler->method : -1,
-                 esp_err_to_name(err));
-    }
-    return err;
+    return web_auth_register(handle, uri_handler);
+}
+
+static inline esp_err_t reg_public(httpd_handle_t handle, const httpd_uri_t *uri_handler)
+{
+    return web_auth_register_public(handle, uri_handler);
 }
 
 /* Hold upload passes while raw capture is live — or while a therapy session
@@ -3491,6 +3502,9 @@ static esp_err_t start_webserver(void)
     /* Guards s_format_progress between format_sd_task and the progress handler.
      * Created here so it exists before any request can reach the handler. */
     if (!s_format_mtx) s_format_mtx = xSemaphoreCreateMutex();
+    /* Optional web password: load it before the first request can arrive.
+     * Needs the nvs_writer task started above. */
+    web_auth_init();
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
@@ -3522,38 +3536,40 @@ static esp_err_t start_webserver(void)
         return ESP_FAIL;
     }
 
+    web_auth_begin_routes();
+    web_auth_register_handlers(s_httpd);
     session_graph_init();
     oximetry_http_register_handlers(s_httpd);
 
     httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
-    reg_uri(s_httpd, &root);
+    reg_public(s_httpd, &root);
 
     httpd_uri_t wifi_uri = { .uri = "/wifi", .method = HTTP_GET, .handler = root_get_handler };
-    reg_uri(s_httpd, &wifi_uri);
+    reg_public(s_httpd, &wifi_uri);
 
     httpd_uri_t manifest = { .uri = "/manifest.json", .method = HTTP_GET, .handler = manifest_get_handler };
-    reg_uri(s_httpd, &manifest);
+    reg_public(s_httpd, &manifest);
 
     httpd_uri_t sw = { .uri = "/sw.js", .method = HTTP_GET, .handler = sw_get_handler };
-    reg_uri(s_httpd, &sw);
+    reg_public(s_httpd, &sw);
 
     httpd_uri_t uplot_js = { .uri = "/uplot.js", .method = HTTP_GET, .handler = uplot_js_get_handler };
-    reg_uri(s_httpd, &uplot_js);
+    reg_public(s_httpd, &uplot_js);
 
     httpd_uri_t uplot_css = { .uri = "/uplot.css", .method = HTTP_GET, .handler = uplot_css_get_handler };
-    reg_uri(s_httpd, &uplot_css);
+    reg_public(s_httpd, &uplot_css);
 
     httpd_uri_t logo_svg = { .uri = "/logo.svg", .method = HTTP_GET, .handler = logo_svg_get_handler };
-    reg_uri(s_httpd, &logo_svg);
+    reg_public(s_httpd, &logo_svg);
 
     httpd_uri_t favicon = { .uri = "/favicon.svg", .method = HTTP_GET, .handler = favicon_get_handler };
-    reg_uri(s_httpd, &favicon);
+    reg_public(s_httpd, &favicon);
 
     httpd_uri_t status = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler };
     reg_uri(s_httpd, &status);
 
     httpd_uri_t tz_db = { .uri = "/api/tz", .method = HTTP_GET, .handler = tz_get_handler };
-    reg_uri(s_httpd, &tz_db);
+    reg_public(s_httpd, &tz_db);
 
     httpd_uri_t scan = { .uri = "/scan", .method = HTTP_GET, .handler = scan_get_handler };
     httpd_uri_t save = { .uri = "/save", .method = HTTP_POST, .handler = save_post_handler };
@@ -3699,7 +3715,7 @@ static esp_err_t start_webserver(void)
                 .method = HTTP_GET,
                 .handler = redirect_to_portal,
             };
-            reg_uri(s_httpd, &probe);
+            reg_public(s_httpd, &probe);
         }
         httpd_register_err_handler(s_httpd, HTTPD_404_NOT_FOUND, http_404_error_handler);
     }

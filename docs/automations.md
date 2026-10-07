@@ -69,6 +69,16 @@ sensor:
         value_template: "{{ state_attr('sensor.somnotrace_status', 'battery').percent }}"
 ```
 
+> **Web interface password:** if you set one in **Settings → Web Interface Password**, add it to every REST sensor and REST command (the user name is ignored, but Home Assistant requires one):
+>
+> ```yaml
+>     authentication: basic
+>     username: "somnotrace"
+>     password: !secret somnotrace_password
+> ```
+>
+> (`rest_command` takes the same three keys.)
+
 ---
 
 ### Method 3: Remote Control Switch (Start / Stop Therapy)

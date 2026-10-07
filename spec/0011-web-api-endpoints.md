@@ -303,7 +303,7 @@ The request blocks for up to the backend's probe timeout (about 10 s), and is re
 ## 5. Security / privacy considerations
 
 - Wi-Fi and cloud upload settings are saved in an **encrypted NVS partition** to prevent raw credential theft in case of device physical tampering.
-- Accessing the configuration dashboard requires standard local network proximity.
+- Accessing the configuration dashboard requires standard local network proximity, and, when one is set, the optional web interface password (`0014-web-interface-password.md`). With a password set, every endpoint in this document answers `401` without a session cookie or HTTP Basic credentials.
 - No health data or telemetry contains patient names or identifiable clinical metadata.
 
 ## 6. Acceptance criteria
@@ -322,3 +322,4 @@ The request blocks for up to the backend's probe timeout (about 10 s), and is re
 - 2026-09-05: Added `/api/uploads/test-smb` and `/api/uploads/test-sleephq` (upload "Test connection" buttons, #123).
 - 2026-09-06: The connection-test probe now claims the upload transport slot for its duration rather than only checking it (#214).
 - 2026-09-06: `POST /api/uploads/test-*` accepts an optional JSON body of settings to probe with, so credentials can be tested before saving (#214).
+- 2026-10-07: All endpoints are subject to the optional web interface password (`0014`); `/api/auth/*` added there.

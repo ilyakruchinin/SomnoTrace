@@ -29,6 +29,7 @@ that is wanted; nothing here depends on running there.
 | `scripts/as11_time_test.c` | AS11 epoch / noon-day arithmetic |
 | `scripts/as11_events_test.c` | AS11 event parser and lifecycle state machine (`main/as11_events.c`) |
 | `scripts/vld3_decoder_test.c` | oximeter VLD3 decoder |
+| `scripts/web_auth_test.c` | web interface password core (`main/web_auth_core.c`): PBKDF2-SHA256 against published vectors, session-token forgery/expiry/boot binding, Basic-auth and Origin parsing, login rate limiter. Links the system mbedTLS (`apt install libmbedtls-dev`) |
 | `scripts/somno_ml_test.c` | SomnoStage C-runtime parity vs the Python reference (features → boosters → decode). Needs a dev-model artifact dir that is never in this repo: compiled+linked on every run, executed only when `SOMNO_ML_ARTIFACTS=<dir>` points at a local export |
 | `scripts/mutants.py` | plants one-line bugs into a copy of `main/`, expects the suite to fail |
 | `scripts/mutants_probe.py` | optional: asks a local model for more bugs, measures them the same way |

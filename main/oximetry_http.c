@@ -24,6 +24,7 @@
 #include "oximetry_canonical.h"
 #include "upload_ox.h"
 #include "somno_ml.h"
+#include "web_auth.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -246,12 +247,12 @@ void oximetry_http_register_handlers(httpd_handle_t server)
         .uri = "/api/somnostage/state", .method = HTTP_GET,
         .handler = somnostage_state_handler,
     };
-    httpd_register_uri_handler(server, &list);
-    httpd_register_uri_handler(server, &days);
-    httpd_register_uri_handler(server, &recording);
-    httpd_register_uri_handler(server, &uploads);
-    httpd_register_uri_handler(server, &diagnostics);
-    httpd_register_uri_handler(server, &file);
-    httpd_register_uri_handler(server, &file_head);
-    httpd_register_uri_handler(server, &sst_state);
+    web_auth_register(server, &list);
+    web_auth_register(server, &days);
+    web_auth_register(server, &recording);
+    web_auth_register(server, &uploads);
+    web_auth_register(server, &diagnostics);
+    web_auth_register(server, &file);
+    web_auth_register(server, &file_head);
+    web_auth_register(server, &sst_state);
 }

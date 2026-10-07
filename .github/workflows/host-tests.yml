@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install libcjson
+      - name: Install libcjson and mbedTLS
         run: |
           # ⚠️ DROP THE RUNNER'S UNRELATED APT SOURCES FIRST. The ubuntu-latest image ships
           # apt sources for Google Chrome and Microsoft that this project never installs from.
@@ -54,7 +54,7 @@ jobs:
               sudo rm -f "$f"
           done
           sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends libcjson-dev
+          sudo apt-get install -y --no-install-recommends libcjson-dev libmbedtls-dev
 
       - name: Run host tests
         # The runner's default shell is `bash -e` without pipefail, so the
