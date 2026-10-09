@@ -67,6 +67,7 @@ void uploader_register_backend(const upload_backend_t *backend)
 /* External backend declarations */
 extern const upload_backend_t smb_backend;
 extern const upload_backend_t sleephq_backend;
+extern const upload_backend_t aerivue_backend;
 
 /* Injected NVS-write executor (the app's internal-stack nvs_writer). */
 static uploader_nvs_exec_fn_t s_nvs_exec = NULL;
@@ -87,6 +88,7 @@ static esp_err_t do_uploader_load_config(void *arg)
     /* Defaults: all toggles enabled for backward compatibility */
     local.smb_enabled   = true;
     local.shq_enabled   = true;
+    local.aer_enabled   = true;
     local.ftp_enabled   = true;
     local.ftp_anonymous = true;
     local.max_days      = UPLOAD_DEFAULT_MAX_DAYS;
@@ -102,6 +104,7 @@ static esp_err_t do_uploader_load_config(void *arg)
     uint8_t u8val;
     local.smb_enabled   = (nvs_get_u8(h, "smb_en", &u8val) == ESP_OK) ? u8val : 1;
     local.shq_enabled   = (nvs_get_u8(h, "shq_en", &u8val) == ESP_OK) ? u8val : 1;
+    local.aer_enabled   = (nvs_get_u8(h, "aer_en", &u8val) == ESP_OK) ? u8val : 1;
     local.ftp_enabled   = (nvs_get_u8(h, "ftp_en", &u8val) == ESP_OK) ? u8val : 1;
     local.ftp_anonymous = (nvs_get_u8(h, "ftp_anon", &u8val) == ESP_OK) ? u8val : 1;
 
@@ -128,6 +131,8 @@ static esp_err_t do_uploader_load_config(void *arg)
     nvs_get_str(h, "shq_cid", local.shq_client_id, &len);
     len = sizeof(local.shq_client_secret);
     nvs_get_str(h, "shq_secret", local.shq_client_secret, &len);
+    len = sizeof(local.aer_key);
+    nvs_get_str(h, "aer_key", local.aer_key, &len);
     len = sizeof(local.ftp_user);
     nvs_get_str(h, "ftp_user", local.ftp_user, &len);
     len = sizeof(local.ftp_pass);
@@ -146,6 +151,7 @@ esp_err_t uploader_load_config(uploader_config_t *cfg)
     /* Defaults: all toggles enabled for backward compatibility */
     cfg->smb_enabled   = true;
     cfg->shq_enabled   = true;
+    cfg->aer_enabled   = true;
     cfg->ftp_enabled   = true;
     cfg->ftp_anonymous = true;
     cfg->max_days      = UPLOAD_DEFAULT_MAX_DAYS;
@@ -206,6 +212,7 @@ static esp_err_t do_uploader_save_config(void *arg)
 
     nvs_set_u8(h, "smb_en", local.smb_enabled ? 1 : 0);
     nvs_set_u8(h, "shq_en", local.shq_enabled ? 1 : 0);
+    nvs_set_u8(h, "aer_en", local.aer_enabled ? 1 : 0);
     nvs_set_u8(h, "ftp_en", local.ftp_enabled ? 1 : 0);
     nvs_set_u8(h, "ftp_anon", local.ftp_anonymous ? 1 : 0);
     nvs_set_i32(h, "max_days", local.max_days);
@@ -216,6 +223,7 @@ static esp_err_t do_uploader_save_config(void *arg)
     nvs_set_str(h, "smb_path", local.smb_path);
     nvs_set_str(h, "shq_cid", local.shq_client_id);
     nvs_set_str(h, "shq_secret", local.shq_client_secret);
+    nvs_set_str(h, "aer_key", local.aer_key);
     nvs_set_str(h, "ftp_user", local.ftp_user);
     nvs_set_str(h, "ftp_pass", local.ftp_pass);
     nvs_commit(h);
@@ -252,6 +260,11 @@ bool uploader_is_sleephq_configured(void)
            s_config.shq_client_id[0] != '\0' && s_config.shq_client_secret[0] != '\0';
 }
 
+bool uploader_is_aerivue_configured(void)
+{
+    return s_config.aer_enabled && s_config.aer_key[0] != '\0';
+}
+
 bool uploader_is_smb_enabled(void)
 {
     return s_config.smb_enabled;
@@ -260,6 +273,11 @@ bool uploader_is_smb_enabled(void)
 bool uploader_is_sleephq_enabled(void)
 {
     return s_config.shq_enabled;
+}
+
+bool uploader_is_aerivue_enabled(void)
+{
+    return s_config.aer_enabled;
 }
 
 bool uploader_is_ftp_enabled(void)
@@ -293,6 +311,13 @@ esp_err_t uploader_get_config_json(char **out_json)
     cJSON_AddStringToObject(shq, "client_secret", s_config.shq_client_secret[0] ? "***" : "");
     cJSON_AddBoolToObject(shq, "configured", uploader_is_sleephq_configured());
     cJSON_AddItemToObject(root, "sleephq", shq);
+
+    cJSON *aer = cJSON_CreateObject();
+    cJSON_AddBoolToObject(aer, "enabled", s_config.aer_enabled);
+    /* Mask upload key — same "***" sentinel convention as passwords */
+    cJSON_AddStringToObject(aer, "key", s_config.aer_key[0] ? "***" : "");
+    cJSON_AddBoolToObject(aer, "configured", uploader_is_aerivue_configured());
+    cJSON_AddItemToObject(root, "aerivue", aer);
 
     cJSON_AddNumberToObject(root, "max_days", uploader_max_days());
     cJSON_AddNumberToObject(root, "max_days_cap", UPLOAD_MAX_DAYS_CAP);
@@ -353,6 +378,18 @@ esp_err_t uploader_save_config_json(const char *json_str)
         if ((v = cJSON_GetObjectItem(shq, "client_secret")) && cJSON_IsString(v)) {
             if (strcmp(v->valuestring, "***") != 0)
                 strlcpy(cfg.shq_client_secret, v->valuestring, sizeof(cfg.shq_client_secret));
+        }
+    }
+
+    cJSON *aer = cJSON_GetObjectItem(root, "aerivue");
+    if (aer) {
+        cJSON *v;
+        if ((v = cJSON_GetObjectItem(aer, "enabled")) && cJSON_IsBool(v))
+            cfg.aer_enabled = cJSON_IsTrue(v);
+        /* Only update the key if not the mask string */
+        if ((v = cJSON_GetObjectItem(aer, "key")) && cJSON_IsString(v)) {
+            if (strcmp(v->valuestring, "***") != 0)
+                strlcpy(cfg.aer_key, v->valuestring, sizeof(cfg.aer_key));
         }
     }
 
@@ -472,6 +509,7 @@ esp_err_t uploader_init(void)
      * are assigned in a stable order and the state files can be attributed. */
     uploader_register_backend(&smb_backend);
     uploader_register_backend(&sleephq_backend);
+    uploader_register_backend(&aerivue_backend);
     for (int i = 0; i < s_n_backends; i++) {
         upload_index_backend_slot(s_backends[i]->id);
     }

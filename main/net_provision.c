@@ -2241,6 +2241,7 @@ static bool upload_test_read_overrides(httpd_req_t *req, uploader_config_t *out)
     cfg_str_from(root, "smb_path",  out->smb_path,  sizeof(out->smb_path));
     cfg_str_from(root, "shq_client_id",     out->shq_client_id,     sizeof(out->shq_client_id));
     cfg_str_from(root, "shq_client_secret", out->shq_client_secret, sizeof(out->shq_client_secret));
+    cfg_str_from(root, "aer_key",           out->aer_key,           sizeof(out->aer_key));
     cJSON_Delete(root);
     return true;
 }
@@ -2290,6 +2291,11 @@ static esp_err_t upload_test_smb_handler(httpd_req_t *req)
 static esp_err_t upload_test_sleephq_handler(httpd_req_t *req)
 {
     return upload_test_send(req, "sleephq");
+}
+
+static esp_err_t upload_test_aerivue_handler(httpd_req_t *req)
+{
+    return upload_test_send(req, "aerivue");
 }
 
 /* ── Device settings endpoints ─────────────────────────────────────── */
@@ -3605,8 +3611,10 @@ static esp_err_t start_webserver(void)
     /* "Test connection" buttons: probe a backend with the saved settings */
     httpd_uri_t up_test_smb = { .uri = "/api/uploads/test-smb", .method = HTTP_POST, .handler = upload_test_smb_handler };
     httpd_uri_t up_test_shq = { .uri = "/api/uploads/test-sleephq", .method = HTTP_POST, .handler = upload_test_sleephq_handler };
+    httpd_uri_t up_test_aer = { .uri = "/api/uploads/test-aerivue", .method = HTTP_POST, .handler = upload_test_aerivue_handler };
     reg_uri(s_httpd, &up_test_smb);
     reg_uri(s_httpd, &up_test_shq);
+    reg_uri(s_httpd, &up_test_aer);
 
     /* Device settings endpoints (brightness, LCD therapy mode) */
     httpd_uri_t settings_all = { .uri = "/api/settings/all", .method = HTTP_GET, .handler = settings_all_get_handler };
