@@ -453,6 +453,7 @@ const upload_backend_t smb_backend = {
     .id = "smb",
     .label = "SMB Network Share",
     .bundle_only_ok = true,     /* plain file copy, no side effects */
+    .supports_ox = true,
     .is_configured = smb_is_configured,
     .session_begin = smb_session_begin,
     .day_begin = smb_day_begin,

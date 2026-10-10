@@ -73,7 +73,7 @@ typedef enum {
 typedef struct uploader_config_s uploader_config_t;
 
 typedef struct {
-    const char *id;         /* "smb" | "sleephq" — stable tracking key      */
+    const char *id;         /* "smb" | "sleephq" | "aerivue" — stable key   */
     const char *label;      /* "NAS (SMB)" — shown in the UI                */
 
     /* May this backend be contacted when the ONLY thing that changed is the
@@ -87,6 +87,15 @@ typedef struct {
      * since a genuinely changed STR.edf with no new sessions only happens
      * when the AS11 revises an earlier day's summary. */
     bool bundle_only_ok;
+
+    /* Does this backend accept oximetry recordings? Backends that do not
+     * (or whose account tier does not, e.g. a service that gates oximetry
+     * behind a subscription) must leave this false so the scheduler skips
+     * ox units for them instead of repeatedly failing put_oximetry.
+     * IMPORTANT: declared after bundle_only_ok, and every existing backend
+     * sets it explicitly — a zero-initialised false would silently disable
+     * oximetry on SMB/SleepHQ/Aerivue. */
+    bool supports_ox;
 
     /* Check if this backend has valid configuration (config keys in NVS). */
     bool (*is_configured)(void);
@@ -146,6 +155,10 @@ struct uploader_config_s {
     bool shq_enabled;        /* toggle: include SleepHQ in upload cycle     */
     char shq_client_id[128];      /* API key (Client UID)                */
     char shq_client_secret[128];  /* Client Secret                       */
+
+    /* Aerivue */
+    bool aer_enabled;        /* toggle: include Aerivue in upload cycle     */
+    char aer_key[64];        /* upload key ("avu_…"), scoped + revocable    */
 
     /* Built-in FTP server */
     bool ftp_enabled;        /* toggle: start FTP server at boot            */
@@ -234,8 +247,10 @@ void uploader_set_progress_notify_fn(uploader_progress_notify_fn_t fn);
 /* Check if specific backends are configured and enabled. */
 bool uploader_is_smb_configured(void);
 bool uploader_is_sleephq_configured(void);
+bool uploader_is_aerivue_configured(void);
 bool uploader_is_smb_enabled(void);
 bool uploader_is_sleephq_enabled(void);
+bool uploader_is_aerivue_enabled(void);
 
 /* Check if FTP server is enabled in config. */
 bool uploader_is_ftp_enabled(void);

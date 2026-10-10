@@ -476,8 +476,11 @@ static bool run_backend(backend_rt_t *r, int max_days)
 
     /* Oximetry packages are self-contained and are tracked independently from
      * EDF groups. A backend connection is reused, but each noon-day gets its
-     * own transport scope so SleepHQ can create one O2 import per day. */
-    if (ox_pending > 0 && be->put_oximetry) {
+     * own transport scope so SleepHQ can create one O2 import per day.
+     * Backends that do not support oximetry at all leave supports_ox=false so
+     * their units stay pending instead of being marked failed (or worse,
+     * fake-uploaded) on every pass. */
+    if (ox_pending > 0 && be->put_oximetry && be->supports_ox) {
         char ox_day[12] = {0};
         bool ox_day_any = false;
         for (int oi = 0; oi < n_ox && fails < FAILS_BEFORE_SWITCH; oi++) {
