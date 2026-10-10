@@ -124,10 +124,10 @@ static int smb_set_mtime(struct smb2_context *smb2, struct smb2fh *fh,
     return sync.status;
 }
 
-/* Upload a single local file to an SMB path. */
-static upload_result_t smb_upload_file(struct smb2_context *smb2,
-                                        const char *local_path,
-                                        const char *remote_path)
+/* Upload a single local file to an SMB path (one attempt). */
+static upload_result_t smb_upload_file_once(struct smb2_context *smb2,
+                                            const char *local_path,
+                                            const char *remote_path)
 {
     FILE *f = fopen(local_path, "rb");
     if (!f) {
@@ -234,53 +234,50 @@ static upload_result_t smb_upload_file(struct smb2_context *smb2,
 
 static struct smb2_context *s_smb;      /* live for the whole run */
 static char s_remote_base[256];
+static bool s_signed_session;           /* s_smb was opened with signing on */
+static bool s_sign_learned;             /* a signed upload worked this boot */
 
 static bool smb_is_configured(void)
 {
     return uploader_is_smb_configured();
 }
 
-static upload_result_t smb_session_begin(void)
+static bool smb_open_session(const uploader_config_t *cfg, bool with_sign)
 {
-    uploader_config_t cfg;
-    uploader_load_config(&cfg);
-    if (!cfg.smb_host[0] || !cfg.smb_share[0]) return UPLOAD_NOT_CONFIGURED;
-
     s_smb = smb2_init_context();
     if (!s_smb) {
         ESP_LOGE(TAG, "smb2_init_context failed");
-        return UPLOAD_ERR_TRANSIENT;
+        return false;
     }
 
     smb2_set_security_mode(s_smb, SMB2_NEGOTIATE_SIGNING_ENABLED);
-    smb2_set_user(s_smb, cfg.smb_user[0] ? cfg.smb_user : "Guest");
-    if (cfg.smb_pass[0]) smb2_set_password(s_smb, cfg.smb_pass);
+    if (with_sign) smb2_set_sign(s_smb, 1);
+    const char *user = cfg->smb_user[0] ? cfg->smb_user : "Guest";
+    smb2_set_user(s_smb, user);
+    if (cfg->smb_pass[0]) smb2_set_password(s_smb, cfg->smb_pass);
 
-    ESP_LOGI(TAG, "connecting to %s/%s as %s", cfg.smb_host, cfg.smb_share,
-             cfg.smb_user[0] ? cfg.smb_user : "Guest");
+    ESP_LOGI(TAG, "connecting to %s/%s as %s%s", cfg->smb_host, cfg->smb_share,
+             user, with_sign ? " (signed)" : "");
 
-    if (smb2_connect_share(s_smb, cfg.smb_host, cfg.smb_share,
-                           cfg.smb_user[0] ? cfg.smb_user : "Guest") != 0) {
+    if (smb2_connect_share(s_smb, cfg->smb_host, cfg->smb_share, user) != 0) {
         ESP_LOGE(TAG, "smb2_connect_share failed: %s", smb2_get_error(s_smb));
         smb2_destroy_context(s_smb);
         s_smb = NULL;
-        /* Unreachable host and bad credentials are indistinguishable here
-         * without parsing the error text, so treat as transient and let the
-         * cooldown ladder slow it down. */
-        return UPLOAD_ERR_TRANSIENT;
+        return false;
     }
-    ESP_LOGI(TAG, "SMB connected");
+    s_signed_session = with_sign;
+    ESP_LOGI(TAG, "SMB connected%s", with_sign ? " (signed)" : "");
 
     /* SMB paths are relative to the share root: a leading slash makes
      * Windows return STATUS_INVALID_PARAMETER. */
-    const char *p = cfg.smb_path;
+    const char *p = cfg->smb_path;
     while (*p == '/' || *p == '\\') p++;
     snprintf(s_remote_base, sizeof(s_remote_base), "%s", p);
 
     char remote_datalog[400];
     snprintf(remote_datalog, sizeof(remote_datalog), "%s/DATALOG", s_remote_base);
     smb2_mkdir(s_smb, remote_datalog);
-    return UPLOAD_OK;
+    return true;
 }
 
 static void smb_session_end(void)
@@ -289,6 +286,90 @@ static void smb_session_end(void)
     smb2_disconnect_share(s_smb);
     smb2_destroy_context(s_smb);
     s_smb = NULL;
+    s_signed_session = false;
+}
+
+/* Connect, preferring the learned signing mode. A learned flag that stops
+ * working (server config changed, different host) falls back to unsigned so
+ * the preference can never wedge the uploader. */
+static bool smb_connect_any(const uploader_config_t *cfg)
+{
+    if (s_sign_learned && smb_open_session(cfg, true)) return true;
+    s_sign_learned = false;
+    return smb_open_session(cfg, false);
+}
+
+static upload_result_t smb_session_begin(void)
+{
+    uploader_config_t cfg;
+    uploader_load_config(&cfg);
+    if (!cfg.smb_host[0] || !cfg.smb_share[0]) return UPLOAD_NOT_CONFIGURED;
+
+    if (!smb_connect_any(&cfg)) {
+        /* Unreachable host and bad credentials are indistinguishable here
+         * without parsing the error text, so treat as transient and let the
+         * cooldown ladder slow it down. */
+        return UPLOAD_ERR_TRANSIENT;
+    }
+    return UPLOAD_OK;
+}
+
+/* Adaptive SMB signing. Some hardened servers (Windows 11 24H2+, per-share
+ * "RequireSigning") advertise signing as only *enabled* in negotiate, then
+ * reject unsigned requests with STATUS_INVALID_PARAMETER — and libsmb2 on
+ * a 3.1.1 session signs the tree connect but nothing else, producing exactly
+ * the mixed session those servers reject. On the first INVALID_PARAMETER on
+ * a 3.1.1 session, rebuild the connection with signing forced and retry the
+ * operation once; on success, s_sign_learned makes later sessions skip the
+ * failed attempt entirely. 3.1.1 is the only dialect where this mixed-signing
+ * pattern occurs, which keeps the retry scoped to the signature we observed. */
+static bool smb_reconnect_signed(void)
+{
+    uploader_config_t cfg;
+    uploader_load_config(&cfg);
+    smb_session_end();
+    return smb_open_session(&cfg, true);
+}
+
+/* mkdir every ancestor directory of remote_path. Intermediate failures are
+ * ignored — the dir may already exist or the share may not allow mkdir. */
+static void smb_mkdir_parents(struct smb2_context *smb2, const char *remote_path)
+{
+    char dir[512];
+    for (const char *s = remote_path; (s = strchr(s, '/')); s++) {
+        size_t len = s - remote_path;
+        if (len == 0 || len >= sizeof(dir)) continue;
+        memcpy(dir, remote_path, len);
+        dir[len] = '\0';
+        smb2_mkdir(smb2, dir);
+    }
+}
+
+static upload_result_t smb_upload_file(struct smb2_context *smb2,
+                                       const char *local_path,
+                                       const char *remote_path)
+{
+    upload_result_t r = smb_upload_file_once(smb2, local_path, remote_path);
+    if (r == UPLOAD_OK || s_signed_session ||
+        (uint32_t)smb2_get_nterror(smb2) != SMB2_STATUS_INVALID_PARAMETER ||
+        smb2_get_dialect(smb2) != SMB2_VERSION_0311) {
+        return r;
+    }
+    uploader_config_t cfg;
+    uploader_load_config(&cfg);
+    if (!cfg.smb_pass[0]) return r;   /* guest session: no session key to sign with */
+
+    ESP_LOGW(TAG, "server rejected unsigned request — retrying with SMB signing");
+    if (!smb_reconnect_signed()) return r;
+    /* mkdir calls made on the unsigned session failed silently, so the
+     * parent chain may not exist on the new session. */
+    smb_mkdir_parents(s_smb, remote_path);
+    r = smb_upload_file_once(s_smb, local_path, remote_path);
+    if (r == UPLOAD_OK) {
+        s_sign_learned = true;
+        ESP_LOGI(TAG, "server requires SMB signing — remembered for this boot");
+    }
+    return r;
 }
 
 /* ── "Test connection" (web UI) ───────────────────────────────────────
@@ -318,6 +399,7 @@ static bool smb_test(const uploader_config_t *cfgp, char *msg, size_t msg_len)
         return false;
     }
     smb2_set_security_mode(ctx, SMB2_NEGOTIATE_SIGNING_ENABLED);
+    if (s_sign_learned) smb2_set_sign(ctx, 1);   /* mirror the upload path */
     smb2_set_timeout(ctx, SMB_TEST_TIMEOUT_S);
     smb2_set_user(ctx, user);
     if (cfg.smb_pass[0]) smb2_set_password(ctx, cfg.smb_pass);
