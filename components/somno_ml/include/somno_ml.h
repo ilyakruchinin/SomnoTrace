@@ -113,6 +113,10 @@ int somno_ml_score_file(const somno_ml_job_t *job);
  * dirs for missing/stale .sst sidecars and enqueue them. */
 int somno_ml_reconcile(void);
 
+/* Same, but only scans day dirs newer than `days` ago.  Used by the
+ * periodic self-heal pass, where drops are always recent. */
+int somno_ml_reconcile_recent(int days);
+
 /* Current rough state for the MQTT/API feed (RAM only, never persisted). */
 typedef struct {
     bool     active;

@@ -62,6 +62,12 @@ int somno_ml_score_file(const somno_ml_job_t *job)
 
 int somno_ml_reconcile(void) { return 0; }
 
+int somno_ml_reconcile_recent(int days)
+{
+    (void)days;
+    return 0;
+}
+
 void somno_ml_live_state(somno_ml_live_state_t *out)
 {
     memset(out, 0, sizeof(*out));

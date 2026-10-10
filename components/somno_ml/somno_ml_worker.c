@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cJSON.h"
@@ -48,6 +49,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 static const char *TAG = "somno_ml";
@@ -66,11 +68,43 @@ static const char *TAG = "somno_ml";
 #define MAX_RING_RECS      96
 #define MAX_FRAG_GROUP     8
 
+/* Self-healing cadence.  Live enqueues are tracked below and verified a few
+ * minutes later; the bounded reconcile rescans only recent days (a dropped
+ * job is always fresh — deeper history is covered by the boot scan and the
+ * daily full pass). */
+#define RECON_RECENT_DAYS    14
+#define RECON_RECENT_MS      (30LL * 60 * 1000)
+#define RECON_FULL_MS        (24LL * 60 * 60 * 1000)
+#define VERIFY_FIRST_MS      (3LL * 60 * 1000)
+#define VERIFY_RETRY_MS      (5LL * 60 * 1000)
+#define VERIFY_MAX_TRIES     3
+#define PENDING_CAP          8
+
 /* ---- SNT wire constants ---- */
 #define SNT_MISSING    (-32768)     /* INT16_MIN sentinel (SNT3 + SNT v2) */
 #define SNT_MISSING_V1 (-1)
 
 static QueueHandle_t s_queue;
+
+/* Expected-.sst tracking for live enqueues.  Every failure mode in the
+ * scoring path is a silent drop by design, so a session whose stage file
+ * never materialises would stay that way until the next boot reconcile.
+ * Instead, live jobs get a deadline: the worker stats the expected .sst a
+ * few minutes after enqueueing and re-enqueues when it is absent.  Jobs
+ * queued by reconcile are not tracked — reconcile itself is the retry. */
+typedef struct {
+    bool     used;
+    int      type;
+    char     id[64];
+    char     dir[192];
+    int64_t  due_ms;
+    int      tries;
+} pending_sst_t;
+
+static pending_sst_t   s_pending[PENDING_CAP];
+static SemaphoreHandle_t s_pending_mux;
+static int64_t s_next_recon_ms = -1;
+static int64_t s_next_full_ms  = -1;
 static somno_ml_live_state_t s_live;
 static portMUX_TYPE s_live_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -83,10 +117,57 @@ static uint32_t rd_u32(const uint8_t *p)
 
 /* ---------------- job enqueue / live state ---------------- */
 
-int somno_ml_enqueue(const somno_ml_job_t *job)
+static int64_t now_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+/* Remember that a live job should produce a .sst soon.  Best-effort: when
+ * the table is full the job is still queued, it just loses its watchdog. */
+static void pending_add(const somno_ml_job_t *job)
+{
+    if (!s_pending_mux) return;
+    xSemaphoreTake(s_pending_mux, portMAX_DELAY);
+    int slot = -1;
+    for (int i = 0; i < PENDING_CAP; i++)
+        if (!s_pending[i].used) { slot = i; break; }
+    if (slot < 0) {
+        xSemaphoreGive(s_pending_mux);
+        ESP_LOGW(TAG, "%s: verify table full — job untracked", job->id);
+        return;
+    }
+    pending_sst_t *p = &s_pending[slot];
+    p->type = job->type;
+    strlcpy(p->id, job->id, sizeof(p->id));
+    strlcpy(p->dir, job->dir, sizeof(p->dir));
+    p->due_ms = now_ms() + VERIFY_FIRST_MS;
+    p->tries = 0;
+    p->used = true;
+    xSemaphoreGive(s_pending_mux);
+}
+
+/* verify=true for live session-end/publish enqueues: a queue-full drop gets
+ * a WARN (it used to vanish silently) and a pending entry so the worker
+ * re-enqueues later.  verify=false for reconcile-sourced jobs: saturation
+ * there is expected and handled by s_recon_more. */
+static int enqueue_internal(const somno_ml_job_t *job, bool verify)
 {
     if (!somno_ml_available() || !s_queue || !job) return -1;
-    return xQueueSend(s_queue, job, 0) == pdTRUE ? 0 : -1;
+    if (xQueueSend(s_queue, job, 0) != pdTRUE) {
+        if (verify) {
+            ESP_LOGW(TAG, "%s: enqueue dropped (queue full) — "
+                     "will retry", job->id);
+            pending_add(job);
+        }
+        return -1;
+    }
+    if (verify) pending_add(job);
+    return 0;
+}
+
+int somno_ml_enqueue(const somno_ml_job_t *job)
+{
+    return enqueue_internal(job, true);
 }
 
 int somno_ml_enqueue_ring(const char *recording_id)
@@ -95,7 +176,7 @@ int somno_ml_enqueue_ring(const char *recording_id)
         return -1;
     somno_ml_job_t j = { .type = SOMNO_ML_SRC_RING_VITALS };
     strlcpy(j.id, recording_id, sizeof(j.id));
-    return somno_ml_enqueue(&j);
+    return enqueue_internal(&j, true);
 }
 
 int somno_ml_enqueue_as11(const char *day_dir, const char *file_prefix)
@@ -106,7 +187,7 @@ int somno_ml_enqueue_as11(const char *day_dir, const char *file_prefix)
         return -1;
     strlcpy(j.dir, day_dir, sizeof(j.dir));
     strlcpy(j.id, file_prefix, sizeof(j.id));
-    return somno_ml_enqueue(&j);
+    return enqueue_internal(&j, true);
 }
 
 void somno_ml_live_state(somno_ml_live_state_t *out)
@@ -262,6 +343,27 @@ static int write_sst(const char *path, const somno_sst_header_t *hdr,
     return 0;
 }
 
+/* Write a 64-byte header-only INSUFFICIENT stub for a source that can never
+ * be scored (deterministic parse failure).  Without it the file stays stale
+ * forever and every reconcile re-enqueues it — enough of those poison the
+ * job queue.  Environmental failures (fopen, alloc) deliberately do NOT
+ * mark so they can succeed on retry. */
+static int mark_unscorable(const char *sst_path, uint8_t source_type,
+                           const char *job_id)
+{
+    somno_sst_header_t hdr = {0};
+    hdr.magic = SOMNO_SST_MAGIC;
+    hdr.version = SOMNO_SST_VERSION;
+    hdr.flags = SOMNO_SST_FLAG_INSUFFICIENT;
+    hdr.source_type = source_type;
+    strlcpy((char *)hdr.model_semver, somno_ml_model_semver(),
+            sizeof(hdr.model_semver));
+    int rc = write_sst(sst_path, &hdr, NULL, NULL);
+    if (rc == 0)
+        ESP_LOGW(TAG, "%s: unscorable source — marked %s", job_id, sst_path);
+    return rc;
+}
+
 /* ---------------- scoring core ---------------- */
 
 typedef struct {
@@ -329,15 +431,14 @@ static int finish_and_write(score_ctx_t *ctx, const char *sst_path,
     if (!stages || !conf) { free(stages); free(conf); return -1; }
 
     if (ctx->valid_epochs < MIN_VALID_EPOCHS) {
-        if (partial) {
-            /* Source still growing — persist nothing so the finalize event
-             * (or a later reconcile) re-scores the complete file. */
-            free(stages);
-            free(conf);
-            return 0;
-        }
-        /* oximeter-presence guard: write a marked stub so reconcile does not
-         * retry forever and the UI knows to hide the band */
+        /* Write a marked stub so reconcile does not re-enqueue this source
+         * forever and the UI knows to hide the band.  The stub deliberately
+         * does NOT carry PARTIAL even when the source looked still-growing:
+         * sst_fresh() rejects PARTIAL files, so one would poison the queue
+         * every bit as much as writing nothing at all.  If the source keeps
+         * growing after the stub lands, its mtime overtakes the stub's and
+         * freshness fails on its own — the file gets re-scored anyway. */
+        hdr.flags &= ~SOMNO_SST_FLAG_PARTIAL;
         hdr.flags |= SOMNO_SST_FLAG_INSUFFICIENT;
         memset(stages, 0xFF, n);
         memset(conf, 0, n);
@@ -389,15 +490,24 @@ typedef struct {
     double   dt;
 } vitals_meta_t;
 
-/* Open + validate a vitals.snt, positioned at the first record. */
-static FILE *vitals_open(const char *vitals_path, vitals_meta_t *m)
+/* Open + validate a vitals.snt, positioned at the first record.
+ * Returns NULL on any failure; *bad_header (when given) is set only for
+ * deterministic content problems (bad magic/fields), not for fopen errors
+ * or truncated reads which may still be growing or transient. */
+static FILE *vitals_open(const char *vitals_path, vitals_meta_t *m,
+                         int *bad_header)
 {
+    if (bad_header) *bad_header = 0;
     FILE *f = fopen(vitals_path, "rb");
     if (!f) return NULL;
     uint8_t hdr[64];
-    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
-        rd_u32(hdr) != 0x33544e53u || hdr[4] != 3) {   /* "SNT3" v3 */
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
         fclose(f);
+        return NULL;
+    }
+    if (rd_u32(hdr) != 0x33544e53u || hdr[4] != 3) {   /* "SNT3" v3 */
+        fclose(f);
+        if (bad_header) *bad_header = 1;
         return NULL;
     }
     m->n_ch = hdr[7];
@@ -411,6 +521,7 @@ static FILE *vitals_open(const char *vitals_path, vitals_meta_t *m)
     if (m->n_ch < 4 || m->n_ch > 16 || sample_bytes != 2 ||
         header_bytes < 64 || period_us == 0 || period_den == 0) {
         fclose(f);
+        if (bad_header) *bad_header = 1;
         return NULL;
     }
     m->dt = (double)period_us / (double)period_den / 1e6;
@@ -470,8 +581,8 @@ static int write_member_sst(const char *sst_path, uint8_t source_type,
     hdr.version = SOMNO_SST_VERSION;
     hdr.decode_mode = SOMNO_ML_DECODE_FORWARD_BACKWARD;
     hdr.flags = (motion_used ? SOMNO_SST_FLAG_MOTION_USED : 0) |
-                (partial ? SOMNO_SST_FLAG_PARTIAL : 0) |
-                (insufficient ? SOMNO_SST_FLAG_INSUFFICIENT : 0);
+                (insufficient ? SOMNO_SST_FLAG_INSUFFICIENT
+                              : (partial ? SOMNO_SST_FLAG_PARTIAL : 0));
     hdr.source_type = source_type;
     hdr.start_ms = start_ms;
     hdr.epoch_sec = epoch_sec;
@@ -504,8 +615,15 @@ static int score_vitals(const char *vitals_path, const char *sst_path,
                         const char *job_id)
 {
     vitals_meta_t m;
-    FILE *f = vitals_open(vitals_path, &m);
-    if (!f) return -1;
+    int bad_header = 0;
+    FILE *f = vitals_open(vitals_path, &m, &bad_header);
+    if (!f) {
+        /* Deterministic corruption can never become scorable — mark it so
+         * reconcile stops re-enqueueing it.  Transient opens stay stale. */
+        if (bad_header)
+            return mark_unscorable(sst_path, SOMNO_SST_SOURCE_RING, job_id);
+        return -1;
+    }
 
     score_ctx_t ctx = {0};
     ctx.fe = somno_feat_create(m.dt, 1);
@@ -552,7 +670,7 @@ static int ring_span(const char *rec_dir, ring_rec_t *r)
                        sst, sizeof(sst)) != 0)
         return -1;
     vitals_meta_t m;
-    FILE *f = vitals_open(vitals, &m);
+    FILE *f = vitals_open(vitals, &m, NULL);
     if (!f) return -1;
     fclose(f);
     r->start_ms = m.start_ms;
@@ -616,7 +734,7 @@ static int score_ring_group(const ring_rec_t *grp, int nmem, const char *job_id)
         char vitals[340];
         if (ring_paths_dir(grp[k].dir, vitals, sizeof(vitals),
                            ssts[k], sizeof(ssts[k])) != 0 ||
-            !(fs[k] = vitals_open(vitals, &metas[k]))) {
+            !(fs[k] = vitals_open(vitals, &metas[k], NULL))) {
             ESP_LOGW(TAG, "%s: unreadable fragment %s — scoring solo",
                      job_id, grp[k].id);
             goto solo;
@@ -753,10 +871,13 @@ static int score_sa2(const char *sa2_path, const char *sst_path,
     FILE *f = fopen(sa2_path, "rb");
     if (!f) return -1;
     uint8_t hdr[28];
-    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
-        rd_u32(hdr) != 0x534e5442u) {   /* SNT_MAGIC (disk bytes "BTNS") */
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
         fclose(f);
-        return -1;
+        return -1;   /* short read: possibly still growing — stay stale */
+    }
+    if (rd_u32(hdr) != 0x534e5442u) {   /* SNT_MAGIC (disk bytes "BTNS") */
+        fclose(f);
+        return mark_unscorable(sst_path, SOMNO_SST_SOURCE_AS11, job_id);
     }
     uint8_t ver = hdr[4];
     uint8_t nch = hdr[6];
@@ -766,7 +887,10 @@ static int score_sa2(const char *sa2_path, const char *sst_path,
     memcpy(&start_ms, hdr + 12, 8);
     uint32_t sample_count;
     memcpy(&sample_count, hdr + 20, 4);
-    if (nch != 2 || hz_x10 == 0) { fclose(f); return -1; }
+    if (nch != 2 || hz_x10 == 0) {
+        fclose(f);
+        return mark_unscorable(sst_path, SOMNO_SST_SOURCE_AS11, job_id);
+    }
     int16_t missing = ver >= 2 ? SNT_MISSING : SNT_MISSING_V1;
     double dt = 10.0 / (double)hz_x10;
 
@@ -850,13 +974,16 @@ int somno_ml_score_file(const somno_ml_job_t *job)
 static int s_recon_n;   /* reconcile enqueue counter (diag log) */
 static volatile bool s_recon_more; /* set when the job queue was full */
 
-static void reconcile_ring(void)
+/* cutoff is a "YYYYMMDD" day-dir name; entries lexically older are skipped.
+ * NULL scans everything.  Day names are chronological, so strcmp works. */
+static void reconcile_ring(const char *cutoff)
 {
     DIR *days = opendir(OX_RECORDINGS);
     if (!days) return;
     struct dirent *de;
     while ((de = readdir(days))) {
         if (de->d_name[0] == '.' || strlen(de->d_name) != 8) continue;
+        if (cutoff && strcmp(de->d_name, cutoff) < 0) continue;
         char day_path[288];
         if (snprintf(day_path, sizeof(day_path), "%s/%s",
                      OX_RECORDINGS, de->d_name) >= (int)sizeof(day_path))
@@ -876,7 +1003,9 @@ static void reconcile_ring(void)
             struct stat st;
             if (stat(vitals, &st) != 0) continue;
             if (sst_fresh(sst, vitals)) continue;
-            if (somno_ml_enqueue_ring(re->d_name) != 0) {
+            somno_ml_job_t j = { .type = SOMNO_ML_SRC_RING_VITALS };
+            strlcpy(j.id, re->d_name, sizeof(j.id));
+            if (enqueue_internal(&j, false) != 0) {
                 s_recon_more = true;   /* queue full — rescan when it drains */
                 closedir(recs);
                 closedir(days);
@@ -889,13 +1018,14 @@ static void reconcile_ring(void)
     closedir(days);
 }
 
-static void reconcile_as11(void)
+static void reconcile_as11(const char *cutoff)
 {
     DIR *days = opendir(SD_STREAMS);
     if (!days) return;
     struct dirent *de;
     while ((de = readdir(days))) {
         if (strlen(de->d_name) != 8) continue;
+        if (cutoff && strcmp(de->d_name, cutoff) < 0) continue;
         int digits = 1;
         for (int i = 0; i < 8; i++)
             if (de->d_name[i] < '0' || de->d_name[i] > '9') { digits = 0; break; }
@@ -921,7 +1051,10 @@ static void reconcile_as11(void)
                     (int)sizeof(sa2))
                 continue;
             if (sst_fresh(sst, sa2)) continue;
-            if (somno_ml_enqueue_as11(day, prefix) != 0) {
+            somno_ml_job_t j = { .type = SOMNO_ML_SRC_AS11_SA2 };
+            strlcpy(j.dir, day, sizeof(j.dir));
+            strlcpy(j.id, prefix, sizeof(j.id));
+            if (enqueue_internal(&j, false) != 0) {
                 s_recon_more = true;
                 closedir(dd);
                 closedir(days);
@@ -934,18 +1067,132 @@ static void reconcile_as11(void)
     closedir(days);
 }
 
-int somno_ml_reconcile(void)
+static int reconcile_impl(int max_age_days)
 {
     if (!somno_ml_available()) return 0;
+    char cutoff[16] = "";
+    if (max_age_days > 0) {
+        time_t now = time(NULL);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        if (tm.tm_year + 1900 >= 2020) {   /* clock unset → scan unbounded */
+            tm.tm_mday -= max_age_days;
+            mktime(&tm);
+            strftime(cutoff, sizeof(cutoff), "%Y%m%d", &tm);
+        }
+    }
     s_recon_n = 0;
     s_recon_more = false;
-    reconcile_ring();
-    reconcile_as11();
-    ESP_LOGI(TAG, "reconcile: %d job(s) queued", s_recon_n);
+    reconcile_ring(cutoff[0] ? cutoff : NULL);
+    reconcile_as11(cutoff[0] ? cutoff : NULL);
+    ESP_LOGI(TAG, "reconcile%s: %d job(s) queued",
+             cutoff[0] ? " (recent)" : "", s_recon_n);
     return 0;
 }
 
+int somno_ml_reconcile(void)
+{
+    return reconcile_impl(0);
+}
+
+int somno_ml_reconcile_recent(int days)
+{
+    return reconcile_impl(days);
+}
+
 /* ---------------- worker task ---------------- */
+
+/* Check every tracked live job whose .sst should exist by now.  Missing
+ * files get re-enqueued (untracked — the entry itself carries the retry
+ * budget); after VERIFY_MAX_TRIES the entry is dropped with a WARN and the
+ * periodic reconcile remains as backstop. */
+static void verify_pending(void)
+{
+    if (!s_pending_mux) return;
+    int64_t now = now_ms();
+    for (int i = 0; i < PENDING_CAP; i++) {
+        somno_ml_job_t j;
+        bool due;
+        xSemaphoreTake(s_pending_mux, portMAX_DELAY);
+        pending_sst_t *p = &s_pending[i];
+        due = p->used && p->due_ms <= now;
+        if (due) {
+            j.type = p->type;
+            strlcpy(j.id, p->id, sizeof(j.id));
+            strlcpy(j.dir, p->dir, sizeof(j.dir));
+        }
+        xSemaphoreGive(s_pending_mux);
+        if (!due) continue;
+
+        char src[320], sst[320];
+        int rc = (j.type == SOMNO_ML_SRC_RING_VITALS)
+               ? ring_paths(j.id, src, sizeof(src), sst, sizeof(sst))
+               : as11_paths(&j, src, sizeof(src), sst, sizeof(sst));
+        struct stat st;
+        bool exists = (rc == 0 && stat(sst, &st) == 0);
+
+        xSemaphoreTake(s_pending_mux, portMAX_DELAY);
+        if (exists) { p->used = false; xSemaphoreGive(s_pending_mux); continue; }
+        p->tries++;
+        if (p->tries >= VERIFY_MAX_TRIES) {
+            p->used = false;
+            xSemaphoreGive(s_pending_mux);
+            ESP_LOGW(TAG, "%s: .sst still missing after %d attempts — "
+                     "leaving to reconcile", j.id, p->tries);
+            continue;
+        }
+        p->due_ms = now + VERIFY_RETRY_MS;
+        xSemaphoreGive(s_pending_mux);
+        ESP_LOGW(TAG, "%s: expected .sst missing — re-enqueueing (%d/%d)",
+                 j.id, p->tries, VERIFY_MAX_TRIES);
+        enqueue_internal(&j, false);
+    }
+}
+
+/* Earliest pending-verify deadline, or -1 when the table is empty. */
+static int64_t pending_next_due(void)
+{
+    int64_t due = -1;
+    if (!s_pending_mux) return -1;
+    xSemaphoreTake(s_pending_mux, portMAX_DELAY);
+    for (int i = 0; i < PENDING_CAP; i++)
+        if (s_pending[i].used &&
+            (due < 0 || s_pending[i].due_ms < due))
+            due = s_pending[i].due_ms;
+    xSemaphoreGive(s_pending_mux);
+    return due;
+}
+
+/* Periodic reconcile: a bounded recent-days pass every RECON_RECENT_MS and
+ * a full scan every RECON_FULL_MS.  A dropped job is always fresh, so the
+ * frequent pass stays cheap regardless of history depth; the daily pass
+ * covers drops that aged past the window on never-rebooted devices. */
+static void service_periodic(void)
+{
+    int64_t now = now_ms();
+    if (s_next_full_ms > 0 && now >= s_next_full_ms) {
+        s_next_full_ms = now + RECON_FULL_MS;
+        s_next_recon_ms = now + RECON_RECENT_MS;
+        somno_ml_reconcile();
+    } else if (s_next_recon_ms > 0 && now >= s_next_recon_ms) {
+        s_next_recon_ms = now + RECON_RECENT_MS;
+        somno_ml_reconcile_recent(RECON_RECENT_DAYS);
+    }
+}
+
+/* Ticks to the next scheduled event (verify deadline or reconcile), or
+ * portMAX_DELAY when nothing is pending. */
+static TickType_t next_wait(void)
+{
+    int64_t due = pending_next_due();
+    if (s_next_recon_ms > 0 && (due < 0 || s_next_recon_ms < due))
+        due = s_next_recon_ms;
+    if (s_next_full_ms > 0 && (due < 0 || s_next_full_ms < due))
+        due = s_next_full_ms;
+    if (due < 0) return portMAX_DELAY;
+    int64_t dms = due - now_ms();
+    return pdMS_TO_TICKS(dms > 0 ? dms : 0);
+}
 
 static void worker_task(void *arg)
 {
@@ -954,14 +1201,19 @@ static void worker_task(void *arg)
     for (;;) {
         /* When the queue drains and a previous reconcile could not enqueue
          * everything (queue was full), rescan for remaining work. */
-        if (xQueueReceive(s_queue, &job,
-                          s_recon_more ? pdMS_TO_TICKS(1000) : portMAX_DELAY)
-                != pdTRUE) {
+        TickType_t wait = next_wait();
+        if (s_recon_more && wait > pdMS_TO_TICKS(1000))
+            wait = pdMS_TO_TICKS(1000);
+        if (xQueueReceive(s_queue, &job, wait) != pdTRUE) {
+            verify_pending();
+            service_periodic();
             if (s_recon_more) somno_ml_reconcile();
             continue;
         }
         somno_ml_score_file(&job);
         live_clear();
+        verify_pending();
+        service_periodic();
         if (s_recon_more && uxQueueMessagesWaiting(s_queue) == 0)
             somno_ml_reconcile();
     }
@@ -974,6 +1226,10 @@ void somno_ml_worker_start(void)
     s_queue = xQueueCreate(JOB_QUEUE_LEN, sizeof(somno_ml_job_t));
     if (!s_queue) return;
     s_live.stage = -1;
+    s_pending_mux = xSemaphoreCreateMutex();
+    int64_t now = now_ms();
+    s_next_recon_ms = now + RECON_RECENT_MS;
+    s_next_full_ms = now + RECON_FULL_MS;
 
     /* PSRAM stack — internal RAM is too scarce for a 16 KB worker stack. */
     static StackType_t *s_stack;
