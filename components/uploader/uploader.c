@@ -291,43 +291,58 @@ esp_err_t uploader_get_config_json(char **out_json)
 {
     if (!out_json) return ESP_ERR_INVALID_ARG;
 
+    /* Serialize a fresh NVS read, not the s_config cache: s_config is only
+     * populated by uploader_init(), which runs after the web server starts
+     * (NTP/BLE waits sit between them). A settings page served in that
+     * window would otherwise show zeroed fields, and saving it would write
+     * the bogus "all disabled" values back to NVS. */
+    uploader_config_t cfg;
+    uploader_load_config(&cfg);
+    int max_days = cfg.max_days;
+    if (max_days <= 0) max_days = UPLOAD_DEFAULT_MAX_DAYS;
+    if (max_days > UPLOAD_MAX_DAYS_CAP) max_days = UPLOAD_MAX_DAYS_CAP;
+
     cJSON *root = cJSON_CreateObject();
 
     cJSON *smb = cJSON_CreateObject();
-    cJSON_AddBoolToObject(smb, "enabled", s_config.smb_enabled);
-    cJSON_AddStringToObject(smb, "host", s_config.smb_host);
-    cJSON_AddStringToObject(smb, "share", s_config.smb_share);
-    cJSON_AddStringToObject(smb, "user", s_config.smb_user);
-    cJSON_AddStringToObject(smb, "path", s_config.smb_path);
+    cJSON_AddBoolToObject(smb, "enabled", cfg.smb_enabled);
+    cJSON_AddStringToObject(smb, "host", cfg.smb_host);
+    cJSON_AddStringToObject(smb, "share", cfg.smb_share);
+    cJSON_AddStringToObject(smb, "user", cfg.smb_user);
+    cJSON_AddStringToObject(smb, "path", cfg.smb_path);
     /* Mask password */
-    cJSON_AddStringToObject(smb, "pass", s_config.smb_pass[0] ? "***" : "");
-    cJSON_AddBoolToObject(smb, "configured", uploader_is_smb_configured());
+    cJSON_AddStringToObject(smb, "pass", cfg.smb_pass[0] ? "***" : "");
+    cJSON_AddBoolToObject(smb, "configured",
+                          cfg.smb_enabled && cfg.smb_host[0] && cfg.smb_share[0]);
     cJSON_AddItemToObject(root, "smb", smb);
 
     cJSON *shq = cJSON_CreateObject();
-    cJSON_AddBoolToObject(shq, "enabled", s_config.shq_enabled);
-    cJSON_AddStringToObject(shq, "client_id", s_config.shq_client_id);
+    cJSON_AddBoolToObject(shq, "enabled", cfg.shq_enabled);
+    cJSON_AddStringToObject(shq, "client_id", cfg.shq_client_id);
     /* Mask secret */
-    cJSON_AddStringToObject(shq, "client_secret", s_config.shq_client_secret[0] ? "***" : "");
-    cJSON_AddBoolToObject(shq, "configured", uploader_is_sleephq_configured());
+    cJSON_AddStringToObject(shq, "client_secret", cfg.shq_client_secret[0] ? "***" : "");
+    cJSON_AddBoolToObject(shq, "configured",
+                          cfg.shq_enabled && cfg.shq_client_id[0] &&
+                          cfg.shq_client_secret[0]);
     cJSON_AddItemToObject(root, "sleephq", shq);
 
     cJSON *aer = cJSON_CreateObject();
-    cJSON_AddBoolToObject(aer, "enabled", s_config.aer_enabled);
+    cJSON_AddBoolToObject(aer, "enabled", cfg.aer_enabled);
     /* Mask upload key — same "***" sentinel convention as passwords */
-    cJSON_AddStringToObject(aer, "key", s_config.aer_key[0] ? "***" : "");
-    cJSON_AddBoolToObject(aer, "configured", uploader_is_aerivue_configured());
+    cJSON_AddStringToObject(aer, "key", cfg.aer_key[0] ? "***" : "");
+    cJSON_AddBoolToObject(aer, "configured",
+                          cfg.aer_enabled && cfg.aer_key[0]);
     cJSON_AddItemToObject(root, "aerivue", aer);
 
-    cJSON_AddNumberToObject(root, "max_days", uploader_max_days());
+    cJSON_AddNumberToObject(root, "max_days", max_days);
     cJSON_AddNumberToObject(root, "max_days_cap", UPLOAD_MAX_DAYS_CAP);
 
     cJSON *ftp = cJSON_CreateObject();
-    cJSON_AddBoolToObject(ftp, "enabled", s_config.ftp_enabled);
-    cJSON_AddBoolToObject(ftp, "anonymous", s_config.ftp_anonymous);
-    cJSON_AddStringToObject(ftp, "user", s_config.ftp_user);
+    cJSON_AddBoolToObject(ftp, "enabled", cfg.ftp_enabled);
+    cJSON_AddBoolToObject(ftp, "anonymous", cfg.ftp_anonymous);
+    cJSON_AddStringToObject(ftp, "user", cfg.ftp_user);
     /* Mask password */
-    cJSON_AddStringToObject(ftp, "pass", s_config.ftp_pass[0] ? "***" : "");
+    cJSON_AddStringToObject(ftp, "pass", cfg.ftp_pass[0] ? "***" : "");
     cJSON_AddItemToObject(root, "ftp", ftp);
 
     *out_json = cJSON_PrintUnformatted(root);
