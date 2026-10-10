@@ -237,6 +237,22 @@ static char s_remote_base[256];
 static bool s_signed_session;           /* s_smb was opened with signing on */
 static bool s_sign_learned;             /* a signed upload worked this boot */
 
+/* Remote base used to prefix every path on the share: "" for the share
+ * root, else "dir[/subdir]/" — never a leading separator, always a trailing
+ * slash when non-empty, so the "%s<rel>" joins below always produce a path
+ * relative to the share root. A leading separator in an SMB2 name makes
+ * Windows return STATUS_INVALID_PARAMETER. */
+static void smb_remote_base(const uploader_config_t *cfg, char *buf, size_t n)
+{
+    const char *p = cfg->smb_path;
+    while (*p == '/' || *p == '\\') p++;
+    strlcpy(buf, p, n);
+    size_t len = strlen(buf);
+    while (len && (buf[len - 1] == '/' || buf[len - 1] == '\\'))
+        buf[--len] = '\0';
+    if (len) strlcat(buf, "/", n);
+}
+
 static bool smb_is_configured(void)
 {
     return uploader_is_smb_configured();
@@ -268,14 +284,10 @@ static bool smb_open_session(const uploader_config_t *cfg, bool with_sign)
     s_signed_session = with_sign;
     ESP_LOGI(TAG, "SMB connected%s", with_sign ? " (signed)" : "");
 
-    /* SMB paths are relative to the share root: a leading slash makes
-     * Windows return STATUS_INVALID_PARAMETER. */
-    const char *p = cfg->smb_path;
-    while (*p == '/' || *p == '\\') p++;
-    snprintf(s_remote_base, sizeof(s_remote_base), "%s", p);
+    smb_remote_base(cfg, s_remote_base, sizeof(s_remote_base));
 
     char remote_datalog[400];
-    snprintf(remote_datalog, sizeof(remote_datalog), "%s/DATALOG", s_remote_base);
+    snprintf(remote_datalog, sizeof(remote_datalog), "%sDATALOG", s_remote_base);
     smb2_mkdir(s_smb, remote_datalog);
     return true;
 }
@@ -376,11 +388,31 @@ static upload_result_t smb_upload_file(struct smb2_context *smb2,
  *
  * The same handshake as smb_session_begin() — negotiate, authenticate, open
  * the share — on a private context so it can run from the httpd task while
- * the scheduler is idle, followed by a stat of the configured folder: the
- * uploader's mkdir calls do not create parents, so a remote path that does
- * not exist on the share fails on the first upload rather than here.
- * Nothing is created or written. */
+ * the scheduler is idle, a stat of the configured folder, and a mkdir probe
+ * of the DATALOG folder the uploader itself creates at every session start.
+ * The probe is what lets the test catch read-only shares and servers that
+ * reject unsigned requests or unusual name shapes — all of which pass
+ * connect+stat while every upload fails. Nothing is created that uploads
+ * would not create themselves. */
 #define SMB_TEST_TIMEOUT_S 10
+
+/* Init + connect a private context for the test path. *connected reports
+ * whether the share attached; the context is returned either way so the
+ * caller can read smb2_get_error(). */
+static struct smb2_context *smb_test_ctx(const uploader_config_t *cfg,
+                                         const char *user, bool with_sign,
+                                         bool *connected)
+{
+    struct smb2_context *ctx = smb2_init_context();
+    if (!ctx) { *connected = false; return NULL; }
+    smb2_set_security_mode(ctx, SMB2_NEGOTIATE_SIGNING_ENABLED);
+    if (with_sign) smb2_set_sign(ctx, 1);
+    smb2_set_timeout(ctx, SMB_TEST_TIMEOUT_S);
+    smb2_set_user(ctx, user);
+    if (cfg->smb_pass[0]) smb2_set_password(ctx, cfg->smb_pass);
+    *connected = smb2_connect_share(ctx, cfg->smb_host, cfg->smb_share, user) == 0;
+    return ctx;
+}
 
 static bool smb_test(const uploader_config_t *cfgp, char *msg, size_t msg_len)
 {
@@ -393,46 +425,88 @@ static bool smb_test(const uploader_config_t *cfgp, char *msg, size_t msg_len)
     }
     const char *user = cfg.smb_user[0] ? cfg.smb_user : "Guest";
 
-    struct smb2_context *ctx = smb2_init_context();
+    /* Same normalization the upload path uses — the write probe below then
+     * exercises the exact path shape uploads will send. */
+    char base[256];
+    smb_remote_base(&cfg, base, sizeof(base));
+
+    bool connected = false;
+    bool signed_conn = s_sign_learned;
+    struct smb2_context *ctx = smb_test_ctx(&cfg, user, signed_conn, &connected);
     if (!ctx) {
         snprintf(msg, msg_len, "Out of memory");
         return false;
     }
-    smb2_set_security_mode(ctx, SMB2_NEGOTIATE_SIGNING_ENABLED);
-    if (s_sign_learned) smb2_set_sign(ctx, 1);   /* mirror the upload path */
-    smb2_set_timeout(ctx, SMB_TEST_TIMEOUT_S);
-    smb2_set_user(ctx, user);
-    if (cfg.smb_pass[0]) smb2_set_password(ctx, cfg.smb_pass);
-
-    ESP_LOGI(TAG, "test: connecting to %s/%s as %s", cfg.smb_host, cfg.smb_share, user);
-    if (smb2_connect_share(ctx, cfg.smb_host, cfg.smb_share, user) != 0) {
+    ESP_LOGI(TAG, "test: connecting to %s/%s as %s%s", cfg.smb_host,
+             cfg.smb_share, user, signed_conn ? " (signed)" : "");
+    if (!connected) {
         snprintf(msg, msg_len, "Cannot open //%s/%s as %s: %s",
                  cfg.smb_host, cfg.smb_share, user, smb2_get_error(ctx));
         smb2_destroy_context(ctx);
         return false;
     }
 
-    /* Relative to the share root, as in smb_session_begin(). */
+    bool ok = true;
+
+    /* The configured folder, relative to the share root. */
     const char *p = cfg.smb_path;
     while (*p == '/' || *p == '\\') p++;
-
-    bool ok = true;
-    if (!*p) {
-        snprintf(msg, msg_len, "Connected to //%s/%s (share root)",
-                 cfg.smb_host, cfg.smb_share);
-    } else {
+    if (*p) {
         struct smb2_stat_64 st;
-        if (smb2_stat(ctx, p, &st) == 0) {
-            snprintf(msg, msg_len, "Connected to //%s/%s, folder '%s' found",
-                     cfg.smb_host, cfg.smb_share, p);
-        } else {
+        if (smb2_stat(ctx, p, &st) != 0) {
             snprintf(msg, msg_len, "Connected to //%s/%s, but folder '%s' was not "
                      "found on the share: create it or fix Remote Path",
                      cfg.smb_host, cfg.smb_share, p);
             ok = false;
         }
     }
-    smb2_disconnect_share(ctx);
+
+    if (ok) {
+        /* Write probe: mkdir the folder the uploader creates at session
+         * start anyway — a fresh create and OBJECT_NAME_COLLISION are both
+         * success, so nothing is made that uploads would not make. */
+        char probe[400];
+        snprintf(probe, sizeof(probe), "%sDATALOG", base);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            int prc = smb2_mkdir(ctx, probe);
+            uint32_t nt = (uint32_t)smb2_get_nterror(ctx);
+            if (prc == 0 || nt == SMB2_STATUS_OBJECT_NAME_COLLISION) {
+                snprintf(msg, msg_len, *p ?
+                         "Connected to //%s/%s, folder '%s' found - write access OK" :
+                         "Connected to //%s/%s (share root) - write access OK",
+                         cfg.smb_host, cfg.smb_share, p);
+                if (signed_conn) s_sign_learned = true;
+                break;
+            }
+            /* Same adaptive signing as the upload path. */
+            if (attempt == 0 && !signed_conn && cfg.smb_pass[0] &&
+                nt == SMB2_STATUS_INVALID_PARAMETER &&
+                smb2_get_dialect(ctx) == SMB2_VERSION_0311) {
+                smb2_disconnect_share(ctx);
+                smb2_destroy_context(ctx);
+                signed_conn = true;
+                ctx = smb_test_ctx(&cfg, user, true, &connected);
+                if (!ctx) {
+                    snprintf(msg, msg_len, "Out of memory");
+                    return false;
+                }
+                if (!connected) {
+                    snprintf(msg, msg_len, "Connected once, but the signed "
+                             "reconnect failed: %s", smb2_get_error(ctx));
+                    ok = false;
+                    break;
+                }
+                continue;
+            }
+            snprintf(msg, msg_len, "Connected to //%s/%s, but write test "
+                     "failed: %s - check write permission for '%s'",
+                     cfg.smb_host, cfg.smb_share, smb2_get_error(ctx), user);
+            ok = false;
+            break;
+        }
+    }
+
+    if (connected) smb2_disconnect_share(ctx);
     smb2_destroy_context(ctx);
     return ok;
 }
@@ -441,7 +515,7 @@ static upload_result_t smb_day_begin(const char *day)
 {
     if (!s_smb) return UPLOAD_ERR_TRANSIENT;
     char remote_day[512];
-    snprintf(remote_day, sizeof(remote_day), "%s/DATALOG/%s", s_remote_base, day);
+    snprintf(remote_day, sizeof(remote_day), "%sDATALOG/%s", s_remote_base, day);
     smb2_mkdir(s_smb, remote_day);   /* EEXIST is fine */
     return UPLOAD_OK;
 }
@@ -454,7 +528,7 @@ static upload_result_t smb_put_group(const char *day, const upload_group_ref_t *
         char local[512], remote[640];
         snprintf(local, sizeof(local), "%s/%s/%s", SD_SDCARD_DATALOG, day,
                  g->files[i]);
-        snprintf(remote, sizeof(remote), "%s/DATALOG/%s/%s", s_remote_base, day,
+        snprintf(remote, sizeof(remote), "%sDATALOG/%s/%s", s_remote_base, day,
                  g->files[i]);
 
         if (smb_upload_file(s_smb, local, remote) != UPLOAD_OK) {
@@ -477,7 +551,7 @@ static upload_result_t smb_put_bundle(const char *day,
     if (!changed) return UPLOAD_OK;
 
     char remote_settings[400];
-    snprintf(remote_settings, sizeof(remote_settings), "%s/SETTINGS",
+    snprintf(remote_settings, sizeof(remote_settings), "%sSETTINGS",
              s_remote_base);
     smb2_mkdir(s_smb, remote_settings);
 
@@ -487,7 +561,7 @@ static upload_result_t smb_put_bundle(const char *day,
         if (b->in_settings[i]) {
             snprintf(remote, sizeof(remote), "%s/%s", remote_settings, b->names[i]);
         } else {
-            snprintf(remote, sizeof(remote), "%s/%s", s_remote_base, b->names[i]);
+            snprintf(remote, sizeof(remote), "%s%s", s_remote_base, b->names[i]);
         }
         if (smb_upload_file(s_smb, b->paths[i], remote) != UPLOAD_OK) {
             ESP_LOGW(TAG, "  failed to upload %s", b->names[i]);
@@ -503,8 +577,8 @@ static upload_result_t smb_ox_day_begin(const char *day)
 {
     if (!s_smb || !day) return UPLOAD_ERR_TRANSIENT;
     char path[640];
-    snprintf(path, sizeof(path), "%s/OXYMETRY", s_remote_base); smb2_mkdir(s_smb, path);
-    snprintf(path, sizeof(path), "%s/OXYMETRY/%s", s_remote_base, day); smb2_mkdir(s_smb, path);
+    snprintf(path, sizeof(path), "%sOXYMETRY", s_remote_base); smb2_mkdir(s_smb, path);
+    snprintf(path, sizeof(path), "%sOXYMETRY/%s", s_remote_base, day); smb2_mkdir(s_smb, path);
     return UPLOAD_OK;
 }
 
@@ -517,7 +591,7 @@ static upload_result_t smb_put_oximetry(const upload_ox_ref_t *ref)
             strcmp(rel, "source/source.vld") != 0) continue;
         const char *ext = strstr(rel, ".vld") ? ".vld" : ".bin";
         char path[760];
-        snprintf(path, sizeof(path), "%s/OXYMETRY/%s/%s%s", s_remote_base,
+        snprintf(path, sizeof(path), "%sOXYMETRY/%s/%s%s", s_remote_base,
                  ref->day, ref->recording_id, ext);
         return smb_upload_file(s_smb, ref->local_paths[i], path);
     }
