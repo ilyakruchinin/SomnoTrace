@@ -68,6 +68,7 @@
 #include "cJSON.h"
 #include "edf_import.h"
 #include "nvs_writer.h"
+#include "upload_sched.h"
 #include "psram_task.h"
 #include "sb_ble.h"
 #include "sb_proto.h"
@@ -110,12 +111,23 @@ static const ble_uuid128_t UUID_DATA =
 #define SB_WINDOW         16384
 #define SB_ACK_EVERY      2880
 #define SB_JSON_TIMEOUT   (20 * 1000)
-#define SB_STREAM_TIMEOUT (120 * 1000)
+/* Per-file STREAM_END wait. The bridge reads each file over the card's
+ * HTTP endpoint while it streams; EZShare reads are bursty and a
+ * multi-MB file can legitimately take minutes even at full BLE speed.
+ * Dead streams are still bounded by the bridge's own 10 s no-credit
+ * abort, so a generous client wait only costs time on true failures.  */
+#define SB_STREAM_TIMEOUT (300 * 1000)
+/* Dead-air bound: the reference client's stream loop abandons a pull
+ * after 30 s without progress; each card read is itself bounded by the
+ * bridge's 30 s HTTP timeout, so ~45 s of silence means the fetch is
+ * wedged — abort it rather than park the sync on dead air.          */
+#define SB_STREAM_STALL_US (45LL * 1000 * 1000)
 #define SB_TIME_ROUNDS    5
 #define SB_TIME_PERIOD_MS (10 * 60 * 1000)
 #define SB_POLL_MS        (30 * 1000)
 #define SB_IDLE_SYNC_MS   (5 * 60 * 1000)
 #define SB_PIN_BUDGET_MS  90000   /* > the bridge's 60 s attempt limit */
+#define SB_SEC_DELAY_MS   700     /* see deferred security note below  */
 #define SB_SYNC_DAYS      14
 #define SB_SYNC_DAYS_FULL 365
 
@@ -133,10 +145,11 @@ static ble_addr_t s_peer;
 static uint16_t s_conn = BLE_HS_CONN_HANDLE_NONE;
 static uint8_t s_own_addr_type;
 static uint16_t s_mtu = 23;
+static int64_t s_sec_due_ms;        /* deferred security_initiate (ms)  */
 
 static uint16_t s_ctrl_val, s_ctrl_cccd, s_data_val, s_data_cccd;
 static uint16_t s_svc_start, s_svc_end;
-static bool s_disc_done;
+static bool s_subscribed;           /* ctrl indicate + data notify armed */
 
 static SemaphoreHandle_t s_req_mtx;   /* one JSON exchange at a time      */
 static SemaphoreHandle_t s_resp_sem;  /* completion of the current one    */
@@ -172,14 +185,24 @@ static int64_t  s_time_last_ms;
 
 /* File stream */
 static bool     s_stream_active;
+static volatile bool s_rx_armed;    /* DATA frames accepted (admitted)   */
+static volatile bool s_stream_dead; /* first terminal cause latched       */
+static char     s_stream_err[48];   /* that cause (sticky until reset)    */
+static bool     s_stream_admitted;  /* remote stream exists → ABORT helps */
+static uint8_t  s_stream_wire_ver;  /* negotiated wire (STREAM_BEGIN)     */
 static uint32_t s_stream_rid;
+static uint32_t s_stream_rsp_rid;   /* rid routed to the stream inbox     */
+static char    *s_stream_rsp_json;  /* completed body for the stream op   */
+static SemaphoreHandle_t s_stream_rsp_sem;
 static FILE    *s_stream_f;
 static char     s_stream_path[192];
 static char     s_stream_tmp[200];
 static int64_t  s_stream_expected;
 static uint64_t s_stream_got;         /* decoded bytes written            */
 static uint64_t s_stream_acked;
-static uint64_t s_stream_wire;        /* wire bytes since last ACK        */
+static uint64_t s_stream_wire;        /* cumulative stream bytes received  */
+static bool     s_ack_pending;        /* due/failed ACK still to send     */
+static int64_t  s_ack_last_us;
 static mbedtls_sha256_context s_sha;
 static bool     s_sha_active;
 static char     s_stream_sha[72];
@@ -187,10 +210,33 @@ static uint8_t *s_v2_buf;             /* compact-frame accumulator        */
 static size_t   s_v2_len;
 static uint16_t s_v2_seq;
 static int      s_v2_seq_errors;
+static uint8_t *s_v2_out;             /* decode buffer (persistent 64KiB) */
+static uint8_t  s_stream_unit_shift;  /* listing display unit, log2       */
+
+/* SPSC receive ring: DATA notifications are flattened/copied here on the
+ * NimBLE host task and consumed by stream_pump() on the bridge task —
+ * inflate/hash/SD writes never run inside the BLE callback.  96 items
+ * cover a full credit window (16384 B ≈ 69 × 240 B frames) plus headroom
+ * for a consumer stall, so the ring can never be overrun while credits
+ * are honoured. */
+#define SB_DQ_N 96
+typedef struct { uint16_t len; uint8_t data[252]; } sb_dq_item_t;
+static sb_dq_item_t *s_dq;
+static volatile uint16_t s_dq_head, s_dq_tail;
+static portMUX_TYPE s_dq_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Stream diagnostics (metadata only — never file content) */
+static uint32_t s_rx_frames, s_dup_frames, s_stale_frames, s_dq_drops;
+static uint32_t s_ack_tries, s_ack_ok, s_ack_fail;
+static uint32_t s_seq_gaps;
+static uint16_t s_gap_expect, s_gap_got;
+static uint32_t s_end_frames;         /* device-side notify count         */
 
 /* Telemetry (read by the HTTP layer) */
 static bool     s_therapy_active;
 static bool     s_transfer_allowed;
+static bool     s_card_wifi;    /* bridge STA joined the card        */
+static char     s_card_mode[8]; /* bridge netw mode: STA/AP/DOWN     */
 static char     s_last_error[64];
 static int64_t  s_last_sync_ms;
 static int      s_sync_days_done, s_sync_files_done;
@@ -310,6 +356,22 @@ static esp_err_t ctrl_write(const uint8_t *data, size_t len, bool rsp)
     return ret;
 }
 
+/* ACK path variant: never block the NimBLE host task on a contended
+ * writer mutex — a busy holder is skipped and the next data frame
+ * re-acks at a higher offset (ACKs are cumulative by design).        */
+static esp_err_t ctrl_write_try(const uint8_t *data, size_t len)
+{
+    if (s_conn == BLE_HS_CONN_HANDLE_NONE || !s_ctrl_val)
+        return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_write_mtx, 0) != pdTRUE)
+        return ESP_ERR_INVALID_STATE;
+    esp_err_t ret = ESP_OK;
+    if (ble_gattc_write_no_rsp_flat(s_conn, s_ctrl_val, data, len) != 0)
+        ret = ESP_FAIL;
+    xSemaphoreGive(s_write_mtx);
+    return ret;
+}
+
 /* Send a logical control message, fragmented to the negotiated MTU. */
 static esp_err_t ctrl_send(uint8_t kind, uint32_t rid, const uint8_t *payload,
                            size_t len)
@@ -345,10 +407,16 @@ static void json_reset_rx(void)
     s_rx_next_off = 0;
 }
 
-/* A complete JSON body arrived: hand it to the waiter. */
+/* A complete JSON body arrived: hand it to the owning waiter.  Stream
+ * ops register their rid in s_stream_rsp_rid so a late STREAM_END can
+ * never be mistaken for a portal answer (and vice versa). */
 static void json_complete(uint32_t rid, const char *body)
 {
-    if (rid == s_pending_rid) {
+    if (rid == s_stream_rsp_rid) {
+        free(s_stream_rsp_json);
+        s_stream_rsp_json = strdup(body);
+        xSemaphoreGive(s_stream_rsp_sem);
+    } else if (rid == s_pending_rid) {
         free(s_resp_json);
         s_resp_json = strdup(body);
         xSemaphoreGive(s_resp_sem);
@@ -513,23 +581,158 @@ static void time_sync_rounds(void)
 
 /* ── File streaming (§10.3) ─────────────────────────────────────────── */
 
-static void stream_ack(uint64_t off, uint32_t window)
+/* Consumer: bridge task only.  The producer (the NimBLE host task's
+ * notify path) writes s_dq[s_dq_head] directly so the mbuf can be
+ * flattened straight into the slot without a second copy. */
+static bool dq_pop(sb_dq_item_t *out)
 {
-    uint8_t pkt[4];
-    wr_u32(pkt, window);
-    if (ctrl_send(SB_KIND_ACK, s_stream_rid, pkt, sizeof(pkt)) == ESP_OK)
-        s_stream_acked = off;
+    if (s_dq_tail == s_dq_head) return false;
+    *out = s_dq[s_dq_tail];
+    portENTER_CRITICAL(&s_dq_mux);
+    s_dq_tail = (uint16_t)((s_dq_tail + 1) % SB_DQ_N);
+    portEXIT_CRITICAL(&s_dq_mux);
+    return true;
 }
 
+/* Drop ring residue between attempts (task context). */
+static void dq_reset(void)
+{
+    portENTER_CRITICAL(&s_dq_mux);
+    s_dq_head = s_dq_tail = 0;
+    portEXIT_CRITICAL(&s_dq_mux);
+}
+
+static void stream_ack(uint64_t off, uint32_t window)
+{
+    /* §10.3: the credit offset travels in the frame header's u64 field
+     * (next contiguous received stream byte), the window as a u32 LE
+     * payload — ctrl_send() only packs fragment offsets, so the ACK
+     * frame is built by hand.                                        */
+    uint8_t pkt[SB_HDR_LEN + 4];
+    sb_hdr_pack(pkt, SB_KIND_ACK, SB_FLAG_START | SB_FLAG_END,
+                s_stream_rid, off);
+    wr_u32(pkt + SB_HDR_LEN, window);
+    /* Write-no-response on the hot path.  Offsets are cumulative so a
+     * failed write is retried at the next cadence point (s_ack_pending)
+     * and counted — not silently subsumed.                            */
+    s_ack_tries++;
+    if (ctrl_write_try(pkt, sizeof(pkt)) == ESP_OK) {
+        s_stream_acked = off;
+        s_ack_last_us = esp_timer_get_time();
+        s_ack_pending = false;
+        s_ack_ok++;
+    } else {
+        s_ack_pending = true;
+        s_ack_fail++;
+    }
+}
+
+/* §10.3 credit cadence: ≥ every 16 frames or 250 ms.  The byte-count
+ * cadence is covered in stream_pump(); this tick closes the right edge
+ * (the sender may be waiting on exactly the tail bytes) and retries a
+ * write that lost to an in-flight control op. */
+static void stream_ack_tick(void)
+{
+    if (s_ack_pending ||
+        (s_rx_armed && s_stream_wire > s_stream_acked &&
+         esp_timer_get_time() - s_ack_last_us >= 250000))
+        stream_ack(s_stream_wire, SB_WINDOW);
+}
+
+/* Initial credit grant, sent from the sync task before the first byte:
+ * this one must land or nothing ever arrives, so it is confirmed — and
+ * its failure must fail the stream instead of burning the stall window. */
+static esp_err_t stream_ack_initial(uint64_t off, uint32_t window)
+{
+    uint8_t pkt[SB_HDR_LEN + 4];
+    sb_hdr_pack(pkt, SB_KIND_ACK, SB_FLAG_START | SB_FLAG_END,
+                s_stream_rid, off);
+    wr_u32(pkt + SB_HDR_LEN, window);
+    if (ctrl_write(pkt, sizeof(pkt), true) != ESP_OK)
+        return ESP_FAIL;
+    s_stream_acked = off;
+    s_ack_last_us = esp_timer_get_time();
+    s_ack_pending = false;
+    s_ack_ok++;
+    s_ack_tries++;
+    return ESP_OK;
+}
+
+/* Tell the bridge to drop the in-flight stream (§10.3 ABORT frame): a
+ * client that simply walks away leaves the bridge fetching a stream
+ * nobody is reading, and the card stays busy for its whole duration.
+ * `confirmed` waits for the write response — only safe off the NimBLE
+ * host task; on it we fire-and-forget like the ACK path.            */
+static void stream_abort(bool confirmed)
+{
+    if (!s_stream_admitted) return;
+    uint8_t pkt[SB_HDR_LEN];
+    sb_hdr_pack(pkt, SB_KIND_ABORT, SB_FLAG_START | SB_FLAG_END,
+                s_stream_rid, 0);
+    if (confirmed)
+        (void)ctrl_write(pkt, sizeof(pkt), true);
+    else
+        (void)ctrl_write_try(pkt, sizeof(pkt));
+}
+
+/* Terminal latch — safe in ANY context (NimBLE host task included): it
+ * only sets flags so the wait loop notices; cleanup runs later on the
+ * bridge task in stream_terminate().  The FIRST cause wins: later
+ * stall/timeout/link-loss fallout must not overwrite what actually
+ * killed the stream. */
 static void stream_fail(const char *why)
 {
+    if (!s_stream_dead) {
+        snprintf(s_stream_err, sizeof(s_stream_err), "%s",
+                 (why && why[0]) ? why : "stream failed");
+        s_stream_dead = true;
+    }
+    s_rx_armed = false;
+    s_stream_active = false;
+}
+
+/* Task-context finaliser: abort the remote fetch (only when the stream
+ * was admitted and the link is up), drop the staged file, free the hash,
+ * and surface the latched cause with the counters that distinguish the
+ * possible loss points.  Safe to call repeatedly. */
+static void stream_terminate(void)
+{
+    if (s_stream_admitted && s_conn != BLE_HS_CONN_HANDLE_NONE)
+        stream_abort(true);
+    s_stream_admitted = false;
+    s_rx_armed = false;
+    s_stream_active = false;
     if (s_stream_f) { fclose(s_stream_f); s_stream_f = NULL; }
     if (s_stream_tmp[0]) unlink(s_stream_tmp);
     s_stream_tmp[0] = '\0';
-    s_stream_active = false;
     if (s_sha_active) { mbedtls_sha256_free(&s_sha); s_sha_active = false; }
-    snprintf(s_last_error, sizeof(s_last_error), "%s", why ? why : "stream failed");
-    ESP_LOGW(TAG, "stream %s: %s", s_stream_path, why ? why : "failed");
+    dq_reset();
+    if (s_stream_err[0])
+        snprintf(s_last_error, sizeof(s_last_error), "%s", s_stream_err);
+    ESP_LOGW(TAG, "stream %s: %s (rx=%u dup=%u stale=%u drop=%u "
+             "gap=%u@%u->%u ack=%u/%u/%u wire=%llu raw=%llu)",
+             s_stream_path, s_stream_err[0] ? s_stream_err : "failed",
+             (unsigned)s_rx_frames, (unsigned)s_dup_frames,
+             (unsigned)s_stale_frames, (unsigned)s_dq_drops,
+             (unsigned)s_seq_gaps, (unsigned)s_gap_expect,
+             (unsigned)s_gap_got,
+             (unsigned)s_ack_ok, (unsigned)s_ack_fail,
+             (unsigned)s_ack_tries,
+             (unsigned long long)s_stream_wire,
+             (unsigned long long)s_stream_got);
+}
+
+/* Transient stream errors worth a bounded wait + retry inside the attempt
+ * budget: STALE — the bridge queued a day rescan (~10 s) and refused
+ * rather than serve stale metadata; BUSY — the previous stream is still
+ * tearing down.  The wait times live in sb_stream_retry_ms so the policy
+ * stays host-testable; true means the caller should retry.            */
+static bool stream_retry_wait(void)
+{
+    unsigned wait = sb_stream_retry_ms(s_last_error);
+    if (!wait) return false;
+    vTaskDelay(pdMS_TO_TICKS(wait));
+    return true;
 }
 
 static esp_err_t stream_begin(const char *directory, const char *name,
@@ -561,7 +764,27 @@ static esp_err_t stream_begin(const char *directory, const char *name,
     s_v2_len = 0;
     s_v2_seq = 0;
     s_v2_seq_errors = 0;
-    s_stream_expected = expected_size ? strtoll(expected_size, NULL, 10) : -1;
+    s_stream_unit_shift = 0;
+    s_stream_wire_ver = 0;
+    s_stream_expected = -1;
+    uint64_t exp;
+    if (expected_size && sb_parse_u64_str(expected_size, &exp) &&
+        exp <= (uint64_t)INT64_MAX)
+        s_stream_expected = (int64_t)exp;
+    /* Fresh attempt state: the sticky error, admission flags, ring, and
+     * all diagnostic counters reset — nothing may survive from a torn
+     * down stream. */
+    s_stream_err[0] = '\0';
+    s_stream_dead = false;
+    s_stream_admitted = false;
+    s_rx_armed = false;
+    s_ack_pending = false;
+    s_rx_frames = s_dup_frames = s_stale_frames = s_dq_drops = 0;
+    s_ack_tries = s_ack_ok = s_ack_fail = 0;
+    s_seq_gaps = 0;
+    s_gap_expect = s_gap_got = 0;
+    s_end_frames = 0;
+    dq_reset();
     mbedtls_sha256_init(&s_sha);
     mbedtls_sha256_starts(&s_sha, 0);
     s_sha_active = true;
@@ -579,11 +802,16 @@ static bool stream_write(const uint8_t *p, size_t n)
     return true;
 }
 
-/* v2 block stream: 12-byte self-describing headers, codecs 0/1/2. */
+/* v2 block stream: 12-byte self-describing headers, codecs 0/1/2.  Runs
+ * on the bridge task inside stream_pump() — never in the BLE callback. */
 static bool stream_v2_decode(const uint8_t *p, size_t n)
 {
     if (!s_v2_buf) s_v2_buf = heap_caps_malloc(96 * 1024, MALLOC_CAP_SPIRAM);
     if (!s_v2_buf) return false;
+    if (!s_v2_out)
+        s_v2_out = heap_caps_malloc(64 * 1024,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_v2_out) return false;
     if (s_v2_len + n > 96 * 1024) { s_v2_seq_errors++; s_v2_len = 0; return false; }
     memcpy(s_v2_buf + s_v2_len, p, n);
     s_v2_len += n;
@@ -596,13 +824,15 @@ static bool stream_v2_decode(const uint8_t *p, size_t n)
         if (raw_len > 64 * 1024 || enc_len > 64 * 1024) return false;
         if (s_v2_len - pos < 12 + enc_len) break;      /* wait for more */
 
-        uint8_t *blk = heap_caps_malloc(raw_len ? raw_len : 1,
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!blk) return false;
-        bool ok = sb_v2_block(codec, s_v2_buf + pos + 12, enc_len, blk, raw_len);
-        if (ok) ok = stream_write(blk, raw_len);
-        free(blk);
-        if (!ok) return false;
+        if (!sb_v2_block(codec, s_v2_buf + pos + 12, enc_len,
+                         s_v2_out, raw_len)) {
+            ESP_LOGW(TAG, "v2 decode fail: blk=%02x raw=%lu enc=%lu "
+                     "buflen=%u seq=%u",
+                     codec, (unsigned long)raw_len, (unsigned long)enc_len,
+                     (unsigned)(s_v2_len - pos), (unsigned)s_v2_seq);
+            return false;
+        }
+        if (!stream_write(s_v2_out, raw_len)) return false;
         pos += 12 + enc_len;
     }
     if (pos) {
@@ -612,45 +842,92 @@ static bool stream_v2_decode(const uint8_t *p, size_t n)
     return true;
 }
 
-static void stream_data(const uint8_t *data, size_t len, uint8_t kind)
+/* Receive worker — the only place stream frames become file bytes.
+ * Consumes the ring the NimBLE callback fills: frame classification,
+ * sequence validation, inflate, SHA-256, SD writes, credit ACKs.  A
+ * forward sequence gap is terminal the moment it is seen: continuing
+ * would splice the deflate input and corrupt every later block. */
+static void stream_pump(void)
 {
-    if (!s_stream_active) return;
-    const uint8_t *payload = data;
-    size_t plen = len;
+    sb_dq_item_t it;
+    while (!s_stream_dead && dq_pop(&it)) {
+        const uint8_t *b = it.data;
+        const uint8_t *payload = NULL;
+        size_t plen = 0;
+        if (it.len >= 4 && b[0] == SB_VER && b[1] == SB_KIND_STREAM2) {
+            const uint16_t seq = rd_u16(b + 2);
+            s_rx_frames++;
+            const sb_seq_kind_t sc = sb_seq_class(seq, s_v2_seq);
+            if (sc == SB_SEQ_DUP) { s_dup_frames++; continue; }
+            if (sc == SB_SEQ_GAP) {
+                if (!s_seq_gaps++) { s_gap_expect = s_v2_seq; s_gap_got = seq; }
+                stream_fail("seq gap");
+                return;
+            }
+            s_v2_seq = (uint16_t)(seq + 1);
+            payload = b + 4;
+            plen = it.len - 4;
+            if (!stream_v2_decode(payload, plen)) {
+                stream_fail("v2 decode");
+                return;
+            }
+        } else if (it.len >= SB_HDR_LEN) {
+            uint8_t kind; uint16_t flags; uint32_t rid; uint64_t off;
+            if (!sb_hdr_parse(it.data, SB_HDR_LEN, &kind, &flags, &rid, &off) ||
+                (kind != SB_KIND_FILE && kind != SB_KIND_EVIDENCE)) {
+                s_dq_drops++;
+                continue;
+            }
+            s_rx_frames++;
+            payload = it.data + SB_HDR_LEN;
+            plen = it.len - SB_HDR_LEN;
+            if (!stream_write(payload, plen)) {
+                stream_fail("write");
+                return;
+            }
+        } else {
+            s_dq_drops++;
+            continue;
+        }
 
-    if (kind == SB_KIND_STREAM2) {
-        if (plen < 4) return;
-        const uint16_t seq = rd_u16(payload + 2);
-        if (seq < s_v2_seq) return;                    /* duplicate delivery */
-        if (seq != s_v2_seq) s_v2_seq_errors++;
-        s_v2_seq = (uint16_t)(seq + 1);
-        payload += 4;
-        plen -= 4;
-        if (!stream_v2_decode(payload, plen)) { stream_fail("v2 decode"); return; }
-    } else {
-        if (!stream_write(payload, plen)) { stream_fail("write"); return; }
-    }
-
-    s_stream_wire += len;
-    if (s_stream_wire >= SB_ACK_EVERY) {
-        s_stream_wire = 0;
-        stream_ack(s_stream_got, SB_WINDOW);
+        /* The credit offset counts contiguous stream payload bytes (the
+         * same unit the sender charges against `sent`), not ATT/notify
+         * bytes — frame headers never enter the total.               */
+        s_stream_wire += plen;
+        if (s_stream_wire - s_stream_acked >= SB_ACK_EVERY || s_ack_pending)
+            stream_ack(s_stream_wire, SB_WINDOW);
     }
 }
 
-/* STREAM_END: verify everything the bridge promises before publishing. */
+/* STREAM_END: every field the bridge promises is REQUIRED — a missing
+ * or malformed field is a failure, never a skipped check.  Publication
+ * (rename) happens only after the byte count, wire count, residual
+ * deflate state, and SHA-256 all prove the file.  Failures route through
+ * stream_fail() so the first cause stays latched for stream_terminate().
+ */
 static bool stream_end(cJSON *result)
 {
     bool ok = false;
-    const char *sha = cJSON_GetStringValue(cJSON_GetObjectItem(result, "sha256"));
+    const char *sha    = cJSON_GetStringValue(cJSON_GetObjectItem(result, "sha256"));
     const char *actual = cJSON_GetStringValue(cJSON_GetObjectItem(result, "actual_bytes"));
-    const bool t_ok = cJSON_IsTrue(cJSON_GetObjectItem(result, "ok"));
-    const bool allow = cJSON_IsTrue(cJSON_GetObjectItem(result, "completion_allowed"));
-    const bool unchanged = cJSON_IsTrue(cJSON_GetObjectItem(result, "source_unchanged"));
-    const bool checked = cJSON_IsTrue(cJSON_GetObjectItem(result, "monitoring_checked"));
-    const int64_t actual_n = actual ? strtoll(actual, NULL, 10) : -1;
+    const char *enc    = cJSON_GetStringValue(cJSON_GetObjectItem(result, "encoded_bytes"));
+    const char *err    = cJSON_GetStringValue(cJSON_GetObjectItem(result, "error"));
+    const bool  t_ok      = cJSON_IsTrue(cJSON_GetObjectItem(result, "ok"));
+    const bool  allow     = cJSON_IsTrue(cJSON_GetObjectItem(result, "completion_allowed"));
+    const bool  unchanged = cJSON_IsTrue(cJSON_GetObjectItem(result, "source_unchanged"));
+    const bool  checked   = cJSON_IsTrue(cJSON_GetObjectItem(result, "monitoring_checked"));
+    const cJSON *clen     = cJSON_GetObjectItem(result, "content_length");
+    const cJSON *fr       = cJSON_GetObjectItem(result, "frames");
+    uint64_t actual_n = 0, enc_n = 0;
 
-    if (s_stream_f) { fclose(s_stream_f); s_stream_f = NULL; }
+    if (s_stream_f) {
+        /* Durability before publication: a corrupt tail rename is the
+         * worst failure mode — surface a close error instead. */
+        if (fflush(s_stream_f) != 0 || fsync(fileno(s_stream_f)) != 0 ||
+            fclose(s_stream_f) != 0)
+            stream_fail("write close");
+        s_stream_f = NULL;
+    }
     if (s_sha_active) {
         uint8_t dig[32];
         mbedtls_sha256_finish(&s_sha, dig);
@@ -660,35 +937,57 @@ static bool stream_end(cJSON *result)
             snprintf(s_stream_sha + i * 2, 3, "%02x", dig[i]);
         s_stream_sha[64] = '\0';
     }
+    if (cJSON_IsNumber(fr) && fr->valuedouble >= 0)
+        s_end_frames = (uint32_t)fr->valuedouble;
 
-    if (!t_ok) snprintf(s_last_error, sizeof(s_last_error), "stream not ok");
-    else if (!allow) snprintf(s_last_error, sizeof(s_last_error), "completion not allowed");
-    else if (!unchanged) snprintf(s_last_error, sizeof(s_last_error), "source changed");
-    else if (!checked) snprintf(s_last_error, sizeof(s_last_error), "monitoring not checked");
-    else if (actual_n >= 0 && (uint64_t)actual_n != s_stream_got)
-        snprintf(s_last_error, sizeof(s_last_error), "size mismatch");
-    else if (s_stream_expected > 0 && s_stream_got != (uint64_t)s_stream_expected)
-        snprintf(s_last_error, sizeof(s_last_error), "expected size mismatch");
-    else if (s_v2_seq_errors) snprintf(s_last_error, sizeof(s_last_error), "stream seq errors");
-    else if (sha && strcmp(sha, s_stream_sha) != 0)
-        snprintf(s_last_error, sizeof(s_last_error), "sha256 mismatch");
+    if (s_stream_dead) {
+        /* an earlier terminal cause wins (e.g. write close) */
+    } else if (!t_ok) stream_fail(err && err[0] ? err : "stream not ok");
+    else if (!sha || !sb_hex_str_ok(sha, 64))
+        stream_fail("missing sha256");
+    else if (!actual || !sb_parse_u64_str(actual, &actual_n))
+        stream_fail("missing actual_bytes");
+    else if (!allow)   stream_fail(err && err[0] ? err : "completion not allowed");
+    else if (!unchanged) stream_fail(err && err[0] ? err : "source changed");
+    else if (!checked) stream_fail(err && err[0] ? err : "monitoring not checked");
+    else if (s_v2_len) stream_fail("truncated block");
+    else if (s_v2_seq_errors) stream_fail("stream seq errors");
+    else if (actual_n != s_stream_got) stream_fail("size mismatch");
+    else if (enc && sb_parse_u64_str(enc, &enc_n) && enc_n != s_stream_wire)
+        stream_fail("wire mismatch");
+    else if (cJSON_IsNumber(clen) && clen->valuedouble >= 0 &&
+             (uint64_t)clen->valuedouble != actual_n)
+        stream_fail("content-length mismatch");
+    /* The LIST token is a ceil-rounded display size, not a byte count:
+     * exact <= listed && listed - exact < unit (ezs_size_within_listing). */
+    else if (s_stream_expected > 0 &&
+             !(s_stream_got <= (uint64_t)s_stream_expected &&
+               (uint64_t)s_stream_expected - s_stream_got <
+               (s_stream_unit_shift ? (1ULL << s_stream_unit_shift) : 1)))
+        stream_fail("expected size mismatch");
+    else if (strcmp(sha, s_stream_sha) != 0)
+        stream_fail("sha256 mismatch");
     else if (s_stream_tmp[0] && rename(s_stream_tmp, s_stream_path) == 0) ok = true;
-    else snprintf(s_last_error, sizeof(s_last_error), "publish failed");
+    else stream_fail("publish failed");
 
     if (!ok && s_stream_tmp[0]) unlink(s_stream_tmp);
     s_stream_tmp[0] = '\0';
     s_stream_active = false;
+    s_rx_armed = false;          /* post-END residue is stale, not data */
+    if (!ok && s_stream_err[0])
+        snprintf(s_last_error, sizeof(s_last_error), "%s", s_stream_err);
     return ok;
 }
 
 /* GET_FILE with v2 framing, retried on the bridge's transient errors. */
-static esp_err_t sb_get_file(const char *day, const char *name,
+static esp_err_t sb_get_file(const char *directory, const char *name,
                              const char *expected_size)
 {
-    /* The bridge canonicalises "A:\DATALOG\<day>" (ezp_logical_to_canon
-     * requires the drive prefix; a bare "/DATALOG/…" is PATH_INVALID). */
+    /* `directory` is already bridge-canonical ("A:\", "A:\SETTINGS",
+     * "A:\DATALOG\<day>") — ezp_logical_to_canon requires the drive
+     * prefix; a bare "/DATALOG/…" is PATH_INVALID. */
     char dir[64];
-    snprintf(dir, sizeof(dir), "A:\\DATALOG\\%s", day);
+    snprintf(dir, sizeof(dir), "%s", directory);
 
     for (int attempt = 0; attempt < 3; attempt++) {
         cJSON *args = cJSON_CreateObject();
@@ -712,60 +1011,219 @@ static esp_err_t sb_get_file(const char *day, const char *name,
         cJSON_AddItemToObject(req, "args", args);
         char *body = cJSON_PrintUnformatted(req);
         cJSON_Delete(req);
-        if (!body) { xSemaphoreGive(s_req_mtx); stream_fail("no mem"); return ESP_ERR_NO_MEM; }
+        if (!body) {
+            xSemaphoreGive(s_req_mtx);
+            stream_fail("no mem");
+            stream_terminate();
+            return ESP_ERR_NO_MEM;
+        }
 
-        s_pending_rid = rid;
+        s_stream_rsp_rid = rid;
         s_rid = rid;
-        free(s_resp_json);
-        s_resp_json = NULL;
-        xSemaphoreTake(s_resp_sem, 0);
+        free(s_stream_rsp_json);
+        s_stream_rsp_json = NULL;
+        xSemaphoreTake(s_stream_rsp_sem, 0);
         json_reset_rx();
         esp_err_t ret = ctrl_send(SB_KIND_JSON_REQ, rid, (const uint8_t *)body,
                                   strlen(body));
         free(body);
-        if (ret != ESP_OK) { s_pending_rid = 0; xSemaphoreGive(s_req_mtx); stream_fail("send"); return ret; }
+        if (ret != ESP_OK) {
+            s_stream_rsp_rid = 0;
+            xSemaphoreGive(s_req_mtx);
+            stream_fail("send");
+            stream_terminate();
+            return ret;
+        }
 
-        /* BEGIN is acknowledged by the first response for this rid. */
-        if (xSemaphoreTake(s_resp_sem, pdMS_TO_TICKS(SB_JSON_TIMEOUT)) != pdTRUE) {
-            s_pending_rid = 0;
+        /* The first response on this rid decides admission: the bridge
+         * replies {"op":"STREAM_BEGIN","ok":true} and starts streaming,
+         * or {"op":"GET_FILE","ok":false,"error":{"code":...}} when it
+         * refuses (STALE day listing, BUSY teardown, therapy gates).
+         * Treating the refusal as a BEGIN used to grant credit to a
+         * stream that never started, then burn the whole attempt in the
+         * dead-air wait below and misreport it as a stalled card fetch.
+         * The wait wakes early on a terminal latch (e.g. link loss).   */
+        cJSON *broot = NULL;
+        const int64_t adm_end = esp_timer_get_time() +
+                                (int64_t)SB_JSON_TIMEOUT * 1000;
+        while (!s_stream_dead && esp_timer_get_time() < adm_end) {
+            if (xSemaphoreTake(s_stream_rsp_sem, pdMS_TO_TICKS(250)) ==
+                    pdTRUE && s_stream_rsp_json) {
+                broot = cJSON_Parse(s_stream_rsp_json);
+                free(s_stream_rsp_json);
+                s_stream_rsp_json = NULL;
+                break;
+            }
+        }
+        if (s_stream_dead) {
+            s_stream_rsp_rid = 0;
+            xSemaphoreGive(s_req_mtx);
+            stream_terminate();
+            if (attempt < 2 && stream_retry_wait()) continue;
+            return ESP_FAIL;
+        }
+        if (!broot) {
+            s_stream_rsp_rid = 0;
             xSemaphoreGive(s_req_mtx);
             stream_fail("no STREAM_BEGIN");
+            stream_terminate();
+            if (attempt < 2 && stream_retry_wait()) goto retry;
             return ESP_ERR_TIMEOUT;
         }
-        free(s_resp_json);
-        s_resp_json = NULL;
-        stream_ack(0, SB_WINDOW);      /* grant the initial credit window */
+        cJSON *bres = NULL;
+        char bcode[32];
+        const sb_rsp_kind_t bkind = sb_rsp_classify(broot, &bres, bcode,
+                                                  sizeof(bcode));
+        const char *bop = cJSON_GetStringValue(cJSON_GetObjectItem(broot, "op"));
+        const bool admitted = bkind == SB_RSP_OK && bop &&
+                              !strcmp(bop, "STREAM_BEGIN");
+        /* Strict BEGIN fields: wire version 1|2 and a well-formed
+         * size_unit_shift (0..24, the display unit the listing tuple was
+         * ceil-rounded into — stream_end applies the within-listing
+         * rule: listed == ceil(exact/unit)*unit, not an exact count).   */
+        bool fields_ok = false;
+        if (admitted) {
+            const cJSON *wire = cJSON_GetObjectItem(bres, "wire");
+            const cJSON *us = cJSON_GetObjectItem(bres, "size_unit_shift");
+            if (cJSON_IsNumber(wire) &&
+                (wire->valuedouble == 1 || wire->valuedouble == 2) &&
+                cJSON_IsNumber(us) && us->valuedouble >= 0 &&
+                us->valuedouble <= 24 &&
+                us->valuedouble == (double)(int)us->valuedouble) {
+                s_stream_wire_ver = (uint8_t)wire->valuedouble;
+                s_stream_unit_shift = (uint8_t)us->valuedouble;
+                fields_ok = true;
+            }
+        }
+        cJSON_Delete(broot);
+        if (!admitted || !fields_ok) {
+            const char *why = !admitted
+                ? ((bkind == SB_RSP_ERROR) ? bcode : "bad STREAM_BEGIN")
+                : "bad STREAM_BEGIN";
+            s_stream_rsp_rid = 0;
+            xSemaphoreGive(s_req_mtx);
+            stream_fail(why);
+            stream_terminate();
+            if (attempt < 2 && stream_retry_wait()) continue;
+            return ESP_FAIL;
+        }
+        s_stream_admitted = true;
+        if (stream_ack_initial(0, SB_WINDOW) != ESP_OK) {
+            s_stream_rsp_rid = 0;
+            xSemaphoreGive(s_req_mtx);
+            stream_fail("initial credit");
+            stream_terminate();
+            if (attempt < 2 && stream_retry_wait()) goto retry;
+            return ESP_FAIL;
+        }
+        /* Admission complete: data frames are accepted from here on.
+         * Frames that arrived earlier are stale residue, not stream
+         * data — the producer counted and dropped them.            */
+        s_rx_armed = true;
         xSemaphoreGive(s_req_mtx);
 
-        /* END arrives on the same rid once the body is complete. */
-        if (xSemaphoreTake(s_resp_sem, pdMS_TO_TICKS(SB_STREAM_TIMEOUT)) != pdTRUE) {
-            stream_fail("no STREAM_END");
-            s_pending_rid = 0;
-            return ESP_ERR_TIMEOUT;
+        /* END arrives on the same rid once the body is complete. Wait
+         * on wire progress, not a flat wall-clock: a wedged card read
+         * emits no data at all, while a slow-but-alive fetch emits a
+         * block per ~64 KB of raw input. Dead air kills the stream
+         * early (and aborts the bridge fetch so it stops hogging the
+         * card); overall SB_STREAM_TIMEOUT still caps total time.   */
+        uint64_t last_wire = 0;
+        int64_t last_prog = esp_timer_get_time();
+        const int64_t deadline = last_prog + (int64_t)SB_STREAM_TIMEOUT * 1000;
+        cJSON *root = NULL;
+        for (;;) {
+            /* Receive worker: decode/hash/write everything the callback
+             * queued, then check the terminal latch BEFORE sleeping.   */
+            stream_pump();
+            if (s_stream_dead) {
+                stream_terminate();
+                s_stream_rsp_rid = 0;
+                free(s_stream_rsp_json);
+                s_stream_rsp_json = NULL;
+                if (attempt < 2 && stream_retry_wait()) goto retry;
+                return ESP_FAIL;
+            }
+            stream_ack_tick();
+            if (xSemaphoreTake(s_stream_rsp_sem, pdMS_TO_TICKS(25)) ==
+                    pdTRUE && s_stream_rsp_json) {
+                root = cJSON_Parse(s_stream_rsp_json);
+                free(s_stream_rsp_json);
+                s_stream_rsp_json = NULL;
+                /* A re-sent STREAM_BEGIN is reassembly armor, not the
+                 * verdict — drop it and keep waiting (same rule as the
+                 * reference client's collect loop).                  */
+                const char *op = cJSON_GetStringValue(
+                    cJSON_GetObjectItem(root, "op"));
+                if (op && !strcmp(op, "STREAM_BEGIN")) {
+                    cJSON_Delete(root);
+                    root = NULL;
+                    continue;
+                }
+                break;
+            }
+            int64_t now = esp_timer_get_time();
+            if (s_stream_wire != last_wire) {
+                last_wire = s_stream_wire;
+                last_prog = now;
+            } else if (now - last_prog >= SB_STREAM_STALL_US ||
+                       now >= deadline) {
+                stream_fail(now >= deadline ? "no STREAM_END"
+                                            : "stream stalled");
+                stream_terminate();
+                s_stream_rsp_rid = 0;
+                if (attempt < 2 && stream_retry_wait()) goto retry;
+                return ESP_ERR_TIMEOUT;
+            }
         }
-        cJSON *root = s_resp_json ? cJSON_Parse(s_resp_json) : NULL;
-        free(s_resp_json);
-        s_resp_json = NULL;
-        s_pending_rid = 0;
-        if (!root) { stream_fail("bad STREAM_END"); return ESP_ERR_INVALID_RESPONSE; }
+        s_stream_rsp_rid = 0;
+        /* The remote stream answered: no ABORT needed on failure paths
+         * below — it is already over on the bridge side.  Drain the
+         * ring tail the END raced ahead of, then judge.              */
+        s_stream_admitted = false;
+        stream_pump();
+        if (s_stream_dead) {
+            stream_terminate();
+            if (attempt < 2 && stream_retry_wait()) goto retry;
+            return ESP_FAIL;
+        }
+        /* Final right-edge credit: confirm everything the body carried
+         * before the verdict is evaluated.                           */
+        if (s_stream_wire > s_stream_acked)
+            stream_ack(s_stream_wire, SB_WINDOW);
+        if (!root) {
+            stream_fail("bad STREAM_END");
+            stream_terminate();
+            return ESP_ERR_INVALID_RESPONSE;
+        }
 
-        cJSON *res = cJSON_GetObjectItem(root, "result");
-        cJSON *err = cJSON_GetObjectItem(root, "error");
+        cJSON *res = NULL;
+        char ecode[32];
+        const sb_rsp_kind_t ekind = sb_rsp_classify(root, &res, ecode,
+                                                  sizeof(ecode));
         bool ok = false;
-        if (cJSON_IsTrue(cJSON_GetObjectItem(root, "ok")) && res)
+        if (ekind == SB_RSP_OK) {
             ok = stream_end(res);
-        else {
-            const char *code = cJSON_GetStringValue(cJSON_GetObjectItem(err, "code"));
-            snprintf(s_last_error, sizeof(s_last_error), "%s", code ? code : "error");
-            stream_fail(code ? code : "error");
+        } else {
+            stream_fail(ekind == SB_RSP_ERROR ? ecode : "bad STREAM_END");
         }
         cJSON_Delete(root);
-        if (ok) return ESP_OK;
-
-        /* Transient bridge states: STALE (freshness guard) and BUSY. */
-        if (strcmp(s_last_error, "STALE") == 0) { vTaskDelay(pdMS_TO_TICKS(12000)); continue; }
-        if (strcmp(s_last_error, "BUSY") == 0)  { vTaskDelay(pdMS_TO_TICKS(1500)); continue; }
+        if (ok) {
+            ESP_LOGI(TAG, "stream done %s wire=%llu raw=%llu "
+                     "(rx=%u dup=%u stale=%u drop=%u end_frames=%lu)",
+                     name, (unsigned long long)s_stream_wire,
+                     (unsigned long long)s_stream_got,
+                     (unsigned)s_rx_frames, (unsigned)s_dup_frames,
+                     (unsigned)s_stale_frames, (unsigned)s_dq_drops,
+                     (unsigned long)s_end_frames);
+            return ESP_OK;
+        }
+        stream_terminate();
+        if (attempt < 2 && stream_retry_wait()) continue;
         return ESP_FAIL;
+
+    retry:
+        continue;
     }
     return ESP_FAIL;
 }
@@ -910,7 +1368,9 @@ static void sync_root_dir(const char *directory, const char *ledger_prefix)
 /* One sync pass: days newest-first, files smallest-first, BRP last. */
 static void sync_run(bool full)
 {
-    const int days = full ? SB_SYNC_DAYS_FULL : SB_SYNC_DAYS;
+    /* normal sync follows the configured "days to keep in sync" window
+     * so bridge pull and upload depth can't diverge; full stays 365  */
+    const int days = full ? SB_SYNC_DAYS_FULL : uploader_max_days();
     cJSON *args = cJSON_CreateObject();
     cJSON_AddNumberToObject(args, "days", days);
     cJSON *res = NULL;
@@ -967,6 +1427,7 @@ static void sync_run(bool full)
         /* Smallest first, BRP last (its BRP is the big one). */
         static const char *const order[] = { "EVE", "CSL", "SA2", "SAD",
                                              "PLD", "BRP" };
+        int day_fail = 0;
         for (size_t k = 0; k < sizeof(order) / sizeof(order[0]); k++) {
             cJSON_ArrayForEach(f, files) {
                 const char *fn = cJSON_GetStringValue(cJSON_GetObjectItem(f, "name"));
@@ -975,7 +1436,10 @@ static void sync_run(bool full)
                 if (!fn || !size || !strstr(fn, order[k])) continue;
                 if (ledger_seen(day, fn, size, ts)) continue;
                 if (s_conn == BLE_HS_CONN_HANDLE_NONE) { cJSON_Delete(dres); return; }
-                if (sb_get_file(day, fn, size) != ESP_OK) {
+                char fdir[48];
+                snprintf(fdir, sizeof(fdir), "A:\\DATALOG\\%s", day);
+                if (sb_get_file(fdir, fn, size) != ESP_OK) {
+                    day_fail++;
                     ESP_LOGW(TAG, "sync: %s/%s failed (%s)", day, fn, s_last_error);
                     if (strstr(s_last_error, "THERAPY")) { cJSON_Delete(dres); return; }
                     continue;
@@ -1006,7 +1470,11 @@ static void sync_run(bool full)
         cJSON_Delete(dres);
 
         s_sync_days_done++;
-        ESP_LOGI(TAG, "sync: %s staged (%d day(s) done)", day, s_sync_days_done);
+        if (day_fail)
+            ESP_LOGW(TAG, "sync: %s staged PARTIAL (%d day(s) done, %d file(s) failed)",
+                     day, s_sync_days_done, day_fail);
+        else
+            ESP_LOGI(TAG, "sync: %s staged (%d day(s) done)", day, s_sync_days_done);
     }
 
     cJSON_Delete(res);
@@ -1030,6 +1498,9 @@ static void poll_status(void)
         s_therapy_active = cJSON_IsNumber(st) && st->valueint == 1;
         s_transfer_allowed = cJSON_IsTrue(ta);
     }
+    s_card_wifi = cJSON_IsTrue(cJSON_GetObjectItem(res, "sta_connected"));
+    const char *mode = cJSON_GetStringValue(cJSON_GetObjectItem(res, "mode"));
+    if (mode) snprintf(s_card_mode, sizeof(s_card_mode), "%s", mode);
     cJSON_Delete(res);
 }
 
@@ -1075,6 +1546,26 @@ static void sb_task(void *arg)
             }
         }
 
+        /* Deferred security_initiate (see CONNECT handler): give the peer's
+         * own connect-time HCI procedures a moment to finish first.
+         * SomnoBridge requires LE Secure Connections + MITM (§3); a bridge
+         * that already holds a *different* bond refuses this by design —
+         * replacing the peer needs its physically confirmed FORGET_PEER
+         * action, so surface the failure instead of sitting in "connecting"
+         * forever. */
+        if (s_sec_due_ms && now >= s_sec_due_ms) {
+            s_sec_due_ms = 0;
+            if (s_conn != BLE_HS_CONN_HANDLE_NONE) {
+                int rc = ble_gap_security_initiate(s_conn);
+                if (rc != 0) {
+                    ESP_LOGW(TAG, "security initiate failed: rc=%d (bond "
+                                  "exists on the bridge? FORGET_PEER is "
+                                  "required)", rc);
+                    set_error("bridge refused pairing");
+                }
+            }
+        }
+
         /* A link that never reaches encryption is a dead end (bond mismatch,
          * window closed): drop it.  The budget is re-derived every pass from
          * the *current* state and anchored to when the link came up, so it
@@ -1116,7 +1607,12 @@ static void sb_task(void *arg)
                     set_state(SB_STATUS_CONNECTING);
             }
         }
-        if (s_conn != BLE_HS_CONN_HANDLE_NONE) {
+        /* GATT ops only once the link is encrypted and CCCDs are armed —
+         * poll_status() blocks up to the JSON timeout when the response
+         * can't come, which used to stall this loop (delaying the deferred
+         * security_initiate past the link budget) and could mask the PIN
+         * mailbox during pairing. */
+        if (s_conn != BLE_HS_CONN_HANDLE_NONE && s_subscribed) {
             if (now - last_poll > SB_POLL_MS) {
                 last_poll = now;
                 poll_status();
@@ -1144,14 +1640,29 @@ static void sb_task(void *arg)
 
 /* ── GATT discovery ─────────────────────────────────────────────────── */
 
+static void subscribe_chars(void);
+
 static int on_dsc(uint16_t conn, const struct ble_gatt_error *err,
                   uint16_t chr_val, const struct ble_gatt_dsc *dsc, void *arg)
 {
     (void)conn; (void)arg;
-    if (err->status == BLE_HS_EDONE) return 0;
+    if (err->status == BLE_HS_EDONE) {
+        if (s_ctrl_cccd || s_data_cccd) subscribe_chars();
+        return 0;
+    }
     if (err->status != 0 || !dsc) return 0;
-    if (chr_val == s_ctrl_val) s_ctrl_cccd = dsc->handle;
-    else if (chr_val == s_data_val) s_data_cccd = dsc->handle;
+    /* Find-Information returns declarations as well as descriptors, and
+     * chr_val is just the discovery's start handle (NimBLE passes it
+     * through verbatim) — so only entries whose UUID is the CCCD
+     * (0x2902) count, classified by which characteristic's range they
+     * sit in.  Anything else (the second char's declaration landed in
+     * s_ctrl_cccd once) makes the subscribe write fail. */
+    static const ble_uuid16_t UUID_CCCD = BLE_UUID16_INIT(0x2902);
+    if (ble_uuid_cmp(&dsc->uuid.u, &UUID_CCCD.u) != 0) return 0;
+    if (dsc->handle > s_ctrl_val && dsc->handle < s_data_val)
+        s_ctrl_cccd = dsc->handle;
+    else if (dsc->handle > s_data_val)
+        s_data_cccd = dsc->handle;
     return 0;
 }
 
@@ -1161,9 +1672,10 @@ static int on_chr(uint16_t conn, const struct ble_gatt_error *err,
     (void)conn; (void)arg;
     if (err->status == BLE_HS_EDONE) {
         if (s_ctrl_val && s_data_val) {
+            /* One discovery over the whole tail of the service finds both
+             * chars' CCCDs — a second call here always answered EBUSY
+             * (NimBLE allows a single GATT client procedure per conn). */
             ble_gattc_disc_all_dscs(s_conn, s_ctrl_val, s_svc_end, on_dsc, NULL);
-            ble_gattc_disc_all_dscs(s_conn, s_data_val, s_svc_end, on_dsc, NULL);
-            s_disc_done = true;
         }
         return 0;
     }
@@ -1187,12 +1699,47 @@ static int on_svc(uint16_t conn, const struct ble_gatt_error *err,
     return 0;
 }
 
+static int cccd_data_cb(uint16_t conn, const struct ble_gatt_error *err,
+                        struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn; (void)attr; (void)arg;
+    if (err && err->status != 0) {
+        ESP_LOGW(TAG, "data cccd write status=%d", err->status);
+        /* Half-armed CCCDs are a dead link: reconnect retries cleanly. */
+        sb_ble_disconnect();
+    } else {
+        s_subscribed = true;
+        ESP_LOGI(TAG, "subscribed: ctrl indicate + data notify");
+    }
+    return 0;
+}
+
+static int cccd_ctrl_cb(uint16_t conn, const struct ble_gatt_error *err,
+                        struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn; (void)attr; (void)arg;
+    if (err && err->status != 0) {
+        ESP_LOGW(TAG, "ctrl cccd write status=%d", err->status);
+        sb_ble_disconnect();
+        return 0;
+    }
+    uint8_t ntf[2] = { 0x01, 0x00 };
+    if (s_data_cccd)
+        ble_gattc_write_flat(s_conn, s_data_cccd, ntf, 2, cccd_data_cb, NULL);
+    return 0;
+}
+
 static void subscribe_chars(void)
 {
+    /* CCCD writes are themselves GATT procedures — chain them, issuing
+     * both at once answers EBUSY on the second and data notifications
+     * would never arrive. */
     uint8_t ind[2] = { 0x02, 0x00 };      /* indicate */
     uint8_t ntf[2] = { 0x01, 0x00 };      /* notify   */
-    if (s_ctrl_cccd) ble_gattc_write_flat(s_conn, s_ctrl_cccd, ind, 2, write_cb, NULL);
-    if (s_data_cccd) ble_gattc_write_flat(s_conn, s_data_cccd, ntf, 2, write_cb, NULL);
+    if (s_ctrl_cccd)
+        ble_gattc_write_flat(s_conn, s_ctrl_cccd, ind, 2, cccd_ctrl_cb, NULL);
+    else if (s_data_cccd)
+        ble_gattc_write_flat(s_conn, s_data_cccd, ntf, 2, cccd_data_cb, NULL);
 }
 
 /* ── GAP events ─────────────────────────────────────────────────────── */
@@ -1217,29 +1764,40 @@ static int sb_gap_event(struct ble_gap_event *event, void *arg)
             }
         }
         ble_gattc_exchange_mtu(s_conn, NULL, NULL);
-        /* SomnoBridge requires LE Secure Connections + MITM (§3).  A bridge
-         * that already holds a bond refuses this by design: replacing the
-         * peer needs its physically confirmed FORGET_PEER action, so surface
-         * the failure instead of sitting in "connecting" forever. */
-        {
-            int rc = ble_gap_security_initiate(s_conn);
-            if (rc != 0) {
-                ESP_LOGW(TAG, "security initiate failed: rc=%d (bond exists on "
-                              "the bridge? FORGET_PEER is required)", rc);
-                set_error("bridge refused pairing");
-            }
-        }
+        /* Do NOT start encryption inside the CONNECT event.  The bridge
+         * pushes its own connect-time HCI burst (LE Set Data Length, Set
+         * PHY, conn-param update) in this same instant, and an LL_ENC_REQ
+         * arriving while its controller is still processing those commands
+         * wedges it — observed as "HCI wait for ack returned 19" on the
+         * bridge followed by a NimBLE reset, which our side saw as
+         * "encryption failed (status 520)" on every bonded reconnect.
+         * BlueZ (and every peer that used to work) starts security lazily,
+         * after its own discovery, so the wedge never showed.  Defer the
+         * request to the task loop instead. */
+        s_sec_due_ms = esp_timer_get_time() / 1000 + SB_SEC_DELAY_MS;
         return 0;
 
-    case BLE_GAP_EVENT_DISCONNECT:
+    case BLE_GAP_EVENT_DISCONNECT: {
         s_pin_pending = false;
-        ESP_LOGW(TAG, "disconnected (reason=%d)", event->disconnect.reason);
+        s_sec_due_ms = 0;
+        /* reason 573 = HCI 0x3d "Connection Terminated due to MIC
+         * Failure" — a detected link-integrity termination, not a plain
+         * timeout; keep it distinct in the log. */
+        struct ble_gap_conn_desc dd;
+        const bool have_dd = ble_gap_conn_find(s_conn, &dd) == 0;
+        ESP_LOGW(TAG, "disconnected (reason=%d%s enc=%d auth=%d bonded=%d)",
+                 event->disconnect.reason,
+                 event->disconnect.reason == 573 ? "/MIC" : "",
+                 have_dd ? (int)dd.sec_state.encrypted : -1,
+                 have_dd ? (int)dd.sec_state.authenticated : -1,
+                 have_dd ? (int)dd.sec_state.bonded : -1);
         s_conn = BLE_HS_CONN_HANDLE_NONE;
-        if (s_stream_active) stream_fail("link lost");
-        s_disc_done = false;
+        if (s_stream_active || s_rx_armed) stream_fail("link lost");
+        s_subscribed = false;
         if (s_paired) set_state(SB_STATUS_CONNECTING);
         else set_state(SB_STATUS_IDLE);
         return 0;
+    }
 
     case BLE_GAP_EVENT_ENC_CHANGE: {
         struct ble_gap_conn_desc desc;
@@ -1251,7 +1809,7 @@ static int sb_gap_event(struct ble_gap_event *event, void *arg)
             s_paired = true;
             set_state(SB_STATUS_PAIRED);
             s_ctrl_val = s_data_val = s_ctrl_cccd = s_data_cccd = 0;
-            s_disc_done = false;
+            s_subscribed = false;
             ble_gattc_disc_all_svcs(s_conn, on_svc, NULL);
         } else {
             ESP_LOGW(TAG, "encryption failed: status=%d encrypted=%d auth=%d bonded=%d",
@@ -1284,16 +1842,57 @@ static int sb_gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_NOTIFY_RX: {
         const uint16_t h = event->notify_rx.attr_handle;
         const uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
+
+        if (h == s_data_val) {
+            /* Stream data: copy the (possibly chained) mbuf into the
+             * receive ring and return — decode/hash/SD writes run on the
+             * bridge task via stream_pump(), never here.  Only frames
+             * for an admitted stream are accepted; anything else is
+             * residue of a torn-down stream: counted, not processed.  A
+             * loss point inside this path (ring full, flatten failure,
+             * malformed frame) is terminal — the bytes are already gone
+             * and a spliced stream must not continue.              */
+            if (!s_rx_armed) { s_stale_frames++; return 0; }
+            if (len < 4 || len > (uint16_t)sizeof(s_dq[0].data)) {
+                s_dq_drops++;
+                stream_fail("rx drop");
+                return 0;
+            }
+            /* The armed check lives inside the lock so a frame can never
+             * commit after dq_reset() cleared the ring: armed is cleared
+             * first, then reset — under the same critical section an
+             * in-flight copy sees disarmed and bails.  The flatten is a
+             * bounded memcpy of ≤252 B, safe inside the spinlock.     */
+            portENTER_CRITICAL(&s_dq_mux);
+            const uint16_t next = (uint16_t)((s_dq_head + 1) % SB_DQ_N);
+            if (!s_rx_armed) {
+                portEXIT_CRITICAL(&s_dq_mux);
+                s_stale_frames++;
+                return 0;
+            }
+            if (next == s_dq_tail) {
+                portEXIT_CRITICAL(&s_dq_mux);
+                s_dq_drops++;
+                stream_fail("rx overflow");
+                return 0;
+            }
+            uint16_t got = 0;
+            if (ble_hs_mbuf_to_flat(event->notify_rx.om,
+                                    s_dq[s_dq_head].data, len, &got) != 0 ||
+                got != len) {
+                portEXIT_CRITICAL(&s_dq_mux);
+                s_dq_drops++;
+                stream_fail("rx flatten");
+                return 0;
+            }
+            s_dq[s_dq_head].len = len;
+            s_dq_head = next;
+            portEXIT_CRITICAL(&s_dq_mux);
+            return 0;
+        }
+
+        /* Control characteristic: the 16-byte header is mandatory. */
         if (len < SB_HDR_LEN) return 0;
-        uint8_t hdr[SB_HDR_LEN];
-        uint16_t copied = 0;
-        ble_hs_mbuf_to_flat(event->notify_rx.om, hdr, sizeof(hdr), &copied);
-        uint8_t kind;
-        uint16_t flags;
-        uint32_t rid;
-        uint64_t off;
-        if (!sb_hdr_parse(hdr, copied, &kind, &flags, &rid, &off)) return 0;
-        const size_t plen = len - SB_HDR_LEN;
         uint8_t *all = malloc(len);
         if (!all) return 0;
         uint16_t got = 0;
@@ -1302,11 +1901,18 @@ static int sb_gap_event(struct ble_gap_event *event, void *arg)
             free(all);
             return 0;
         }
+        uint8_t kind;
+        uint16_t flags;
+        uint32_t rid;
+        uint64_t off;
+        if (!sb_hdr_parse(all, SB_HDR_LEN, &kind, &flags, &rid, &off)) {
+            free(all);
+            return 0;
+        }
+        const size_t plen = len - SB_HDR_LEN;
         uint8_t *payload = all + SB_HDR_LEN;
 
-        if (h == s_data_val) {
-            stream_data(payload, plen, kind);
-        } else if (kind == SB_KIND_TIME_RSP) {
+        if (kind == SB_KIND_TIME_RSP) {
             time_on_reply(payload, plen);
         } else if (kind == SB_KIND_JSON_RSP) {
             if (flags & SB_FLAG_START) { s_rx_len = 0; s_rx_next_off = 0; s_rx_rid = rid; }
@@ -1339,15 +1945,24 @@ esp_err_t sb_ble_init(void)
     if (!s_rx_buf) s_rx_buf = malloc(SB_JSON_MAX + 1);
     if (!s_rx_buf) return ESP_ERR_NO_MEM;
 
+    /* Receive ring: covers a full credit window plus headroom (~24 KiB
+     * PSRAM) so the bridge can never overrun the receiver while credits
+     * are honoured — a full ring is a local-loss event, not backpressure. */
+    s_dq = heap_caps_malloc(sizeof(sb_dq_item_t) * SB_DQ_N,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_dq) s_dq = malloc(sizeof(sb_dq_item_t) * SB_DQ_N);
+    if (!s_dq) return ESP_ERR_NO_MEM;
+
     s_req_mtx = xSemaphoreCreateMutex();
     s_write_mtx = xSemaphoreCreateMutex();
     s_resp_sem = xSemaphoreCreateBinary();
+    s_stream_rsp_sem = xSemaphoreCreateBinary();
     s_write_done = xSemaphoreCreateBinary();
     s_pin_sem = xSemaphoreCreateBinary();
     s_pin_mbox = xSemaphoreCreateBinary();
     s_sync_mtx = xSemaphoreCreateMutex();
     if (!s_req_mtx || !s_write_mtx || !s_resp_sem || !s_write_done ||
-        !s_pin_sem || !s_sync_mtx || !s_pin_mbox)
+        !s_pin_sem || !s_sync_mtx || !s_pin_mbox || !s_stream_rsp_sem)
         return ESP_ERR_NO_MEM;
 
     if (ble_hs_id_infer_auto(0, &s_own_addr_type) != 0) {
@@ -1433,17 +2048,39 @@ esp_err_t sb_ble_confirm_pair(const char *pin6)
     return ESP_OK;
 }
 
+static esp_err_t forget_nvs_op(void *arg)
+{
+    (void)arg;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(SB_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    nvs_erase_key(h, SB_NVS_ADDR);
+    err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+static esp_err_t forget_bond_op(void *arg)
+{
+    const ble_addr_t *peer = arg;
+    if (peer->type != BLE_ADDR_PUBLIC && peer->type != BLE_ADDR_RANDOM)
+        return ESP_OK;
+    ble_store_util_delete_peer(peer);
+    return ESP_OK;
+}
+
 esp_err_t sb_ble_forget(void)
 {
+    /* NVS + bond-store writes must run on an internal-RAM task: this API is
+     * invoked by the httpd worker, which lives on a PSRAM stack — writing
+     * flash from there panics (observed as reset reason PANIC on Unpair).
+     * Delete only *this* peer's bond too — ble_store_clear() would wipe the
+     * AS11's bond along with it. */
     s_paired = false;
+    ble_addr_t peer = s_peer;
     memset(&s_peer, 0, sizeof(s_peer));
-    nvs_handle_t h;
-    if (nvs_open(SB_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_erase_key(h, SB_NVS_ADDR);
-        nvs_commit(h);
-        nvs_close(h);
-    }
-    ble_store_clear();
+    nvs_writer_run(forget_nvs_op, NULL);
+    nvs_writer_run(forget_bond_op, &peer);
     sb_ble_disconnect();
     set_state(SB_STATUS_IDLE);
     return ESP_OK;
@@ -1465,6 +2102,43 @@ esp_err_t sb_ble_sync_now(bool full)
     return ESP_OK;
 }
 
+/* Generic JSON op passthrough for the portal's bridge-config dialog
+ * (GET_CONFIG/SET_CONFIG/WIFI_SCAN/EZSHARE_CHECK). Builds
+ * {"ok":true,"result":{...}} / {"ok":false,"error":{...}} so the UI can
+ * render the bridge reply verbatim. Caller frees *out_json. */
+esp_err_t sb_ble_rpc(const char *op, const cJSON *args, uint32_t timeout_ms,
+                     char **out_json)
+{
+    if (!op || !op[0] || !out_json) return ESP_ERR_INVALID_ARG;
+    *out_json = NULL;
+    if (s_conn == BLE_HS_CONN_HANDLE_NONE || !s_subscribed) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    cJSON *res = NULL, *err = NULL;
+    esp_err_t ret = json_request(op, args ? cJSON_Duplicate(args, 1) : NULL,
+                                 NULL, &res, &err, timeout_ms);
+    cJSON *out = cJSON_CreateObject();
+    cJSON_AddBoolToObject(out, "ok", ret == ESP_OK);
+    if (ret == ESP_OK) {
+        if (res) cJSON_AddItemToObject(out, "result", res);
+        else cJSON_AddObjectToObject(out, "result");
+    } else {
+        if (err) cJSON_AddItemToObject(out, "error", err);
+        else {
+            cJSON *e = cJSON_CreateObject();
+            cJSON_AddStringToObject(e, "code",
+                                    ret == ESP_ERR_TIMEOUT ? "TIMEOUT"
+                                                           : "LINK_ERROR");
+            cJSON_AddItemToObject(out, "error", e);
+        }
+        cJSON_Delete(res);
+    }
+    *out_json = cJSON_PrintUnformatted(out);
+    cJSON_Delete(out);
+    if (!*out_json) return ESP_ERR_NO_MEM;
+    return ret;
+}
+
 cJSON *sb_ble_status_json(void)
 {
     cJSON *o = cJSON_CreateObject();
@@ -1474,6 +2148,8 @@ cJSON *sb_ble_status_json(void)
     cJSON_AddBoolToObject(o, "connected", s_conn != BLE_HS_CONN_HANDLE_NONE);
     cJSON_AddBoolToObject(o, "therapy_active", s_therapy_active);
     cJSON_AddBoolToObject(o, "transfer_allowed", s_transfer_allowed);
+    cJSON_AddBoolToObject(o, "card_wifi", s_card_wifi);
+    if (s_card_mode[0]) cJSON_AddStringToObject(o, "card_mode", s_card_mode);
     cJSON_AddBoolToObject(o, "sync_running", s_sync_running);
     cJSON_AddNumberToObject(o, "mtu", s_mtu);
     if (s_error[0]) cJSON_AddStringToObject(o, "error", s_error);
@@ -1481,5 +2157,11 @@ cJSON *sb_ble_status_json(void)
     cJSON_AddNumberToObject(o, "last_sync_s", s_last_sync_ms / 1000);
     cJSON_AddNumberToObject(o, "sync_days", s_sync_days_done);
     cJSON_AddNumberToObject(o, "sync_files", s_sync_files_done);
+    /* live stream counters — lets the UI/diag tell a slow fetch from
+     * a dead wire while a pull is in flight                        */
+    if (s_stream_f || s_stream_wire || s_stream_got) {
+        cJSON_AddNumberToObject(o, "stream_wire", (double)s_stream_wire);
+        cJSON_AddNumberToObject(o, "stream_raw", (double)s_stream_got);
+    }
     return o;
 }

@@ -41,6 +41,9 @@ typedef struct cJSON {
     int type;
 } cJSON;
 
+#define cJSON_False  1
+#define cJSON_True   2
+#define cJSON_NULL   4
 #define cJSON_Number 8
 #define cJSON_String 16
 #define cJSON_Array  32
@@ -58,6 +61,26 @@ static inline cJSON *cJSON_GetObjectItem(const cJSON *o, const char *key)
 static inline bool cJSON_IsString(const cJSON *i)
 {
     return i && i->type == cJSON_String;
+}
+
+static inline const char *cJSON_GetStringValue(const cJSON *i)
+{
+    return cJSON_IsString(i) ? i->valuestring : NULL;
+}
+
+static inline bool cJSON_IsTrue(const cJSON *i)
+{
+    return i && i->type == cJSON_True;
+}
+
+static inline bool cJSON_IsFalse(const cJSON *i)
+{
+    return i && i->type == cJSON_False;
+}
+
+static inline bool cJSON_IsObject(const cJSON *i)
+{
+    return i && i->type == cJSON_Object;
 }
 
 static inline bool cJSON_IsNumber(const cJSON *i)
@@ -158,6 +181,16 @@ static inline void cJSON_AddNullToObject(cJSON *obj, const char *name)
     if (!obj) return;
     cJSON *item = (cJSON *)calloc(1, sizeof(cJSON));
     if (!item) return;
+    if (name) item->string = _test_strdup(name);
+    cJSON_AddItemToArray(obj, item);
+}
+
+static inline void cJSON_AddBoolToObject(cJSON *obj, const char *name, bool val)
+{
+    if (!obj) return;
+    cJSON *item = (cJSON *)calloc(1, sizeof(cJSON));
+    if (!item) return;
+    item->type = val ? cJSON_True : cJSON_False;
     if (name) item->string = _test_strdup(name);
     cJSON_AddItemToArray(obj, item);
 }

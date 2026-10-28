@@ -2140,12 +2140,18 @@ typedef struct {
     const char          *src_serial;
     char                 day[9];       /* streams noon-day label */
     char                 id[40];
+    /* Bitmask over the cluster's source slots {brp,pld,sa2,eve,csl}
+     * marking which sources the commit/augment path consumed (merged or
+     * verified duplicate).  Sources whose bit is clear must NOT be
+     * deleted — their coverage could not be verified. */
+    uint8_t              src_consumed;
     uint32_t             n_flow, n_press, n_mm, n_sa2, n_pld, n_events;
 } imp_work_t;
 
 /* Duplicate/collision resolution: returns a free session id in out_id, or
  * ESP_ERR_INVALID_STATE when the session at this start time already exists
- * (caller then treats it as "already imported" and only deletes sources). */
+ * (out_id then receives the EXISTING id so the caller can augment it in
+ * place instead of discarding a late-recovered file as a duplicate). */
 static esp_err_t pick_session_id(const char *dir, int64_t start_ntp,
                                  char *out_id, size_t out_len)
 {
@@ -2169,8 +2175,10 @@ static esp_err_t pick_session_id(const char *dir, int64_t start_ntp,
             json_i64(mj, "start_epoch_ms", &stt);
             cJSON_Delete(mj);
         }
-        if (stt && llabs(stt - start_ntp) <= (int64_t)IMP_SESS_DUP_MS)
+        if (stt && llabs(stt - start_ntp) <= (int64_t)IMP_SESS_DUP_MS) {
+            snprintf(out_id, out_len, "%s", id);
             return ESP_ERR_INVALID_STATE;
+        }
         /* different session sharing the same second → next suffix */
     }
     return ESP_ERR_INVALID_SIZE;
@@ -2271,6 +2279,218 @@ static void manifest_enforce_cap(cJSON *r)
         cJSON_AddBoolToObject(r, "somnobridge_drift_truncated", true);
 }
 
+static uint32_t manifest_u32(const cJSON *m, const char *key)
+{
+    const cJSON *j = cJSON_GetObjectItem((cJSON *)m, key);
+    return (cJSON_IsNumber(j) && j->valuedouble > 0)
+               ? (uint32_t)j->valuedouble : 0;
+}
+
+static bool manifest_has_kind(const cJSON *kinds, const char *k)
+{
+    const cJSON *it;
+    cJSON_ArrayForEach(it, kinds)
+        if (cJSON_IsString(it) && it->valuestring &&
+            !strcmp(it->valuestring, k))
+            return true;
+    return false;
+}
+
+static void manifest_add_kind(cJSON *mj, const char *k)
+{
+    cJSON *kinds = cJSON_GetObjectItem(mj, "src_kinds");
+    if (!cJSON_IsArray(kinds)) kinds = cJSON_AddArrayToObject(mj, "src_kinds");
+    if (!kinds || manifest_has_kind(kinds, k)) return;
+    cJSON_AddItemToArray(kinds, cJSON_CreateString(k));
+}
+
+static void manifest_set_num(cJSON *mj, const char *key, double v)
+{
+    cJSON *j = cJSON_GetObjectItem(mj, key);
+    if (cJSON_IsNumber(j)) cJSON_SetNumberValue(j, v);
+    else cJSON_AddNumberToObject(mj, key, v);
+}
+
+/* Merge newly recovered stream kinds into an already-committed session.
+ * A file that failed to transfer during the original sync (or arrived
+ * later than its siblings) completes the session in place here instead
+ * of being deleted as a duplicate — the hazard that silently discarded
+ * recovered BRPs.  Coverage is proven by the manifest's sample counts
+ * (wave kinds) and src_kinds list (annotation kinds): a kind already
+ * recorded is a duplicate; a kind that cannot be verified is left in
+ * place, never deleted on a guess.
+ *
+ * Event merging regenerates <id>_events.snt from THIS cluster, so it is
+ * only done when every already-recorded annotation kind is re-emittable
+ * from the cluster — otherwise recorded events would be lost.
+ *
+ * Returns ESP_OK when every offered kind was merged or confirmed
+ * duplicate, ESP_ERR_INVALID_STATE when nothing new was offered (the
+ * all-duplicate fast path), ESP_ERR_NOT_SUPPORTED when unverifiable
+ * sources had to be left (w->src_consumed flags the deletable bits), or
+ * ESP_FAIL on conversion/write failure. */
+static esp_err_t augment_session(const char *dir, const char *id,
+                                 imp_work_t *w, const imp_cluster_t *cl,
+                                 int64_t wav_ntp, int64_t wav_dev,
+                                 int64_t end_dev, int64_t end_ntp)
+{
+    char mp[448];
+    snprintf(mp, sizeof(mp), "%s/%s_session.json", dir, id);
+    cJSON *mj = read_json_file(mp);
+    if (!mj) {
+        ESP_LOGW(TAG, "import: %s session manifest unreadable — sources kept",
+                 id);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    const uint32_t m_flow = manifest_u32(mj, "brp_samples");
+    const uint32_t m_sa2  = manifest_u32(mj, "sa2_samples");
+    const uint32_t m_pld  = manifest_u32(mj, "pld_samples");
+    const cJSON *kinds = cJSON_GetObjectItem(mj, "src_kinds");
+    const bool kinds_known = cJSON_IsArray(kinds);
+    const bool rec_eve = kinds_known && manifest_has_kind(kinds, "eve");
+    const bool rec_csl = kinds_known && manifest_has_kind(kinds, "csl");
+
+    esp_err_t ret = ESP_OK;
+    uint32_t nf = 0, np = 0, nm = 0, ns2 = 0, npl = 0, nev = 0;
+    bool m_brp = false, m_sa2m = false, m_pldm = false, m_ev = false;
+    /* Consumption decision (bits: 0 brp, 1 pld, 2 sa2, 3 eve, 4 csl) —
+     * declared up top so the goto-out path never sees them uninitialised. */
+    uint8_t consumed = 0;
+    const uint8_t offered = (uint8_t)((cl->brp ? 0x01 : 0) |
+                                     (cl->pld ? 0x02 : 0) |
+                                     (cl->sa2 ? 0x04 : 0) |
+                                     (cl->eve ? 0x08 : 0) |
+                                     (cl->csl ? 0x10 : 0));
+    bool merged = false;
+
+    /* Wave kinds merge when the manifest records no samples for them —
+     * either the file arrived late, or the original commit found no data
+     * (an empty stream converts as "absent" and stays a duplicate). */
+    if (cl->brp && m_flow == 0) {
+        imp_edf_t *e = imp_malloc(sizeof(imp_edf_t));
+        esp_err_t r = e ? imp_edf_open(e, cl->brp->path) : ESP_ERR_NO_MEM;
+        if (r == ESP_OK) {
+            r = conv_brp(e, dir, id, wav_ntp, &nf, &np, &nm);
+            if (r == ESP_ERR_NOT_FOUND) r = ESP_OK;
+        }
+        free(e);
+        if (r != ESP_OK) { ret = ESP_FAIL; goto out; }
+        m_brp = true;
+        merged = true;
+        ESP_LOGI(TAG, "import: %s augmented with BRP "
+                 "(flow=%lu press=%lu mm=%lu)", id, (unsigned long)nf,
+                 (unsigned long)np, (unsigned long)nm);
+    }
+    if (cl->sa2 && m_sa2 == 0) {
+        imp_edf_t *e = imp_malloc(sizeof(imp_edf_t));
+        esp_err_t r = e ? imp_edf_open(e, cl->sa2->path) : ESP_ERR_NO_MEM;
+        if (r == ESP_OK) {
+            r = conv_sa2(e, dir, id, wav_ntp, &ns2);
+            if (r == ESP_ERR_NOT_FOUND) r = ESP_OK;
+        }
+        free(e);
+        if (r != ESP_OK) { ret = ESP_FAIL; goto out; }
+        m_sa2m = true;
+        merged = true;
+        ESP_LOGI(TAG, "import: %s augmented with SA2 (%lu)", id,
+                 (unsigned long)ns2);
+    }
+    if (cl->pld && m_pld == 0) {
+        imp_edf_t *e = imp_malloc(sizeof(imp_edf_t));
+        esp_err_t r = e ? imp_edf_open(e, cl->pld->path) : ESP_ERR_NO_MEM;
+        if (r == ESP_OK) {
+            r = conv_pld(e, dir, id, wav_ntp, &npl);
+            if (r == ESP_ERR_NOT_FOUND) r = ESP_OK;
+        }
+        free(e);
+        if (r != ESP_OK) { ret = ESP_FAIL; goto out; }
+        m_pldm = true;
+        merged = true;
+        ESP_LOGI(TAG, "import: %s augmented with PLD (%lu)", id,
+                 (unsigned long)npl);
+    }
+
+    /* Annotation kinds: regenerate the whole events file, so it is only
+     * safe when every recorded ann kind is re-emittable from this
+     * cluster.  Without src_kinds (legacy manifests) nothing about the
+     * stored events can be verified — the sources stay put. */
+    const bool missing_ann = (cl->eve && !rec_eve) || (cl->csl && !rec_csl);
+    const bool regenerable = (!rec_eve || cl->eve) && (!rec_csl || cl->csl);
+    if (kinds_known && missing_ann && regenerable && (cl->eve || cl->csl)) {
+        if (write_events_snt(dir, id, cl->eve, cl->csl, cl->eve_ts,
+                             wav_dev, end_dev, &nev) != ESP_OK) {
+            ret = ESP_FAIL;
+            goto out;
+        }
+        m_ev = true;
+        merged = true;
+        ESP_LOGI(TAG, "import: %s events regenerated (+%lu events)", id,
+                 (unsigned long)nev);
+    }
+
+    /* Publish + manifest update only when something actually merged. */
+    if (merged) {
+        if (publish_parts(dir, id) != ESP_OK) { ret = ESP_FAIL; goto out; }
+        if (m_brp) {
+            manifest_set_num(mj, "brp_samples", (double)nf);
+            manifest_set_num(mj, "brp_mm_samples", (double)nm);
+            manifest_set_num(mj, "press_samples", (double)np);
+            manifest_add_kind(mj, "brp");
+        }
+        if (m_sa2m) {
+            manifest_set_num(mj, "sa2_samples", (double)ns2);
+            manifest_add_kind(mj, "sa2");
+        }
+        if (m_pldm) {
+            manifest_set_num(mj, "pld_samples", (double)npl);
+            manifest_add_kind(mj, "pld");
+        }
+        if (m_ev) {
+            if (cl->eve) manifest_add_kind(mj, "eve");
+            if (cl->csl) manifest_add_kind(mj, "csl");
+        }
+        /* A merged wave file can extend the session's true end beyond
+         * the annotation-only estimate it was committed with. */
+        int64_t m_end = 0;
+        json_i64(mj, "end_epoch_ms", &m_end);
+        if (end_ntp > m_end) {
+            manifest_set_num(mj, "end_epoch_ms", (double)end_ntp);
+            char iso[32];
+            imp_epoch_to_local_iso(end_ntp, iso, sizeof(iso));
+            cJSON_ReplaceItemInObject(mj, "end_iso",
+                                    cJSON_CreateString(iso));
+        }
+        /* A repeated augment replaces the marker rather than adding a
+         * duplicate key. */
+        if (cJSON_GetObjectItem(mj, "augmented"))
+            cJSON_ReplaceItemInObject(mj, "augmented", cJSON_CreateBool(true));
+        else
+            cJSON_AddBoolToObject(mj, "augmented", true);
+        manifest_set_num(mj, "augmented_at_ms", (double)time(NULL) * 1000);
+        if (write_json_atomic(mp, mj) != ESP_OK) { ret = ESP_FAIL; goto out; }
+    }
+
+    /* A kind is consumable when the manifest proves coverage (samples or
+     * src_kinds) or when it was just merged — anything unverifiable keeps
+     * its bit clear and is left in place by the caller. */
+    if (cl->brp && (m_flow > 0 || m_brp))   consumed |= 0x01;
+    if (cl->pld && (m_pld  > 0 || m_pldm))  consumed |= 0x02;
+    if (cl->sa2 && (m_sa2  > 0 || m_sa2m))  consumed |= 0x04;
+    if (cl->eve && (rec_eve || m_ev))       consumed |= 0x08;
+    if (cl->csl && (rec_csl || m_ev))       consumed |= 0x10;
+    w->src_consumed = consumed;
+
+out:
+    cJSON_Delete(mj);
+    if (ret != ESP_OK) return ret;
+    const bool all_done = ((consumed & offered) == offered);
+    if (!merged) return all_done ? ESP_ERR_INVALID_STATE
+                                : ESP_ERR_NOT_SUPPORTED;
+    ESP_LOGI(TAG, "import: %s session augmented in place", id);
+    return all_done ? ESP_OK : ESP_ERR_NOT_SUPPORTED;
+}
+
 static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
                                 const imp_drift_t *drift)
 {
@@ -2323,7 +2543,14 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
     mkdir(dir, 0775);
 
     esp_err_t sel = pick_session_id(dir, start_ntp, w->id, sizeof(w->id));
-    if (sel != ESP_OK) return sel;   /* INVALID_STATE = already imported */
+    if (sel == ESP_ERR_INVALID_STATE) {
+        /* The session already exists — merge whatever this cluster can
+         * still offer instead of deleting a late-recovered file as a
+         * duplicate (augment returns INVALID_STATE for a true dup). */
+        return augment_session(dir, w->id, w, cl, wav_ntp, wav_dev,
+                               end_dev, end_ntp);
+    }
+    if (sel != ESP_OK) return sel;
 
     ESP_LOGI(TAG, "import: session %s (day %s, wav+%lld ms, %s)",
              w->id, w->day, (long long)wav_off_ms, drift->source);
@@ -2453,6 +2680,17 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
         cJSON_AddNumberToObject(r, "press_samples", (double)n_press);
         cJSON_AddNumberToObject(r, "sa2_samples", (double)n_sa2);
         cJSON_AddNumberToObject(r, "pld_samples", (double)n_pld);
+        /* Which source kinds were offered at commit: the augment path
+         * relies on it to merge a late-recovered file without ever
+         * discarding verifiable content. */
+        cJSON *kinds = cJSON_AddArrayToObject(r, "src_kinds");
+        if (kinds) {
+            if (cl->brp) cJSON_AddItemToArray(kinds, cJSON_CreateString("brp"));
+            if (cl->pld) cJSON_AddItemToArray(kinds, cJSON_CreateString("pld"));
+            if (cl->sa2) cJSON_AddItemToArray(kinds, cJSON_CreateString("sa2"));
+            if (cl->eve) cJSON_AddItemToArray(kinds, cJSON_CreateString("eve"));
+            if (cl->csl) cJSON_AddItemToArray(kinds, cJSON_CreateString("csl"));
+        }
         cJSON_AddNumberToObject(r, "stream_notifications", 0);
         cJSON_AddNumberToObject(r, "gap_events", 0);
         cJSON_AddNumberToObject(r, "gap_missing", 0);
@@ -3142,11 +3380,22 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
                              w.day, g->src_dir);
                 }
             }
-        } else if (r == ESP_ERR_INVALID_STATE) {
-            /* Session already exists in the raw store → sources consumed */
+        } else if (r == ESP_ERR_INVALID_STATE || r == ESP_ERR_NOT_SUPPORTED) {
+            /* INVALID_STATE: true duplicate — every offered kind proved
+             * covered.  NOT_FINISHED: augment merged what it safely could
+             * and flagged the consumable sources in w.src_consumed; the
+             * rest stay in place — unverifiable, never deleted on a
+             * guess, retried on a later pass. */
             u->sessions_skipped++;
             for (int s = 0; s < 5; s++)
-                if (srcs[s]) { delete_source(srcs[s]); u->files_consumed++; }
+                if (srcs[s] && (w.src_consumed & (1u << s))) {
+                    delete_source(srcs[s]);
+                    u->files_consumed++;
+                }
+            if (r == ESP_ERR_NOT_SUPPORTED)
+                ESP_LOGW(TAG, "import: %s session %s — unverifiable "
+                         "source(s) kept for a later pass",
+                         g->src_dir, w.id);
         } else {
             u->sessions_failed++;
             /* Move unconvertible sources aside as *.bad — never deleted,

@@ -660,7 +660,8 @@ static bool run_backend(backend_rt_t *r, int max_days,
     } else {
         cooldown_reset(r);
         set_be_state(r, SB_IDLE);
-        ESP_LOGI(TAG, "%s: up to date%s", be->id,
+        ESP_LOGI(TAG, "%s: up to date%s%s", be->id,
+                 deferred_busy ? " (some work deferred)" : "",
                  bundle_committed && !any_ok ? " (root files)" : "");
     }
     return true;

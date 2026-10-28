@@ -80,3 +80,11 @@ bool sb_ble_therapy_active(void);
 /* Injected by main.c: run the Phase-1 importer over freshly staged files. */
 typedef void (*sb_import_kick_fn_t)(void);
 void sb_ble_set_import_kick_fn(sb_import_kick_fn_t fn);
+
+/* Generic provisioning-op passthrough for the portal bridge-config dialog.
+ * `op` is a bridge op name (GET_CONFIG/SET_CONFIG/WIFI_SCAN/EZSHARE_CHECK),
+ * `args` is the request's "args" object (not consumed). *out_json receives
+ * a heap-allocated {"ok":...,"result"|"error":{...}} the caller frees.
+ * Returns the op result; the JSON envelope exists even when it fails. */
+esp_err_t sb_ble_rpc(const char *op, const cJSON *args, uint32_t timeout_ms,
+                     char **out_json);

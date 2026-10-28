@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "cJSON.h"
 #include "sb_proto.h"
 
 #ifdef SB_PROTO_HOST
@@ -35,6 +36,8 @@
 #endif
 #else
 #include "miniz.h"         /* firmware: ROM tinfl                    */
+#include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "sd_storage.h"
 #endif
 
@@ -93,11 +96,39 @@ static bool inflate_raw(const uint8_t *src, uint32_t src_len, uint8_t *dst,
     zs.avail_out = dst_len;
     int rc = inflate(&zs, Z_FINISH);
     const uint32_t produced = dst_len - zs.avail_out;
+    const uLong consumed = zs.total_in;
     inflateEnd(&zs);
-    return (rc == Z_STREAM_END || rc == Z_OK) && produced == dst_len;
+    /* One block = exactly one deflate stream: it must END, produce the
+     * declared raw length, and consume the whole encoded payload — a
+     * stream that finishes early with trailing bytes means the input was
+     * spliced, which the caller must treat as corruption, not success. */
+    return rc == Z_STREAM_END && produced == dst_len && consumed == src_len;
 #else
-    const size_t got = tinfl_decompress_mem_to_mem(dst, dst_len, src, src_len, 0);
-    return got == dst_len;
+    /* tinfl_decompress_mem_to_mem() instantiates the ~11 KiB
+     * tinfl_decompressor on the stack.  Keep one static context in PSRAM
+     * and drive the low-level API instead (single-user: stream decode is
+     * confined to the bridge task's receive pump).                     */
+    static tinfl_decompressor *s_tinfl;
+    if (!s_tinfl)
+        s_tinfl = heap_caps_malloc(sizeof(tinfl_decompressor),
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_tinfl) return false;
+    tinfl_init(s_tinfl);
+    size_t in = src_len, out = dst_len;
+    /* USING_NON_WRAPPING_OUTPUT_BUF: dst always holds the whole block —
+     * without it tinfl requires a power-of-2 output buffer and returns
+     * BAD_PARAM for the arbitrary raw_len sizes the codec emits.        */
+    const tinfl_status st = tinfl_decompress(s_tinfl, src, &in, dst, dst,
+                                             &out,
+                                             TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    /* in must equal src_len: TINFL_STATUS_DONE with bytes left over is
+     * an early-ended stream + trailing junk — a spliced input, i.e.
+     * corruption the stream layer must fail on (see seq-gap handling). */
+    if (st != TINFL_STATUS_DONE || out != dst_len || in != src_len)
+        ESP_LOGW("sb_proto", "tinfl st=%d in=%u/%lu out=%u/%lu",
+                 (int)st, (unsigned)in, (unsigned long)src_len,
+                 (unsigned)out, (unsigned long)dst_len);
+    return st == TINFL_STATUS_DONE && out == dst_len && in == src_len;
 #endif
 }
 
@@ -147,4 +178,87 @@ bool sb_stage_path(const char *directory, const char *name, char *out,
         return false;                               /* never guess a path */
     }
     return w > 0 && (size_t)w < cap;
+}
+
+sb_rsp_kind_t sb_rsp_classify(const struct cJSON *root, struct cJSON **result,
+                              char *code, size_t code_cap)
+{
+    if (result) *result = NULL;
+    if (code && code_cap) code[0] = '\0';
+    if (!root) return SB_RSP_BAD;
+    if (cJSON_IsTrue(cJSON_GetObjectItem(root, "ok"))) {
+        struct cJSON *res = cJSON_GetObjectItem(root, "result");
+        if (!cJSON_IsObject(res)) return SB_RSP_BAD;
+        if (result) *result = res;
+        return SB_RSP_OK;
+    }
+    const char *ec = cJSON_GetStringValue(
+        cJSON_GetObjectItem(cJSON_GetObjectItem(root, "error"), "code"));
+    if (!ec) return SB_RSP_BAD;
+    if (code && code_cap) snprintf(code, code_cap, "%s", ec);
+    return SB_RSP_ERROR;
+}
+
+unsigned sb_stream_retry_ms(const char *code)
+{
+    if (!code) return 0;
+    /* Bridge refusals: the wait mirrors the resource the bridge named. */
+    if (!strcmp(code, "STALE")) return 12000;
+    if (!strcmp(code, "BUSY"))  return 1500;
+    if (!strcmp(code, "HTTP_ERROR") || !strcmp(code, "http_error"))
+        return 1500;
+    if (!strcmp(code, "source_unverified") ||
+        !strcmp(code, "journal_error"))
+        return 2000;
+    /* Local transport terminations: the stream is already dead, so a fresh
+     * whole-file attempt (§10.3 restart-at-0) is the recovery path.  A
+     * short settle lets the bridge finish tearing the old fetch down. */
+    static const char *const transport[] = {
+        "seq gap", "v2 decode", "rx overflow", "rx drop", "rx flatten",
+        "stream stalled", "no STREAM_END", "no STREAM_BEGIN",
+        "link lost", "initial credit", "write", "decode overflow",
+        "size mismatch", "wire mismatch", "sha256 mismatch",
+        "stream not ok", "aborted",
+    };
+    for (size_t i = 0; i < sizeof(transport) / sizeof(transport[0]); i++)
+        if (!strcmp(code, transport[i])) return 1000;
+    return 0;
+}
+
+sb_seq_kind_t sb_seq_class(uint16_t seq, uint16_t expected)
+{
+    /* back = how far seq sits BEHIND expected (mod 65536).  A frame
+     * behind the consumer position is a re-send and is dropped; a
+     * forward jump (back > half the space) means frames were lost.  The
+     * exact 0x8000 midpoint is genuinely ambiguous and is pinned to DUP:
+     * if it really was a gap, the next in-order frame terminates the
+     * stream anyway. */
+    if (seq == expected) return SB_SEQ_ACCEPT;
+    return (uint16_t)(expected - seq) > (uint16_t)0x8000 ? SB_SEQ_GAP
+                                                       : SB_SEQ_DUP;
+}
+
+bool sb_parse_u64_str(const char *s, uint64_t *out)
+{
+    if (!s || !s[0]) return false;
+    uint64_t v = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+        const uint64_t d = (uint64_t)(*p - '0');
+        if (v > (UINT64_MAX - d) / 10) return false;
+        v = v * 10 + d;
+    }
+    if (out) *out = v;
+    return true;
+}
+
+bool sb_hex_str_ok(const char *s, size_t n)
+{
+    if (!s || strlen(s) != n) return false;
+    for (size_t i = 0; i < n; i++) {
+        const char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F'))) return false;
+    }
+    return true;
 }

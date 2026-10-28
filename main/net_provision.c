@@ -1550,6 +1550,14 @@ static esp_err_t ble_pair_handler(httpd_req_t *req)
     bool scanned_bridge = false;
     if (as11_ble_scan_lookup_ex(addr->valuestring, &addr_type, &scanned_bridge))
         bridge = scanned_bridge;    /* the scan is authoritative */
+    /* Slot 1 is a single source: pairing a device of the other type
+     * drops the previous bond, or the stranded peer would keep owning
+     * the slot (bridge_owns_slot1 suppresses AS11 reconnect forever). */
+    if (bridge) {
+        if (as11_ble_is_paired()) as11_ble_forget();
+    } else {
+        if (sb_ble_is_paired()) sb_ble_forget();
+    }
     esp_err_t e = bridge ? sb_ble_start_pair_ex(addr->valuestring, addr_type)
                          : as11_ble_start_pair(addr->valuestring);
     cJSON_Delete(j);
@@ -1741,6 +1749,73 @@ static esp_err_t ble_passthrough_handler(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_send(req, out_json, HTTPD_RESP_USE_STRLEN);
+    free(out_json);
+    return ESP_OK;
+}
+
+/* POST /api/sb/op — proxy a provisioning op to the bonded SomnoBridge so
+ * the portal can configure the bridge's Wi-Fi/EZShare without its setup
+ * AP. Whitelisted ops only; file/stream ops stay on the sync path. */
+static esp_err_t sb_op_handler(httpd_req_t *req)
+{
+    int total = req->content_len;
+    if (total <= 0 || total > 1024) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body (1..1024 bytes)");
+        return ESP_FAIL;
+    }
+
+    char *body = malloc(total + 1);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    int received = httpd_req_recv(req, body, total);
+    if (received < 0) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    cJSON *j = cJSON_Parse(body);
+    free(body);
+    const char *op = j ? cJSON_GetStringValue(cJSON_GetObjectItem(j, "op"))
+                       : NULL;
+    static const char *const allowed[] = {
+        "GET_CONFIG", "SET_CONFIG", "WIFI_SCAN", "EZSHARE_CHECK"
+    };
+    bool ok = false;
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        if (op && strcmp(op, allowed[i]) == 0) { ok = true; break; }
+    }
+    if (!ok) {
+        cJSON_Delete(j);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unsupported op");
+        return ESP_FAIL;
+    }
+
+    /* EZSHARE_CHECK runs a live probe-join on the bridge (~10 s worst
+     * case); the others answer from RAM/NVS state quickly. */
+    uint32_t tmo = strcmp(op, "EZSHARE_CHECK") == 0 ? 25000 : 12000;
+    char *out_json = NULL;
+    esp_err_t err = sb_ble_rpc(op, cJSON_GetObjectItem(j, "args"), tmo,
+                               &out_json);
+    cJSON_Delete(j);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    if (!out_json) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        const char *errmsg = (err == ESP_ERR_INVALID_STATE)
+                                 ? "bridge not connected"
+                                 : "bridge RPC failed";
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "{\"ok\":false,\"error\":\"%s\"}",
+                 errmsg);
+        httpd_resp_sendstr(req, errbuf);
+        return ESP_FAIL;
+    }
     httpd_resp_send(req, out_json, HTTPD_RESP_USE_STRLEN);
     free(out_json);
     return ESP_OK;
@@ -3648,6 +3723,7 @@ static esp_err_t start_webserver(void)
     httpd_uri_t ble_conf = { .uri = "/api/ble/confirm", .method = HTTP_POST, .handler = ble_confirm_handler };
     httpd_uri_t ble_forget = { .uri = "/api/ble/forget", .method = HTTP_POST, .handler = ble_forget_handler };
     httpd_uri_t ble_pass = { .uri = "/api/ble/passthrough", .method = HTTP_POST, .handler = ble_passthrough_handler };
+    httpd_uri_t sb_op = { .uri = "/api/sb/op", .method = HTTP_POST, .handler = sb_op_handler };
     httpd_uri_t ble_exp_get = { .uri = "/api/ble/experimental", .method = HTTP_GET, .handler = ble_experimental_get_handler };
     httpd_uri_t ble_exp_post = { .uri = "/api/ble/experimental", .method = HTTP_POST, .handler = ble_experimental_post_handler };
     reg_uri(s_httpd, &import_status);
@@ -3657,6 +3733,7 @@ static esp_err_t start_webserver(void)
     reg_uri(s_httpd, &ble_conf);
     reg_uri(s_httpd, &ble_forget);
     reg_uri(s_httpd, &ble_pass);
+    reg_uri(s_httpd, &sb_op);
     reg_uri(s_httpd, &ble_exp_get);
     reg_uri(s_httpd, &ble_exp_post);
 

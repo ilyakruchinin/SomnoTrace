@@ -72,3 +72,43 @@ bool sb_v2_block(uint8_t codec, const uint8_t *enc, uint32_t enc_len,
  * anything else (never guesses a path). */
 bool sb_stage_path(const char *directory, const char *name, char *out,
                    size_t cap, char *day, size_t day_cap);
+
+struct cJSON;
+
+/* Stream-op response classification (STREAM_BEGIN / STREAM_END shapes).
+ * SB_RSP_OK    — ok:true with a result object; *result receives it
+ * SB_RSP_ERROR — a protocol rejection; error.code copied (bounded) to `code`
+ * SB_RSP_BAD   — anything else: malformed or an unexpected shape          */
+typedef enum {
+    SB_RSP_OK = 0,
+    SB_RSP_ERROR,
+    SB_RSP_BAD
+} sb_rsp_kind_t;
+sb_rsp_kind_t sb_rsp_classify(const struct cJSON *root, struct cJSON **result,
+                              char *code, size_t code_cap);
+
+/* How long to wait before retrying a transient stream error: STALE means
+ * the bridge queued a day rescan (~10 s); BUSY means the previous stream
+ * is still tearing down.  Local transport terminations (sequence gap,
+ * decode failure, dead air, link loss) restart the whole file after a
+ * short settle.  0 for anything not retryable. */
+unsigned sb_stream_retry_ms(const char *code);
+
+/* Compact-frame sequence check, modulo 65536.  Frames behind the expected
+ * counter by >= 0x8000 (a backward distance) are duplicates of already
+ * received frames — the sender never reuses seq — and must be dropped.
+ * A forward jump means frames were lost; the splice that would follow is
+ * unrecoverable, so the stream must be terminated rather than continued. */
+typedef enum {
+    SB_SEQ_ACCEPT = 0,
+    SB_SEQ_DUP,
+    SB_SEQ_GAP
+} sb_seq_kind_t;
+sb_seq_kind_t sb_seq_class(uint16_t seq, uint16_t expected);
+
+/* Strict unsigned-64 decimal parse: the whole string must be 1-20 digits
+ * and fit — partial parses and trailing junk are rejected. */
+bool sb_parse_u64_str(const char *s, uint64_t *out);
+
+/* True when s is exactly n hex digits (either case). */
+bool sb_hex_str_ok(const char *s, size_t n);

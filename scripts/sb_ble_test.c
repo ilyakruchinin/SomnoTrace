@@ -22,18 +22,25 @@
  * (https://github.com/ilyakruchinin)." See the NOTICE file for details.
  */
 
-/* Covers the three pieces of the SomnoBridge client that do not need BLE:
+/* Covers the pieces of the SomnoBridge client that do not need BLE:
  *   - the 16-byte frame header (pack/parse round-trip, rejections),
  *   - the v2 block codecs (raw / raw-deflate / deflate+delta16),
  *   - the bridge-path → IMPORT/ mapping, including the drive-prefixed form
- *     the bridge canonicaliser demands.
+ *     the bridge canonicaliser demands,
+ *   - stream response classification: the first GET_FILE reply may be a
+ *     STREAM_BEGIN grant or an ok:false refusal (STALE/BUSY/therapy gates)
+ *     that must be surfaced, never mistaken for stream admission,
+ *   - the retry policy for those transient refusals.
  * The deflate fixtures are produced with zlib here, the same wire format the
- * firmware inflates through the ESP ROM. */
+ * firmware inflates through the ESP ROM.  Response trees are built with the
+ * cJSON shim — its parser is a stub, but its constructors produce the same
+ * trees the firmware sees after cJSON_Parse. */
 
 #include <stdio.h>
 #include <string.h>
 #include <zlib.h>
 
+#include "cJSON.h"
 #include "sb_proto.h"
 
 static int checks, fails;
@@ -169,6 +176,19 @@ static void test_codecs(void)
           "unknown codec rejected");
     CHECK(!sb_v2_block(1, enc, (uint32_t)elen, out, sizeof(raw) - 1),
           "wrong raw_len rejected");
+
+    /* Trailing bytes after the deflate stream mean the block boundary
+     * was spliced (a lost frame) — the stream must fail, not accept
+     * a cleanly-ending prefix.  Previously this returned true.      */
+    uint8_t junk[800];
+    memcpy(junk, enc, (size_t)elen);
+    junk[elen] = 0xAA;
+    memset(out, 0, sizeof(out));
+    CHECK(!sb_v2_block(1, junk, (uint32_t)elen + 1, out, sizeof(raw)),
+          "trailing byte after deflate stream rejected");
+    /* and a truncated stream that ends early must also fail */
+    CHECK(!sb_v2_block(1, enc, (uint32_t)elen - 1, out, sizeof(raw)),
+          "truncated deflate stream rejected");
 }
 
 static void test_paths(void)
@@ -217,12 +237,202 @@ static void test_paths(void)
           "short output buffer rejected");
 }
 
+/* Build a response tree shaped like the bridge's replies:
+ *   {"op":<op>,"ok":true,"result":{"size_unit_shift":<shift>}}
+ *   {"op":<op>,"ok":false,"error":{"code":<code>}}                    */
+static cJSON *mk_rsp(const char *op, bool ok, const char *code, int shift)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (op) cJSON_AddStringToObject(root, "op", op);
+    cJSON_AddBoolToObject(root, "ok", ok);
+    if (ok) {
+        cJSON *res = cJSON_CreateObject();
+        cJSON_AddNumberToObject(res, "size_unit_shift", shift);
+        cJSON_AddItemToObject(root, "result", res);
+    } else if (code) {
+        cJSON *err = cJSON_CreateObject();
+        cJSON_AddStringToObject(err, "code", code);
+        cJSON_AddItemToObject(root, "error", err);
+    }
+    return root;
+}
+
+static void test_rsp_classify(void)
+{
+    cJSON *res;
+    char code[16];
+
+    /* admission granted: ok + result object, unit shift extractable */
+    cJSON *r = mk_rsp("STREAM_BEGIN", true, NULL, 12);
+    CHECK(sb_rsp_classify(r, &res, code, sizeof(code)) == SB_RSP_OK,
+          "STREAM_BEGIN ok classifies");
+    CHECK(res && cJSON_IsObject(res), "result object returned");
+    cJSON *us = cJSON_GetObjectItem(res, "size_unit_shift");
+    CHECK(cJSON_IsNumber(us) && us->valuedouble == 12, "unit shift visible");
+    cJSON_Delete(r);
+
+    /* refusals carry the real error code — the phantom-stall fix relies
+     * on these reaching s_last_error instead of a stall timeout       */
+    const char *errs[] = { "STALE", "BUSY", "THERAPY_UNKNOWN",
+                           "THERAPY_ACTIVE", "SIZE_MISMATCH" };
+    for (size_t i = 0; i < sizeof(errs) / sizeof(errs[0]); i++) {
+        code[0] = '\0';
+        r = mk_rsp("GET_FILE", false, errs[i], 0);
+        CHECK(sb_rsp_classify(r, &res, code, sizeof(code)) == SB_RSP_ERROR,
+              "refusal classifies as error");
+        CHECK(res == NULL, "refusal yields no result");
+        CHECK_STR(code, errs[i], "error code preserved");
+        cJSON_Delete(r);
+    }
+
+    /* a long code must still be copied bounded + NUL-terminated */
+    char tiny[8];
+    r = mk_rsp("GET_FILE", false, "THERAPY_UNKNOWN_LONG", 0);
+    CHECK(sb_rsp_classify(r, NULL, tiny, sizeof(tiny)) == SB_RSP_ERROR,
+          "long code still classifies");
+    CHECK(strlen(tiny) < sizeof(tiny), "code copy is bounded");
+    CHECK(tiny[sizeof(tiny) - 1] == '\0', "code copy is terminated");
+    cJSON_Delete(r);
+
+    /* malformed shapes are BAD, never OK or ERROR */
+    CHECK(sb_rsp_classify(NULL, &res, code, sizeof(code)) == SB_RSP_BAD,
+          "NULL response is malformed");
+    r = mk_rsp("GET_FILE", false, NULL, 0);        /* ok:false, no error */
+    CHECK(sb_rsp_classify(r, &res, code, sizeof(code)) == SB_RSP_BAD,
+          "refusal without code is malformed");
+    cJSON_Delete(r);
+    r = cJSON_CreateObject();                      /* empty object */
+    CHECK(sb_rsp_classify(r, &res, code, sizeof(code)) == SB_RSP_BAD,
+          "empty response is malformed");
+    cJSON_Delete(r);
+    r = cJSON_CreateObject();                      /* ok:true, no result */
+    cJSON_AddBoolToObject(r, "ok", true);
+    CHECK(sb_rsp_classify(r, &res, code, sizeof(code)) == SB_RSP_BAD,
+          "ok without result is malformed");
+    cJSON_Delete(r);
+    r = cJSON_CreateObject();                      /* ok:true, result≠object */
+    cJSON_AddBoolToObject(r, "ok", true);
+    cJSON_AddStringToObject(r, "result", "nope");
+    CHECK(sb_rsp_classify(r, &res, code, sizeof(code)) == SB_RSP_BAD,
+          "non-object result is malformed");
+    cJSON_Delete(r);
+}
+
+static void test_retry_policy(void)
+{
+    /* transient refusals: bounded waits matching the reference client */
+    CHECK(sb_stream_retry_ms("STALE") == 12000, "STALE waits out the rescan");
+    CHECK(sb_stream_retry_ms("BUSY") == 1500, "BUSY waits out teardown");
+    CHECK(sb_stream_retry_ms("HTTP_ERROR") == 1500, "card-side HTTP retry");
+    CHECK(sb_stream_retry_ms("http_error") == 1500, "END http_error retry");
+    CHECK(sb_stream_retry_ms("source_unverified") == 2000, "post-verify race");
+    CHECK(sb_stream_retry_ms("journal_error") == 2000, "journal flush retry");
+    /* local transport terminations: restart-at-0 after a short settle —
+     * the stream is already dead, so retrying is the recovery path     */
+    const char *transport[] = {
+        "seq gap", "v2 decode", "rx overflow", "rx drop", "rx flatten",
+        "stream stalled", "no STREAM_END", "no STREAM_BEGIN",
+        "link lost", "initial credit", "write", "decode overflow",
+        "size mismatch", "wire mismatch", "sha256 mismatch",
+        "stream not ok", "aborted",
+    };
+    for (size_t i = 0; i < sizeof(transport) / sizeof(transport[0]); i++)
+        CHECK(sb_stream_retry_ms(transport[i]) == 1000,
+              "transport failure retries");
+    /* everything else fails the attempt outright */
+    CHECK(sb_stream_retry_ms("THERAPY_UNKNOWN") == 0, "therapy gate not retried");
+    CHECK(sb_stream_retry_ms("THERAPY_ACTIVE") == 0, "active therapy not retried");
+    CHECK(sb_stream_retry_ms("SIZE_MISMATCH") == 0, "source change not retried");
+    CHECK(sb_stream_retry_ms("bad STREAM_BEGIN") == 0, "malformed not retried");
+    CHECK(sb_stream_retry_ms("bad STREAM_END") == 0, "malformed END not retried");
+    CHECK(sb_stream_retry_ms("expected size mismatch") == 0,
+          "listing disagreement not retried");
+    CHECK(sb_stream_retry_ms("truncated block") == 0, "residual not retried");
+    CHECK(sb_stream_retry_ms("missing sha256") == 0, "missing field not retried");
+    CHECK(sb_stream_retry_ms("") == 0, "empty code not retried");
+    CHECK(sb_stream_retry_ms(NULL) == 0, "NULL code not retried");
+    /* exact-match only: prefixes/truncations must not retry */
+    CHECK(sb_stream_retry_ms("STAL") == 0, "truncated STALE not retried");
+    CHECK(sb_stream_retry_ms("STALE ") == 0, "padded STALE not retried");
+    CHECK(sb_stream_retry_ms("seq") == 0, "prefix of seq gap not retried");
+}
+
+/* Compact-frame sequence check, modulo 65536: duplicates behind the
+ * expected position must be dropped, forward jumps are lost frames. */
+static void test_seq_class(void)
+{
+    CHECK(sb_seq_class(0, 0) == SB_SEQ_ACCEPT, "first frame accepts");
+    CHECK(sb_seq_class(7, 7) == SB_SEQ_ACCEPT, "in-order frame accepts");
+    CHECK(sb_seq_class(6, 7) == SB_SEQ_DUP, "one-behind is a duplicate");
+    CHECK(sb_seq_class(0, 7) == SB_SEQ_DUP, "re-send from far behind");
+    CHECK(sb_seq_class(8, 7) == SB_SEQ_GAP, "one-ahead means a lost frame");
+    CHECK(sb_seq_class(700, 7) == SB_SEQ_GAP, "large forward jump is a gap");
+    /* wrap-around: the counter crosses 65535→0 continuously, and a frame
+     * that stayed behind the wrap is still a duplicate, not a gap       */
+    CHECK(sb_seq_class(0, 0) == SB_SEQ_ACCEPT, "wrapped position accepts");
+    CHECK(sb_seq_class(65535, 0) == SB_SEQ_DUP, "pre-wrap frame is dup");
+    CHECK(sb_seq_class(1, 0) == SB_SEQ_GAP, "post-wrap forward jump is gap");
+    CHECK(sb_seq_class(65534, 65535) == SB_SEQ_DUP, "one before wrap dup");
+    /* boundary: forward distances below half the space are gaps; the
+     * exact midpoint is pinned to DUP (a real gap terminates on the next
+     * in-order frame anyway, so the ambiguous edge must not)           */
+    CHECK(sb_seq_class(32772, 5) == SB_SEQ_GAP,
+          "forward distance 32767 is a gap");
+    CHECK(sb_seq_class(32773, 5) == SB_SEQ_DUP,
+          "midpoint 0x8000 is pinned to dup");
+}
+
+/* Strict u64 decimal parse — the whole string must be digits. */
+static void test_parse_u64(void)
+{
+    uint64_t v = 0;
+    CHECK(sb_parse_u64_str("0", &v) && v == 0, "zero parses");
+    CHECK(sb_parse_u64_str("12345", &v) && v == 12345, "plain parses");
+    CHECK(sb_parse_u64_str("18446744073709551615", &v) &&
+          v == 18446744073709551615ULL, "u64 max parses");
+    CHECK(!sb_parse_u64_str("18446744073709551616", &v),
+          "u64 overflow rejected");
+    CHECK(!sb_parse_u64_str("99999999999999999999", &v),
+          "long overflow rejected");
+    CHECK(!sb_parse_u64_str("12x", &v), "trailing junk rejected");
+    CHECK(!sb_parse_u64_str("x12", &v), "leading junk rejected");
+    CHECK(!sb_parse_u64_str("12 3", &v), "embedded space rejected");
+    CHECK(!sb_parse_u64_str("", &v), "empty rejected");
+    CHECK(!sb_parse_u64_str("-1", &v), "sign rejected");
+    CHECK(!sb_parse_u64_str(NULL, &v), "NULL rejected");
+    CHECK(sb_parse_u64_str("12", NULL), "NULL out is validate-only");
+}
+
+static void test_hex_str_ok(void)
+{
+    const char *h64 =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    CHECK(sb_hex_str_ok(h64, 64), "64-hex sha accepted");
+    CHECK(sb_hex_str_ok(h64, 63) == false, "short sha rejected");
+    CHECK(sb_hex_str_ok(h64, 65) == false, "long sha rejected");
+    char bad[65];
+    memcpy(bad, h64, 64);
+    bad[63] = 'g';
+    bad[64] = '\0';
+    CHECK(!sb_hex_str_ok(bad, 64), "non-hex char rejected");
+    memcpy(bad, h64, 64);
+    bad[10] = 'F';
+    CHECK(sb_hex_str_ok(bad, 64), "uppercase hex accepted");
+    CHECK(!sb_hex_str_ok(NULL, 64), "NULL rejected");
+    CHECK(sb_hex_str_ok("", 0), "empty with n=0 vacuously true");
+}
+
 int main(void)
 {
     test_header();
     test_delta16();
     test_codecs();
     test_paths();
+    test_rsp_classify();
+    test_retry_policy();
+    test_seq_class();
+    test_parse_u64();
+    test_hex_str_ok();
     printf("sb_ble_test: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

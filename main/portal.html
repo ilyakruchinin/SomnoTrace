@@ -481,6 +481,43 @@ body.fixed-height .logs-container{flex:0 0 auto;height:calc(100dvh - 145px);min-
 </form>
 </div>
 
+<!-- SomnoBridge network setup — offered automatically right after pairing -->
+<div id="sb-cfg-overlay" class="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="sb-cfg-title">
+<div class="auth-box" style="max-width:420px;text-align:left">
+<div class="card-title" id="sb-cfg-title" style="margin-bottom:4px">Configure SomnoBridge</div>
+<p class="card-desc">Give the bridge access to your EZShare card's Wi-Fi so it can fetch therapy files on its own. This replaces the bridge's own setup AP.</p>
+<div class="form-group" style="margin-top:12px">
+<label for="sb-cfg-ssid">EZShare network</label>
+<div style="display:flex;gap:8px">
+<select id="sb-cfg-ssid" class="form-control" style="flex:1" onchange="sbCfgSsidChange()">
+<option value="">— scan for networks —</option>
+</select>
+<button type="button" class="btn btn-outline btn-sm" id="sb-cfg-scan-btn" onclick="sbCfgScan()">Scan</button>
+</div>
+<input type="text" id="sb-cfg-ssid-manual" class="form-control" style="display:none;margin-top:6px" placeholder="Network name (SSID)" maxlength="32">
+</div>
+<div class="form-group" id="sb-cfg-pass-group">
+<label for="sb-cfg-pass">Wi-Fi password</label>
+<div class="pw-wrap">
+<input type="password" id="sb-cfg-pass" class="form-control" maxlength="64" placeholder="EZShare card password" autocomplete="off">
+<button type="button" class="pw-toggle" onclick="togglePw('sb-cfg-pass')" aria-label="Toggle password visibility">
+<svg viewBox="0 0 24 24" class="eye-open"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
+</button>
+</div>
+<p class="card-desc" id="sb-cfg-pass-hint" style="margin-top:4px">Leave blank to keep the password already stored on the bridge.</p>
+</div>
+<div id="sb-cfg-warning" class="card" style="display:none;border-color:var(--warning);background:rgba(255,170,0,.08);padding:10px 12px;margin-top:8px">
+<div style="font-weight:600;font-size:.85rem;color:var(--warning)">Insecure EZShare card</div>
+<p class="card-desc" style="margin-top:4px" id="sb-cfg-warning-text"></p>
+</div>
+<div id="sb-cfg-msg" class="status-msg" style="margin-top:8px"></div>
+<div style="display:flex;gap:8px;margin-top:14px">
+<button type="button" class="btn btn-primary" style="flex:1" id="sb-cfg-save-btn" onclick="sbCfgSave()">Save &amp; Test</button>
+<button type="button" class="btn" onclick="closeSbConfig()">Done</button>
+</div>
+</div>
+</div>
+
 <header>
 <a href="#" class="brand">
 <img src="/logo.svg" alt="SomnoTrace" class="brand-full">
@@ -588,23 +625,16 @@ Scan for CPAP / SomnoBridge
 <select id="ble-dev" class="form-control"></select>
 </div>
 <button class="btn btn-primary btn-sm" type="button" id="btn-ble-pair" style="display:none;margin-top:8px" onclick="blePair()">Pair Device</button>
-<div class="form-group" id="sb-status-group" style="margin-top:12px;display:none">
-<label>SomnoBridge</label>
-<p class="card-desc" id="sb-status-line" style="margin:2px 0 8px 0"></p>
-<div style="display:flex;gap:8px;flex-wrap:wrap">
-<button type="button" class="btn btn-sm" id="sb-pair-btn" style="display:none" onclick="sbPairFound()">Pair SomnoBridge</button>
-<button type="button" class="btn btn-sm" id="sb-sync-btn" onclick="sbSyncNow(false)">Sync now</button>
-<button type="button" class="btn btn-sm" onclick="sbSyncNow(true)">Full sync</button>
-<button type="button" class="btn btn-sm" onclick="importNow()">Import now</button>
-</div>
-</div>
 <div class="form-group" id="ble-passkey-group" style="display:none;margin-top:12px">
 <label id="ble-passkey-label">Enter the 4-digit code shown on your CPAP screen</label>
 <input id="ble-passkey" type="text" inputmode="numeric" maxlength="6" placeholder="123456" class="form-control" style="max-width:170px;text-align:center;font-size:1.2rem;letter-spacing:.3em">
 <button class="btn btn-primary btn-sm" type="button" style="margin-top:8px" onclick="bleConfirm()">Confirm Code</button>
 </div>
 </div>
-<button class="btn btn-danger btn-sm" type="button" id="btn-ble-forget" style="display:none;margin-top:10px;width:fit-content" onclick="bleForget()">Unpair Device</button>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+<button class="btn btn-danger btn-sm" type="button" id="btn-ble-forget" style="display:none;width:fit-content" onclick="bleForget()">Unpair Device</button>
+<button class="btn btn-outline btn-sm" type="button" id="btn-sb-config" style="display:none;width:fit-content" onclick="openSbConfig()">Configure SomnoBridge</button>
+</div>
 <div id="ble-status" class="status-msg"></div>
 </div>
 </div>
@@ -1352,6 +1382,16 @@ Upload Progress
 <div class="info-row"><span class="info-label">PSRAM LFB</span><span class="info-value" id="stat-ps-lfb">--</span></div>
 <div class="info-row"><span class="info-label">Tasks</span><span class="info-value" id="stat-tasks">--</span></div>
 </div>
+<!-- SomnoBridge detail — only while a bridge is/was the paired source -->
+<div class="card info-list" id="sb-status-card" style="display:none">
+<div class="card-title">SomnoBridge</div>
+<div class="info-row"><span class="info-label">Connection</span><span class="info-value" id="sb-conn">--</span></div>
+<div class="info-row"><span class="info-label">Therapy</span><span class="info-value" id="sb-therapy">--</span></div>
+<div class="info-row"><span class="info-label">Card transfer</span><span class="info-value" id="sb-transfer">--</span></div>
+<div class="info-row"><span class="info-label">Sync</span><span class="info-value" id="sb-sync">--</span></div>
+<div class="info-row"><span class="info-label">Last sync</span><span class="info-value" id="sb-lastsync">--</span></div>
+<div class="info-row"><span class="info-label">Last error</span><span class="info-value" id="sb-err">--</span></div>
+</div>
 </div>
 </section>
 
@@ -1378,6 +1418,21 @@ Upload Progress
 
 <!-- ═══════════════ ACTIONS TAB ═══════════════ -->
 <section id="actions" class="tab-content sta-only">
+<!-- SomnoBridge sync — only while a bridge is the bonded source -->
+<div class="card" id="sb-actions-card" style="display:none">
+<div class="card-title">
+<svg viewBox="0 0 24 24"><path d="M17 7h-4v2h4c1.65 0 3 1.35 3 3s-1.35 3-3 3h-4v2h4c2.76 0 5-2.24 5-5s-2.24-5-5-5zm-6 8H7c-1.65 0-3-1.35-3-3s1.35-3 3-3h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-2zm-3-4h8v2H8v-2z"/></svg>
+SomnoBridge Sync
+</div>
+<p class="card-desc">Pull therapy data from the EZShare card through the paired SomnoBridge, then import it into SomnoTrace.</p>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<button type="button" class="btn btn-primary btn-sm" onclick="sbSyncNow(false)">Sync now</button>
+<button type="button" class="btn btn-sm" onclick="sbSyncNow(true)">Full sync (365 days)</button>
+<button type="button" class="btn btn-outline btn-sm" onclick="importNow()">Import now</button>
+</div>
+<div id="sb-status-line" class="status-msg" style="margin-top:8px"></div>
+</div>
+
 <div class="card">
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>
@@ -2314,6 +2369,7 @@ function loadStatusTab(d) {
   var bleEl = document.getElementById('status-ble');
   if (bleEl) {
     var ble = d.ble || {};
+    var brdg = ble.bridge || {};
     var st = ble.state || 'idle';
     var labels = {
       'idle': 'Not paired', 'scanning': 'Scanning…', 'connecting': 'Connecting…',
@@ -2325,8 +2381,16 @@ function loadStatusTab(d) {
       'waiting_passkey': 'var(--warning)', 'confirming': 'var(--warning)',
       'paired': 'var(--success)', 'error': 'var(--danger)'
     };
-    bleEl.textContent = labels[st] || st;
-    bleEl.style.color = colors[st] || 'var(--text-muted)';
+    if (brdg.paired) {
+      bleEl.textContent = 'SomnoBridge';
+      bleEl.style.color = 'var(--success)';
+    } else if (!ble.paired && brdg.state === 'waiting_passkey') {
+      bleEl.textContent = 'SomnoBridge PIN';
+      bleEl.style.color = 'var(--warning)';
+    } else {
+      bleEl.textContent = labels[st] || st;
+      bleEl.style.color = colors[st] || 'var(--text-muted)';
+    }
   }
 
   /* Oximeter (O2 Ring) status */
@@ -2548,7 +2612,10 @@ function bleScan() {
     var sel = document.getElementById('ble-dev');
     if (!sel) return;
     sel.innerHTML = '';
-    if (!d.length) { bleStatusMsg('No AirSense 11 or SomnoBridge found'); return; }
+    if (!d.length) {
+      bleStatusMsg('No AirSense 11 or SomnoBridge found — if the bridge LCD shows a setup network, hold its button to leave setup first');
+      return;
+    }
     d.sort(function(a, b) { return b.rssi - a.rssi; });
     d.forEach(function(n) {
       var o = document.createElement('option');
@@ -2561,8 +2628,12 @@ function bleScan() {
     sel.selectedIndex = 0;
     lastBridgeAddr = '';
     d.forEach(function(n) { if (n.type === 'somnobridge' && !lastBridgeAddr) lastBridgeAddr = n.addr; });
-    var sbPairBtn = document.getElementById('sb-pair-btn');
-    if (sbPairBtn) sbPairBtn.style.display = lastBridgeAddr ? '' : 'none';
+    /* Pre-select the bridge so "Pair Device" pairs it directly. */
+    if (lastBridgeAddr) {
+      for (var i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === lastBridgeAddr) { sel.selectedIndex = i; break; }
+      }
+    }
     document.getElementById('ble-select-group').style.display = 'block';
     document.getElementById('btn-ble-pair').style.display = '';
     bleStatusMsg(d.length + ' device(s) found' +
@@ -2571,16 +2642,6 @@ function bleScan() {
 }
 
 var lastBridgeAddr = '';
-function sbPairFound() {
-  if (!lastBridgeAddr) { bleStatusMsg('Scan first'); return; }
-  var sel = document.getElementById('ble-dev');
-  if (sel) {
-    for (var i = 0; i < sel.options.length; i++) {
-      if (sel.options[i].value === lastBridgeAddr) { sel.selectedIndex = i; break; }
-    }
-  }
-  blePair();
-}
 function sbSyncNow(full) {
   fetch('/api/import/run', { method: 'POST', headers: { 'Content-Type': 'application/json' },
                              body: JSON.stringify({ full: !!full }) })
@@ -2593,22 +2654,207 @@ function importNow() {
     .then(function(){ bleStatusMsg('Import requested'); bleRefresh(); })
     .catch(function(){ bleStatusMsg('Import request failed'); });
 }
+
+/* ── SomnoBridge: Status tab card + Actions card + config dialog ── */
+var sbWasPaired = false;      /* last rendered bridge bonded state    */
+var sbPairingActive = false;  /* a bridge pairing attempt is running  */
+var sbCfgAutoShown = false;   /* config dialog already auto-opened    */
+function sbSet(id, val) { var el = document.getElementById(id); if (el) el.textContent = val; }
+
 function renderBridge(b) {
-  var g = document.getElementById('sb-status-group');
+  var card = document.getElementById('sb-status-card');
+  var act  = document.getElementById('sb-actions-card');
+  var cfg  = document.getElementById('btn-sb-config');
+  var paired = !!(b && b.paired);
+  /* The Status-tab block shows whenever a bridge is/was the selected
+   * source (bonded, or a pairing attempt is live); the Actions card and
+   * the Configure button only while it is actually bonded. */
+  var involved = !!(b && b.available && (paired ||
+                    (b.state && b.state !== 'idle')));
+  if (card) card.style.display = involved ? '' : 'none';
+  if (act)  act.style.display  = paired ? '' : 'none';
+  if (cfg)  cfg.style.display  = paired ? '' : 'none';
+  if (!b || !involved) return;
+
+  var connEl = document.getElementById('sb-conn');
+  if (connEl) {
+    connEl.textContent = b.connected ? 'Connected'
+                        : (paired ? 'Bonded — reconnecting' : 'Pairing…');
+    connEl.style.color = b.connected ? 'var(--success)' : 'var(--warning)';
+  }
+  var thEl = document.getElementById('sb-therapy');
+  if (thEl) {
+    thEl.textContent = b.therapy_active ? 'Active' : 'Idle';
+    thEl.style.color = b.therapy_active ? 'var(--warning)' : 'var(--text-muted)';
+  }
+  var trEl = document.getElementById('sb-transfer');
+  if (trEl) {
+    trEl.textContent = b.transfer_allowed ? 'Ready'
+                       : (b.card_wifi ? 'Verifying card is quiet…'
+                                      : 'No card Wi-Fi — tap Configure SomnoBridge');
+    trEl.style.color = b.transfer_allowed ? 'var(--success)' : 'var(--warning)';
+  }
+  sbSet('sb-sync', b.sync_running ? 'Syncing…' : 'Idle');
+  sbSet('sb-lastsync', b.last_sync_s > 0
+        ? Math.round(b.last_sync_s / 60) + ' min ago' : '—');
+  sbSet('sb-err', b.last_error || b.error || '—');
+
   var l = document.getElementById('sb-status-line');
-  if (!g || !l) return;
-  if (!b || !b.available) { g.style.display = 'none'; return; }
-  g.style.display = 'block';
-  var bits = [];
-  bits.push(b.connected ? 'connected'
-            : (b.paired ? 'bonded, not connected'
-                        : 'not paired — Scan, then Pair, then type the 6-digit PIN from its LCD'));
-  if (b.therapy_active) bits.push('therapy active');
-  else if (b.transfer_allowed) bits.push('ready to sync');
-  if (b.sync_running) bits.push('syncing…');
-  if (b.last_sync_s > 0) bits.push('last sync ' + Math.round(b.last_sync_s / 60) + ' min ago');
-  if (b.last_error) bits.push('last error: ' + b.last_error);
-  l.textContent = bits.join(' · ');
+  if (l) {
+    var bits = [];
+    if (b.sync_running) bits.push('syncing…');
+    if (b.last_sync_s > 0) bits.push('last sync ' + Math.round(b.last_sync_s / 60) + ' min ago');
+    if (!b.transfer_allowed && !b.card_wifi) bits.push('bridge needs card Wi-Fi — Configure SomnoBridge');
+    else if (!b.transfer_allowed) bits.push('bridge is verifying the card is idle');
+    if (b.last_error) bits.push('last error: ' + b.last_error);
+    l.textContent = bits.join(' · ');
+  }
+}
+
+/* ── SomnoBridge config dialog (runs over /api/sb/op → BLE) ───────── */
+var sbCfgAps = [];   /* last WIFI_SCAN result                           */
+
+function sbCfgMsg(t, isErr) {
+  var el = document.getElementById('sb-cfg-msg');
+  if (el) { el.textContent = t || ''; el.style.color = isErr ? 'var(--danger)' : ''; }
+}
+function sbOp(op, args, cb) {
+  fetch('/api/sb/op', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ op: op, args: args || {} }) })
+    .then(function(r){ return r.json(); })
+    .then(cb)
+    .catch(function(){ cb({ ok: false, error: { code: 'HTTP' } }); });
+}
+function openSbConfig() {
+  var ov = document.getElementById('sb-cfg-overlay');
+  if (!ov) return;
+  ov.classList.add('show');
+  document.getElementById('sb-cfg-warning').style.display = 'none';
+  sbCfgMsg('Reading bridge configuration…');
+  sbOp('GET_CONFIG', {}, function(d) {
+    if (d.ok && d.result) {
+      var ssid = d.result.ezshare_ssid || '';
+      if (ssid) {
+        var sel = document.getElementById('sb-cfg-ssid');
+        sel.innerHTML = '';
+        var o = document.createElement('option');
+        o.value = ssid; o.textContent = ssid + ' (saved)'; sel.appendChild(o);
+        sel.value = ssid;
+        document.getElementById('sb-cfg-ssid-manual').style.display = 'none';
+      }
+      document.getElementById('sb-cfg-pass-hint').textContent =
+        d.result.password_set
+          ? 'A password is stored — leave blank to keep it, or type a new one.'
+          : 'Leave blank for an open (passwordless) card.';
+      sbCfgMsg('');
+    } else {
+      sbCfgMsg('Could not read bridge config — scan and enter manually.', true);
+    }
+    sbCfgScan();   /* always refresh the network list */
+  });
+}
+function closeSbConfig() {
+  var ov = document.getElementById('sb-cfg-overlay');
+  if (ov) ov.classList.remove('show');
+  bleRefresh();
+}
+function sbCfgSsidChange() {
+  var sel = document.getElementById('sb-cfg-ssid');
+  var man = document.getElementById('sb-cfg-ssid-manual');
+  if (sel.value === '__manual__') {
+    man.style.display = ''; man.focus();
+  } else {
+    man.style.display = 'none';
+    var ap = sbCfgAps.find(function(a){ return a.ssid === sel.value; });
+    var pg = document.getElementById('sb-cfg-pass-group');
+    if (pg && ap) pg.style.opacity = ap.open ? '.45' : '1';
+  }
+}
+function sbCfgScan() {
+  var btn = document.getElementById('sb-cfg-scan-btn');
+  if (btn) btn.disabled = true;
+  sbCfgMsg('Scanning for networks from the bridge…');
+  sbOp('WIFI_SCAN', {}, function(d) {
+    if (btn) btn.disabled = false;
+    var sel = document.getElementById('sb-cfg-ssid');
+    var prev = sel.value;
+    sel.innerHTML = '';
+    sbCfgAps = (d.ok && d.result && d.result.aps) || [];
+    sbCfgAps.forEach(function(a) {
+      var o = document.createElement('option');
+      o.value = a.ssid;
+      o.textContent = a.ssid + ' (' + a.rssi + ' dBm' + (a.open ? ', open' : '') + ')';
+      sel.appendChild(o);
+    });
+    var man = document.createElement('option');
+    man.value = '__manual__'; man.textContent = 'Enter manually…';
+    sel.appendChild(man);
+    if (prev && sbCfgAps.some(function(a){ return a.ssid === prev; })) {
+      sel.value = prev;
+    } else {
+      var ez = sbCfgAps.find(function(a){ return a.ssid === 'ez Share'; });
+      if (ez) sel.value = 'ez Share';
+    }
+    sbCfgSsidChange();
+    sbCfgMsg(sbCfgAps.length ? '' : 'No networks found — try again or enter manually.');
+  });
+}
+function sbCfgCheck() {
+  var sel = document.getElementById('sb-cfg-ssid');
+  var ssid = (sel.value === '__manual__')
+             ? document.getElementById('sb-cfg-ssid-manual').value.trim()
+             : sel.value;
+  sbCfgMsg('Testing card security…');
+  /* Default target is the factory name "ez Share"; when another SSID was
+   * configured we probe that one — an open or default-password card is
+   * insecure under any name. */
+  sbOp('EZSHARE_CHECK', { try_default: true, ssid: ssid || '' }, function(d) {
+    var warn = document.getElementById('sb-cfg-warning');
+    var wt = document.getElementById('sb-cfg-warning-text');
+    if (d.ok && d.result && d.result.insecure) {
+      warn.style.display = '';
+      wt.textContent = d.result.open
+        ? 'The card "' + (d.result.ssid || ssid) + '" is an open network — anyone nearby can read your therapy data. Set a Wi-Fi password on the EZShare card (ez Share app → card settings), then update it here.'
+        : 'The card "' + (d.result.ssid || ssid) + '" still uses the factory password 88888888 — anyone nearby can read your therapy data. Change it in the ez Share app (card settings), then update it here.';
+      sbCfgMsg('Card reachable — but insecure, see warning.');
+    } else if (d.ok && d.result && d.result.found) {
+      warn.style.display = 'none';
+      sbCfgMsg('Card found and the default password does not work — good.');
+    } else {
+      warn.style.display = 'none';
+      sbCfgMsg(d.ok ? 'Card not visible right now — settings were saved; the bridge will keep retrying.'
+                    : 'Security check failed — settings were saved anyway.');
+    }
+  });
+}
+function sbCfgSave() {
+  var sel = document.getElementById('sb-cfg-ssid');
+  var ssid = (sel.value === '__manual__')
+             ? document.getElementById('sb-cfg-ssid-manual').value.trim()
+             : sel.value;
+  var pass = document.getElementById('sb-cfg-pass').value;
+  if (!ssid) { sbCfgMsg('Pick or enter the EZShare network first.', true); return; }
+  var ap = sbCfgAps.find(function(a){ return a.ssid === ssid; });
+  var args = { ezshare_ssid: ssid };
+  if (pass) {
+    args.ezshare_password = pass;
+  } else if (ap && ap.open) {
+    args.clear_password = true;
+    args.allow_open_wifi = true;
+  }
+  var btn = document.getElementById('sb-cfg-save-btn');
+  if (btn) btn.disabled = true;
+  sbCfgMsg('Saving to the bridge…');
+  sbOp('SET_CONFIG', args, function(d) {
+    if (btn) btn.disabled = false;
+    if (d.ok) {
+      sbCfgMsg('Saved — the bridge is joining "' + ssid + '".');
+      sbCfgCheck();
+    } else {
+      var code = (d.error && d.error.code) || 'ERROR';
+      sbCfgMsg('Save failed: ' + code, true);
+    }
+  });
 }
 
 /* While a pairing attempt runs, poll fast: the bridge only shows its PIN for
@@ -2639,9 +2885,10 @@ function blePair() {
   var sel = document.getElementById('ble-dev');
   var type = (sel && sel.selectedOptions && sel.selectedOptions[0])
            ? (sel.selectedOptions[0].getAttribute('data-type') || 'as11') : 'as11';
+  if (type === 'somnobridge') { sbPairingActive = true; sbCfgAutoShown = false; }
   fetch('/api/ble/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ addr: addr, type: type }) })
     .then(function(r){ return r.json(); }).then(function() { blePoll(); startPairFastPoll(); })
-    .catch(function() { bleStatusMsg('Pair failed'); });
+    .catch(function() { sbPairingActive = false; bleStatusMsg('Pair failed'); });
 }
 function bleConfirm() {
   var pk = document.getElementById('ble-passkey').value.trim();
@@ -2655,7 +2902,7 @@ function bleConfirm() {
     .catch(function() { bleStatusMsg('Confirm failed'); });
 }
 function bleForget() {
-  if (!confirm('Unpair the CPAP device?')) return;
+  if (!confirm('Unpair the ' + (sbWasPaired ? 'SomnoBridge' : 'CPAP device') + '?')) return;
   fetch('/api/ble/forget', { method: 'POST' }).then(function() { bleRefresh(); });
 }
 function blePoll() {
@@ -2678,6 +2925,16 @@ function updateBleUI(ble) {
 
   /* SomnoBridge pairing drives its own state machine; the PIN prompt must
    * follow it, not the AS11's (that was why the field never appeared). */
+  /* Fresh bridge bond → offer network configuration once per pairing.
+   * Only when a pairing attempt ran in this session: a stored bond from
+   * an earlier boot must not pop the dialog on every page load. */
+  if (br && br.paired && !sbWasPaired && sbPairingActive && !sbCfgAutoShown) {
+    sbCfgAutoShown = true;
+    sbPairingActive = false;
+    openSbConfig();
+  }
+  sbWasPaired = !!(br && br.paired);
+
   if (br && br.available && !br.paired) {
     if (br.state === 'waiting_passkey') {
       pg.style.display = 'block';
@@ -2685,11 +2942,12 @@ function updateBleUI(ble) {
       var lbl = document.getElementById('ble-passkey-label');
       if (pin) pin.placeholder = '6-digit PIN';
       if (lbl) lbl.textContent = 'Enter the 6-digit PIN shown on the SomnoBridge LCD';
-      bleStatusMsg('Enter the 6-digit PIN shown on the SomnoBridge LCD');
+      bleStatusMsg('Enter the 6-digit PIN shown on the SomnoBridge LCD — no PIN? Press the bridge button once to open pairing');
       return;
     }
     if (br.state === 'connecting') { bleStatusMsg('Connecting to SomnoBridge…'); return; }
     if (br.state === 'error') {
+      sbPairingActive = false;
       if (pg) pg.style.display = 'none';
       bleStatusMsg('SomnoBridge: ' + (br.last_error || br.error || 'pairing failed'));
       return;
@@ -2717,15 +2975,20 @@ function updateBleUI(ble) {
   if (ble.state === 'confirming') { bleStatusMsg('Verifying code…'); return; }
   if (ble.state === 'error') { if (blePollTimer) clearInterval(blePollTimer); if (pg) pg.style.display = 'none'; bleStatusMsg('Error: ' + (ble.error || 'pairing failed')); return; }
 
-  if (ble.paired) {
+  /* One source slot, one badge: whichever of AS11/bridge is bonded shows
+   * as plain "Paired". The bridge's live detail lives on the Status tab. */
+  var brPaired = !!(br && br.paired);
+  if (ble.paired || brPaired) {
     if (blePollTimer) clearInterval(blePollTimer);
     if (paired) paired.style.display = 'block';
     if (unp) unp.style.display = 'none';
     if (fgt) fgt.style.display = '';
     if (pg) pg.style.display = 'none';
     var dn = document.getElementById('ble-dev-name');
-    if (dn) dn.textContent = (ble.device && ble.device.name) || 'AirSense 11';
-    bleStatusMsg(ble.state === 'paired' ? 'Paired successfully' : '');
+    if (dn) dn.textContent = brPaired ? 'SomnoBridge'
+                            : ((ble.device && ble.device.name) || 'AirSense 11');
+    bleStatusMsg(ble.state === 'paired' || (br && br.state === 'paired')
+                 ? 'Paired successfully' : '');
   } else {
     if (paired) paired.style.display = 'none';
     if (unp) unp.style.display = 'block';
