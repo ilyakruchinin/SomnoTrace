@@ -33,6 +33,7 @@
 #include "bsp_display.h"
 #include "net_provision.h"
 #include "as11_ble.h"
+#include "sb_ble.h"
 #include "oximeter.h"
 #include "sd_storage.h"
 #include "session_writer.h"
@@ -217,6 +218,12 @@ void app_main(void)
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 
     /* 4c-ter. Initialise O2 Ring oximeter (shares NimBLE host with AS11). */
+    /* SomnoBridge shares the NimBLE host (slot 1 alternative to the AS11);
+     * it stages into IMPORT/ and kicks the Phase-1 importer itself. */
+    if (sb_ble_init() != ESP_OK)
+        ESP_LOGW(TAG, "SomnoBridge client unavailable");
+    sb_ble_set_import_kick_fn(edf_import_kick_now);
+
     if (oximeter_init() != ESP_OK) {
         ESP_LOGE(TAG, "Oximeter init failed; O2 Ring sync unavailable");
     }

@@ -25,6 +25,8 @@
 
 #include "net_provision.h"
 #include "as11_ble.h"
+#include "sb_ble.h"
+#include "edf_import.h"
 #include "oximeter.h"
 #include "time_sync.h"
 #include "uploader.h"
@@ -1260,6 +1262,9 @@ cJSON *netprov_build_status_json(void)
                 cJSON_AddItemToObject(ble, "device", info);
             }
         }
+        /* SomnoBridge (Phase 2): its own state, therapy flag and sync
+         * counters.  Present even when unpaired so the portal can offer it. */
+        cJSON_AddItemToObject(ble, "bridge", sb_ble_status_json());
     }
 
     /* Oximeter (O2 Ring) status (only in connected mode) */
@@ -1485,6 +1490,45 @@ static esp_err_t ble_scan_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Phase 3: import status (Phase-1 inbox + bridge telemetry) and an explicit
+ * "Import now" / "Sync now" trigger. */
+static esp_err_t import_status_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "pending", edf_import_pending());
+    cJSON_AddItemToObject(root, "bridge", sb_ble_status_json());
+    char *txt = cJSON_Print(root);
+    cJSON_Delete(root);
+    if (!txt) { httpd_resp_send_500(req); return ESP_FAIL; }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_send(req, txt, HTTPD_RESP_USE_STRLEN);
+    free(txt);
+    return ESP_OK;
+}
+
+static esp_err_t import_run_handler(httpd_req_t *req)
+{
+    bool full = false;
+    if (req->content_len > 0) {
+        char body[96];
+        if (recv_body(req, body, sizeof(body)) == ESP_OK) {
+            cJSON *j = cJSON_Parse(body);
+            if (j) {
+                full = cJSON_IsTrue(cJSON_GetObjectItem(j, "full"));
+                cJSON_Delete(j);
+            }
+        }
+    }
+    /* Pull from the bridge first (it stages into IMPORT/), then let the
+     * Phase-1 importer drain whatever is there. */
+    if (sb_ble_is_paired()) sb_ble_sync_now(full);
+    edf_import_kick_now();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
 static esp_err_t ble_pair_handler(httpd_req_t *req)
 {
     char body[128];
@@ -1499,7 +1543,15 @@ static esp_err_t ble_pair_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing addr");
         return ESP_FAIL;
     }
-    esp_err_t e = as11_ble_start_pair(addr->valuestring);
+    cJSON *jt = cJSON_GetObjectItem(j, "type");
+    const char *type = cJSON_GetStringValue(jt);
+    bool bridge = type && strcmp(type, "somnobridge") == 0;
+    uint8_t addr_type = 0;   /* BLE_ADDR_PUBLIC; replaced by the scan hit */
+    bool scanned_bridge = false;
+    if (as11_ble_scan_lookup_ex(addr->valuestring, &addr_type, &scanned_bridge))
+        bridge = scanned_bridge;    /* the scan is authoritative */
+    esp_err_t e = bridge ? sb_ble_start_pair_ex(addr->valuestring, addr_type)
+                         : as11_ble_start_pair(addr->valuestring);
     cJSON_Delete(j);
     if (e != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "pair start failed");
@@ -1524,10 +1576,19 @@ static esp_err_t ble_confirm_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing passkey");
         return ESP_FAIL;
     }
-    esp_err_t e = as11_ble_confirm_pair(pk->valuestring);
+    /* SomnoBridge uses a 6-digit BLE-SM PIN; the AS11 uses 4-digit SRP. */
+    bool bridge = strlen(pk->valuestring) >= 6 ||
+                  strcmp(sb_ble_get_status(), SB_STATUS_WAIT_PASSKEY) == 0;
+    esp_err_t e = bridge ? sb_ble_confirm_pair(pk->valuestring)
+                         : as11_ble_confirm_pair(pk->valuestring);
     cJSON_Delete(j);
     if (e != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "confirm failed");
+        char msg[128];
+        snprintf(msg, sizeof(msg), "{\"ok\":false,\"error\":\"%s\"}",
+                 bridge ? sb_ble_get_error() : as11_ble_get_error());
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, msg);
         return ESP_FAIL;
     }
     httpd_resp_set_type(req, "application/json");
@@ -1537,7 +1598,9 @@ static esp_err_t ble_confirm_handler(httpd_req_t *req)
 
 static esp_err_t ble_forget_handler(httpd_req_t *req)
 {
-    as11_ble_forget();
+    /* SomnoBridge owns slot 1 when it is the bonded source. */
+    if (sb_ble_is_paired()) sb_ble_forget();
+    else as11_ble_forget();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
@@ -3578,6 +3641,8 @@ static esp_err_t start_webserver(void)
     reg_uri(s_httpd, &save);
 
     /* AirSense 11 BLE pairing endpoints (status folded into /api/status) */
+    httpd_uri_t import_status = { .uri = "/api/import/status", .method = HTTP_GET, .handler = import_status_handler };
+    httpd_uri_t import_run = { .uri = "/api/import/run", .method = HTTP_POST, .handler = import_run_handler };
     httpd_uri_t ble_scan = { .uri = "/api/ble/scan", .method = HTTP_GET, .handler = ble_scan_handler };
     httpd_uri_t ble_pair = { .uri = "/api/ble/pair", .method = HTTP_POST, .handler = ble_pair_handler };
     httpd_uri_t ble_conf = { .uri = "/api/ble/confirm", .method = HTTP_POST, .handler = ble_confirm_handler };
@@ -3585,6 +3650,8 @@ static esp_err_t start_webserver(void)
     httpd_uri_t ble_pass = { .uri = "/api/ble/passthrough", .method = HTTP_POST, .handler = ble_passthrough_handler };
     httpd_uri_t ble_exp_get = { .uri = "/api/ble/experimental", .method = HTTP_GET, .handler = ble_experimental_get_handler };
     httpd_uri_t ble_exp_post = { .uri = "/api/ble/experimental", .method = HTTP_POST, .handler = ble_experimental_post_handler };
+    reg_uri(s_httpd, &import_status);
+    reg_uri(s_httpd, &import_run);
     reg_uri(s_httpd, &ble_scan);
     reg_uri(s_httpd, &ble_pair);
     reg_uri(s_httpd, &ble_conf);

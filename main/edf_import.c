@@ -3578,6 +3578,13 @@ static void edf_import_task(void *arg)
     vTaskDelete(NULL);
 }
 
+void edf_import_kick_now(void)
+{
+    esp_err_t err = edf_import_start_worker();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+        ESP_LOGW(TAG, "import kick: %s", esp_err_to_name(err));
+}
+
 esp_err_t edf_import_start_worker(void)
 {
     if (s_worker_running) return ESP_OK;

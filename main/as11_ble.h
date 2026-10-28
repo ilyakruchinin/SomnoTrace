@@ -59,6 +59,15 @@ esp_err_t as11_ble_scan(int timeout_sec);
  * Caller must call cJSON_Delete() on the returned object. */
 cJSON *as11_ble_get_scan_results(void);
 
+/* Address type of a scan hit (BLE_ADDR_PUBLIC / _RANDOM), so a client can
+ * connect with the type the peer actually advertised. */
+bool as11_ble_scan_lookup(const char *addr_str, uint8_t *addr_type);
+/* Same, plus whether that hit is a SomnoBridge (the pair router trusts this
+ * over whatever the browser sends, so a stale cached page cannot send a
+ * bridge to the AS11 path). */
+bool as11_ble_scan_lookup_ex(const char *addr_str, uint8_t *addr_type,
+                             bool *is_bridge);
+
 /* Begin pairing with the device at the given BLE address (AA:BB:CC:DD:EE:FF).
  * This connects, discovers GATT services, and sends StartKeyExchange.
  * When the AS11 shows a 4-digit passkey on its LCD, the state transitions

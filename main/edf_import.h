@@ -103,6 +103,11 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
  * edf_gen_rebuild_day() + uploader_on_export_complete() per imported day.
  * Idempotent — a second call is a no-op. */
 esp_err_t edf_import_start_worker(void);
+
+/* Re-run the inbox scan now (used after SomnoBridge stages a day, and by the
+ * Phase-3 "Import now" button).  Safe to call while the worker is running:
+ * it is a no-op then, and restarts a worker that has already exited. */
+void edf_import_kick_now(void);
 #endif
 
 #ifdef __cplusplus

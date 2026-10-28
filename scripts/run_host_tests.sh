@@ -157,6 +157,9 @@ run_test legacy_file_list_test -I"$SHIM" -I"$MAIN_DIR" scripts/legacy_file_list_
 run_test upload_park_test -I"$UPLOADER_DIR" scripts/upload_park_test.c
 run_test as11_reconnect_test -I"$SHIM" -I"$MAIN_DIR" scripts/as11_reconnect_test.c "$MAIN_DIR/as11_reconnect.c"
 run_test leak_roll_test     -I"$SHIM" -I"$MAIN_DIR" scripts/leak_roll_test.c "$MAIN_DIR/leak_roll.c"
+# SomnoBridge wire helpers: frame header, v2 block codecs, IMPORT path mapping
+run_test sb_ble_test         -I"$SHIM" -I"$MAIN_DIR" -DSB_PROTO_HOST \
+    scripts/sb_ble_test.c "$MAIN_DIR/sb_proto.c" -lz
 # ntfy credential encoding: Basic/Bearer headers + the ?auth= query form
 run_test alert_auth_test     -I"$SHIM" -Icomponents/therapy_alert scripts/alert_auth_test.c components/therapy_alert/alert_auth.c
 run_test as11_adv_test       -I"$SHIM" -I"$MAIN_DIR" scripts/as11_adv_test.c "$MAIN_DIR/as11_adv.c"

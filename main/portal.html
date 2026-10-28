@@ -581,16 +581,26 @@ ResMed AirSense 11 CPAP
 <div id="ble-unpaired">
 <button class="btn btn-outline btn-sm" type="button" onclick="bleScan()">
 <svg viewBox="0 0 24 24" style="width:14px;height:14px"><path d="M17.65 6.35A7.96 7.96 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
-Scan for AirSense 11
+Scan for CPAP / SomnoBridge
 </button>
 <div class="form-group" id="ble-select-group" style="display:none;margin-top:10px">
 <label>Select Device</label>
 <select id="ble-dev" class="form-control"></select>
 </div>
 <button class="btn btn-primary btn-sm" type="button" id="btn-ble-pair" style="display:none;margin-top:8px" onclick="blePair()">Pair Device</button>
+<div class="form-group" id="sb-status-group" style="margin-top:12px;display:none">
+<label>SomnoBridge</label>
+<p class="card-desc" id="sb-status-line" style="margin:2px 0 8px 0"></p>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<button type="button" class="btn btn-sm" id="sb-pair-btn" style="display:none" onclick="sbPairFound()">Pair SomnoBridge</button>
+<button type="button" class="btn btn-sm" id="sb-sync-btn" onclick="sbSyncNow(false)">Sync now</button>
+<button type="button" class="btn btn-sm" onclick="sbSyncNow(true)">Full sync</button>
+<button type="button" class="btn btn-sm" onclick="importNow()">Import now</button>
+</div>
+</div>
 <div class="form-group" id="ble-passkey-group" style="display:none;margin-top:12px">
-<label>Enter the 4-digit code shown on your CPAP screen</label>
-<input id="ble-passkey" type="text" inputmode="numeric" maxlength="4" placeholder="1234" class="form-control" style="max-width:140px;text-align:center;font-size:1.2rem;letter-spacing:.3em">
+<label id="ble-passkey-label">Enter the 4-digit code shown on your CPAP screen</label>
+<input id="ble-passkey" type="text" inputmode="numeric" maxlength="6" placeholder="123456" class="form-control" style="max-width:170px;text-align:center;font-size:1.2rem;letter-spacing:.3em">
 <button class="btn btn-primary btn-sm" type="button" style="margin-top:8px" onclick="bleConfirm()">Confirm Code</button>
 </div>
 </div>
@@ -2533,39 +2543,116 @@ var blePollTimer = null;
 function bleStatusMsg(t) { var el = document.getElementById('ble-status'); if (el) el.textContent = t; }
 
 function bleScan() {
-  bleStatusMsg('Scanning for AirSense 11…');
+  bleStatusMsg('Scanning for AirSense 11 / SomnoBridge…');
   fetch('/api/ble/scan').then(function(r){ return r.json(); }).then(function(d) {
     var sel = document.getElementById('ble-dev');
     if (!sel) return;
     sel.innerHTML = '';
-    if (!d.length) { bleStatusMsg('No AirSense 11 devices found'); return; }
+    if (!d.length) { bleStatusMsg('No AirSense 11 or SomnoBridge found'); return; }
     d.sort(function(a, b) { return b.rssi - a.rssi; });
     d.forEach(function(n) {
       var o = document.createElement('option');
       o.value = n.addr;
-      o.textContent = n.name + ' (' + n.rssi + ' dBm)';
+      o.setAttribute('data-type', n.type || 'as11');
+      var tag = (n.type === 'somnobridge') ? ' [SomnoBridge]' : '';
+      o.textContent = n.name + tag + ' (' + n.rssi + ' dBm)';
       sel.appendChild(o);
     });
     sel.selectedIndex = 0;
+    lastBridgeAddr = '';
+    d.forEach(function(n) { if (n.type === 'somnobridge' && !lastBridgeAddr) lastBridgeAddr = n.addr; });
+    var sbPairBtn = document.getElementById('sb-pair-btn');
+    if (sbPairBtn) sbPairBtn.style.display = lastBridgeAddr ? '' : 'none';
     document.getElementById('ble-select-group').style.display = 'block';
     document.getElementById('btn-ble-pair').style.display = '';
-    bleStatusMsg(d.length + ' device(s) found');
+    bleStatusMsg(d.length + ' device(s) found' +
+      (lastBridgeAddr ? ' — SomnoBridge found: press Pair, then type the 6-digit PIN from its LCD' : ''));
   }).catch(function() { bleStatusMsg('Scan failed'); });
+}
+
+var lastBridgeAddr = '';
+function sbPairFound() {
+  if (!lastBridgeAddr) { bleStatusMsg('Scan first'); return; }
+  var sel = document.getElementById('ble-dev');
+  if (sel) {
+    for (var i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === lastBridgeAddr) { sel.selectedIndex = i; break; }
+    }
+  }
+  blePair();
+}
+function sbSyncNow(full) {
+  fetch('/api/import/run', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                             body: JSON.stringify({ full: !!full }) })
+    .then(function(r){ return r.json(); })
+    .then(function(){ bleStatusMsg(full ? 'Full sync requested' : 'Sync requested'); bleRefresh(); })
+    .catch(function(){ bleStatusMsg('Sync request failed'); });
+}
+function importNow() {
+  fetch('/api/import/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    .then(function(){ bleStatusMsg('Import requested'); bleRefresh(); })
+    .catch(function(){ bleStatusMsg('Import request failed'); });
+}
+function renderBridge(b) {
+  var g = document.getElementById('sb-status-group');
+  var l = document.getElementById('sb-status-line');
+  if (!g || !l) return;
+  if (!b || !b.available) { g.style.display = 'none'; return; }
+  g.style.display = 'block';
+  var bits = [];
+  bits.push(b.connected ? 'connected'
+            : (b.paired ? 'bonded, not connected'
+                        : 'not paired — Scan, then Pair, then type the 6-digit PIN from its LCD'));
+  if (b.therapy_active) bits.push('therapy active');
+  else if (b.transfer_allowed) bits.push('ready to sync');
+  if (b.sync_running) bits.push('syncing…');
+  if (b.last_sync_s > 0) bits.push('last sync ' + Math.round(b.last_sync_s / 60) + ' min ago');
+  if (b.last_error) bits.push('last error: ' + b.last_error);
+  l.textContent = bits.join(' · ');
+}
+
+/* While a pairing attempt runs, poll fast: the bridge only shows its PIN for
+ * 60 s, and the regular 5 s status poll can miss the whole window (which is
+ * exactly how the PIN field kept failing to appear). */
+var pairFastTimer = null;
+function startPairFastPoll() {
+  if (pairFastTimer) clearInterval(pairFastTimer);
+  var ticks = 0;
+  pairFastTimer = setInterval(function() {
+    if (++ticks > 100) { clearInterval(pairFastTimer); pairFastTimer = null; return; }
+    fetch('/api/status').then(function(r){ return r.json(); }).then(function(d) {
+      updateBleUI(d.ble);
+      var br = (d.ble && d.ble.bridge) || null;
+      var st = br ? br.state : '';
+      if (st === 'paired' || st === 'error' ||
+          (d.ble && d.ble.state === 'paired') || (d.ble && d.ble.state === 'error')) {
+        clearInterval(pairFastTimer); pairFastTimer = null;
+      }
+    }).catch(function() {});
+  }, 1000);
 }
 
 function blePair() {
   var addr = document.getElementById('ble-dev').value;
   if (!addr) { bleStatusMsg('Select a device first'); return; }
   bleStatusMsg('Connecting…');
-  fetch('/api/ble/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ addr: addr }) })
-    .then(function(r){ return r.json(); }).then(function() { blePoll(); }).catch(function() { bleStatusMsg('Pair failed'); });
+  var sel = document.getElementById('ble-dev');
+  var type = (sel && sel.selectedOptions && sel.selectedOptions[0])
+           ? (sel.selectedOptions[0].getAttribute('data-type') || 'as11') : 'as11';
+  fetch('/api/ble/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ addr: addr, type: type }) })
+    .then(function(r){ return r.json(); }).then(function() { blePoll(); startPairFastPoll(); })
+    .catch(function() { bleStatusMsg('Pair failed'); });
 }
 function bleConfirm() {
   var pk = document.getElementById('ble-passkey').value.trim();
-  if (pk.length !== 4) { bleStatusMsg('Enter the 4-digit code from your CPAP'); return; }
+  if (!/^[0-9]+$/.test(pk) || (pk.length !== 4 && pk.length !== 6)) {
+    bleStatusMsg('Enter the 4-digit CPAP code or the 6-digit SomnoBridge PIN');
+    return;
+  }
   bleStatusMsg('Verifying…');
   fetch('/api/ble/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ passkey: pk }) })
-    .then(function(r){ return r.json(); }).then(function() { blePoll(); }).catch(function() { bleStatusMsg('Confirm failed'); });
+    .then(function(r){ return r.json(); }).then(function() { blePoll(); startPairFastPoll(); })
+    .catch(function() { bleStatusMsg('Confirm failed'); });
 }
 function bleForget() {
   if (!confirm('Unpair the CPAP device?')) return;
@@ -2582,12 +2669,42 @@ function blePoll() {
 }
 function updateBleUI(ble) {
   if (!ble) return;
+  renderBridge(ble.bridge);
   var paired = document.getElementById('ble-paired');
   var unp = document.getElementById('ble-unpaired');
   var fgt = document.getElementById('btn-ble-forget');
   var pg = document.getElementById('ble-passkey-group');
+  var br = ble.bridge || null;
 
-  if (ble.state === 'waiting_passkey') { pg.style.display = 'block'; bleStatusMsg('Enter the code shown on your CPAP screen'); return; }
+  /* SomnoBridge pairing drives its own state machine; the PIN prompt must
+   * follow it, not the AS11's (that was why the field never appeared). */
+  if (br && br.available && !br.paired) {
+    if (br.state === 'waiting_passkey') {
+      pg.style.display = 'block';
+      var pin = document.getElementById('ble-passkey');
+      var lbl = document.getElementById('ble-passkey-label');
+      if (pin) pin.placeholder = '6-digit PIN';
+      if (lbl) lbl.textContent = 'Enter the 6-digit PIN shown on the SomnoBridge LCD';
+      bleStatusMsg('Enter the 6-digit PIN shown on the SomnoBridge LCD');
+      return;
+    }
+    if (br.state === 'connecting') { bleStatusMsg('Connecting to SomnoBridge…'); return; }
+    if (br.state === 'error') {
+      if (pg) pg.style.display = 'none';
+      bleStatusMsg('SomnoBridge: ' + (br.last_error || br.error || 'pairing failed'));
+      return;
+    }
+  }
+
+  if (ble.state === 'waiting_passkey') {
+    pg.style.display = 'block';
+    var albl = document.getElementById('ble-passkey-label');
+    var apin = document.getElementById('ble-passkey');
+    if (albl) albl.textContent = 'Enter the 4-digit code shown on your CPAP screen';
+    if (apin) apin.placeholder = '1234';
+    bleStatusMsg('Enter the code shown on your CPAP screen');
+    return;
+  }
   if (ble.state === 'connecting') {
     if (ble.paired) {
       if (paired) paired.style.display = 'none';

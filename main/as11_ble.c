@@ -39,6 +39,7 @@
  */
 
 #include "as11_ble.h"
+#include "sb_ble.h"
 #include "as11_reconnect.h"
 #include "as11_adv.h"
 #include "session_writer.h"
@@ -87,6 +88,7 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
+#include "host/ble_store.h"
 #include "host/util/util.h"
 
 #include <time.h>
@@ -99,6 +101,11 @@ static const char *TAG = "as11_ble";
 /* Service fd56, TX a6220002, RX a6220003 (128-bit), CCCD 0x2902. */
 static const ble_uuid16_t UUID_SERVICE =
     BLE_UUID16_INIT(0xfd56);
+/* SomnoBridge advertises its private service (somnopal §10.1). */
+static const ble_uuid128_t UUID_SB_SVC =
+    BLE_UUID128_INIT(0x50, 0x6f, 0x6e, 0x76, 0x06, 0x73, 0x1d, 0x9f,
+                     0xb4, 0x4b, 0x4b, 0x6e, 0x00, 0xd1, 0xa7, 0x8b);
+
 static const ble_uuid128_t UUID_TX =
     BLE_UUID128_INIT(0xaa, 0x44, 0x20, 0x9d, 0x08, 0xcb, 0xae, 0xaf,
                      0x20, 0x4b, 0xf1, 0x35, 0x02, 0x00, 0x22, 0xa6);
@@ -134,6 +141,7 @@ struct scan_entry {
     ble_addr_t addr;
     char name[32];
     int8_t rssi;
+    bool bridge;          /* SomnoBridge advertisement (Phase 2/3) */
 };
 static struct scan_entry s_scan[SCAN_MAX];
 static int s_scan_count;
@@ -1087,6 +1095,12 @@ static void handle_notify(const uint8_t *data, int len)
     }
 }
 
+/* True when the SomnoBridge owns CPAP BLE slot 1. */
+static bool bridge_owns_slot1(void)
+{
+    return sb_ble_is_paired() || sb_ble_get_status()[0] != 'i';
+}
+
 static void auto_reconnect_task(void *arg);
 
 static int gap_event(struct ble_gap_event *event, void *arg)
@@ -1150,6 +1164,22 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             }
         }
 
+        /* SomnoBridge: name prefix "SomnoBri" (31-byte adv truncation) or
+         * the private 128-bit service UUID. */
+        bool bridge = false;
+        if (name[0] != '\0' && strncmp(name, "SomnoBri", 8) == 0) {
+            bridge = true;
+        } else if (f.uuids128 != NULL && f.num_uuids128 > 0) {
+            for (int i = 0; i < f.num_uuids128; i++) {
+                if (ble_uuid_cmp(&f.uuids128[i].u, &UUID_SB_SVC.u) == 0) {
+                    bridge = true;
+                    if (name[0] == '\0') strlcpy(name, "SomnoBridge", sizeof(name));
+                    break;
+                }
+            }
+        }
+        if (bridge) match = true;
+
         if (!match) {
             return 0;
         }
@@ -1157,6 +1187,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         for (int i = 0; i < s_scan_count; i++) {
             if (memcmp(&s_scan[i].addr, &event->disc.addr, sizeof(ble_addr_t)) == 0) {
                 s_scan[i].rssi = event->disc.rssi;
+                if (bridge) s_scan[i].bridge = true;
                 /* If the first packet matched by UUID only (fallback name
                  * "ResMed AS11") and the scan response now carries the real
                  * device name (e.g. "ResMed 436648"), update it.  Never
@@ -1174,6 +1205,7 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             s_scan[s_scan_count].addr = event->disc.addr;
             strlcpy(s_scan[s_scan_count].name, name, sizeof(s_scan[s_scan_count].name));
             s_scan[s_scan_count].rssi = event->disc.rssi;
+            s_scan[s_scan_count].bridge = bridge;
             s_scan_count++;
             ESP_LOGI(TAG, "found '%s' rssi=%d", name, event->disc.rssi);
         }
@@ -1279,8 +1311,12 @@ static int gap_event(struct ble_gap_event *event, void *arg)
             strcmp(s_state, AS11_STATUS_PAIRED) == 0) {
             ESP_LOGI(TAG, "auto-reconnect: unexpected disconnect while paired, "
                          "launching reconnect");
-            psram_task_create(auto_reconnect_task, "as11_reconn", 8192,
-                              NULL, 5, tskNO_AFFINITY, NULL, NULL);
+            if (bridge_owns_slot1()) {
+                ESP_LOGI(TAG, "auto-reconnect skipped: SomnoBridge owns slot 1");
+            } else {
+                psram_task_create(auto_reconnect_task, "as11_reconn", 8192,
+                                  NULL, 5, tskNO_AFFINITY, NULL, NULL);
+            }
         } else {
             ESP_LOGI(TAG, "auto-reconnect: skipped (pairing=%d manual=%d state=%s)",
                      s_pair_cache.valid, s_manual_disconnect, s_state);
@@ -2951,6 +2987,21 @@ esp_err_t as11_ble_init(void)
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
 
+    /* SomnoBridge needs LE Secure Connections + MITM + bonding (§5.2).
+     * The AS11 (application-layer SRP) and the O2 ring never request SMP
+     * security, so their links stay unencrypted exactly as before. */
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_KEYBOARD_ONLY;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_mitm = 1;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    /* Without a registered bond store ble_gap_security_initiate() fails with
+     * BLE_HS_EINVAL, so SomnoBridge pairing could never start.  Declared here
+     * because the store-config header is not on the public include path. */
+    extern void ble_store_config_init(void);
+    ble_store_config_init();
+
     /* Quiet NimBLE's per-byte HCI hex dumps — warnings/errors only. */
     esp_log_level_set("NimBLE", ESP_LOG_WARN);
     esp_log_level_set("NimBLE_HCI", ESP_LOG_WARN);
@@ -3011,6 +3062,28 @@ esp_err_t as11_ble_scan(int timeout_sec)
     return ESP_OK;
 }
 
+bool as11_ble_scan_lookup(const char *addr_str, uint8_t *addr_type)
+{
+    bool bridge = false;
+    return as11_ble_scan_lookup_ex(addr_str, addr_type, &bridge);
+}
+
+bool as11_ble_scan_lookup_ex(const char *addr_str, uint8_t *addr_type,
+                             bool *is_bridge)
+{
+    if (!addr_str) return false;
+    char a[18];
+    for (int i = 0; i < s_scan_count; i++) {
+        addr_to_str(&s_scan[i].addr, a);
+        if (strcasecmp(a, addr_str) == 0) {
+            if (addr_type) *addr_type = s_scan[i].addr.type;
+            if (is_bridge) *is_bridge = s_scan[i].bridge;
+            return true;
+        }
+    }
+    return false;
+}
+
 cJSON *as11_ble_get_scan_results(void)
 {
     cJSON *arr = cJSON_CreateArray();
@@ -3021,6 +3094,8 @@ cJSON *as11_ble_get_scan_results(void)
         cJSON_AddStringToObject(o, "addr", addr_str);
         cJSON_AddStringToObject(o, "name", s_scan[i].name);
         cJSON_AddNumberToObject(o, "rssi", s_scan[i].rssi);
+        cJSON_AddStringToObject(o, "type", s_scan[i].bridge ? "somnobridge" : "as11");
+        cJSON_AddNumberToObject(o, "addr_type", s_scan[i].addr.type);
         cJSON_AddItemToArray(arr, o);
     }
     return arr;
