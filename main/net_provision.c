@@ -1783,7 +1783,8 @@ static esp_err_t sb_op_handler(httpd_req_t *req)
     const char *op = j ? cJSON_GetStringValue(cJSON_GetObjectItem(j, "op"))
                        : NULL;
     static const char *const allowed[] = {
-        "GET_CONFIG", "SET_CONFIG", "WIFI_SCAN", "EZSHARE_CHECK"
+        "GET_CONFIG", "SET_CONFIG", "WIFI_SCAN", "EZSHARE_CHECK",
+        "CARD_GET", "EZSHARE_ADMIN"
     };
     bool ok = false;
     for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
@@ -1796,8 +1797,10 @@ static esp_err_t sb_op_handler(httpd_req_t *req)
     }
 
     /* EZSHARE_CHECK runs a live probe-join on the bridge (~10 s worst
-     * case); the others answer from RAM/NVS state quickly. */
-    uint32_t tmo = strcmp(op, "EZSHARE_CHECK") == 0 ? 25000 : 12000;
+     * case); EZSHARE_ADMIN logs into the card and reboots its AP (~15 s);
+     * the others answer from RAM/NVS state quickly. */
+    uint32_t tmo = strcmp(op, "EZSHARE_CHECK") == 0 ? 25000 :
+                   strcmp(op, "EZSHARE_ADMIN") == 0 ? 45000 : 12000;
     char *out_json = NULL;
     esp_err_t err = sb_ble_rpc(op, cJSON_GetObjectItem(j, "args"), tmo,
                                &out_json);

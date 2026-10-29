@@ -199,6 +199,28 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .auth-box{width:100%;max-width:360px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;padding:24px;box-shadow:0 4px 20px rgba(0,0,0,0.35)}
 .auth-box img{display:block;height:36px;margin:0 auto 18px}
 .auth-box .btn{width:100%;margin-top:12px}
+.sb-box{position:relative;max-height:92vh;overflow-y:auto}
+.sb-x{position:absolute;top:8px;right:10px;background:none;border:0;color:var(--text-muted);font-size:1.35rem;cursor:pointer;line-height:1;padding:6px;width:auto!important;margin-top:0!important}
+.sb-x:hover{color:var(--text)}
+.sb-aps{border:1px solid var(--card-border);border-radius:8px;max-height:172px;overflow-y:auto;margin-top:6px}
+.sb-ap{padding:9px 12px;display:flex;justify-content:space-between;align-items:center;gap:8px;cursor:pointer;border-bottom:1px solid var(--card-border)}
+.sb-ap:last-child{border-bottom:0}
+.sb-ap:hover{background:var(--primary-glow)}
+.sb-ap.sel{background:var(--primary-glow);box-shadow:inset 3px 0 0 var(--primary)}
+.sb-ap .n{font-weight:600;font-size:.88rem;word-break:break-all}
+.sb-ap .m{color:var(--text-muted);font-size:.74rem;white-space:nowrap}
+.sb-badge{font-size:.66rem;padding:2px 7px;border-radius:10px;font-weight:700}
+.sb-sec{background:rgba(52,211,153,.15);color:var(--success)}
+.sb-open-b{background:rgba(251,191,36,.15);color:var(--warning)}
+.sb-ap-empty{padding:12px;color:var(--text-muted);font-size:.84rem;text-align:center}
+.sb-machines{display:flex;gap:10px;margin-top:4px}
+.sb-mach{position:relative;flex:1;border:1.5px solid var(--card-border);border-radius:10px;padding:10px 6px 8px;text-align:center;cursor:pointer;background:var(--card-bg);opacity:.55;filter:grayscale(.55);transition:opacity .15s,filter .15s}
+.sb-mach.sel{border-color:var(--success);background:rgba(52,211,153,.08);opacity:1;filter:none;box-shadow:0 0 0 3px rgba(52,211,153,.12)}
+.sb-mach::after{content:'\2713';position:absolute;top:6px;right:8px;width:20px;height:20px;line-height:20px;border-radius:50%;background:var(--success);color:#fff;font-weight:700;font-size:.85rem;opacity:0;transform:scale(.5);transition:.15s}
+.sb-mach.sel::after{opacity:1;transform:scale(1)}
+.sb-mach img{width:100%;height:64px;object-fit:contain;display:block;margin:0 auto 4px}
+.sb-mach .t{font-weight:600;font-size:.85rem;color:var(--text)}
+.sb-mach .d{color:var(--text-muted);font-size:.7rem;margin-top:3px;line-height:1.35}
 
 /* ── Save Footer (Sticky Action Bar) ───────────────────────────── */
 .save-footer{position:sticky;bottom:16px;z-index:50;padding:14px 18px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.35);display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:12px;transition:all .3s cubic-bezier(0.16,1,0.3,1)}
@@ -483,16 +505,17 @@ body.fixed-height .logs-container{flex:0 0 auto;height:calc(100dvh - 145px);min-
 
 <!-- SomnoBridge network setup — offered automatically right after pairing -->
 <div id="sb-cfg-overlay" class="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="sb-cfg-title">
-<div class="auth-box" style="max-width:420px;text-align:left">
+<div class="auth-box sb-box" style="max-width:420px;text-align:left">
+<button type="button" class="sb-x" onclick="closeSbConfig()" aria-label="Close">&times;</button>
 <div class="card-title" id="sb-cfg-title" style="margin-bottom:4px">Configure SomnoBridge</div>
 <p class="card-desc">Give the bridge access to your EZShare card's Wi-Fi so it can fetch therapy files on its own. This replaces the bridge's own setup AP.</p>
 <div class="form-group" style="margin-top:12px">
-<label for="sb-cfg-ssid">EZShare network</label>
-<div style="display:flex;gap:8px">
-<select id="sb-cfg-ssid" class="form-control" style="flex:1" onchange="sbCfgSsidChange()">
-<option value="">— scan for networks —</option>
-</select>
-<button type="button" class="btn btn-outline btn-sm" id="sb-cfg-scan-btn" onclick="sbCfgScan()">Scan</button>
+<label>EZShare network</label>
+<p class="card-desc" style="margin:2px 0 0 0;font-size:.78rem">Pick your EZShare Wi-Fi network</p>
+<div id="sb-cfg-aps" class="sb-aps"><div class="sb-ap-empty">Scan to see networks&hellip;</div></div>
+<div style="display:flex;gap:8px;margin-top:8px">
+<button type="button" class="btn btn-outline btn-sm" id="sb-cfg-scan-btn" style="width:auto;margin-top:0" onclick="sbCfgScan()">Scan</button>
+<button type="button" class="btn btn-ghost btn-sm" id="sb-cfg-manual-btn" style="width:auto;margin-top:0" onclick="sbCfgManual()">Enter manually&hellip;</button>
 </div>
 <input type="text" id="sb-cfg-ssid-manual" class="form-control" style="display:none;margin-top:6px" placeholder="Network name (SSID)" maxlength="32">
 </div>
@@ -506,14 +529,45 @@ body.fixed-height .logs-container{flex:0 0 auto;height:calc(100dvh - 145px);min-
 </div>
 <p class="card-desc" id="sb-cfg-pass-hint" style="margin-top:4px">Leave blank to keep the password already stored on the bridge.</p>
 </div>
+<div class="form-group" style="margin-top:14px;padding-top:14px;border-top:1px solid var(--card-border)">
+<label>Your CPAP machine</label>
+<p class="card-desc" style="margin:2px 0 6px 0;font-size:.78rem;color:var(--warning)">&#9888; Ensure you choose the model you actually have &mdash; it changes how file times are read.</p>
+<div class="sb-machines">
+<div class="sb-mach" id="sb-mach10" onclick="sbMachPick('as10')">
+<img src="data:image/jpeg;base64,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" alt="AirSense 10">
+<div class="t">ResMed 10-series</div>
+<div class="d">AirSense 10 &mdash; clock set by hand, no timezone menu</div>
+</div>
+<div class="sb-mach" id="sb-mach11" onclick="sbMachPick('as11')">
+<img src="data:image/jpeg;base64,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" alt="AirSense 11">
+<div class="t">ResMed 11-series</div>
+<div class="d">AirSense 11 &mdash; GMT offset in its settings menu</div>
+</div>
+</div>
+<div id="sb-cfg-tzblock" style="display:none;margin-top:10px">
+<label for="sb-cfg-tz">Machine time zone (GMT offset)</label>
+<select id="sb-cfg-tz" class="form-control"></select>
+<p class="card-desc" style="margin-top:4px;font-size:.78rem">Whole hours only &mdash; match the GMT offset chosen in the machine's settings menu (GMT&minus;12&hellip;GMT+14).</p>
+</div>
+</div>
 <div id="sb-cfg-warning" class="card" style="display:none;border-color:var(--warning);background:rgba(255,170,0,.08);padding:10px 12px;margin-top:8px">
 <div style="font-weight:600;font-size:.85rem;color:var(--warning)">Insecure EZShare card</div>
 <p class="card-desc" style="margin-top:4px" id="sb-cfg-warning-text"></p>
 </div>
+<div id="sb-cfg-secure" class="card" style="display:none;border-color:var(--warning);background:rgba(255,170,0,.08);padding:10px 12px;margin-top:8px">
+<div style="font-weight:600;font-size:.85rem;color:var(--warning)">Secure this card</div>
+<p class="card-desc" style="margin-top:4px">Set a new Wi-Fi password on the card now &mdash; the bridge will update its stored credentials and rejoin automatically.</p>
+<div class="pw-wrap" style="margin-top:6px">
+<input type="password" id="sb-cfg-newpass" class="form-control" maxlength="63" placeholder="New card Wi-Fi password (8&ndash;63 chars)" autocomplete="new-password">
+<button type="button" class="pw-toggle" onclick="togglePw('sb-cfg-newpass')" aria-label="Toggle password visibility">
+<svg viewBox="0 0 24 24" class="eye-open"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
+</button>
+</div>
+<button type="button" class="btn btn-primary btn-sm" id="sb-cfg-secure-btn" style="width:auto;margin-top:8px" onclick="sbCfgSecure()">Change card password</button>
+</div>
 <div id="sb-cfg-msg" class="status-msg" style="margin-top:8px"></div>
 <div style="display:flex;gap:8px;margin-top:14px">
 <button type="button" class="btn btn-primary" style="flex:1" id="sb-cfg-save-btn" onclick="sbCfgSave()">Save &amp; Test</button>
-<button type="button" class="btn" onclick="closeSbConfig()">Done</button>
 </div>
 </div>
 </div>
@@ -2730,24 +2784,25 @@ function openSbConfig() {
   if (!ov) return;
   ov.classList.add('show');
   document.getElementById('sb-cfg-warning').style.display = 'none';
+  document.getElementById('sb-cfg-secure').style.display = 'none';
+  document.getElementById('sb-cfg-newpass').value = '';
   sbCfgMsg('Reading bridge configuration…');
   sbOp('GET_CONFIG', {}, function(d) {
     if (d.ok && d.result) {
-      var ssid = d.result.ezshare_ssid || '';
-      if (ssid) {
-        var sel = document.getElementById('sb-cfg-ssid');
-        sel.innerHTML = '';
-        var o = document.createElement('option');
-        o.value = ssid; o.textContent = ssid + ' (saved)'; sel.appendChild(o);
-        sel.value = ssid;
-        document.getElementById('sb-cfg-ssid-manual').style.display = 'none';
-      }
+      sbCfgSavedSsid = d.result.ezshare_ssid || '';
+      sbCfgSsid = sbCfgSavedSsid;
+      document.getElementById('sb-cfg-ssid-manual').style.display = 'none';
       document.getElementById('sb-cfg-pass-hint').textContent =
         d.result.password_set
           ? 'A password is stored — leave blank to keep it, or type a new one.'
           : 'Leave blank for an open (passwordless) card.';
+      var cur = d.result.as10_tz || 'UTC0';
+      sbTzFill(cur);
+      sbMachPick(sbParseTz(cur) === 0 ? 'as10' : 'as11');
+      sbRenderAps();
       sbCfgMsg('');
     } else {
+      sbTzFill('UTC0'); sbMachPick('as10');
       sbCfgMsg('Could not read bridge config — scan and enter manually.', true);
     }
     sbCfgScan();   /* always refresh the network list */
@@ -2758,17 +2813,91 @@ function closeSbConfig() {
   if (ov) ov.classList.remove('show');
   bleRefresh();
 }
-function sbCfgSsidChange() {
-  var sel = document.getElementById('sb-cfg-ssid');
-  var man = document.getElementById('sb-cfg-ssid-manual');
-  if (sel.value === '__manual__') {
-    man.style.display = ''; man.focus();
-  } else {
-    man.style.display = 'none';
-    var ap = sbCfgAps.find(function(a){ return a.ssid === sel.value; });
-    var pg = document.getElementById('sb-cfg-pass-group');
-    if (pg && ap) pg.style.opacity = ap.open ? '.45' : '1';
+var sbCfgSsid = '';
+var sbCfgSavedSsid = '';
+var sbMach = 'as10';
+/* AS11 menu: GMT-12..GMT+14, whole hours only. AS10 has no TZ setting
+ * (manual clock) and is stored as UTC0 — mirrors the bridge's own portal. */
+var sbTzZones=[[-12,0,'Baker Island'],[-11,0,'American Samoa'],
+[-10,0,'Hawaii'],[-9,0,'Alaska'],[-8,0,'Los Angeles, Vancouver'],
+[-7,0,'Denver, Calgary'],[-6,0,'Chicago, Mexico City'],
+[-5,0,'New York, Toronto'],[-4,0,'Santiago, Halifax'],
+[-3,0,'Sao Paulo, Buenos Aires'],[-2,0,'South Georgia'],
+[-1,0,'Azores, Cape Verde'],[0,0,'UTC'],
+[1,0,'Berlin, Paris, Madrid'],[2,0,'Athens, Cairo, Johannesburg'],
+[3,0,'Moscow, Istanbul, Riyadh'],[4,0,'Dubai, Baku'],
+[5,0,'Karachi, Tashkent'],[6,0,'Dhaka, Almaty'],
+[7,0,'Bangkok, Jakarta, Hanoi'],[8,0,'Beijing, Singapore, Perth'],
+[9,0,'Tokyo, Seoul'],[10,0,'Sydney, Melbourne'],
+[11,0,'Solomon Islands'],[12,0,'Auckland, Wellington'],[13,0,'Tonga'],
+[14,0,'Kiritimati']];
+/* POSIX TZ sign is inverted (west-positive): UTC+2 -> "UTC-2" */
+function sbPosixTz(off){if(!off)return 'UTC0';var s=off>0?'-':'+';
+var a=Math.abs(off),h=Math.floor(a/60),m=a%60;
+return 'UTC'+s+h+(m?':'+m:'');}
+function sbParseTz(v){if(v==='UTC0'||v==='GMT0')return 0;
+var m=/^[A-Za-z]{3,}([+-])(\d{1,2})(?::(\d{1,2}))?$/.exec(v||'');
+if(!m)return null;return (m[1]==='+'?-1:1)*((+m[2])*60+(+m[3]||0));}
+function sbTzFill(cur){var t=document.getElementById('sb-cfg-tz');
+var coff=sbParseTz(cur),match=false;t.innerHTML='';
+sbTzZones.forEach(function(z){var off=z[0]*60+z[1];
+var o=document.createElement('option');o.value=sbPosixTz(off);
+o.textContent='GMT'+(off===0?'+/-0':(off>0?'+':'-')+Math.abs(off/60))+' \u2014 '+z[2];
+if(coff!==null&&off===coff){o.selected=true;match=true;}
+t.appendChild(o);});
+if(!match&&cur){var o=document.createElement('option');o.value=cur;
+o.textContent='Stored: '+cur;o.selected=true;t.insertBefore(o,t.firstChild);}}
+function sbMachPick(m){sbMach=m;
+document.getElementById('sb-mach10').classList.toggle('sel',m==='as10');
+document.getElementById('sb-mach11').classList.toggle('sel',m==='as11');
+document.getElementById('sb-cfg-tzblock').style.display=m==='as11'?'':'none';}
+function sbRenderAps() {
+  var box = document.getElementById('sb-cfg-aps');
+  box.innerHTML = '';
+  var rows = [];
+  if (sbCfgSavedSsid && !sbCfgAps.some(function(a){ return a.ssid === sbCfgSavedSsid; }))
+    rows.push({ ssid: sbCfgSavedSsid, saved: true });
+  sbCfgAps.forEach(function(a){ rows.push(a); });
+  if (!rows.length) {
+    box.innerHTML = '<div class="sb-ap-empty">Scan to see networks&hellip;</div>';
   }
+  rows.forEach(function(a) {
+    var d = document.createElement('div');
+    d.className = 'sb-ap' + (a.ssid === sbCfgSsid ? ' sel' : '');
+    var n = document.createElement('span'); n.className = 'n';
+    n.textContent = a.ssid + (a.saved ? ' (saved)' : '');
+    var m = document.createElement('span'); m.className = 'm';
+    if (a.open !== undefined && a.open !== null) {
+      var b = document.createElement('span');
+      b.className = 'sb-badge ' + (a.open ? 'sb-open-b' : 'sb-sec');
+      b.textContent = a.open ? 'OPEN' : 'SECURED';
+      m.appendChild(b);
+      m.appendChild(document.createTextNode(' ' + a.rssi + ' dBm'));
+    }
+    d.appendChild(n); d.appendChild(m);
+    d.onclick = function() { sbApPick(a.ssid); };
+    box.appendChild(d);
+  });
+}
+function sbApPick(ssid) {
+  sbCfgSsid = ssid;
+  document.getElementById('sb-cfg-ssid-manual').style.display = 'none';
+  var ap = sbCfgAps.find(function(a){ return a.ssid === ssid; });
+  var pg = document.getElementById('sb-cfg-pass-group');
+  if (pg) pg.style.opacity = (ap && ap.open) ? '.45' : '1';
+  sbRenderAps();
+}
+function sbCfgManual() {
+  sbCfgSsid = '';
+  var man = document.getElementById('sb-cfg-ssid-manual');
+  man.style.display = ''; man.focus();
+  document.getElementById('sb-cfg-pass-group').style.opacity = '1';
+  sbRenderAps();
+}
+function sbCfgSelSsid() {
+  var man = document.getElementById('sb-cfg-ssid-manual');
+  if (man.style.display !== 'none') return man.value.trim();
+  return sbCfgSsid;
 }
 function sbCfgScan() {
   var btn = document.getElementById('sb-cfg-scan-btn');
@@ -2776,34 +2905,21 @@ function sbCfgScan() {
   sbCfgMsg('Scanning for networks from the bridge…');
   sbOp('WIFI_SCAN', {}, function(d) {
     if (btn) btn.disabled = false;
-    var sel = document.getElementById('sb-cfg-ssid');
-    var prev = sel.value;
-    sel.innerHTML = '';
     sbCfgAps = (d.ok && d.result && d.result.aps) || [];
-    sbCfgAps.forEach(function(a) {
-      var o = document.createElement('option');
-      o.value = a.ssid;
-      o.textContent = a.ssid + ' (' + a.rssi + ' dBm' + (a.open ? ', open' : '') + ')';
-      sel.appendChild(o);
-    });
-    var man = document.createElement('option');
-    man.value = '__manual__'; man.textContent = 'Enter manually…';
-    sel.appendChild(man);
-    if (prev && sbCfgAps.some(function(a){ return a.ssid === prev; })) {
-      sel.value = prev;
-    } else {
+    /* Keep the current pick when it survives the scan; otherwise prefer the
+     * factory name — but never clobber a manual entry the user is typing. */
+    var manual = document.getElementById('sb-cfg-ssid-manual');
+    if (manual.style.display === 'none' &&
+        !sbCfgAps.some(function(a){ return a.ssid === sbCfgSsid; })) {
       var ez = sbCfgAps.find(function(a){ return a.ssid === 'ez Share'; });
-      if (ez) sel.value = 'ez Share';
+      if (ez) sbCfgSsid = 'ez Share';
     }
-    sbCfgSsidChange();
+    sbRenderAps();
     sbCfgMsg(sbCfgAps.length ? '' : 'No networks found — try again or enter manually.');
   });
 }
 function sbCfgCheck() {
-  var sel = document.getElementById('sb-cfg-ssid');
-  var ssid = (sel.value === '__manual__')
-             ? document.getElementById('sb-cfg-ssid-manual').value.trim()
-             : sel.value;
+  var ssid = sbCfgSelSsid();
   sbCfgMsg('Testing card security…');
   /* Default target is the factory name "ez Share"; when another SSID was
    * configured we probe that one — an open or default-password card is
@@ -2811,27 +2927,59 @@ function sbCfgCheck() {
   sbOp('EZSHARE_CHECK', { try_default: true, ssid: ssid || '' }, function(d) {
     var warn = document.getElementById('sb-cfg-warning');
     var wt = document.getElementById('sb-cfg-warning-text');
+    var sec = document.getElementById('sb-cfg-secure');
     if (d.ok && d.result && d.result.insecure) {
       warn.style.display = '';
+      sec.style.display = '';
       wt.textContent = d.result.open
-        ? 'The card "' + (d.result.ssid || ssid) + '" is an open network — anyone nearby can read your therapy data. Set a Wi-Fi password on the EZShare card (ez Share app → card settings), then update it here.'
-        : 'The card "' + (d.result.ssid || ssid) + '" still uses the factory password 88888888 — anyone nearby can read your therapy data. Change it in the ez Share app (card settings), then update it here.';
+        ? 'The card "' + (d.result.ssid || ssid) + '" is an open network — anyone nearby can read your therapy data.'
+        : 'The card "' + (d.result.ssid || ssid) + '" still uses the factory password 88888888 — anyone nearby can read your therapy data.';
       sbCfgMsg('Card reachable — but insecure, see warning.');
     } else if (d.ok && d.result && d.result.found) {
       warn.style.display = 'none';
+      sec.style.display = 'none';
       sbCfgMsg('Card found and the default password does not work — good.');
     } else {
       warn.style.display = 'none';
+      sec.style.display = 'none';
       sbCfgMsg(d.ok ? 'Card not visible right now — settings were saved; the bridge will keep retrying.'
                     : 'Security check failed — settings were saved anyway.');
     }
   });
 }
+function sbCfgSecure() {
+  var np = document.getElementById('sb-cfg-newpass').value;
+  if (np.length < 8 || np.length > 63) {
+    sbCfgMsg('Card password must be 8–63 characters.', true); return;
+  }
+  if (np === '88888888') {
+    sbCfgMsg('That is the factory password — pick a different one.', true); return;
+  }
+  var btn = document.getElementById('sb-cfg-secure-btn');
+  if (btn) btn.disabled = true;
+  sbCfgMsg('Changing the card password — the bridge will rejoin with it…');
+  sbOp('EZSHARE_ADMIN', { wifi_password: np }, function(d) {
+    if (btn) btn.disabled = false;
+    if (d.ok && d.result && d.result.changed) {
+      document.getElementById('sb-cfg-secure').style.display = 'none';
+      document.getElementById('sb-cfg-warning').style.display = 'none';
+      document.getElementById('sb-cfg-pass').value = '';
+      if (d.result.saved === false) {
+        sbCfgMsg('Card password changed, but the bridge could not store it — enter the new password above and Save & Test.', true);
+      } else {
+        sbCfgMsg(d.result.rejoined
+          ? 'Card password changed — the bridge has rejoined with it.'
+          : 'Card password changed — the bridge is still rejoining the card.');
+      }
+    } else {
+      var code = (d.error && d.error.code) || (d.result && d.result.error) || 'ERROR';
+      sbCfgMsg('Card password change failed: ' + code +
+        ' — if the card admin password is not "admin" it cannot be changed from here.', true);
+    }
+  });
+}
 function sbCfgSave() {
-  var sel = document.getElementById('sb-cfg-ssid');
-  var ssid = (sel.value === '__manual__')
-             ? document.getElementById('sb-cfg-ssid-manual').value.trim()
-             : sel.value;
+  var ssid = sbCfgSelSsid();
   var pass = document.getElementById('sb-cfg-pass').value;
   if (!ssid) { sbCfgMsg('Pick or enter the EZShare network first.', true); return; }
   var ap = sbCfgAps.find(function(a){ return a.ssid === ssid; });
@@ -2842,6 +2990,10 @@ function sbCfgSave() {
     args.clear_password = true;
     args.allow_open_wifi = true;
   }
+  args.as10_tz = (sbMach === 'as11')
+                 ? document.getElementById('sb-cfg-tz').value
+                 : 'UTC0';
+  args.timezone_confirmed = true;
   var btn = document.getElementById('sb-cfg-save-btn');
   if (btn) btn.disabled = true;
   sbCfgMsg('Saving to the bridge…');
