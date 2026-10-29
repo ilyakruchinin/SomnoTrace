@@ -32,6 +32,7 @@
 
 #include "esp_log.h"
 #include "esp_sntp.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "nvs_writer.h"
 
@@ -52,15 +53,32 @@ static const char *TAG = "time_sync";
 #define NVS_KEY_NTP_SRV  "ntp_srv"
 #define NVS_KEY_DRIFT    "drift_ms"
 #define NVS_KEY_DRIFT_AT "drift_at"
+#define NVS_KEY_EPOCH    "t_epoch"
 #define TZ_STR_MAX       64
 #define TZ_NAME_MAX      40
 #define NTP_SRV_MAX      64
 #define SNTP_SYNC_MS    (3600 * 1000)   /* 1 hour */
 #define NTP_INITIAL_TIMEOUT_MS  15000   /* per-attempt wait for initial sync */
 #define NTP_INITIAL_ATTEMPTS    3
+/* A wall-clock step larger than this starts a new time-source epoch.
+ * The natural hourly NTP correction is expected ≤ ~0.1 s; every real
+ * discontinuity (TZ/DST shift, re-anchoring after an outage, manual set)
+ * is seconds-to-hours, so the gate sits well clear of both. */
+#define TIME_STEP_GATE_US (500LL * 1000)
 
 static bool s_synced = false;
 static bool s_initial_sync_done = false;
+
+/* ── Time-source epoch (SomnoBridge §8.1 anchor segmentation) ────────────
+ * Persisted counter identifying the current unbroken timescale.  Bumped
+ * once per boot at the first anchoring and again whenever a wall-clock
+ * step beyond TIME_STEP_GATE_US is applied.  SomnoBridge discards anchor
+ * history when this changes — small periodic corrections ride the map
+ * untouched while real discontinuities start the drift fit fresh. */
+static uint32_t s_time_epoch;
+static bool     s_epoch_loaded;
+static int64_t  s_wall_at_sync_us = -1;   /* wall µs at last anchoring  */
+static int64_t  s_mono_at_sync_us = -1;   /* monotonic µs then          */
 
 /* ── Time-source provenance ─────────────────────────────────────────── */
 static time_source_t s_source = TIME_SRC_NONE;
@@ -69,8 +87,78 @@ static int64_t s_drift_at_ms = 0;    /* NTP epoch ms when drift was measured */
 static bool s_drift_loaded = false;  /* true once s_drift_ms/at loaded from NVS */
 static const char *s_drift_src = "none";  /* provenance of s_drift_ms */
 
+static esp_err_t do_load_epoch(void *arg)
+{
+    uint32_t *out = arg;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_get_u32(h, NVS_KEY_EPOCH, out);
+    nvs_close(h);
+    return err;
+}
+
+static esp_err_t do_save_epoch(void *arg)
+{
+    const uint32_t v = *(const uint32_t *)arg;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u32(h, NVS_KEY_EPOCH, v);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+static void epoch_bump(void)
+{
+    s_time_epoch++;
+    uint32_t v = s_time_epoch;
+    nvs_writer_run(do_save_epoch, &v);
+}
+
+/* Record an anchoring of the wall clock (called with the new wall time and
+ * the monotonic instant it was applied).  The first anchoring of the boot
+ * is unconditionally a fresh timescale; later ones bump the epoch only
+ * when the applied step exceeds the gate. */
+static void epoch_note_anchor(int64_t wall_us, int64_t mono_us)
+{
+    if (!s_epoch_loaded) {
+        s_epoch_loaded = true;
+        uint32_t v = 0;
+        nvs_writer_run(do_load_epoch, &v);
+        s_time_epoch = v;
+    }
+    if (s_wall_at_sync_us < 0) {
+        epoch_bump();
+        ESP_LOGI(TAG, "time source epoch %lu (first anchor this boot)",
+                 (unsigned long)s_time_epoch);
+    } else {
+        int64_t step = wall_us - (s_wall_at_sync_us +
+                                  (mono_us - s_mono_at_sync_us));
+        if (step < 0) step = -step;
+        if (step > TIME_STEP_GATE_US) {
+            epoch_bump();
+            ESP_LOGW(TAG, "time source epoch %lu (step %lld us > gate)",
+                     (unsigned long)s_time_epoch, (long long)step);
+        } else {
+            ESP_LOGD(TAG, "ntp step %lld us within gate — epoch %lu kept",
+                     (long long)step, (unsigned long)s_time_epoch);
+        }
+    }
+    s_wall_at_sync_us = wall_us;
+    s_mono_at_sync_us = mono_us;
+}
+
+uint32_t time_sync_source_epoch(void)
+{
+    return s_time_epoch;
+}
+
 static void sntp_sync_cb(struct timeval *tv)
 {
+    epoch_note_anchor((int64_t)tv->tv_sec * 1000000 + tv->tv_usec,
+                      esp_timer_get_time());
     s_synced = true;
     s_source = TIME_SRC_NTP;
     time_t now = tv->tv_sec;
@@ -521,6 +609,10 @@ esp_err_t time_sync_recover_from_as11(void)
     int64_t wall_ms = as11_ms + s_drift_ms;
     struct timeval tv = { .tv_sec = wall_ms / 1000, .tv_usec = (wall_ms % 1000) * 1000 };
     settimeofday(&tv, NULL);
+    /* Explicit re-anchor: the new wall time is a fresh timescale, so peers
+     * must never interpolate anchors across this jump. */
+    epoch_note_anchor((int64_t)tv.tv_sec * 1000000 + tv.tv_usec,
+                      esp_timer_get_time());
 
     s_source = TIME_SRC_AS11_DRIFT;
 

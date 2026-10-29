@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -123,7 +124,7 @@ static const ble_uuid128_t UUID_DATA =
  * wedged — abort it rather than park the sync on dead air.          */
 #define SB_STREAM_STALL_US (45LL * 1000 * 1000)
 #define SB_TIME_ROUNDS    5
-#define SB_TIME_PERIOD_MS (10 * 60 * 1000)
+#define SB_TIME_PERIOD_MS (5 * 60 * 1000)
 #define SB_POLL_MS        (30 * 1000)
 #define SB_IDLE_SYNC_MS   (5 * 60 * 1000)
 #define SB_PIN_BUDGET_MS  90000   /* > the bridge's 60 s attempt limit */
@@ -178,6 +179,8 @@ static uint32_t s_time_rid;
 static int64_t  s_time_t1_us;
 static uint32_t s_time_epoch;
 static int64_t  s_time_best_rtt;
+static int64_t  s_time_round_rtt;
+static uint32_t s_time_best_rid;
 static uint64_t s_time_best_t1, s_time_best_t4, s_time_best_m2, s_time_best_m3;
 static uint32_t s_time_best_epoch;
 static int      s_time_rounds;
@@ -504,27 +507,46 @@ static esp_err_t json_op(const char *op, cJSON *args, cJSON **result)
 
 /* ── Time exchange (§10.4) ──────────────────────────────────────────── */
 
-static void time_on_reply(const uint8_t *p, size_t len)
+/* SomnoTrace wall-clock UTC in microseconds — the t1/t4 wire domain.
+ * esp_timer_get_time() is monotonic uptime and must NEVER be sent. */
+static int64_t utc_now_us(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+}
+
+static void time_on_reply(uint32_t rid, const uint8_t *p, size_t len)
 {
     if (len < 8 + 8 + 8 + 4) return;
     const uint64_t t1 = rd_u64(p);
     const uint64_t m2 = rd_u64(p + 8);
     const uint64_t m3 = rd_u64(p + 16);
     const uint32_t epoch = rd_u32(p + 24);
-    const int64_t t4 = esp_timer_get_time();
-    if (t1 != (uint64_t)s_time_t1_us || epoch != s_time_epoch) return;
+    const int64_t t4 = utc_now_us();
+    if (!s_time_pending || rid != s_time_rid ||
+        t1 != (uint64_t)s_time_t1_us || epoch != s_time_epoch) return;
+
+    s_time_pending = false;
+    /* An NTP step between t1 and t4 puts the pair on different
+     * timescales — the round is unusable for the anchor. */
+    if (time_sync_source_epoch() != epoch || t4 <= (int64_t)t1) {
+        xSemaphoreGive(s_resp_sem);
+        return;
+    }
 
     const int64_t rtt = (t4 - (int64_t)t1) - ((int64_t)m3 - (int64_t)m2);
-    if (rtt < 0) return;
+    if (rtt < 0) { xSemaphoreGive(s_resp_sem); return; }
+    s_time_round_rtt = rtt;
     if (s_time_best_rtt < 0 || rtt < s_time_best_rtt) {
         s_time_best_rtt = rtt;
+        s_time_best_rid = rid;
         s_time_best_t1 = t1;
         s_time_best_t4 = (uint64_t)t4;
         s_time_best_m2 = m2;
         s_time_best_m3 = m3;
         s_time_best_epoch = epoch;
     }
-    s_time_pending = false;
     xSemaphoreGive(s_resp_sem);      /* reuse the waiter: round finished */
 }
 
@@ -534,8 +556,8 @@ static int64_t time_round(void)
     if (!time_sync_is_synced()) return -1;
 
     uint8_t pkt[8 + 4 + 4];
-    const int64_t t1 = esp_timer_get_time();
-    const uint32_t epoch = (uint32_t)(time(NULL) & 0xFFFFFFFFu);
+    const int64_t t1 = utc_now_us();
+    const uint32_t epoch = time_sync_source_epoch();
     wr_u64(pkt, (uint64_t)t1);
     wr_u32(pkt + 8, 25000);          /* source uncertainty: 25 ms */
     wr_u32(pkt + 12, epoch);
@@ -545,7 +567,7 @@ static int64_t time_round(void)
     s_time_t1_us = t1;
     s_time_epoch = epoch;
     s_time_pending = true;
-    s_time_best_rtt = -1;
+    s_time_round_rtt = -1;
     xSemaphoreTake(s_resp_sem, 0);
 
     if (ctrl_send(SB_KIND_TIME_REQ, rid, pkt, sizeof(pkt)) != ESP_OK) return -1;
@@ -553,18 +575,27 @@ static int64_t time_round(void)
         s_time_pending = false;
         return -1;
     }
-    return s_time_best_rtt;
+    return s_time_round_rtt;
 }
 
 static void time_sync_rounds(void)
 {
     s_time_rounds = 0;
+    s_time_best_rtt = -1;
     for (int i = 0; i < SB_TIME_ROUNDS; i++) {
-        if (time_round() < 0) break;
+        const int64_t rtt = time_round();
+        if (rtt < 0) break;
         s_time_rounds++;
+        /* per-round rtt return is informational only; the burst's best
+         * lives in s_time_best_* accumulated by time_on_reply */
     }
     if (s_time_best_rtt < 0) {
         ESP_LOGW(TAG, "time sync: no usable round");
+        return;
+    }
+    if (time_sync_source_epoch() != s_time_best_epoch) {
+        ESP_LOGW(TAG, "time sync: source epoch changed mid-burst — "
+                 "commit skipped");
         return;
     }
 
@@ -572,11 +603,45 @@ static void time_sync_rounds(void)
     wr_u64(pkt, s_time_best_t1);
     wr_u64(pkt + 8, s_time_best_t4);
     wr_u32(pkt + 16, s_time_best_epoch);
-    if (ctrl_send(SB_KIND_TIME_CMT, s_time_rid, pkt, sizeof(pkt)) == ESP_OK) {
-        ESP_LOGI(TAG, "time sync: %d round(s), best RTT %lld us committed",
-                 s_time_rounds, (long long)s_time_best_rtt);
-        s_time_last_ms = esp_timer_get_time() / 1000;
+
+    /* Commit under the winning round's request id: the bridge correlates
+     * it with that exchange's pending entry (t1/m2/m3).  Capture its JSON
+     * ack so acceptance and anchor count are visible in the log. */
+    xSemaphoreTake(s_req_mtx, portMAX_DELAY);
+    s_pending_rid = s_time_best_rid;
+    free(s_resp_json);
+    s_resp_json = NULL;
+    xSemaphoreTake(s_resp_sem, 0);
+    json_reset_rx();
+    esp_err_t sret = ctrl_send(SB_KIND_TIME_CMT, s_time_best_rid,
+                               pkt, sizeof(pkt));
+    bool acked = false;
+    if (sret == ESP_OK &&
+        xSemaphoreTake(s_resp_sem, pdMS_TO_TICKS(2000)) == pdTRUE &&
+        s_resp_json) {
+        cJSON *ack = cJSON_Parse(s_resp_json);
+        const cJSON *res = ack ? cJSON_GetObjectItem(ack, "result") : NULL;
+        const cJSON *acc = res ? cJSON_GetObjectItem(res, "accepted") : NULL;
+        const cJSON *why = res ? cJSON_GetObjectItem(res, "reason")
+                             : cJSON_GetObjectItem(
+                                 cJSON_GetObjectItem(ack, "error"), "code");
+        const cJSON *nac = res ? cJSON_GetObjectItem(res, "anchors") : NULL;
+        acked = acc && cJSON_IsTrue(acc);
+        ESP_LOGI(TAG, "time sync: %d round(s), best RTT %lld us — commit %s "
+                 "(%s, anchors=%d)", s_time_rounds,
+                 (long long)s_time_best_rtt,
+                 acked ? "accepted" : "rejected",
+                 (why && cJSON_IsString(why)) ? why->valuestring : "?",
+                 (nac && cJSON_IsNumber(nac)) ? (int)nac->valuedouble : -1);
+        if (ack) cJSON_Delete(ack);
     }
+    s_pending_rid = 0;
+    free(s_resp_json);
+    s_resp_json = NULL;
+    xSemaphoreGive(s_req_mtx);
+
+    if (sret == ESP_OK && acked)
+        s_time_last_ms = esp_timer_get_time() / 1000;
 }
 
 /* ── File streaming (§10.3) ─────────────────────────────────────────── */
@@ -1365,6 +1430,44 @@ static void sync_root_dir(const char *directory, const char *ledger_prefix)
     cJSON_Delete(res);
 }
 
+/* One-line drift-health probe at the end of every sync pass.  The per-day
+ * sidecar fetch only runs while files download, which left drift state
+ * invisible for whole days — this keeps the estimate, TZ rule, SOT and
+ * best-available selection auditable in the log history. */
+static void drift_probe_log(void)
+{
+    cJSON *args = cJSON_CreateObject();
+    cJSON_AddBoolToObject(args, "best_available", true);
+    cJSON *res = NULL;
+    if (json_op("GET_DRIFT", args, &res) != ESP_OK || !res) {
+        cJSON_Delete(res);
+        return;
+    }
+    const cJSON *est  = cJSON_GetObjectItem(res, "estimate");
+    const cJSON *sot  = cJSON_GetObjectItem(res, "source_of_truth");
+    const cJSON *best = cJSON_GetObjectItem(res, "best_available_offset");
+    const char *state = cJSON_IsObject(est)
+        ? cJSON_GetStringValue(cJSON_GetObjectItem(est, "estimate_state")) : NULL;
+    const char *tzr = cJSON_IsObject(est)
+        ? cJSON_GetStringValue(cJSON_GetObjectItem(est, "timezone_rule")) : NULL;
+    const cJSON *dm = cJSON_IsObject(est)
+        ? cJSON_GetObjectItem(est, "clock_drift_ms") : NULL;
+    const cJSON *hm = cJSON_IsObject(est)
+        ? cJSON_GetObjectItem(est, "accuracy_half_ms") : NULL;
+    const char *view = cJSON_IsObject(best)
+        ? cJSON_GetStringValue(cJSON_GetObjectItem(best, "selected_view"))
+        : cJSON_GetStringValue(cJSON_GetObjectItem(res, "best_available_reason"));
+    ESP_LOGI(TAG, "drift probe: est=%s drift=%lldms half=%lldms sot=%s "
+             "best=%s tz=%s",
+             state ? state : "none",
+             (dm && cJSON_IsNumber(dm)) ? (long long)dm->valuedouble : 0LL,
+             (hm && cJSON_IsNumber(hm)) ? (long long)hm->valuedouble : -1LL,
+             cJSON_IsObject(sot) ? "live" : "null",
+             view ? view : "none",
+             tzr ? tzr : "?");
+    cJSON_Delete(res);
+}
+
 /* One sync pass: days newest-first, files smallest-first, BRP last. */
 static void sync_run(bool full)
 {
@@ -1450,11 +1553,15 @@ static void sync_run(bool full)
             }
         }
 
-        /* Drift sidecar: the importer embeds it in every session manifest. */
+        /* Drift sidecar: the importer embeds it in every session manifest.
+         * best_available opts in to the bridge's best-effort correction
+         * (current estimate or previous-session fallback) — without it the
+         * field stays null even when a usable candidate exists. */
         cJSON *ga = cJSON_CreateObject();
         char gdir[48];
         snprintf(gdir, sizeof(gdir), "/DATALOG/%s", day);
         cJSON_AddStringToObject(ga, "directory", gdir);
+        cJSON_AddBoolToObject(ga, "best_available", true);
         cJSON *gres = NULL;
         if (json_op("GET_DRIFT", ga, &gres) == ESP_OK && gres) {
             char p[200];
@@ -1477,6 +1584,7 @@ static void sync_run(bool full)
             ESP_LOGI(TAG, "sync: %s staged (%d day(s) done)", day, s_sync_days_done);
     }
 
+    drift_probe_log();
     cJSON_Delete(res);
     s_last_sync_ms = esp_timer_get_time() / 1000;
 
@@ -1913,7 +2021,7 @@ static int sb_gap_event(struct ble_gap_event *event, void *arg)
         uint8_t *payload = all + SB_HDR_LEN;
 
         if (kind == SB_KIND_TIME_RSP) {
-            time_on_reply(payload, plen);
+            time_on_reply(rid, payload, plen);
         } else if (kind == SB_KIND_JSON_RSP) {
             if (flags & SB_FLAG_START) { s_rx_len = 0; s_rx_next_off = 0; s_rx_rid = rid; }
             if (rid == s_rx_rid && off == s_rx_next_off && s_rx_len + plen < SB_JSON_MAX) {

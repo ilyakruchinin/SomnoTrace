@@ -962,50 +962,108 @@ static int64_t imp_ann_span_ms(const char *path, bool csl)
 }
 
 /* Emit one EventNotification JSON line per event (each well under the
- * 512/640-byte consumer line buffers). */
-static int emit_event_line(FILE *f, const char *data_id, const char *event,
-                           int64_t dev_ms, int dur_s, int backdate_s)
+ * 512/640-byte consumer line buffers).  fmt_event_line is the single
+ * source for the line format so in-memory renders stay byte-identical
+ * to file output. */
+static int fmt_event_line(char *line, size_t cap, const char *data_id,
+                          const char *event, int64_t dev_ms, int dur_s,
+                          int backdate_s)
 {
     char iso[32];
     imp_dev_to_iso(dev_ms, iso, sizeof(iso));
-    char line[512];
     int n;
     if (backdate_s > 0)
-        n = snprintf(line, sizeof(line),
+        n = snprintf(line, cap,
             "{\"method\":\"EventNotification\",\"params\":{\"dataId\":\"%s\","
             "\"events\":[{\"event\":\"%s\",\"reportTime\":\"%s\","
             "\"backdateSeconds\":%d}]}}\n",
             data_id, event, iso, backdate_s);
     else if (dur_s > 0)
-        n = snprintf(line, sizeof(line),
+        n = snprintf(line, cap,
             "{\"method\":\"EventNotification\",\"params\":{\"dataId\":\"%s\","
             "\"events\":[{\"event\":\"%s\",\"reportTime\":\"%s\","
             "\"durationSeconds\":%d}]}}\n",
             data_id, event, iso, dur_s);
     else
-        n = snprintf(line, sizeof(line),
+        n = snprintf(line, cap,
             "{\"method\":\"EventNotification\",\"params\":{\"dataId\":\"%s\","
             "\"events\":[{\"event\":\"%s\",\"reportTime\":\"%s\"}]}}\n",
             data_id, event, iso);
-    if (n <= 0 || n >= (int)sizeof(line)) return -1;
+    return (n > 0 && n < (int)cap) ? n : -1;
+}
+
+static int emit_event_line(FILE *f, const char *data_id, const char *event,
+                           int64_t dev_ms, int dur_s, int backdate_s)
+{
+    char line[512];
+    int n = fmt_event_line(line, sizeof(line), data_id, event, dev_ms,
+                           dur_s, backdate_s);
+    if (n <= 0) return -1;
     if ((int)fwrite(line, 1, (size_t)n, f) != n) return -1;
     return n;
 }
 
-/* Build <id>_events.snt for a session.
- * t_eve_dev = annotation-cluster start (TherapyStart), -1 when absent.
- * t_wav_dev = waveform-cluster start (MaskOn / _ZLE), -1 when absent.
- * Session start = t_eve when present else t_wav; end = end_dev_ms. */
-static esp_err_t write_events_snt(const char *dir, const char *id,
-                                  const imp_file_t *eve_f, const imp_file_t *csl_f,
-                                  int64_t t_eve_dev, int64_t t_wav_dev,
-                                  int64_t end_dev_ms, uint32_t *out_events)
+/* Emit sink: the events render below produces identical output whether it
+ * lands in the staged file (commit path) or an in-memory line set (the
+ * legacy-manifest coverage check in augment_session). */
+typedef int (*imp_emit_fn)(void *ctx, const char *data_id,
+                           const char *event, int64_t dev_ms, int dur_s,
+                           int backdate_s);
+
+static int emit_to_file(void *ctx, const char *data_id, const char *event,
+                        int64_t dev_ms, int dur_s, int backdate_s)
 {
-    char path[400], tmp[408];
-    snprintf(path, sizeof(path), "%s/%s_events.snt", dir, id);
-    snprintf(tmp, sizeof(tmp), "%s.part", path);
-    FILE *f = fopen(tmp, "w");
-    if (!f) return ESP_FAIL;
+    return emit_event_line((FILE *)ctx, data_id, event, dev_ms, dur_s,
+                           backdate_s);
+}
+
+typedef struct {
+    char **v;      /* each entry is a malloc'd NUL-free line incl '\n' */
+    int     n, cap;
+} imp_line_set_t;
+
+static int emit_to_set(void *ctx, const char *data_id, const char *event,
+                       int64_t dev_ms, int dur_s, int backdate_s)
+{
+    imp_line_set_t *S = (imp_line_set_t *)ctx;
+    char line[512];
+    int n = fmt_event_line(line, sizeof(line), data_id, event, dev_ms,
+                           dur_s, backdate_s);
+    if (n <= 0) return -1;
+    if (S->n >= S->cap) {
+        int ncap = S->cap ? S->cap * 2 : 64;
+        char **t = imp_realloc(S->v, (size_t)ncap * sizeof(char *));
+        if (!t) return -1;
+        S->v = t; S->cap = ncap;
+    }
+    char *dup = imp_malloc((size_t)n + 1);
+    if (!dup) return -1;
+    memcpy(dup, line, (size_t)n + 1);
+    S->v[S->n++] = dup;
+    return n;
+}
+
+static void line_set_free(imp_line_set_t *S)
+{
+    for (int i = 0; i < S->n; i++) free(S->v[i]);
+    free(S->v);
+    S->v = NULL; S->n = S->cap = 0;
+}
+
+/* The full events.snt render: synthetic Therapy/Mask window (device
+ * domain) then respiratory (EVE) + CSR (CSL) annotations, byte-identical
+ * via emit.  t_eve_dev = annotation-cluster start (TherapyStart), -1
+ * when absent; t_wav_dev = waveform-cluster start (MaskOn/_ZLE), -1 when
+ * absent; session start = t_eve when present else t_wav.
+ * reportTime is written in the device clock domain so edf_annotations'
+ * (as11 + drift - session) inversion lands exactly on the source onset. */
+static esp_err_t events_render(const imp_file_t *eve_f,
+                               const imp_file_t *csl_f,
+                               int64_t t_eve_dev, int64_t t_wav_dev,
+                               int64_t end_dev_ms,
+                               imp_emit_fn emit, void *ctx,
+                               uint32_t *out_events)
+{
     esp_err_t ret = ESP_OK;
     uint32_t n_ev = 0;
 
@@ -1015,21 +1073,18 @@ static esp_err_t write_events_snt(const char *dir, const char *id,
      * collect_session_mask_pairs() prefers MaskOn/MaskOff; TherapyStart/
      * TherapyStop are the fallback and mirror what the AS11 emits. */
     if (sess_start >= 0 &&
-        emit_event_line(f, "UsageEvents-TherapyStatusEvents", "TherapyStart",
-                        sess_start, 0, 0) < 0) ret = ESP_FAIL;
+        emit(ctx, "UsageEvents-TherapyStatusEvents", "TherapyStart",
+             sess_start, 0, 0) < 0) ret = ESP_FAIL;
     if (ret == ESP_OK && t_wav_dev >= 0 &&
-        emit_event_line(f, "UsageEvents-TherapyStatusEvents", "MaskOn",
-                        t_wav_dev, 0, 0) < 0) ret = ESP_FAIL;
+        emit(ctx, "UsageEvents-TherapyStatusEvents", "MaskOn",
+             t_wav_dev, 0, 0) < 0) ret = ESP_FAIL;
     if (ret == ESP_OK && t_wav_dev >= 0 && end_dev_ms > t_wav_dev &&
-        emit_event_line(f, "UsageEvents-TherapyStatusEvents", "MaskOff",
-                        end_dev_ms, 0, 0) < 0) ret = ESP_FAIL;
+        emit(ctx, "UsageEvents-TherapyStatusEvents", "MaskOff",
+             end_dev_ms, 0, 0) < 0) ret = ESP_FAIL;
     if (ret == ESP_OK && end_dev_ms > sess_start &&
-        emit_event_line(f, "UsageEvents-TherapyStatusEvents", "TherapyStop",
-                        end_dev_ms, 0, 0) < 0) ret = ESP_FAIL;
+        emit(ctx, "UsageEvents-TherapyStatusEvents", "TherapyStop",
+             end_dev_ms, 0, 0) < 0) ret = ESP_FAIL;
 
-    /* Respiratory (EVE) + CSR (CSL) annotations.  reportTime is written in
-     * the device clock domain so edf_annotations' (as11 + drift - session)
-     * inversion lands exactly on the source onset. */
     for (int pass = 0; pass < 2 && ret == ESP_OK; pass++) {
         const imp_file_t *src = pass ? csl_f : eve_f;
         if (!src) continue;
@@ -1044,9 +1099,9 @@ static esp_err_t write_events_snt(const char *dir, const char *id,
             for (int i = 0; i < L.n && ret == ESP_OK; i++) {
                 const char *name = imp_event_name(L.ev[i].label, csl);
                 if (!name) continue;
-                if (emit_event_line(f, "TherapyEvents-RespiratoryEvents",
-                                    name, src->ts_dev_ms + L.ev[i].onset_ms,
-                                    (int)(L.ev[i].dur_ms / 1000), 0) < 0)
+                if (emit(ctx, "TherapyEvents-RespiratoryEvents",
+                         name, src->ts_dev_ms + L.ev[i].onset_ms,
+                         (int)(L.ev[i].dur_ms / 1000), 0) < 0)
                     ret = ESP_FAIL;
                 else
                     n_ev++;
@@ -1054,14 +1109,123 @@ static esp_err_t write_events_snt(const char *dir, const char *id,
         }
         free(L.ev);
     }
+    if (ret == ESP_OK) *out_events = n_ev;
+    return ret;
+}
 
+/* Build <id>_events.snt for a session. */
+static esp_err_t write_events_snt(const char *dir, const char *id,
+                                  const imp_file_t *eve_f, const imp_file_t *csl_f,
+                                  int64_t t_eve_dev, int64_t t_wav_dev,
+                                  int64_t end_dev_ms, uint32_t *out_events)
+{
+    char path[400], tmp[408];
+    snprintf(path, sizeof(path), "%s/%s_events.snt", dir, id);
+    snprintf(tmp, sizeof(tmp), "%s.part", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return ESP_FAIL;
+    esp_err_t ret = events_render(eve_f, csl_f, t_eve_dev, t_wav_dev,
+                                  end_dev_ms, emit_to_file, f, out_events);
     if (ret == ESP_OK) ret = imp_flush_close(f, tmp);
     else fclose(f);
     if (ret != ESP_OK) { unlink(tmp); return ret; }
     /* Leave the .part staged — publish_parts() renames it with the rest of
      * the session output. */
-    *out_events = n_ev;
     return ESP_OK;
+}
+
+/* Collect the TherapyEvents lines the offered annotation files would
+ * emit — the part of events.snt that EVE/CSL actually own.  The
+ * synthetic UsageEvents block is session-anchored, not source-anchored,
+ * so it is intentionally excluded here: an annotation-only re-offer
+ * cannot reproduce wave-derived MaskOn/MaskOff times and must not be
+ * judged on them. */
+static esp_err_t collect_ann_lines(const imp_file_t *eve_f,
+                                   const imp_file_t *csl_f,
+                                   imp_line_set_t *S, uint32_t *out_events)
+{
+    esp_err_t ret = ESP_OK;
+    uint32_t n_ev = 0;
+    for (int pass = 0; pass < 2 && ret == ESP_OK; pass++) {
+        const imp_file_t *src = pass ? csl_f : eve_f;
+        if (!src) continue;
+        bool csl = (pass == 1);
+        imp_ev_list_t L = {0};
+        esp_err_t cr = collect_tal(src->path, &L, csl);
+        if (cr != ESP_OK) {
+            ESP_LOGW(TAG, "import: %s annotations unreadable (%s)",
+                     src->path, esp_err_to_name(cr));
+            ret = ESP_FAIL;
+        }
+        if (ret == ESP_OK && L.n > 0) {
+            qsort(L.ev, L.n, sizeof(imp_ev_t), imp_event_cmp);
+            for (int i = 0; i < L.n && ret == ESP_OK; i++) {
+                const char *name = imp_event_name(L.ev[i].label, csl);
+                if (!name) continue;
+                if (emit_to_set(S, "TherapyEvents-RespiratoryEvents",
+                                name, src->ts_dev_ms + L.ev[i].onset_ms,
+                                (int)(L.ev[i].dur_ms / 1000), 0) < 0)
+                    ret = ESP_FAIL;
+                else
+                    n_ev++;
+            }
+        }
+        free(L.ev);
+    }
+    if (ret == ESP_OK) *out_events = n_ev;
+    return ret;
+}
+
+/* Legacy manifests carry no src_kinds, so recorded annotation coverage
+ * cannot be read back from metadata.  Instead re-render the annotation
+ * events the offered sources would produce and require every recorded
+ * TherapyEvents line to be present in the render: the merge then can
+ * only grow the events file, never shrink it — a true duplicate
+ * verifies line-for-line while a genuinely late file still merges its
+ * new events.  UsageEvents lines (session-anchored) are kept verbatim;
+ * a missing/empty events file covers trivially. */
+#define ANN_DATA_ID "\"dataId\":\"TherapyEvents-RespiratoryEvents\""
+
+static bool events_file_covered(const char *dir, const char *id,
+                                imp_line_set_t *cand, imp_line_set_t *kept)
+{
+    char ep[440];
+    snprintf(ep, sizeof(ep), "%s/%s_events.snt", dir, id);
+    FILE *f = fopen(ep, "r");
+    if (!f) return errno == ENOENT;
+
+    /* Linear membership scan: cand stays in canonical emit order
+     * (EVE block then CSL block) for the merged write.  Sets are
+     * small — a session has at most a few hundred recorded events. */
+    bool covered = true;
+    char buf[640];
+    while (covered && fgets(buf, sizeof(buf), f)) {
+        if (!strstr(buf, ANN_DATA_ID)) {
+            /* Session-anchored line — carried into the merged file. */
+            int n = (int)strlen(buf);
+            if (kept->n >= kept->cap) {
+                int ncap = kept->cap ? kept->cap * 2 : 16;
+                char **t = imp_realloc(kept->v, (size_t)ncap * sizeof(char *));
+                if (!t) { covered = false; break; }
+                kept->v = t; kept->cap = ncap;
+            }
+            char *dup = imp_malloc((size_t)n + 1);
+            if (!dup) { covered = false; break; }
+            memcpy(dup, buf, (size_t)n + 1);
+            kept->v[kept->n++] = dup;
+            continue;
+        }
+        bool found = false;
+        for (int i = 0; i < cand->n; i++)
+            if (!strcmp(buf, cand->v[i])) { found = true; break; }
+        if (!found) {
+            covered = false;
+            ESP_LOGI(TAG, "import: %s uncovered event line: %.120s", id, buf);
+        }
+    }
+    covered = covered && !ferror(f);
+    fclose(f);
+    return covered;
 }
 
 /* ── Identification / settings resolution ───────────────────────────── */
@@ -1816,9 +1980,16 @@ static void write_device_metadata(const edf_import_ctx_t *ctx)
 
 typedef struct {
     int64_t  drift_ms;          /* effective drift actually applied (0 when !usable) */
+    int64_t  half_ms;           /* accuracy bound of the chosen record, -1 absent */
     int64_t  measured_at_ms;    /* reference_at_ms from the sidecar, 0 when absent */
     bool     valid, usable;
     char     source[48];     /* clock_drift_source / import provenance */
+    /* Source-device fixed zone: civil times inside the EDFs are the
+     * device's own local civil — when the bridge confirms a fixed-offset
+     * rule it wins over the ESP's own zone for device-domain parsing.
+     * INT32_MIN = no confirmed rule (ESP-local interpretation kept). */
+    int32_t  dev_tz_off_s;
+    char     dev_tz_rule[40];
     cJSON   *raw;            /* full sidecar JSON, embedded in the manifest */
 } imp_drift_t;
 
@@ -1842,15 +2013,130 @@ static bool json_bool(const cJSON *o, const char *key, bool dflt)
     return (v && cJSON_IsBool(v)) ? cJSON_IsTrue(v) : dflt;
 }
 
-/* Selection order per .ai/IMPORT-EDFs.md §4.2:
- *   1. source_of_truth           → measured, valid+usable
- *   2. best_available_offset     → valid+usable
- *   3. estimate (has_drift)      → valid=false, usable iff half_ms ≤ 5000
- *   4. none                      → drift 0, everything false
+/* A CPAP clock can plausibly be wrong by at most ~a timezone plus drift;
+ * |drift| beyond 24 h is an epoch-conversion bug, not a measurement. */
+#define IMP_DRIFT_MAX_MS     (24LL * 3600 * 1000)
+#define IMP_DRIFT_USABLE_HALF 5000
+
+/* schema-5 selection record (source_of_truth / best_available_offset):
+ * drift = clock_drift_ms or the midpoint of interval_ms;
+ * half = accuracy_half_ms (legacy half_ms accepted). */
+static bool drift_sel_parse(const cJSON *r, int64_t *drift, int64_t *half,
+                            int64_t *measured_at, const char **quality,
+                            const char **view)
+{
+    int64_t v;
+    if (!json_i64(r, "clock_drift_ms", &v)) {
+        const cJSON *iv = cJSON_GetObjectItem(r, "interval_ms");
+        const cJSON *lo = iv ? cJSON_GetArrayItem(iv, 0) : NULL;
+        const cJSON *hi = iv ? cJSON_GetArrayItem(iv, 1) : NULL;
+        if (!cJSON_IsNumber(lo) || !cJSON_IsNumber(hi)) return false;
+        v = ((int64_t)lo->valuedouble + (int64_t)hi->valuedouble) / 2;
+    }
+    int64_t h = -1;
+    if (!json_i64(r, "accuracy_half_ms", &h)) json_i64(r, "half_ms", &h);
+    int64_t at = 0;
+    if (!json_i64(r, "reference_at_ms", &at))
+        json_i64(r, "computed_at_ms", &at);
+    const cJSON *q = cJSON_GetObjectItem(r, "quality");
+    const cJSON *vw = cJSON_GetObjectItem(r, "selected_view");
+    if (!(vw && cJSON_IsString(vw)))
+        vw = cJSON_GetObjectItem(r, "origin");
+    *drift = v;
+    *half = h;
+    *measured_at = at;
+    *quality = (q && cJSON_IsString(q)) ? q->valuestring : NULL;
+    *view = (vw && cJSON_IsString(vw)) ? vw->valuestring : NULL;
+    return true;
+}
+
+static bool estimate_state_ok(const cJSON *est)
+{
+    const char *s = cJSON_GetStringValue(cJSON_GetObjectItem(est,
+                                                           "estimate_state"));
+    return s && (!strcmp(s, "provisional") || !strcmp(s, "validated"));
+}
+
+/* Inverse of imp_civil_from_days (public-domain algorithm). */
+static int64_t imp_days_from_civil(int y, int m, int d)
+{
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (int64_t)era * 146097 + (int)doe - 719468;
+}
+
+/* The ESP local-time UTC offset (s) at an epoch instant — computed without
+ * the non-portable tm_gmtoff, so the host test build sees the same math. */
+static int64_t imp_esp_off_at(int64_t epoch_ms)
+{
+    time_t t = (time_t)(epoch_ms / 1000);
+    struct tm lt;
+    if (!localtime_r(&t, &lt)) return 0;
+    int64_t naive = imp_days_from_civil(lt.tm_year + 1900, lt.tm_mon + 1,
+                                        lt.tm_mday) * 86400
+                  + (int64_t)lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec;
+    return naive - (int64_t)t;
+}
+
+/* Parse a fixed-offset zone rule ("UTC-10", "AEST-10", "UTC+5:30") into
+ * seconds EAST of UTC (local = utc + off).  POSIX sign is west-positive:
+ * "UTC-10" means UTC+10, i.e. +36000.  Returns false for non-fixed or
+ * unparseable rules (a DST tail means the rule isn't a fixed offset). */
+static bool imp_parse_tz_offset(const char *rule, int32_t *off_s)
+{
+    if (!rule || !off_s) return false;
+    const char *sign = NULL;
+    for (const char *p = rule; *p; p++)
+        if (*p == '+' || *p == '-') sign = p;
+    if (!sign) return false;
+    const char *q = sign + 1;
+    int parts[3] = {0, 0, 0};
+    int np = 0;
+    while (np < 3 && *q >= '0' && *q <= '9') {
+        char *end = NULL;
+        long v = strtol(q, &end, 10);
+        if (end == q) return false;
+        parts[np++] = (int)v;
+        q = (*end == ':') ? end + 1 : end;
+        if (*end != ':') break;
+    }
+    if (*q != '\0' && *q != ',') return false;
+    int64_t off = (int64_t)parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (off > 14 * 3600) return false;
+    *off_s = (int32_t)(*sign == '-' ? off : -off);
+    return true;
+}
+
+/* Total shift applied at a device-domain instant: the measured drift plus
+ * the zone delta between the source device's confirmed fixed rule and the
+ * ESP's own zone — source civil times are device-local, and mktime()
+ * reinterpreted them under the ESP zone, so the difference between the
+ * two interpretations is the correction. */
+static int64_t imp_shift_at(const imp_drift_t *d, int64_t t_dev_ms)
+{
+    int64_t s = d->drift_ms;
+    if (d->dev_tz_off_s != INT32_MIN)
+        s += (imp_esp_off_at(t_dev_ms) - (int64_t)d->dev_tz_off_s) * 1000;
+    return s;
+}
+
+/* Selection order (schema-5 shapes; legacy field names accepted):
+ *   1. source_of_truth            → fresh live qualified → valid+usable
+ *   2. best_available_offset      → current or previous-session selection
+ *   3. completed_session_fallback → eligible persisted record
+ *   4. estimate                   → valid=false, usable iff half ≤ 5000
+ *   5. none                       → drift 0, everything false
+ * Every tier is bounded by |drift| ≤ 24 h — an epoch-conversion bug
+ * produces values orders of magnitude beyond a real clock offset.
  * The whole sidecar is kept verbatim under "somnobridge_drift". */
 static void parse_drift_sidecar(const char *path, imp_drift_t *d)
 {
     memset(d, 0, sizeof(*d));
+    d->dev_tz_off_s = INT32_MIN;
+    d->half_ms = -1;
     snprintf(d->source, sizeof(d->source), "file_import");
     if (!path || !path[0]) return;
 
@@ -1859,46 +2145,108 @@ static void parse_drift_sidecar(const char *path, imp_drift_t *d)
         ESP_LOGW(TAG, "import: %s unreadable — file_import drift", path);
         return;
     }
-    const char *const keys[] = {
-        "source_of_truth", "best_available_offset", "estimate"
-    };
-    const cJSON *rec = NULL;
-    int64_t drift = 0;
-    int tier = -1;
-    for (int i = 0; i < 3; i++) {
-        const cJSON *r = cJSON_GetObjectItem(d->raw, keys[i]);
-        if (!r || !cJSON_IsObject(r)) continue;
-        int64_t v;
-        if (!json_i64(r, "clock_drift_ms", &v)) continue;
-        if (i == 1 && !json_bool(r, "valid", true)) continue;
-        if (i == 2 && !json_bool(r, "has_drift", false)) continue;
-        rec = r; drift = v; tier = i;
-        break;
+
+    const cJSON *est = cJSON_GetObjectItem(d->raw, "estimate");
+    /* Device-zone rule applies independently of drift usability. */
+    const char *rule = cJSON_GetStringValue(cJSON_GetObjectItem(est,
+                                                              "timezone_rule"));
+    if (rule && json_bool(est, "timezone_confirmed", false) &&
+        imp_parse_tz_offset(rule, &d->dev_tz_off_s)) {
+        snprintf(d->dev_tz_rule, sizeof(d->dev_tz_rule), "%s", rule);
+    } else {
+        d->dev_tz_off_s = INT32_MIN;
     }
-    if (!rec) {
+
+    const cJSON *sot  = cJSON_GetObjectItem(d->raw, "source_of_truth");
+    const cJSON *best = cJSON_GetObjectItem(d->raw, "best_available_offset");
+    const cJSON *fb   = cJSON_GetObjectItem(d->raw,
+                                          "completed_session_fallback");
+
+    int64_t drift = 0, half = -1, at = 0, v = 0, h = -1;
+    const char *src = NULL, *q = NULL, *view = NULL;
+    bool valid = false, usable = false;
+
+    if (cJSON_IsObject(sot) &&
+        drift_sel_parse(sot, &v, &h, &at, &q, &view) &&
+        (!q || strcmp(q, "none"))) {
+        if (llabs(v) <= IMP_DRIFT_MAX_MS) {
+            drift = v; half = h;
+            valid = true; usable = (h < 0 || h <= IMP_DRIFT_USABLE_HALF);
+            src = (q && q[0]) ? q : "sot";
+        } else {
+            ESP_LOGW(TAG, "import: %s sot drift %lld ms implausible",
+                     path, (long long)v);
+        }
+    }
+    if (!src && cJSON_IsObject(best) && json_bool(best, "valid", true) &&
+        drift_sel_parse(best, &v, &h, &at, &q, &view) &&
+        (!q || strcmp(q, "none"))) {
+        if (llabs(v) <= IMP_DRIFT_MAX_MS) {
+            drift = v; half = h;
+            valid = true; usable = (h < 0 || h <= IMP_DRIFT_USABLE_HALF);
+            src = (view && !strcmp(view, "previous_session_fallback"))
+                ? "fallback"
+                : (view && !strcmp(view, "current_session_estimate"))
+                ? "current" : (q && q[0]) ? q : "best";
+        } else {
+            ESP_LOGW(TAG, "import: %s best drift %lld ms implausible",
+                     path, (long long)v);
+        }
+    }
+    if (!src && cJSON_IsObject(fb) &&
+        json_bool(fb, "fallback_eligible", false)) {
+        const cJSON *rec = cJSON_GetObjectItem(fb, "record");
+        if (cJSON_IsObject(rec) && json_i64(rec, "clock_drift_ms", &v)) {
+            if (llabs(v) <= IMP_DRIFT_MAX_MS) {
+                if (!json_i64(fb, "adjusted_half_ms", &h))
+                    json_i64(rec, "accuracy_half_ms", &h);
+                if (!json_i64(rec, "reference_at_ms", &at))
+                    json_i64(rec, "computed_at_ms", &at);
+                drift = v; half = h;
+                valid = true;
+                usable = (h < 0 || h <= IMP_DRIFT_USABLE_HALF);
+                src = "fallback";
+            } else {
+                ESP_LOGW(TAG, "import: %s fallback drift %lld ms implausible",
+                         path, (long long)v);
+            }
+        }
+    }
+    if (!src && cJSON_IsObject(est) &&
+        (json_bool(est, "has_drift", false) || estimate_state_ok(est)) &&
+        json_i64(est, "clock_drift_ms", &v)) {
+        if (llabs(v) <= IMP_DRIFT_MAX_MS) {
+            if (!json_i64(est, "accuracy_half_ms", &h))
+                json_i64(est, "half_ms", &h);
+            if (!json_i64(est, "reference_at_ms", &at))
+                json_i64(est, "computed_at_ms", &at);
+            drift = v; half = h;
+            valid = false;
+            usable = (h >= 0 && h <= IMP_DRIFT_USABLE_HALF);
+            src = "estimate";
+        } else {
+            ESP_LOGW(TAG, "import: %s estimate drift %lld ms implausible",
+                     path, (long long)v);
+        }
+    }
+
+    if (!src) {
         snprintf(d->source, sizeof(d->source), "somnobridge_none");
         return;
     }
-    d->valid    = (tier < 2);
-    int64_t half = 0;
-    bool have_half = json_i64(rec, "half_ms", &half) ||
-                     json_i64(rec, "accuracy_half_ms", &half);
-    d->usable   = (tier < 2) ? true : (have_half && half <= 5000);
+    d->valid  = valid;
+    d->usable = usable;
+    d->half_ms = half;
+    d->measured_at_ms = at;
     /* Only a usable drift may shift session timestamps (spec §4.2).  The
-     * raw estimate stays inside somnobridge_drift for diagnostics. */
+     * raw record stays inside somnobridge_drift for diagnostics. */
     d->drift_ms = d->usable ? drift : 0;
-    if (!json_i64(rec, "reference_at_ms", &d->measured_at_ms))
-        json_i64(rec, "computed_at_ms", &d->measured_at_ms);
-    const cJSON *q = cJSON_GetObjectItem(rec, "quality");
-    if (!(q && cJSON_IsString(q) && q->valuestring))
-        q = cJSON_GetObjectItem(rec, "origin");
-    snprintf(d->source, sizeof(d->source), "somnobridge_%s",
-             (q && cJSON_IsString(q) && q->valuestring) ? q->valuestring
-             : (tier == 0 ? "sot" : tier == 1 ? "provisional" : "estimate"));
+    snprintf(d->source, sizeof(d->source), "somnobridge_%s", src);
     ESP_LOGI(TAG, "import: %s drift=%lld ms, applied=%lld ms "
-             "(%s, valid=%d usable=%d)",
+             "(%s, valid=%d usable=%d, half=%lld, tz=%s)",
              path, (long long)drift, (long long)d->drift_ms,
-             d->source, (int)d->valid, (int)d->usable);
+             d->source, (int)d->valid, (int)d->usable, (long long)half,
+             d->dev_tz_off_s != INT32_MIN ? d->dev_tz_rule : "esp");
 }
 
 /* ── Session clustering ─────────────────────────────────────────────── */
@@ -2414,7 +2762,9 @@ static esp_err_t augment_session(const char *dir, const char *id,
     /* Annotation kinds: regenerate the whole events file, so it is only
      * safe when every recorded ann kind is re-emittable from this
      * cluster.  Without src_kinds (legacy manifests) nothing about the
-     * stored events can be verified — the sources stay put. */
+     * stored events can be read back from metadata — instead re-render
+     * the offered sources and require every recorded event to be
+     * covered; the merge then can only grow the events file. */
     const bool missing_ann = (cl->eve && !rec_eve) || (cl->csl && !rec_csl);
     const bool regenerable = (!rec_eve || cl->eve) && (!rec_csl || cl->csl);
     if (kinds_known && missing_ann && regenerable && (cl->eve || cl->csl)) {
@@ -2427,6 +2777,44 @@ static esp_err_t augment_session(const char *dir, const char *id,
         merged = true;
         ESP_LOGI(TAG, "import: %s events regenerated (+%lu events)", id,
                  (unsigned long)nev);
+    } else if (!kinds_known && (cl->eve || cl->csl)) {
+        imp_line_set_t cand = {0}, kept = {0};
+        if (collect_ann_lines(cl->eve, cl->csl, &cand, &nev) != ESP_OK) {
+            line_set_free(&cand);
+            ret = ESP_FAIL;
+            goto out;
+        }
+        if (events_file_covered(dir, id, &cand, &kept)) {
+            char path[400], tmp[408];
+            snprintf(path, sizeof(path), "%s/%s_events.snt", dir, id);
+            snprintf(tmp, sizeof(tmp), "%s.part", path);
+            FILE *ef = fopen(tmp, "w");
+            bool wr = ef != NULL;
+            for (int i = 0; wr && i < kept.n; i++)
+                wr = fputs(kept.v[i], ef) >= 0;
+            for (int i = 0; wr && i < cand.n; i++)
+                wr = fputs(cand.v[i], ef) >= 0;
+            if (wr)
+                wr = imp_flush_close(ef, tmp) == ESP_OK;
+            else if (ef)
+                fclose(ef);
+            if (!wr) {
+                unlink(tmp);
+                line_set_free(&cand);
+                line_set_free(&kept);
+                ret = ESP_FAIL;
+                goto out;
+            }
+            m_ev = true;
+            merged = true;
+            ESP_LOGI(TAG, "import: %s events merged by coverage "
+                     "(+%lu rendered)", id, (unsigned long)nev);
+        } else {
+            ESP_LOGI(TAG, "import: %s annotation sources not verifiable "
+                     "against recorded events — kept", id);
+        }
+        line_set_free(&cand);
+        line_set_free(&kept);
     }
 
     /* Publish + manifest update only when something actually merged. */
@@ -2494,13 +2882,17 @@ out:
 static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
                                 const imp_drift_t *drift)
 {
-    /* Session anchors (device domain) */
+    /* Session anchors (device domain).  The applied shift is the measured
+     * drift plus, when the sidecar confirms a fixed zone for the source
+     * device, the delta to the ESP's own zone — evaluated per anchor so
+     * a session straddling an ESP DST boundary still lands exactly. */
     int64_t anchor_dev = (cl->eve_ts >= 0) ? cl->eve_ts : cl->wav_ts;
     int64_t wav_off_ms = (cl->eve_ts >= 0 && cl->wav_ts >= 0)
                          ? cl->wav_ts - cl->eve_ts : 0;
     int64_t wav_dev = (cl->wav_ts >= 0) ? cl->wav_ts : anchor_dev;
-    int64_t start_ntp = anchor_dev + drift->drift_ms;
-    int64_t wav_ntp   = wav_dev + drift->drift_ms;
+    const int64_t shift = imp_shift_at(drift, anchor_dev);
+    int64_t start_ntp = anchor_dev + shift;
+    int64_t wav_ntp   = wav_dev + imp_shift_at(drift, wav_dev);
     int64_t end_dev   = anchor_dev;
 
     /* Longest member file span ends the session */
@@ -2529,7 +2921,7 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
      * records MaskOff = MaskOn for 0-duration sessions. */
     if (ann_only && end_dev <= anchor_dev)
         end_dev = anchor_dev + 1000;
-    int64_t end_ntp = end_dev + drift->drift_ms;
+    int64_t end_ntp = end_dev + imp_shift_at(drift, end_dev);
 
     /* Noon-day stream folder — raw device time, never drifted.  Create the
      * full parent chain defensively: a fresh card whose first content is an
@@ -2694,13 +3086,30 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
         cJSON_AddNumberToObject(r, "stream_notifications", 0);
         cJSON_AddNumberToObject(r, "gap_events", 0);
         cJSON_AddNumberToObject(r, "gap_missing", 0);
-        cJSON_AddNumberToObject(r, "clock_drift_ms", (double)drift->drift_ms);
+        /* The applied session shift: measured drift + device-zone delta
+         * at the session anchor.  Downstream readers reconstruct device
+         * time as start_epoch_ms - clock_drift_ms, so the total applied
+         * shift is what must be recorded here; the decomposition stays
+         * visible in device_tz_* and somnobridge_drift. */
+        cJSON_AddNumberToObject(r, "clock_drift_ms", (double)shift);
         cJSON_AddBoolToObject(r, "clock_drift_valid", drift->valid);
         cJSON_AddBoolToObject(r, "clock_drift_usable", drift->usable);
         cJSON_AddStringToObject(r, "clock_drift_source", drift->source);
         if (drift->measured_at_ms > 0)
             cJSON_AddNumberToObject(r, "clock_drift_measured_at_ms",
                                     (double)drift->measured_at_ms);
+        if (drift->half_ms >= 0)
+            cJSON_AddNumberToObject(r, "clock_drift_half_ms",
+                                    (double)drift->half_ms);
+        if (drift->dev_tz_off_s != INT32_MIN) {
+            cJSON_AddNumberToObject(r, "device_tz_offset_s",
+                                    (double)drift->dev_tz_off_s);
+            cJSON_AddNumberToObject(r, "device_tz_delta_ms",
+                                    (double)(shift - drift->drift_ms));
+            if (drift->dev_tz_rule[0])
+                cJSON_AddStringToObject(r, "device_tz_rule",
+                                        drift->dev_tz_rule);
+        }
         cJSON_AddStringToObject(r, "time_source",
                                 drift->valid ? "ntp" : "file_import");
         cJSON_AddStringToObject(r, "import_source", w->import_src);

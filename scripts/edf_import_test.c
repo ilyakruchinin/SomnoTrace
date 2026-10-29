@@ -832,6 +832,253 @@ static void phase_e(void)
         cJSON_Delete(m3);
     }
     edf_import_ctx_destroy(c);
+
+    /* ── schema-5 envelope shapes (SomnoBridge update6) ── */
+
+    /* sot as interval_ms (no scalar clock_drift_ms) → midpoint used */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"source_of_truth\":{\"selected_view\":\"current_session_estimate\","
+          "\"quality\":\"qualified\",\"interval_ms\":[213500,214500],"
+          "\"accuracy_half_ms\":500,\"reference_at_ms\":1705357000000}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_221334_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m4 = parse_json_file(p);
+    CHECK(m4 != NULL, "schema-5 sot manifest parses");
+    if (m4) {
+        cJSON *v = cJSON_GetObjectItem(m4, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == 214000,
+              "interval midpoint drift");
+        v = cJSON_GetObjectItem(m4, "clock_drift_half_ms");
+        CHECK(v && (int64_t)v->valuedouble == 500, "sot half recorded");
+        v = cJSON_GetObjectItem(m4, "clock_drift_measured_at_ms");
+        CHECK(v && (int64_t)v->valuedouble == 1705357000000LL,
+              "sot reference_at");
+        CHECK(cJSON_IsTrue(cJSON_GetObjectItem(m4, "clock_drift_valid")),
+              "sot valid");
+        v = cJSON_GetObjectItem(m4, "clock_drift_source");
+        CHECK(v && !strcmp(v->valuestring, "somnobridge_qualified"),
+              "sot source = qualified");
+        cJSON_Delete(m4);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* best_available_offset previous-session fallback → -480000 ms */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"best_available_offset\":{\"selected_view\":"
+          "\"previous_session_fallback\",\"quality\":\"provisional\","
+          "\"interval_ms\":[-480500,-479500],\"accuracy_half_ms\":500,"
+          "\"reference_at_ms\":1705356400000}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_220200_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m5 = parse_json_file(p);
+    CHECK(m5 != NULL, "best-available manifest parses");
+    if (m5) {
+        cJSON *v = cJSON_GetObjectItem(m5, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == -480000,
+              "best_available drift -480s");
+        CHECK(cJSON_IsTrue(cJSON_GetObjectItem(m5, "clock_drift_valid")),
+              "best_available valid");
+        CHECK(cJSON_IsTrue(cJSON_GetObjectItem(m5, "clock_drift_usable")),
+              "best_available usable");
+        v = cJSON_GetObjectItem(m5, "clock_drift_source");
+        CHECK(v && !strcmp(v->valuestring, "somnobridge_fallback"),
+              "fallback view → fallback source");
+        cJSON_Delete(m5);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* completed_session_fallback eligible record → -481000 ms */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"completed_session_fallback\":{\"fallback_eligible\":true,"
+          "\"adjusted_half_ms\":2300,\"record\":{\"clock_drift_ms\":"
+          "\"-481000\",\"accuracy_half_ms\":1300,"
+          "\"reference_at_ms\":1705356000000}}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_220159_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m6 = parse_json_file(p);
+    CHECK(m6 != NULL, "completed-fallback manifest parses");
+    if (m6) {
+        cJSON *v = cJSON_GetObjectItem(m6, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == -481000,
+              "completed fallback drift");
+        v = cJSON_GetObjectItem(m6, "clock_drift_half_ms");
+        CHECK(v && (int64_t)v->valuedouble == 2300,
+              "adjusted half used");
+        CHECK(cJSON_IsTrue(cJSON_GetObjectItem(m6, "clock_drift_valid")),
+              "completed fallback valid");
+        cJSON_Delete(m6);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* estimate-only + confirmed device zone UTC-10 under a UTC host:
+     * applied shift = -480000 + (0 - 36000)*1000 = -36480000 */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"estimate\":{\"estimate_state\":\"provisional\","
+          "\"clock_drift_ms\":\"-480000\",\"accuracy_half_ms\":1191,"
+          "\"timezone_rule\":\"UTC-10\",\"timezone_confirmed\":true}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_120200_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m7 = parse_json_file(p);
+    CHECK(m7 != NULL, "device-zone manifest parses");
+    if (m7) {
+        cJSON *v = cJSON_GetObjectItem(m7, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == -36480000,
+              "drift+zone applied");
+        v = cJSON_GetObjectItem(m7, "device_tz_offset_s");
+        CHECK(v && (int64_t)v->valuedouble == 36000,
+              "device offset +10h");
+        v = cJSON_GetObjectItem(m7, "device_tz_delta_ms");
+        CHECK(v && (int64_t)v->valuedouble == -36000000,
+              "zone delta -10h");
+        v = cJSON_GetObjectItem(m7, "device_tz_rule");
+        CHECK(v && !strcmp(v->valuestring, "UTC-10"),
+              "device rule recorded");
+        CHECK(cJSON_IsFalse(cJSON_GetObjectItem(m7, "clock_drift_valid")),
+              "estimate not valid");
+        CHECK(cJSON_IsTrue(cJSON_GetObjectItem(m7, "clock_drift_usable")),
+              "estimate usable");
+        cJSON_Delete(m7);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* unconfirmed device zone → zone delta NOT applied */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"estimate\":{\"estimate_state\":\"provisional\","
+          "\"clock_drift_ms\":\"-480000\",\"accuracy_half_ms\":1191,"
+          "\"timezone_rule\":\"UTC-10\",\"timezone_confirmed\":false}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_220200_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m8 = parse_json_file(p);
+    CHECK(m8 != NULL, "unconfirmed-zone manifest parses");
+    if (m8) {
+        cJSON *v = cJSON_GetObjectItem(m8, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == -480000,
+              "unconfirmed zone → drift only");
+        CHECK(cJSON_GetObjectItem(m8, "device_tz_offset_s") == NULL,
+              "no device offset field");
+        CHECK(cJSON_GetObjectItem(m8, "device_tz_delta_ms") == NULL,
+              "no zone delta field");
+        cJSON_Delete(m8);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* unusable estimate (half 15000) but confirmed zone → zone delta
+     * still applied, drift stays 0 */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"estimate\":{\"estimate_state\":\"provisional\","
+          "\"clock_drift_ms\":\"-480000\",\"accuracy_half_ms\":15000,"
+          "\"timezone_rule\":\"UTC-10\",\"timezone_confirmed\":true}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_121000_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m9 = parse_json_file(p);
+    CHECK(m9 != NULL, "zone-only manifest parses");
+    if (m9) {
+        cJSON *v = cJSON_GetObjectItem(m9, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == -36000000,
+              "zone-only shift");
+        CHECK(cJSON_IsFalse(cJSON_GetObjectItem(m9, "clock_drift_usable")),
+              "estimate not usable");
+        cJSON_Delete(m9);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* poisoned drift magnitude (>24 h) → ignored entirely (RC1 bug) */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"estimate\":{\"estimate_state\":\"provisional\","
+          "\"clock_drift_ms\":\"-1793194135596\",\"accuracy_half_ms\":1191}}",
+          f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_221000_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m10 = parse_json_file(p);
+    CHECK(m10 != NULL, "garbage-drift manifest parses");
+    if (m10) {
+        cJSON *v = cJSON_GetObjectItem(m10, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == 0,
+              "garbage drift → 0");
+        CHECK(cJSON_IsFalse(cJSON_GetObjectItem(m10, "clock_drift_valid")),
+              "garbage → not valid");
+        CHECK(cJSON_IsFalse(cJSON_GetObjectItem(m10, "clock_drift_usable")),
+              "garbage → not usable");
+        v = cJSON_GetObjectItem(m10, "clock_drift_source");
+        CHECK(v && !strcmp(v->valuestring, "somnobridge_none"),
+              "garbage → none source");
+        v = cJSON_GetObjectItem(m10, "start_epoch_ms");
+        CHECK(v && (int64_t)v->valuedouble == 1705356600000LL,
+              "garbage → unshifted start");
+        cJSON_Delete(m10);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* garbage sot must not shadow a valid lower tier (fallthrough) */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"source_of_truth\":{\"quality\":\"qualified\",\"interval_ms\":"
+          "[-1793194135596,-1793194135000],\"accuracy_half_ms\":500},"
+          "\"completed_session_fallback\":{\"fallback_eligible\":true,"
+          "\"adjusted_half_ms\":1300,\"record\":{\"clock_drift_ms\":"
+          "\"-480500\",\"accuracy_half_ms\":1300,"
+          "\"reference_at_ms\":1705356000000}}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_220159_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m11 = parse_json_file(p);
+    CHECK(m11 != NULL, "fallthrough manifest parses");
+    if (m11) {
+        cJSON *v = cJSON_GetObjectItem(m11, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == -480500,
+              "garbage sot → fallback tier");
+        v = cJSON_GetObjectItem(m11, "clock_drift_source");
+        CHECK(v && !strcmp(v->valuestring, "somnobridge_fallback"),
+              "fallback source");
+        cJSON_Delete(m11);
+    }
+    edf_import_ctx_destroy(c);
     printf("phase e OK (%d checks)\n", g_checks);
 }
 
