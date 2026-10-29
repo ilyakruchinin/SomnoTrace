@@ -39,6 +39,7 @@
 #include "esp_log.h"
 #include "esp_rom_crc.h"
 #include "cJSON.h"
+#include "upload_park.h"
 
 static const char *TAG = "up_stage";
 
@@ -938,6 +939,25 @@ int upload_stage_reconcile(upload_stage_ref_t *out, int max_out, int max_days)
             days_seen++;
         }
         if (days_seen > max_days) continue;
+        /* State is keyed by unit_id alone — the same id under a second day
+         * folder (e.g. a duplicated recording tree) would alternate the
+         * stored fingerprint between copies and reset backends every pass.
+         * Refs arrive sorted by day descending: first sight is the newest
+         * (canonical) copy; later duplicates are dropped before they can
+         * touch state. */
+        int dup_at = -1;
+        for (int k = 0; k < kept; k++) {
+            if (strcmp(out[k].unit_id, out[i].unit_id) == 0) {
+                dup_at = k;
+                break;
+            }
+        }
+        if (dup_at >= 0) {
+            ESP_LOGW(TAG, "unit %s exists under %s and %s — %s wins",
+                     out[i].unit_id, out[dup_at].day, out[i].day,
+                     out[dup_at].day);
+            continue;
+        }
         if (kept != i) out[kept] = out[i];
         bool existed = (state_find_id(out[kept].unit_id) != NULL);
         stage_state_t *u = state_get(out[kept].unit_id, out[kept].day,
@@ -1062,13 +1082,36 @@ void upload_stage_mark(const upload_stage_ref_t *ref, int backend_slot,
     st_unlock();
 }
 
+/* Same park semantics as EDF groups (upload_park.h): a unit that has failed
+ * UPLOAD_MAX_GROUP_ATTEMPTS times stops counting as pending and is skipped by
+ * dispatch until the parking goes stale — one permanently bad or rejected
+ * unit must not retry forever.  A fingerprint change resets status/attempts
+ * through reconcile and unparks automatically. */
+bool upload_stage_parked(const upload_stage_ref_t *ref, int backend_slot)
+{
+    if (!ref || backend_slot < 0 || backend_slot >= STAGE_MAX_BACKENDS ||
+        !st_lock_init()) return false;
+    uint64_t rfp = ref_fp_for_slot(ref, backend_slot);
+    if (rfp == 0) return false;   /* format not present on this unit */
+    st_lock();
+    stage_state_t *u = state_find_id(ref->unit_id);
+    bool parked = u && state_fp_for_slot(u, backend_slot) == rfp &&
+                  upload_park_active(u->backend[backend_slot].status == UG_FAILED,
+                                     u->backend[backend_slot].attempts,
+                                     u->backend[backend_slot].last_try_s,
+                                     (uint32_t)time(NULL));
+    st_unlock();
+    return parked;
+}
+
 int upload_stage_pending(const upload_stage_ref_t *refs, int n_refs,
                          int backend_slot)
 {
     int n = 0;
     for (int i = 0; i < n_refs; i++) {
         if (ref_fp_for_slot(&refs[i], backend_slot) == 0) continue;
-        if (upload_stage_status(&refs[i], backend_slot) != UG_OK) n++;
+        if (upload_stage_status(&refs[i], backend_slot) != UG_OK &&
+            !upload_stage_parked(&refs[i], backend_slot)) n++;
     }
     return n;
 }
@@ -1081,9 +1124,14 @@ int upload_stage_cached_pending(int backend_slot)
         return 0;
     st_lock();
     int n = 0;
-    for (stage_state_t *u = s_states; u; u = u->next)
+    uint32_t now = (uint32_t)time(NULL);
+    for (stage_state_t *u = s_states; u; u = u->next) {
+        const upload_unit_t *un = &u->backend[backend_slot];
         if (u->in_window && state_fp_for_slot(u, backend_slot) != 0 &&
-            u->backend[backend_slot].status != UG_OK) n++;
+            un->status != UG_OK &&
+            !upload_park_active(un->status == UG_FAILED, un->attempts,
+                                un->last_try_s, now)) n++;
+    }
     st_unlock();
     return n;
 }

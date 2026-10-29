@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
@@ -56,6 +57,10 @@ int upload_ox_status(const upload_ox_ref_t *ref, int backend_slot);
 void upload_ox_mark(const upload_ox_ref_t *ref, int backend_slot,
                     upload_unit_status_t status, const char *remote_id);
 esp_err_t upload_ox_save(void);
+/* Same park rule as EDF groups (upload_park.h): a unit failed
+ * UPLOAD_MAX_GROUP_ATTEMPTS times is skipped by dispatch and excluded from
+ * pending until the parking goes stale. */
+bool upload_ox_parked(const upload_ox_ref_t *ref, int backend_slot);
 int upload_ox_pending(const upload_ox_ref_t *refs, int n_refs, int backend_slot);
 int upload_ox_cached_pending(int backend_slot);
 void upload_ox_backend_progress(int backend_slot, int max_days,

@@ -55,6 +55,7 @@
 #include <unistd.h>
 
 #include "upload_ox.h"
+#include "upload_park.h"
 
 /* ── Backend registry stub (upload_index.c is not linked) ──────────── */
 
@@ -409,7 +410,7 @@ static int state_files(void)
  * touched, so historical recordings kept their UG_OK marks and were never
  * re-uploaded.  upload_ox_clear() must wipe both, and the next reconcile
  * must re-offer every recording inside the window. */
-static int phase_d(void)
+static int phase_d(const char *self)
 {
     CHECK(upload_ox_init() == ESP_OK, "upload_ox_init failed");
 
@@ -435,6 +436,75 @@ static int phase_d(void)
     CHECK(upload_ox_cached_pending(SLOT_SHQ) == N_RECS - 1,
           "cleared recordings not re-offered in cached pending");
     free(refs);
+    int r = run_phase(self, "e");
+    return g_failures + r;
+}
+
+/* ── Phase E: one recording_id under two day folders ─────────────────
+ *
+ * The SleepHQ incident: an O2 recording existed under both
+ * recordings/<dayA>/<id> and recordings/<dayB>/<id> with different
+ * metadata.  One state node per id meant every reconcile alternated the
+ * stored fingerprint between the copies and reset all backends — the same
+ * file re-uploaded every pass forever (SleepHQ hit its 100-imports/day
+ * cap).  Reconcile now keeps the newest-day copy only, and a repeatedly
+ * failing unit parks instead of retrying every pass. */
+static int phase_e(void)
+{
+    CHECK(upload_ox_init() == ESP_OK, "upload_ox_init failed");
+
+    upload_ox_ref_t *refs = calloc(UPLOAD_OX_MAX_UNITS, sizeof(*refs));
+    if (!refs) return 1;
+    int kept = upload_ox_reconcile(refs, UPLOAD_OX_MAX_UNITS, WINDOW);
+    CHECK(kept == N_RECS - 1, "baseline reconcile count wrong");
+
+    /* Duplicate rec #0 (canonical dir 20260801) under an older day folder
+     * with different content so the two copies fingerprint differently. */
+    char id0[16], day0[12];
+    rec_id(0, id0, day0);
+    mk_recording("20260701", id0, 0xEE);
+
+    kept = upload_ox_reconcile(refs, UPLOAD_OX_MAX_UNITS, WINDOW);
+    CHECK(kept == N_RECS - 1, "duplicate-id reconcile kept the shadow copy");
+    const upload_ox_ref_t *r0 = find_ref(refs, kept, id0);
+    CHECK(r0 && !strcmp(r0->day, "20260801"),
+          "the older-day duplicate won over the canonical copy");
+    int n_r0 = 0;
+    for (int i = 0; i < kept; i++)
+        if (!strcmp(refs[i].recording_id, id0)) n_r0++;
+    CHECK(n_r0 == 1, "same recording_id present twice after reconcile");
+
+    /* The mark must stick: before the fix the next reconcile's fingerprint
+     * comparison flipped the stored fp back and forth between the twins and
+     * reset the unit to pending on every pass. */
+    if (r0) upload_ox_mark(r0, SLOT_SHQ, UG_OK, "imp-dup");
+    kept = upload_ox_reconcile(refs, UPLOAD_OX_MAX_UNITS, WINDOW);
+    r0 = find_ref(refs, kept, id0);
+    CHECK(r0 && upload_ox_status(r0, SLOT_SHQ) == UG_OK,
+          "duplicate-id copy re-pended the recording — the infinite loop");
+    CHECK(upload_ox_pending(refs, kept, SLOT_SHQ) == N_RECS - 2,
+          "pending count wrong after marking the winner");
+
+    /* Parking: after UPLOAD_MAX_GROUP_ATTEMPTS failures the unit leaves the
+     * retry path — the same rule EDF groups already had. */
+    char id1[16], day1[12];
+    rec_id(1, id1, day1);
+    const upload_ox_ref_t *r1 = find_ref(refs, kept, id1);
+    CHECK(r1 != NULL, "test unit missing");
+    if (r1) {
+        for (int i = 0; i < UPLOAD_MAX_GROUP_ATTEMPTS - 1; i++)
+            upload_ox_mark(r1, SLOT_SHQ, UG_FAILED, NULL);
+        CHECK(!upload_ox_parked(r1, SLOT_SHQ),
+              "unit parked before the attempt cap");
+        upload_ox_mark(r1, SLOT_SHQ, UG_FAILED, NULL);
+        CHECK(upload_ox_parked(r1, SLOT_SHQ),
+              "unit not parked after UPLOAD_MAX_GROUP_ATTEMPTS failures");
+        CHECK(upload_ox_pending(refs, kept, SLOT_SHQ) == N_RECS - 3,
+              "parked unit still counts as pending");
+        CHECK(upload_ox_cached_pending(SLOT_SHQ) == N_RECS - 3,
+              "parked unit counted in cached pending");
+    }
+    free(refs);
     return g_failures;
 }
 
@@ -445,10 +515,11 @@ int main(int argc, char **argv)
     if      (!strcmp(phase, "a")) r = phase_a(argv[0]);
     else if (!strcmp(phase, "b")) r = phase_b(argv[0]);
     else if (!strcmp(phase, "c")) r = phase_c(argv[0]);
-    else if (!strcmp(phase, "d")) r = phase_d();
+    else if (!strcmp(phase, "d")) r = phase_d(argv[0]);
+    else if (!strcmp(phase, "e")) r = phase_e();
     else r = 1;
 
     if (r) { printf("upload_ox_test: phase %s FAILED (%d)\n", phase, r); return 1; }
-    if (!strcmp(phase, "d")) printf("upload_ox_test: all phases passed\n");
+    if (!strcmp(phase, "e")) printf("upload_ox_test: all phases passed\n");
     return 0;
 }

@@ -39,6 +39,7 @@
 #include "esp_log.h"
 #include "esp_rom_crc.h"
 #include "cJSON.h"
+#include "upload_park.h"
 
 static const char *TAG = "up_ox";
 
@@ -688,6 +689,25 @@ int upload_ox_reconcile(upload_ox_ref_t *out, int max_out, int max_days)
             strlcpy(last_day, out[i].day, sizeof(last_day)); days_seen++;
         }
         if (days_seen > max_days) continue;
+        /* State is keyed by recording_id alone — the same id appearing under
+         * a second day folder would make every pass alternate the stored
+         * fingerprint between the two copies and reset backends forever.
+         * Refs arrive sorted by day descending, so first sight is the newest
+         * (canonical) copy; later duplicates are dropped before they can
+         * touch state. */
+        int dup_at = -1;
+        for (int k = 0; k < kept; k++) {
+            if (strcmp(out[k].recording_id, out[i].recording_id) == 0) {
+                dup_at = k;
+                break;
+            }
+        }
+        if (dup_at >= 0) {
+            ESP_LOGW(TAG, "recording %s exists under %s and %s — %s wins",
+                     out[i].recording_id, out[dup_at].day, out[i].day,
+                     out[dup_at].day);
+            continue;
+        }
         if (kept != i) out[kept] = out[i];
         ox_state_t *u = state_get(out[kept].recording_id, out[kept].day,
                                   out[kept].generation, out[kept].fingerprint,
@@ -788,9 +808,33 @@ void upload_ox_mark(const upload_ox_ref_t *ref, int backend_slot,
     ox_unlock();
 }
 
+/* Same park semantics as EDF groups (upload_park.h): a unit that has failed
+ * UPLOAD_MAX_GROUP_ATTEMPTS times stops counting as pending and is skipped by
+ * dispatch until the parking goes stale — one permanently bad or rejected
+ * recording must not retry forever.  Parked state follows the stored unit:
+ * a generation or fingerprint change resets status/attempts and unparks. */
+bool upload_ox_parked(const upload_ox_ref_t *ref, int backend_slot)
+{
+    if (!ref || backend_slot < 0 || backend_slot >= OX_MAX_BACKENDS_LOCAL ||
+        !ox_lock_init()) return false;
+    ox_lock();
+    ox_state_t *u = state_find_id(ref->recording_id);
+    bool parked = u && u->generation == ref->generation &&
+                  upload_park_active(u->backend[backend_slot].status == UG_FAILED,
+                                     u->backend[backend_slot].attempts,
+                                     u->backend[backend_slot].last_try_s,
+                                     (uint32_t)time(NULL));
+    ox_unlock();
+    return parked;
+}
+
 int upload_ox_pending(const upload_ox_ref_t *refs, int n_refs, int backend_slot)
 {
-    int n = 0; for (int i = 0; i < n_refs; i++) if (upload_ox_status(&refs[i], backend_slot) != UG_OK) n++; return n;
+    int n = 0;
+    for (int i = 0; i < n_refs; i++)
+        if (upload_ox_status(&refs[i], backend_slot) != UG_OK &&
+            !upload_ox_parked(&refs[i], backend_slot)) n++;
+    return n;
 }
 
 int upload_ox_cached_pending(int backend_slot)
@@ -804,8 +848,12 @@ int upload_ox_cached_pending(int backend_slot)
     if (!s_loaded || backend_slot < 0 || backend_slot >= OX_MAX_BACKENDS_LOCAL) return 0;
     ox_lock();
     int n = 0;
+    uint32_t now = (uint32_t)time(NULL);
     for (ox_state_t *u = s_states; u; u = u->next) {
-        if (u->in_window && u->backend[backend_slot].status != UG_OK) n++;
+        const upload_unit_t *un = &u->backend[backend_slot];
+        if (u->in_window && un->status != UG_OK &&
+            !upload_park_active(un->status == UG_FAILED, un->attempts,
+                                un->last_try_s, now)) n++;
     }
     ox_unlock();
     return n;
