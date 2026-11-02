@@ -67,6 +67,8 @@ typedef struct {
     /* When true, a raw sample equal to the missing sentinel is written to EDF
      * as digital -1 directly, bypassing physical->digital scaling. */
     bool invalid_passthrough;
+    /* Clamp nonmissing samples even when invalid_passthrough is enabled. */
+    bool clamp_valid;
 } edf_signal_def_t;
 
 /* ── Signal Counts ─────────────────────────────────────────────────── */
@@ -151,7 +153,7 @@ static const edf_signal_def_t g_pld_signals[EDF_PLD_SIGNAL_COUNT] = {
       .unit = "", .phys_min = 0.0, .phys_max = 5.0,
       .dig_min = 0, .dig_max = 250,
       .prefilter = "", .samples_per_record = 30,
-      .invalid_passthrough = false },
+      .invalid_passthrough = true, .clamp_valid = true },
     { .label = "FlowLim.2s", .transducer = "",
       .unit = "", .phys_min = 0.0, .phys_max = 1.0,
       .dig_min = 0, .dig_max = 100,

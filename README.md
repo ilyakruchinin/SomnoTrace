@@ -20,6 +20,11 @@ Spiritual successor to [CPAP-AutoSync](https://github.com/ilyakruchinin/CPAP-Aut
 - 🖥️ **Color screen & web dashboard:** Live breathing graphs, Wi-Fi status, battery level, and clock on the bedside LCD; interactive sleep charts and device settings from any browser at `http://somnotrace.local`.
 - 🏕️ **Camping mode:** Records therapy with no Wi-Fi or internet at all — just the AirSense 11 nearby. See the [Camping Mode guide](docs/camping.md).
 
+> **Settings history upgrade:** Older unverified snapshots now export as unknown
+> rather than potentially incorrect historical settings. See the
+> [settings history and recovery notes](docs/settings-history.md), including
+> important OSCAR and AS10 validation limits.
+
 ---
 
 ## Hardware

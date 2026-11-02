@@ -103,7 +103,7 @@ esp_err_t edf_generate_csl_edf(const char *out_path, const char *events_snt_path
 esp_err_t edf_generate_str_edf(const char *sdcard_dir,
                                const char *patient_id, const char *recording_id,
                                const char *start_date,
-                               const cJSON *settings_json,
+                               const cJSON *settings_json, const cJSON *ident_json,
                                const char *session_dir,
                                const char *session_id,
                                int64_t start_epoch_ms, int64_t end_epoch_ms,

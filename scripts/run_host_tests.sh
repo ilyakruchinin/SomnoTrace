@@ -155,6 +155,11 @@ run_test oximetry_time_test -I"$SHIM" -I"$MAIN_DIR" scripts/oximetry_time_test.c
 run_test session_gap_test -I"$SHIM" -I"$MAIN_DIR" scripts/session_gap_test.c
 run_test legacy_file_list_test -I"$SHIM" -I"$MAIN_DIR" scripts/legacy_file_list_test.c "$MAIN_DIR/legacy_file_list.c"
 run_test upload_park_test -I"$UPLOADER_DIR" scripts/upload_park_test.c
+if command -v node >/dev/null 2>&1; then
+    run_check dashboard_panel_test node scripts/dashboard_panel_test.js
+else
+    skip_test dashboard_panel_test "no node"
+fi
 run_test as11_reconnect_test -I"$SHIM" -I"$MAIN_DIR" scripts/as11_reconnect_test.c "$MAIN_DIR/as11_reconnect.c"
 run_test leak_roll_test     -I"$SHIM" -I"$MAIN_DIR" scripts/leak_roll_test.c "$MAIN_DIR/leak_roll.c"
 run_test bridge_indicator_test -I"$MAIN_DIR" scripts/bridge_indicator_test.c "$MAIN_DIR/bridge_indicator.c"
@@ -202,10 +207,11 @@ else
 fi
 if [ -n "$CJ_INC" ]; then
     run_test edf_gen_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
-        scripts/edf_gen_test.c "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
+        "-DSD_MOUNT_POINT=\"$OUT/edf_gen_card\"" \
+        scripts/edf_gen_test.c "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" $CJ_SRC $CJ_LIB -lm
     # upstream's EDF pipeline property suite (54ae598)
     run_test edf_properties_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
-        scripts/edf_properties_test.c "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
+        scripts/edf_properties_test.c "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" $CJ_SRC $CJ_LIB -lm
     # Oximetry upload-state store: the 64-slot-table overflow that kept
     # re-uploading the same recording.  Needs real cJSON (the shim's Parse
     # returns NULL) and scratch dirs under /tmp for a fake card + state tree.
@@ -239,7 +245,7 @@ if [ -n "$CJ_INC" ]; then
     run_test edf_import_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
         -DEDF_IMPORT_HOST '-DSD_MOUNT_POINT="/tmp/somnotrace_imp/sd"' \
         scripts/edf_import_test.c "$MAIN_DIR/edf_import.c" \
-        "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
+        "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" $CJ_SRC $CJ_LIB -lm
     # Round trip: a live night exported by edf_gen, staged as an IMPORT/ card
     # image, imported, and exported again must be byte-identical.  edf_gen's
     # output is the real-card reference, so this catches layout assumptions
@@ -247,7 +253,7 @@ if [ -n "$CJ_INC" ]; then
     run_test edf_roundtrip_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
         -DEDF_IMPORT_HOST '-DSD_MOUNT_POINT="/tmp/somnotrace_rt/sd"' \
         scripts/edf_roundtrip_test.c "$MAIN_DIR/edf_import.c" \
-        "$MAIN_DIR/as11_time.c" $CJ_SRC $CJ_LIB -lm
+        "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" $CJ_SRC $CJ_LIB -lm
 fi
 
 # The mutation harness's TEXTUAL layer has nothing else to catch a mistake in it. Every

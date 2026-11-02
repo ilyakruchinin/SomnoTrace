@@ -43,7 +43,7 @@ extern "C" {
  *  The engine converts each session cluster into native .snt streams +
  *  events.snt + ident/settings/session manifests under
  *  .somnotrace/sessions/streams/<day>/, writes summaries/<day>.spool +
- *  <day>.settings.json from STR.edf (or synthesises them from imported
+ *  <day>.imported.settings.json from STR.edf (or synthesises spools from imported
  *  sessions), and only then deletes the consumed source files.
  * ──────────────────────────────────────────────────────────────────── */
 
@@ -60,6 +60,7 @@ typedef struct {
     int  files_consumed;    /* source files deleted after durable commit */
     int  files_rejected;    /* corrupt files moved aside to *.bad */
     int  spools_written;
+    int  settings_written;  /* new or changed imported daily settings */
     bool deferred;          /* nothing processed: the next unit's files were
                              * modified within the quiescence window (a copy
                              * may still be in flight) — call again later */

@@ -401,6 +401,7 @@ static edf_import_unit_t drain(edf_import_ctx_t *c, int *units)
         tot.files_consumed    += u.files_consumed;
         tot.files_rejected    += u.files_rejected;
         tot.spools_written    += u.spools_written;
+        tot.settings_written  += u.settings_written;
         if (u.day_label[0]) memcpy(tot.day_label, u.day_label, 9);
         if (u.day2_label[0]) memcpy(tot.day2_label, u.day2_label, 9);
         (*units)++;
@@ -1220,6 +1221,11 @@ static uint8_t *read_bin(const char *path, size_t *n)
 static void phase_g(void)
 {
     fresh_tree();
+    char legacy_path[700];
+    snprintf(legacy_path, sizeof(legacy_path), "%s/20240115.settings.json", SD_SUMMARIES_DIR);
+    FILE *legacy = fopen(legacy_path, "w");
+    CHECK(legacy != NULL, "create legacy settings");
+    if (legacy) { fputs("{\"legacy_marker\":true}", legacy); fclose(legacy); }
     /* AS11 Identification.json */
     char ip[700];
     snprintf(ip, sizeof(ip), "%s/Identification.json", IMPORT_DIR);
@@ -1274,6 +1280,10 @@ static void phase_g(void)
     edf_import_unit_t t = drain(c, &units);
     CHECK(t.spools_written == 2, "two spools from STR");
     CHECK(t.sessions_imported == 1, "session imported");
+    cJSON *legacy_json = parse_json_file(legacy_path);
+    CHECK(legacy_json && cJSON_IsTrue(cJSON_GetObjectItem(legacy_json, "legacy_marker")),
+          "existing unmarked settings must remain intact");
+    cJSON_Delete(legacy_json);
 
     /* 20240115.spool — field walk: f2 noon_ms(0115), f3 +24h, f5=420,
      * f7 AHI raw=230, f10 OAI raw=110, f39 session count=1. */
@@ -1298,8 +1308,9 @@ static void phase_g(void)
         free(blob);
     }
 
-    /* <day>.settings.json — TherapyProfile from Mode dig=1 → AutoSet */
-    snprintf(sp, sizeof(sp), "%s/20240115.settings.json", SD_SUMMARIES_DIR);
+    /* Native daily settings contain only fields from the STR record. */
+    CHECK(t.settings_written == 2, "two native settings snapshots");
+    snprintf(sp, sizeof(sp), "%s/20240115.imported.settings.json", SD_SUMMARIES_DIR);
     cJSON *sj = parse_json_file(sp);
     CHECK(sj != NULL, "day settings written");
     if (sj) {
@@ -1340,6 +1351,7 @@ static void phase_g(void)
     c = edf_import_ctx_create();
     t = drain(c, &units);
     CHECK(t.spools_written == 0, "re-imported STR creates no new spools");
+    CHECK(t.settings_written == 0, "unchanged STR creates no new settings");
     edf_import_ctx_destroy(c);
 
     /* A fresh ctx with no root ident falls back to EDF recording_id */
@@ -1597,10 +1609,8 @@ static void phase_k(void)
         free(blob);
     }
 
-    /* <day>.settings.json = CurrentSettings overlaid with S.* channels:
-     * SetPressure 10.0 (dig 500/50) replaces the stub's 4.0; PatientView
-     * "Basic" survives because no S.* channel covers it. */
-    snprintf(p, sizeof(p), "%s/20240115.settings.json", SD_SUMMARIES_DIR);
+    /* Native daily settings do not inherit fields absent from STR. */
+    snprintf(p, sizeof(p), "%s/20240115.imported.settings.json", SD_SUMMARIES_DIR);
     cJSON *sj = parse_json_file(p);
     CHECK(sj != NULL, "day settings written");
     if (sj) {
@@ -1632,8 +1642,7 @@ static void phase_k(void)
               "S.Mask 3 → FullFace (1-idx)");
         v = cJSON_GetObjectItem(cJSON_GetObjectItem(fp, "PatientViewFeature"),
                                 "PatientView");
-        CHECK(v && !strcmp(v->valuestring, "Basic"),
-              "unmapped CurrentSettings field preserved");
+        CHECK(v == NULL, "unmapped CurrentSettings field must remain unknown");
         cJSON_Delete(sj);
     }
     edf_import_ctx_destroy(c);
@@ -2090,6 +2099,137 @@ static void phase_o(void)
     printf("phase o OK (%d checks)\n", g_checks);
 }
 
+static void phase_p(void)
+{
+    fresh_tree();
+    char source[700], blocked[700];
+    FILE *meta = fopen(SD_DEVICE_METADATA_PATH, "w");
+    CHECK(meta != NULL, "create other-machine metadata");
+    if (meta) {
+        fputs("{\"ident\":{\"SerialNumber\":\"fixture-old\"},\"settings\":{\"old\":true}}", meta);
+        fclose(meta);
+    }
+    static int16_t date[] = {19737}, mode[] = {3}, pressure[] = {400};
+    const fx_sig_t sig[] = {
+        {"Date", "d", 0, 40000, 0, 40000, 1, date, NULL, 0},
+        {"Mode", "", 0, 32, 0, 32, 1, mode, NULL, 0},
+        {"S.C.Press", "cmH2O", 0, 40, 0, 2000, 1, pressure, NULL, 0},
+    };
+    snprintf(source, sizeof(source), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, sig, 3, 0);
+    snprintf(blocked, sizeof(blocked), "%s/20240115.imported.settings.json.tmp",
+             SD_SUMMARIES_DIR);
+    CHECK(mkdir(blocked, 0775) == 0, "create blocked temporary path");
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t u;
+    CHECK(edf_import_process_next(c, &u) != ESP_OK, "failed snapshot must fail root pass");
+    CHECK(file_exists(source), "failed root pass must retain source STR");
+    CHECK(rmdir(blocked) == 0, "remove test-created blocker");
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.settings_written == 1,
+          "retry writes imported settings");
+    CHECK(!file_exists(source), "successful retry consumes source STR");
+    cJSON *kept = parse_json_file(SD_DEVICE_METADATA_PATH);
+    cJSON *kept_ident = cJSON_GetObjectItem(kept, "ident");
+    cJSON *kept_serial = cJSON_GetObjectItem(kept_ident, "SerialNumber");
+    CHECK(cJSON_IsString(kept_serial) && !strcmp(kept_serial->valuestring, "fixture-old"),
+          "different machine must not replace cached identity");
+    cJSON_Delete(kept);
+    edf_import_ctx_destroy(c);
+    mode[0] = -1;
+    pressure[0] = -1;
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, sig, 3, 0);
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.settings_written == 1,
+          "new unknown STR record invalidates earlier settings");
+    char settings_path[700];
+    snprintf(settings_path, sizeof(settings_path), "%s/20240115.imported.settings.json",
+             SD_SUMMARIES_DIR);
+    cJSON *unknown = parse_json_file(settings_path);
+    cJSON *profiles = cJSON_GetObjectItem(unknown, "SettingProfiles");
+    CHECK(cJSON_IsObject(profiles) && cJSON_GetArraySize(profiles) == 0,
+          "unknown record must not retain previous settings");
+    cJSON_Delete(unknown);
+    edf_import_ctx_destroy(c);
+    printf("phase p OK (%d checks)\n", g_checks);
+}
+
+static void phase_q(void)
+{
+    fresh_tree();
+    char source[700], ident[700], snapshot[700];
+    static int16_t date[] = {19737}, mode[] = {3}, pressure[] = {400};
+    const fx_sig_t sig[] = {
+        {"Date", "d", 0, 40000, 0, 40000, 1, date, NULL, 0},
+        {"Mode", "", 0, 32, 0, 32, 1, mode, NULL, 0},
+        {"S.C.Press", "cmH2O", 0, 40, 0, 2000, 1, pressure, NULL, 0},
+    };
+    snprintf(source, sizeof(source), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, sig, 3, 0);
+    snprintf(ident, sizeof(ident), "%s/Identification.json", IMPORT_DIR);
+    FILE *f = fopen(ident, "w");
+    CHECK(f != NULL, "create conflicting identification");
+    if (f) {
+        fputs("{\"FlowGenerator\":{\"IdentificationProfiles\":{\"Product\":"
+              "{\"SerialNumber\":\"22188888888\",\"PlatformIdentifier\":46}}}}", f);
+        fclose(f);
+    }
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t u;
+    CHECK(edf_import_process_next(c, &u) != ESP_OK, "reject mismatched root identity");
+    CHECK(file_exists(source) && file_exists(ident), "retain mismatched root files");
+
+    f = fopen(ident, "w");
+    CHECK(f != NULL, "correct fixture identity");
+    if (f) {
+        fputs("{\"FlowGenerator\":{\"IdentificationProfiles\":{\"Product\":"
+              "{\"SerialNumber\":\"22199999999\",\"PlatformIdentifier\":46}}}}", f);
+        fclose(f);
+    }
+    snprintf(snapshot, sizeof(snapshot), "%s/20240115.imported.settings.json", SD_SUMMARIES_DIR);
+    f = fopen(snapshot, "w");
+    CHECK(f != NULL, "create existing other-machine snapshot");
+    if (f) {
+        fputs("{\"marker\":\"preserve\",\"_somnotrace_provenance\":"
+              "{\"version\":1,\"source\":\"imported_str\",\"day\":\"20240115\","
+              "\"serial\":\"22188888888\",\"local_sessions\":[]}}", f);
+        fclose(f);
+    }
+    CHECK(edf_import_process_next(c, &u) != ESP_OK, "reject other-machine snapshot overwrite");
+    cJSON *old = parse_json_file(snapshot);
+    CHECK(old && cJSON_GetObjectItem(old, "marker"), "preserve existing snapshot");
+    cJSON_Delete(old);
+    CHECK(file_exists(source), "retain STR after snapshot conflict");
+    f = fopen(snapshot, "w");
+    CHECK(f != NULL, "create same-machine snapshot");
+    if (f) {
+        fputs("{\"marker\":\"preserve\",\"_somnotrace_provenance\":"
+              "{\"version\":1,\"source\":\"imported_str\",\"day\":\"20240115\","
+              "\"family\":\"AS11\",\"serial\":\"22199999999\",\"local_sessions\":[]}}", f);
+        fclose(f);
+    }
+    char day_dir[700], session_path[800], ident_path[800];
+    snprintf(day_dir, sizeof(day_dir), "%s/20240115", SD_STREAMS_DIR);
+    mkpath(day_dir);
+    snprintf(session_path, sizeof(session_path), "%s/20240115_220000_session.json", day_dir);
+    snprintf(ident_path, sizeof(ident_path), "%s/20240115_220000_ident.json", day_dir);
+    f = fopen(session_path, "w");
+    CHECK(f != NULL, "create local session");
+    if (f) { fputs("{}", f); fclose(f); }
+    f = fopen(ident_path, "w");
+    CHECK(f != NULL, "create local other-machine identity");
+    if (f) { fputs("{\"SerialNumber\":\"22188888888\"}", f); fclose(f); }
+    CHECK(edf_import_process_next(c, &u) != ESP_OK, "reject day with another machine's session");
+    old = parse_json_file(snapshot);
+    CHECK(old && cJSON_GetObjectItem(old, "marker"), "preserve snapshot on session conflict");
+    cJSON_Delete(old);
+    CHECK(file_exists(source), "retain STR after session conflict");
+    edf_import_ctx_destroy(c);
+    printf("phase q OK (%d checks)\n", g_checks);
+}
+
 int main(void)
 {
     setenv("TZ", "UTC", 1);
@@ -2112,6 +2252,8 @@ int main(void)
     phase_m();
     phase_n();
     phase_o();
+    phase_p();
+    phase_q();
 
     rmtree(SD_MOUNT_POINT);
     printf("edf_import_test: %d checks, %d failures\n", g_checks, g_fail);

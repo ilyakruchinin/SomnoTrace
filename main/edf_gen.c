@@ -22,6 +22,7 @@
  */
 
 #include "edf_gen.h"
+#include "settings_provenance.h"
 #include "edf_internal.h"
 #include "edf_header.h"
 #include "edf_waveform.h"
@@ -441,9 +442,18 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     snprintf(self_settings_path, sizeof(self_settings_path), "%s/%s_settings.json",
              session_dir, session_id);
     char settings_path[420];
-    strlcpy(settings_path, self_settings_path, sizeof(settings_path));
-
+    snprintf(settings_path, sizeof(settings_path), "%s/%s.live.settings.json",
+             session_dir, session_id);
     cJSON *settings = edf_read_json_file(settings_path);
+    if (!settings) {
+        snprintf(settings_path, sizeof(settings_path), "%s/%s.cached.settings.json",
+                 session_dir, session_id);
+        settings = edf_read_json_file(settings_path);
+    }
+    if (!settings) {
+        strlcpy(settings_path, self_settings_path, sizeof(settings_path));
+        settings = edf_read_json_file(settings_path);
+    }
     if (!settings && day_metadata_fallback(session_dir, session_id, "_settings.json",
                                            settings_path, sizeof(settings_path))) {
         settings = edf_read_json_file(settings_path);
@@ -468,7 +478,6 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         if (settings) {
             ESP_LOGW(TAG, "session %s has no settings.json — using %s from another day",
                      session_id, settings_path);
-            edf_write_json_file(self_settings_path, settings);
         }
     }
     if (!settings) {
@@ -476,7 +485,6 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         if (settings) {
             ESP_LOGW(TAG, "session %s has no settings.json — using device_metadata.json snapshot",
                      session_id);
-            edf_write_json_file(self_settings_path, settings);
         }
     }
     ESP_LOGI(TAG, "settings.json: path=%s %s", settings_path,
@@ -842,7 +850,8 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
             { .label = "Snore.2s", .transducer = "",
               .unit = "", .phys_min = 0.0, .phys_max = 5.0,
               .dig_min = 0, .dig_max = 250,
-              .prefilter = "", .samples_per_record = 30 },
+              .prefilter = "", .samples_per_record = 30,
+              .invalid_passthrough = true, .clamp_valid = true },
             { .label = "FlowLim.2s", .transducer = "",
               .unit = "", .phys_min = 0.0, .phys_max = 1.0,
               .dig_min = 0, .dig_max = 100,
@@ -867,7 +876,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
      * multi-day cumulative file with one record per day. */
     if ((flags & EDF_GEN_SHARED) &&
         edf_generate_str_edf(out_root, patient_id, recording_id,
-                         "", settings,
+                         "", settings, ident,
                          session_dir, session_id,
                          start_epoch_ms, end_epoch_ms, clock_drift_ms) != ESP_OK) {
         errors++;
@@ -922,11 +931,23 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     /* ── Copy settings to SDCARD/SETTINGS/CurrentSettings.json ──
      * The device returns {"SettingProfiles":{...}} but AS11 nests this under
      * a "FlowGenerator" wrapper: {"FlowGenerator":{"SettingProfiles":{...}}}.
-     * Use a reference wrapper so the original `settings` tree is freed once
-     * below (cJSON_AddItemReferenceToObject does not transfer ownership). */
+     * Strip internal provenance before publishing the device-compatible JSON. */
     if ((flags & EDF_GEN_SHARED) && settings) {
         cJSON *cs_root = cJSON_CreateObject();
-        cJSON_AddItemReferenceToObject(cs_root, "FlowGenerator", settings);
+        cJSON *cs_settings = cJSON_Duplicate(settings, true);
+        if (!cs_root || !cs_settings) {
+            cJSON_Delete(cs_root);
+            cJSON_Delete(cs_settings);
+            errors++;
+            goto after_current_settings;
+        }
+        cJSON_DeleteItemFromObjectCaseSensitive(cs_settings, SETTINGS_PROVENANCE_KEY);
+        if (!cJSON_AddItemToObject(cs_root, "FlowGenerator", cs_settings)) {
+            cJSON_Delete(cs_settings);
+            cJSON_Delete(cs_root);
+            errors++;
+            goto after_current_settings;
+        }
         char *settings_str = cJSON_PrintUnformatted(cs_root);
         cJSON_Delete(cs_root);
         if (settings_str) {
@@ -1030,6 +1051,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
             free(settings_str);
         }
     }
+after_current_settings:
 
     /* ── Cleanup ── */
     if (ident) cJSON_Delete(ident);

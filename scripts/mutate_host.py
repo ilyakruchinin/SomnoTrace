@@ -78,11 +78,11 @@ INC = [os.path.join(ROOT, "main"), os.path.join(HERE, "test_include"), ROOT]
 TESTS = {
     "as11_time_test":       ["main/as11_time.c"],
     "as11_events_test":     ["main/as11_events.c", "main/as11_time.c", "@cjson"],
-    "edf_gen_test":         ["main/as11_time.c", "@cjson",
+    "edf_gen_test":         ["main/as11_time.c", "main/settings_provenance.c", "@cjson",
                              "#main/edf_header.c", "#main/edf_waveform.c",
                              "#main/edf_annotations.c", "#main/edf_summary.c",
                              "#main/edf_gen.c"],
-    "edf_properties_test":  ["main/as11_time.c", "main/edf_data_dict.h", "@cjson",
+    "edf_properties_test":  ["main/as11_time.c", "main/settings_provenance.c", "main/edf_data_dict.h", "@cjson",
                              "#main/edf_summary.c"],
     "vld3_decoder_test":    ["main/oximetry_vld3.c"],
     "as11_reconnect_test":  ["main/as11_reconnect.c"],
@@ -914,4 +914,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

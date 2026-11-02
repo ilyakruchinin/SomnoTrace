@@ -32,8 +32,9 @@ the ResMed AirSense 11 writes to its SD card.  Output goes to
   per-day protobuf records pulled via BLE `StartSpool` with a 30-day
   lookback.  Each record contains scalars (AHI, indices, enums) and
   metric submessages (percentiles for pressure, flow, leak, etc.).
-- **Settings JSON** (`<session>_settings.json`): from BLE `Get` RPC for
-  `SettingProfiles`, captured during post-therapy collection.
+- **Settings JSON** (`<session>.live.settings.json`): `SettingProfiles` from
+  the post-therapy BLE `Get` RPC, with session/day provenance. Cached and
+  legacy snapshots are not authoritative historical settings.
 - **Stream data** (`<session>_brp.snt`, `_pld.snt`, `_sa2.snt`): raw
   therapy waveforms recorded during the session.
 - **Events** (`<session>_events.snt`): JSON-line event notifications
@@ -47,7 +48,7 @@ the ResMed AirSense 11 writes to its SD card.  Output goes to
    - Pull Summary spool (30-day lookback) → per-day `.spool` files.
    - Pull respiratory events spool → `.bin` file.
    - Get device identification → `_ident.json`.
-   - Get current settings → `_settings.json`.
+   - Get current settings → `.live.settings.json`; mark cached fallback separately.
 2. **EDF generation** (`edf_gen_generate`):
    - Generate `BRP.edf`, `PLD.edf`, `SA2.edf` from stream data.
    - Generate `EVE.edf` from respiratory events.
@@ -93,9 +94,10 @@ Verified against live BLE data (spool vs `Get` RPC):
 | Indices (AHI etc)    | 10            | `raw / 10`      | 80 → 8 → 0.8 events/hr     |
 | Duration/enums/SAU   | 1             | no conversion   | —                          |
 
-Settings fields [6-30] come from the `Get` RPC response (settings.json)
-and are already in EDF digital units (e.g. pressures × 50, temperatures
-× 10).  No additional scaling is applied to those.
+Mode and settings fields [5-75] come from provenance-verified settings,
+converted to EDF digital units (e.g. pressures × 50, temperatures × 10).
+Fields 76-77 are spool-derived. For upgrade, import and consumer limitations,
+see [settings history](../docs/settings-history.md).
 
 #### 4.3.3 Current day in STR.edf
 
@@ -120,7 +122,8 @@ all other fields.
 - Missing summary spool for a day → that day is omitted from STR.edf.
 - Spool pull failure → `build_current_day_record()` synthesizes a
   minimal record from session events.
-- Missing settings JSON → settings fields [6-30] remain -1 sentinel.
+- Unverified or ambiguous settings → Mode and JSON-backed fields [5-75]
+  remain -1; spool-derived fields 76-77 are preserved.
 - Spool filenames use raw AS11 PeriodStart for noon-day classification
   (no drift correction) — consistent with `edf_gen.c`'s day matching.
 

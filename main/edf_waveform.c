@@ -444,7 +444,7 @@ esp_err_t edf_convert_snt_to_edf(const char *snt_path, const char *edf_path,
                     double phys = stored / 100.0;
                     double dig = dmin + (phys - pmin) * k;
                     int idig = (int)(dig < 0 ? dig - 0.5 : dig + 0.5);
-                    if (!passthrough) {
+                    if (!passthrough || sig[ch].clamp_valid) {
                         idig = clamp_i16(idig, sig[ch].dig_min, sig[ch].dig_max);
                     } else {
                         idig = clamp_i16(idig, INT16_MIN, INT16_MAX);

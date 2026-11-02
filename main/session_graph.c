@@ -533,8 +533,16 @@ esp_err_t session_settings_handler(httpd_req_t *req)
     resolve_day_dir(req, session_id, day_dir, sizeof(day_dir));
 
     char path[400];
-    snprintf(path, sizeof(path), "%s/%s_settings.json", day_dir, session_id);
+    snprintf(path, sizeof(path), "%s/%s.live.settings.json", day_dir, session_id);
     FILE *f = fopen(path, "r");
+    if (!f) {
+        snprintf(path, sizeof(path), "%s/%s.cached.settings.json", day_dir, session_id);
+        f = fopen(path, "r");
+    }
+    if (!f) {
+        snprintf(path, sizeof(path), "%s/%s_settings.json", day_dir, session_id);
+        f = fopen(path, "r");
+    }
     if (!f) {
         httpd_resp_set_type(req, "application/json");
         httpd_resp_set_status(req, "404 Not Found");

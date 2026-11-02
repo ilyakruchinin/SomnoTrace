@@ -26,6 +26,7 @@
 #include "as11_ble.h"
 #include "session_writer.h"
 #include "sd_storage.h"
+#include "settings_provenance.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -443,7 +444,7 @@ void post_therapy_cache_device_metadata(void)
 }
 
 static esp_err_t write_session_settings_files(const char *dir, const char *prefix,
-                                              const cJSON *settings)
+                                              const cJSON *settings, bool live)
 {
     as11_offset_t as11_off;
     if (as11_time_offset_from_settings(settings, &as11_off)) {
@@ -451,21 +452,37 @@ static esp_err_t write_session_settings_files(const char *dir, const char *prefi
                  (int)(as11_off / 60));
     }
 
-    char path[330];
-    snprintf(path, sizeof(path), "%s/%s_settings.json", dir, prefix);
-    if (write_json_file(path, settings) != ESP_OK) {
+    const char *slash = strrchr(dir, '/');
+    const char *day_label = slash ? slash + 1 : dir;
+    cJSON *marked = cJSON_Duplicate(settings, true);
+    if (!marked || !settings_provenance_set(marked,
+            live ? SETTINGS_SOURCE_LIVE : SETTINGS_SOURCE_CACHED, day_label, prefix)) {
+        cJSON_Delete(marked);
         return ESP_FAIL;
     }
 
-    /* Also save to summaries directory for fast O(1) STR.edf lookup */
-    const char *slash = strrchr(dir, '/');
-    const char *day_label = slash ? slash + 1 : dir;
-    if (day_label && strlen(day_label) == 8) {
-        char sum_settings_path[300];
-        snprintf(sum_settings_path, sizeof(sum_settings_path), "%s/%s.settings.json",
-                 SD_SUMMARIES_DIR, day_label);
-        write_json_file(sum_settings_path, settings);
+    char path[330];
+    int n = snprintf(path, sizeof(path), "%s/%s.%s.settings.json", dir, prefix,
+                     live ? "live" : "cached");
+    char *json = cJSON_PrintUnformatted(marked);
+    if (!json || n < 0 || (size_t)n + 4 >= sizeof(path) ||
+        write_bin_atomic(path, (const uint8_t *)json, strlen(json)) != ESP_OK) {
+        free(json);
+        cJSON_Delete(marked);
+        return ESP_FAIL;
     }
+
+    /* Keep legacy snapshots untouched; cached device settings are not history. */
+    if (live) {
+        char sum_settings_path[300];
+        snprintf(sum_settings_path, sizeof(sum_settings_path), "%s/%s.live.settings.json",
+                 SD_SUMMARIES_DIR, day_label);
+        if (write_bin_atomic(sum_settings_path, (const uint8_t *)json, strlen(json)) != ESP_OK) {
+            ESP_LOGW(TAG, "could not write daily live settings snapshot");
+        }
+    }
+    free(json);
+    cJSON_Delete(marked);
     return ESP_OK;
 }
 
@@ -505,7 +522,7 @@ static void fallback_from_device_metadata(const char *dir, const char *prefix,
     if (settings_ok && !*settings_ok) {
         cJSON *st_obj = cJSON_GetObjectItem(snap, "settings");
         if (cJSON_IsObject(st_obj)) {
-            if (write_session_settings_files(dir, prefix, st_obj) == ESP_OK) {
+            if (write_session_settings_files(dir, prefix, st_obj, false) == ESP_OK) {
                 ESP_LOGW(TAG, "used cached device settings for %s", prefix);
                 *settings_ok = true;
             }
@@ -540,7 +557,7 @@ static esp_err_t collect_settings(const char *dir, const char *prefix)
         return ESP_FAIL;
     }
 
-    esp_err_t err = write_session_settings_files(dir, prefix, settings);
+    esp_err_t err = write_session_settings_files(dir, prefix, settings, true);
     save_device_metadata_snapshot(NULL, settings);
     cJSON_Delete(settings);
     return err;
@@ -869,8 +886,8 @@ esp_err_t post_therapy_collect(const char *session_dir, const char *file_prefix,
         errors++;
     }
 
-    /* 3 & 4. Get device identification (<prefix>_ident.json) and current
-     * settings (<prefix>_settings.json).
+    /* 3 & 4. Get device identification and a provenance-tagged settings
+     * snapshot for this session.
      *
      * If an ATT write stalls here, NimBLE's 30 s ATT transaction timer will
      * terminate the connection and auto-reconnect in ~5 s.  Wait passively

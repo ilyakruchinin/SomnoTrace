@@ -60,6 +60,7 @@
 
 #include <assert.h>
 #include <dirent.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -387,6 +388,146 @@ static void roundtrip(const char *label, const char *tz, const char *tz_off,
     same_bytes("STR.edf", !full_str);
 }
 
+static int as10_sample(const uint8_t *bytes, size_t len, const char *label, int record)
+{
+    if (!bytes || len < 256) return INT_MIN;
+    char text[9] = {0};
+    memcpy(text, bytes + 252, 4);
+    int ns = atoi(text);
+    memcpy(text, bytes + 184, 8);
+    int header = atoi(text);
+    if (ns <= 0 || header < 256 || (size_t)header > len) return INT_MIN;
+    int stride = 0, offset = -1;
+    for (int i = 0; i < ns; i++) {
+        char name[17];
+        memcpy(name, bytes + 256 + i * 16, 16);
+        name[16] = '\0';
+        for (int j = 15; j >= 0 && name[j] == ' '; j--) name[j] = '\0';
+        if (strcmp(name, label) == 0) offset = stride;
+        memcpy(text, bytes + 256 + ns * 216 + i * 8, 8);
+        stride += atoi(text) * 2;
+    }
+    size_t pos = (size_t)header + (size_t)record * stride + offset;
+    if (offset < 0 || pos + 2 > len) return INT_MIN;
+    int16_t value;
+    memcpy(&value, bytes + pos, 2);
+    return value;
+}
+
+/* Independent synthetic Air 10 card -> importer -> actual STR generator. */
+static void as10_roundtrip(void)
+{
+    setenv("TZ", "UTC", 1);
+    tzset();
+    sh("rm -rf '%s'; mkdir -p '%s' '%s' '%s'",
+       SD_MOUNT_POINT, SD_IMPORT_DIR, SD_STREAMS_DIR, SD_SUMMARIES_DIR);
+    const edf_signal_def_t signals[] = {
+        {"Date", "", "", 0, 24836, 0, 24836, "", 1},
+        {"Duration", "", "min.", 0, 1440, 0, 1440, "", 1},
+        {"Mode", "", "", 0, 16, 0, 16, "", 1},
+        {"S.C.StartPress", "", "cmH2O", 0, 30, 0, 3000, "", 1},
+        {"S.C.Press", "", "cmH2O", 0, 30, 0, 300, "", 1},
+        {"S.AS.MinPress", "", "cmH2O", 0, 30, 0, 300, "", 1},
+        {"S.VA.MinEPAP", "", "cmH2O", 0, 30, 0, 300, "", 1},
+        {"S.BL.IPAP", "", "cmH2O", 0, 30, 0, 300, "", 1},
+        {"S.BL.EPAP", "", "cmH2O", 0, 30, 0, 300, "", 1},
+        {"S.EasyBreathe", "", "", 0, 16, 0, 16, "", 1},
+        {"S.RiseTime", "", "ms", 0, 2000, 0, 2000, "", 1},
+        {"S.TiMax", "", "ms", 0, 4000, 0, 4000, "", 1},
+        {"S.TiMin", "", "unknown", 0, 4000, 0, 4000, "", 1},
+        {"S.Trigger", "", "", 0, 16, 0, 16, "", 1},
+        {"S.Cycle", "", "", 0, 16, 0, 16, "", 1},
+        {"S.Mask", "", "", 0, 16, 0, 16, "", 1},
+        {"HeatedTube", "", "", 0, 16, 0, 16, "", 1},
+    };
+    char source[400], out[400];
+    snprintf(source, sizeof(source), "%s/STR.edf", SD_IMPORT_DIR);
+    snprintf(out, sizeof(out), "%s/as10-export", SD_MOUNT_POINT);
+    FILE *f = fopen(source, "wb");
+    check(f != NULL, "AS10 fixture source");
+    if (!f) return;
+    int header = edf_write_header(f, "X X X X", "Startdate 27-FEB-2026 X X X SRN=fixture10 MID=36 VID=1",
+                                  "27.02.26", "12.00.00", 3, "86400", "EDF",
+                                  signals, (int)(sizeof(signals) / sizeof(signals[0])));
+    check(header > 0, "write AS10 STR header");
+    int16_t rows[3][17] = {
+        {(int16_t)as11_time_day_number("20260227"), 120, 0, 801, 90, 80, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 2},
+        {(int16_t)as11_time_day_number("20260228"), 120, 3, -1, -1, -1, -1, 100, 65, 1, 300, 1200, 400, 2, 1, 1, 3},
+        {(int16_t)as11_time_day_number("20260301"), 120, 6, -1, -1, -1, 115, -1, -1, -1, -1, 1200, 400, 2, 1, 2, 3},
+    };
+    for (int r = 0; r < 3; r++) {
+        uint16_t crc = edf_crc16_ccitt((const uint8_t *)rows[r], sizeof(rows[r]));
+        fwrite(rows[r], 1, sizeof(rows[r]), f);
+        fwrite(&crc, 1, sizeof(crc), f);
+    }
+    fclose(f);
+    edf_import_ctx_t *ctx = edf_import_ctx_create();
+    edf_import_unit_t unit;
+    check(ctx != NULL && edf_import_process_next(ctx, &unit) == ESP_OK &&
+          unit.settings_written == 3, "import AS10 STR daily settings");
+    edf_import_ctx_destroy(ctx);
+    mkdir(out, 0775);
+    cJSON *ident = cJSON_Parse("{\"SerialNumber\":\"fixture10\",\"PlatformIdentifier\":36}");
+    check(ident != NULL && edf_generate_str_edf(out, "X X X X",
+          "Startdate 01-MAR-2026 X X X SRN=fixture10 MID=36 VID=1", "01.03.26",
+          NULL, ident, SD_STREAMS_DIR "/20260301", SID,
+          START_MS, START_MS + 7200000, 0) == ESP_OK, "generate AS10 STR");
+    cJSON_Delete(ident);
+    char generated[450];
+    snprintf(generated, sizeof(generated), "%s/STR.edf", out);
+    size_t len = 0;
+    uint8_t *bytes = slurp(generated, &len);
+    check(as10_sample(bytes, len, "Mode", 0) == 0 &&
+          as10_sample(bytes, len, "Mode", 1) == 3 &&
+          as10_sample(bytes, len, "Mode", 2) == 6, "AS10 mode indices");
+    check(as10_sample(bytes, len, "S.C.Press", 0) == 450,
+          "AS10 pressure uses physical header scaling");
+    check(as10_sample(bytes, len, "S.C.StartPress", 0) == -1,
+          "AS10 unrepresentable pressure remains unknown");
+    check(as10_sample(bytes, len, "S.AS.MinPress", 0) == 400,
+          "AS10 AutoSet label and pressure");
+    check(as10_sample(bytes, len, "S.VA.MinEPAP", 2) == 575,
+          "AS10 VAuto pressure");
+    check(as10_sample(bytes, len, "S.BL.IPAP", 1) == 500 &&
+          as10_sample(bytes, len, "S.BL.EPAP", 1) == 325 &&
+          as10_sample(bytes, len, "S.RiseTime", 1) == 300,
+          "AS10 S-mode settings and rise time");
+    check(as10_sample(bytes, len, "S.TiMax", 2) == 60 &&
+          as10_sample(bytes, len, "S.TiMin", 2) == -1,
+          "AS10 duration units and unknown unit");
+    check(as10_sample(bytes, len, "S.Trigger", 1) == 2 &&
+          as10_sample(bytes, len, "S.Cycle", 1) == 1 &&
+          as10_sample(bytes, len, "S.Mask", 0) == 0 &&
+          as10_sample(bytes, len, "S.Mask", 2) == 2, "AS10 native enum values");
+    check(as10_sample(bytes, len, "HeatedTube", 0) == 2 &&
+          as10_sample(bytes, len, "HeatedTube", 1) == 3,
+          "AS10 spool-derived signals");
+    if (bytes && len >= 256) {
+        char t[9] = {0};
+        memcpy(t, bytes + 184, 8);
+        size_t hdr = (size_t)atoi(t);
+        size_t stride = len >= hdr ? (len - hdr) / 3 : 0;
+        for (int r = 0; r < 3 && stride >= 2; r++) {
+            const uint8_t *rec = bytes + hdr + (size_t)r * stride;
+            uint16_t stored;
+            memcpy(&stored, rec + stride - 2, 2);
+            check(stored == edf_crc16_ccitt(rec, stride - 2), "AS10 STR CRC");
+        }
+    }
+    free(bytes);
+    ident = cJSON_Parse("{\"SerialNumber\":\"fixture10\",\"PlatformIdentifier\":46}");
+    check(ident != NULL && edf_generate_str_edf(out, "X X X X",
+          "Startdate 01-MAR-2026 X X X SRN=fixture10 MID=46 VID=1", "01.03.26",
+          NULL, ident, SD_STREAMS_DIR "/20260301", SID,
+          START_MS, START_MS + 7200000, 0) == ESP_OK, "generate different-family STR");
+    cJSON_Delete(ident);
+    bytes = slurp(generated, &len);
+    check(as10_sample(bytes, len, "Mode", 0) == -1 &&
+          as10_sample(bytes, len, "S.C.Press", 0) == -1,
+          "AS10 snapshot must not be used under an AS11 identity");
+    free(bytes);
+}
+
 int main(void)
 {
     roundtrip("no clock drift", "UTC", "+00:00", 0, true);
@@ -401,6 +542,7 @@ int main(void)
     roundtrip("Melbourne (AEDT)", "Australia/Melbourne", "+11:00", 0, false);
     roundtrip("Melbourne (AEDT), clock slow by 214 s", "Australia/Melbourne", "+11:00", 214000, false);
     roundtrip("New York (EST)", "America/New_York", "-05:00", 0, true);
+    as10_roundtrip();
     printf("edf_roundtrip_test: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

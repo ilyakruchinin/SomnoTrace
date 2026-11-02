@@ -39,10 +39,14 @@
  *     <prefix>_events.snt                                 ← live events
  *     <prefix>_resp_events.bin                             ← TherapyEvents spool
  *     <prefix>_ident.json                                  ← device identity
- *     <prefix>_settings.json                               ← current settings
+ *     <prefix>.live.settings.json                          ← Get RPC snapshot
+ *     <prefix>.cached.settings.json                        ← cached fallback
+ *     <prefix>_settings.json                               ← legacy/imported snapshot
  *     <prefix>_session.json                                ← session metadata
  *   /somnotrace/.somnotrace/sessions/summaries/
  *     YYYYMMDD.spool                                       ← per-day Summary spool
+ *     YYYYMMDD.live.settings.json                          ← live day snapshot
+ *     YYYYMMDD.imported.settings.json                      ← imported STR settings
  *
  * Output goes to SDCARD/ (ResMed-compatible SD card image, OSCAR-ready):
  *   /somnotrace/SDCARD/

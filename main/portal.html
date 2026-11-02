@@ -408,6 +408,8 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 /* ── Dashboard Shimmer & Loading Polish ───────────────────────── */
 .dash-panel-loading{position:relative;overflow:hidden;background:var(--input-bg);border-radius:8px;min-height:160px}
 .dash-panel-loading::after{content:"";position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,rgba(255,255,255,0.06),transparent);animation:shimmer 1.5s infinite}
+.dash-panel-empty{position:relative}
+.dash-panel-empty::after{content:attr(data-empty-label);position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--text-muted);pointer-events:none}
 @keyframes shimmer{100%{transform:translateX(100%)}}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.3;transform:scale(1.2)}}
 
@@ -6702,7 +6704,7 @@ function loadDashboardData() {
 
     /* Initialize per-session data slots. Each holds two independent sources:
      * brp (flow + pressure, 25 Hz) and pld (leak/snore/flowlim, 0.5 Hz). */
-    dashSessionData = dashSessions.map(function() { return {brp: null, pld: null}; });
+    dashSessionData = dashSessions.map(function() { return {brp: null, pld: null, pldState: 'loading'}; });
 
     /* Events overlay + per-session gating windows (tiny files). Awaited before
      * any waveform fetch so every sample is gated from the first paint. */
@@ -6769,10 +6771,11 @@ function loadDashboardData() {
           var pldBuf = res[0], sa2Buf = res[1], stgBuf = res[2];
           if (pldBuf) {
             var parsed = gateTrim(parseSntPld(pldBuf), dashSessionData[idx].gate);
-            if (parsed && parsed.t.length) {
+            if (parsed) {
               dashSessionData[idx].pld = parsed;
             }
           }
+          dashSessionData[idx].pldState = dashSessionData[idx].pld ? 'ready' : 'unavailable';
           if (sa2Buf) {
             var parsedSa2 = gateTrim(parseSntSa2(sa2Buf), dashSessionData[idx].gate);
             if (parsedSa2 && parsedSa2.t.length) {
@@ -6923,6 +6926,31 @@ function dashChartCols(chart, el) {
   return Math.max(2, Math.round(w));
 }
 
+/* An empty PLD signal is not the same as a file still being fetched. */
+function dashPanelState(sig, src) {
+  if (src && src.t && src.t.length > 0) return 'ready';
+  if (sig.key !== 'snore' && sig.key !== 'flowlim') return 'loading';
+  var pending = false, unavailable = false;
+  for (var i = 0; i < dashSessionData.length; i++) {
+    var session = dashSessionData[i];
+    if (!session || session.noTherapy) continue;
+    if (session.pldState === 'loading') pending = true;
+    else if (session.pldState === 'unavailable') unavailable = true;
+  }
+  if (pending) return 'loading';
+  return unavailable ? 'unavailable' : 'empty';
+}
+
+function setDashPanelState(el, sig, src) {
+  if (!el) return;
+  var state = dashPanelState(sig, src);
+  el.classList.toggle('dash-panel-loading', state === 'loading');
+  el.classList.toggle('dash-panel-empty', state === 'empty' || state === 'unavailable');
+  if (state === 'empty') el.setAttribute('data-empty-label', 'No data in this range');
+  else if (state === 'unavailable') el.setAttribute('data-empty-label', 'Data unavailable');
+  else el.removeAttribute('data-empty-label');
+}
+
 /* Push current-range data into every panel without recreating them. */
 var updateDashViewTimer = null;
 function updateDashView() {
@@ -6942,13 +6970,7 @@ function updateDashViewImpl() {
     var sig = dashActiveSignals[i] || DASH_SIGNALS[i];
     var src = buildSignalData(sig, cur, dashChartCols(chart));
     var chartEl = document.getElementById('chart-' + sig.key);
-    if (chartEl) {
-      if (src && src.t && src.t.length > 0) {
-        chartEl.classList.remove('dash-panel-loading');
-      } else {
-        chartEl.classList.add('dash-panel-loading');
-      }
-    }
+    setDashPanelState(chartEl, sig, src);
     chart.batch(function(u) {
       if (sig.overlay) {
         u.setData([src ? src.t : [], src ? src.v : [], (src && src.ovV) ? src.ovV : []], false);
@@ -6977,11 +6999,7 @@ function dashPanelHeight(sig) {
 /* Build a single uPlot panel for one signal into container `el`. */
 function makeDashPanel(sig, el, cur) {
   var src = buildSignalData(sig, cur, dashChartCols(null, el));
-  if (!src || !src.t || !src.t.length) {
-    if (el) el.classList.add('dash-panel-loading');
-  } else if (el) {
-    el.classList.remove('dash-panel-loading');
-  }
+  setDashPanelState(el, sig, src);
   var data = sig.overlay
     ? [src ? src.t : [], src ? src.v : [], (src && src.ovV) ? src.ovV : []]
     : (src ? [src.t, src.v] : [[], []]);

@@ -58,6 +58,8 @@
 #include "sd_storage.h"
 #include "snt_format.h"
 #include "as11_time.h"
+#include "settings_provenance.h"
+#include "edf_as10_settings.h"
 
 #ifndef EDF_IMPORT_HOST
 #include "freertos/FreeRTOS.h"
@@ -1596,6 +1598,15 @@ struct edf_import_ctx {
 /* STR Mode digital → ActiveTherapyProfile name (inverse of MODE_MAP). */
 static const char *mode_to_profile(int dig, bool as10)
 {
+    if (as10) {
+        static const char *const profiles[] = {
+            "CpapProfile", "AutoSetProfile", NULL, "SpontProfile", "STProfile",
+            "TimedProfile", "VAutoProfile", "ASVProfile", "ASVAutoProfile",
+            "iVAPSProfile", "PACProfile", "AutoSetForHerProfile",
+        };
+        return dig >= 0 && dig < (int)(sizeof(profiles) / sizeof(profiles[0]))
+               ? profiles[dig] : NULL;
+    }
     /* AS11 MODE_MAP = {3,1,2,4,10,16,8,6,7,5,9}: profile index → dig. */
     static const struct { int dig; const char *name; } T[] = {
         {3, "CpapProfile"}, {1, "AutoSetProfile"}, {2, "AutoSetForHerProfile"},
@@ -1603,10 +1614,76 @@ static const char *mode_to_profile(int dig, bool as10)
         {8, "VAutoProfile"}, {6, "ASVProfile"}, {7, "ASVAutoProfile"},
         {5, "iVAPSProfile"}, {9, "PACProfile"},
     };
-    (void)as10;   /* AS10 mode codes are label-matched the same way */
     for (size_t i = 0; i < sizeof(T) / sizeof(T[0]); i++)
         if (T[i].dig == dig) return T[i].name;
     return NULL;
+}
+
+/* Convert a source signal's physical unit to the canonical unit in our STR
+ * header. Unknown units remain absent rather than being guessed. */
+static bool as10_unit_factor(as10_setting_unit_t kind, const char *unit, double *factor)
+{
+    *factor = 1.0;
+    switch (kind) {
+    case AS10_UNIT_ENUM:
+        return !unit[0] || !strcmp(unit, "1");
+    case AS10_UNIT_PRESSURE:
+        return !strcasecmp(unit, "cmH2O") || !strcasecmp(unit, "cmH20");
+    case AS10_UNIT_SECONDS:
+    case AS10_UNIT_MILLISECONDS:
+        if (!strcasecmp(unit, "s") || !strcasecmp(unit, "sec") ||
+            !strcasecmp(unit, "seconds")) {
+            if (kind == AS10_UNIT_MILLISECONDS) *factor = 1000.0;
+            return true;
+        }
+        if (!strcasecmp(unit, "ms") || !strcasecmp(unit, "msec")) {
+            if (kind == AS10_UNIT_SECONDS) *factor = 0.001;
+            return true;
+        }
+        return false;
+    case AS10_UNIT_MINUTES:
+        return !strcasecmp(unit, "min") || !strcasecmp(unit, "min.") ||
+               !strcasecmp(unit, "minutes");
+    case AS10_UNIT_CELSIUS:
+        return !strcasecmp(unit, "C") || !strcasecmp(unit, "degC") ||
+               !strcasecmp(unit, "Celsius");
+    }
+    return false;
+}
+
+/* Preserve physical values from the AS10 card's own EDF header and labels.
+ * The exporter maps these into a family-specific header without interpreting
+ * the raw device enum values. */
+static cJSON *as10_str_settings(const imp_edf_t *e, const uint8_t *rec)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *fields = root ? cJSON_AddObjectToObject(root, "_as10_edf_settings") : NULL;
+    if (!fields) { cJSON_Delete(root); return NULL; }
+    for (size_t i = 0; i < sizeof(g_as10_setting_fields) / sizeof(g_as10_setting_fields[0]); i++) {
+        const as10_setting_field_t *field = &g_as10_setting_fields[i];
+        const imp_sig_t *sig = NULL;
+        for (int k = 0; k < e->n_sigs; k++) {
+            if (strcmp(e->sigs[k].label, field->label) == 0) {
+                sig = &e->sigs[k];
+                break;
+            }
+        }
+        if (!sig || sig->spr != 1 || sig->dmax <= sig->dmin ||
+            !isfinite(sig->pmin) || !isfinite(sig->pmax) || sig->pmax <= sig->pmin)
+            continue;
+        int16_t dig = str_dig_at(rec, sig, 0);
+        double factor;
+        if (dig == -1 || dig == INT16_MIN || dig < sig->dmin || dig > sig->dmax ||
+            !as10_unit_factor(field->unit, sig->unit, &factor)) continue;
+        double physical = (sig->pmin + (dig - sig->dmin) *
+                           (sig->pmax - sig->pmin) / (sig->dmax - sig->dmin)) * factor;
+        if (!isfinite(physical)) continue;
+        if (!cJSON_AddNumberToObject(fields, field->label, physical)) {
+            cJSON_Delete(root);
+            return NULL;
+        }
+    }
+    return root;
 }
 
 /* Write summaries/<day>.spool (atomic) for one decoded STR day. */
@@ -1846,47 +1923,51 @@ static int overlay_str_settings(cJSON *root, const imp_edf_t *e,
     return applied;
 }
 
-/* Import every record of an STR.edf into per-day spools + day settings.
- * summaries/<day>.settings.json = the card's CurrentSettings tree (when
- * present) overlaid with that record's S.* channels — never a stub that
- * shadows the real tree in edf_generate_str_edf's priority lookup.
- * With no CurrentSettings (AS10 cards), the newest record's S.*-only
- * reconstruction becomes ctx->settings so session sidecars still carry
- * a usable tree. */
+/* Treat each explicitly imported AS11 STR record as the source for that day.
+ * Absent fields remain unknown rather than inheriting CurrentSettings. */
 static int import_str_edf(const char *path, edf_import_ctx_t *ctx,
                           edf_import_unit_t *u)
 {
     imp_edf_t *e = imp_malloc(sizeof(imp_edf_t));
-    if (!e) return 0;
-    if (imp_edf_open(e, path) != ESP_OK) { free(e); return 0; }
+    if (!e) return -1;
+    if (imp_edf_open(e, path) != ESP_OK) { free(e); return -1; }
 
     /* Platform family: Identification.* wins when resolved; else the
      * STR's own recording_id carries SRN=/MID=/VID= (MID < 40 → AS10,
      * which also selects 0-indexed enum decoding for S.* channels). */
-    if (!ctx->src_family[0] || !ctx->ident) {
-        cJSON *rid = ident_from_rec_id(e->rec_id);
-        if (rid) {
-            const cJSON *mid = cJSON_GetObjectItem(rid, "PlatformIdentifier");
-            const cJSON *sn  = cJSON_GetObjectItem(rid, "SerialNumber");
-            if (!ctx->src_family[0] && mid && cJSON_IsNumber(mid))
-                snprintf(ctx->src_family, sizeof(ctx->src_family), "%s",
-                         mid->valueint >= 40 ? "AS11" : "AS10");
-            if (!ctx->src_serial[0] && sn && cJSON_IsString(sn))
-                snprintf(ctx->src_serial, sizeof(ctx->src_serial), "%s",
-                         sn->valuestring);
-            if (!ctx->ident) ctx->ident = rid;
-            else cJSON_Delete(rid);
+    cJSON *rid = ident_from_rec_id(e->rec_id);
+    if (rid) {
+        const cJSON *mid = cJSON_GetObjectItem(rid, "PlatformIdentifier");
+        const cJSON *sn = cJSON_GetObjectItem(rid, "SerialNumber");
+        const char *family = cJSON_IsNumber(mid)
+                             ? (mid->valueint >= 40 ? "AS11" : "AS10") : "";
+        if ((ctx->src_family[0] && family[0] && strcmp(ctx->src_family, family) != 0) ||
+            (ctx->src_serial[0] && cJSON_IsString(sn) && sn->valuestring &&
+             sn->valuestring[0] && strcmp(ctx->src_serial, sn->valuestring) != 0)) {
+            ESP_LOGE(TAG, "import: STR and identification refer to different machines");
+            cJSON_Delete(rid);
+            free(e);
+            return -1;
         }
+        if (!ctx->src_family[0] && family[0])
+            snprintf(ctx->src_family, sizeof(ctx->src_family), "%s", family);
+        if (!ctx->src_serial[0] && cJSON_IsString(sn) && sn->valuestring)
+            snprintf(ctx->src_serial, sizeof(ctx->src_serial), "%s", sn->valuestring);
+        if (!ctx->ident) ctx->ident = rid;
+        else cJSON_Delete(rid);
     }
     bool as10 = !strcmp(ctx->src_family, "AS10");
+    if (!ctx->src_serial[0])
+        ESP_LOGW(TAG, "import: STR source serial unknown; daily settings will remain unknown");
 
     FILE *f = fopen(path, "rb");
-    if (!f) { free(e); return 0; }
+    if (!f) { free(e); return -1; }
     uint8_t *rec = imp_malloc((size_t)e->rec_stride);
     str_day_t *d = imp_calloc(1, sizeof(*d));
-    if (!rec || !d) { free(rec); free(d); fclose(f); free(e); return 0; }
+    if (!rec || !d) { free(rec); free(d); fclose(f); free(e); return -1; }
 
-    int written = 0;
+    int written = 0, settings_written = 0;
+    bool failed = false;
     cJSON *latest = NULL;   /* newest S.* reconstruction (no CurrentSettings) */
     int64_t n = e->n_records;
     if (n > IMP_MAX_STR_REC) n = IMP_MAX_STR_REC;
@@ -1896,7 +1977,10 @@ static int import_str_edf(const char *path, edf_import_ctx_t *ctx,
         decode_str_record(e, rec, d);
         if (d->day_number <= 0) continue;
         bool spool_new = false;
-        if (write_spool_for_day(d, false, &spool_new) != ESP_OK) continue;
+        if (write_spool_for_day(d, false, &spool_new) != ESP_OK) {
+            failed = true;
+            break;
+        }
         /* Only a spool this pass created counts: re-importing a card whose
          * days already exist must not look like new data (the worker would
          * rebuild and re-offer the newest day for nothing). */
@@ -1904,24 +1988,59 @@ static int import_str_edf(const char *path, edf_import_ctx_t *ctx,
 
         int y, mo, dd;
         imp_civil_from_days(d->day_number, &y, &mo, &dd);
-        char spath[340];
-        snprintf(spath, sizeof(spath), "%s/%04d%02d%02d.settings.json",
-                 SD_SUMMARIES_DIR, y, mo, dd);
+        char day[9], spath[340];
+        snprintf(day, sizeof(day), "%04d%02d%02d", y, mo, dd);
         cJSON *root = ctx->settings ? cJSON_Duplicate(ctx->settings, true)
                                     : cJSON_CreateObject();
-        if (!root) continue;
-        int applied = overlay_str_settings(root, e, rec, d->mode_dig, as10);
-        struct stat st;
-        /* Only write when the file carries real settings — an empty stub
-         * would shadow richer per-session settings.json files in the
-         * edf_summary.c priority chain. */
-        if ((ctx->settings || applied > 0) && stat(spath, &st) != 0) {
-            mkdir(SD_SESSIONS_DIR, 0775);
-            mkdir(SD_SUMMARIES_DIR, 0775);
-            write_json_atomic(spath, root);
+        if (!root) { failed = true; break; }
+        overlay_str_settings(root, e, rec, d->mode_dig, as10);
+
+        if (ctx->src_serial[0] &&
+            (!strcmp(ctx->src_family, "AS11") || as10)) {
+            cJSON *native = as10 ? as10_str_settings(e, rec) : cJSON_CreateObject();
+            int applied = 0;
+            if (native && as10) {
+                const cJSON *fields = cJSON_GetObjectItemCaseSensitive(native, "_as10_edf_settings");
+                applied = cJSON_GetArraySize(fields);
+            } else if (native) {
+                applied = overlay_str_settings(native, e, rec, d->mode_dig, false);
+            }
+            snprintf(spath, sizeof(spath), "%s/%s.imported.settings.json",
+                     SD_SUMMARIES_DIR, day);
+            cJSON *old = read_json_file(spath);
+            struct stat existing;
+            int stat_result = stat(spath, &existing);
+            bool unreadable = (stat_result == 0 && !old) ||
+                              (stat_result != 0 && errno != ENOENT);
+            if (unreadable) {
+                ESP_LOGE(TAG, "import: cannot safely read existing daily settings");
+                failed = true;
+            } else if (native && (applied > 0 || old) &&
+                settings_provenance_set(native, SETTINGS_SOURCE_IMPORTED_STR, day, NULL) &&
+                settings_provenance_set_serial(native, ctx->src_serial) &&
+                settings_provenance_set_family(native, as10 ? SETTINGS_FAMILY_AS10 : SETTINGS_FAMILY_AS11) &&
+                settings_provenance_record_sessions(native, day)) {
+                const char *old_serial = settings_provenance_serial(old);
+                if (old && (!old_serial || strcmp(old_serial, ctx->src_serial) != 0 ||
+                            !settings_provenance_is_family(old, as10 ? SETTINGS_FAMILY_AS10 : SETTINGS_FAMILY_AS11))) {
+                    ESP_LOGE(TAG, "import: daily settings belong to another or unknown machine");
+                    failed = true;
+                } else if (!old || !cJSON_Compare(old, native, true)) {
+                    mkdir(SD_SESSIONS_DIR, 0775);
+                    mkdir(SD_SUMMARIES_DIR, 0775);
+                    if (write_json_atomic(spath, native) == ESP_OK) settings_written++;
+                    else failed = true;
+                }
+            } else if (!native || applied > 0 || old) {
+                ESP_LOGE(TAG, "import: cannot establish daily settings provenance");
+                failed = true;
+            }
+            cJSON_Delete(old);
+            cJSON_Delete(native);
         }
         if (!ctx->settings) { cJSON_Delete(latest); latest = root; }
         else cJSON_Delete(root);
+        if (failed) break;
     }
     if (latest) ctx->settings = latest;
     free(d);
@@ -1929,7 +2048,8 @@ static int import_str_edf(const char *path, edf_import_ctx_t *ctx,
     fclose(f);
     free(e);
     u->spools_written += written;
-    return written;
+    u->settings_written += settings_written;
+    return failed ? -1 : written;
 }
 
 /* Refresh device_metadata.json when the root pass resolved ident or
@@ -1955,6 +2075,16 @@ static void write_device_metadata(const edf_import_ctx_t *ctx)
         const cJSON *os = cJSON_GetObjectItem(old_ident, "SerialNumber");
         if (os && cJSON_IsString(os) && os->valuestring)
             old_serial = os->valuestring;
+    }
+    int old_family = settings_provenance_family(old_ident);
+    int new_family = settings_provenance_family(ctx->ident);
+    if (old_ident && ctx->ident &&
+        (!serial[0] || !old_serial[0] || strcmp(serial, old_serial) != 0 ||
+         (old_family != SETTINGS_FAMILY_UNKNOWN && new_family != SETTINGS_FAMILY_UNKNOWN &&
+          old_family != new_family))) {
+        ESP_LOGW(TAG, "import: preserving existing metadata for a different or unknown machine");
+        cJSON_Delete(existing);
+        return;
     }
     const cJSON *use_settings = ctx->settings;
     if (!use_settings && old_settings &&
@@ -3343,7 +3473,10 @@ static void resolve_ident(edf_import_ctx_t *ctx)
         ctx->ident = ident_from_ident_json(j);
         cJSON_Delete(j);
         if (ctx->ident) {
-            snprintf(ctx->src_family, sizeof(ctx->src_family), "AS11");
+            const cJSON *mid = cJSON_GetObjectItem(ctx->ident, "PlatformIdentifier");
+            if (cJSON_IsNumber(mid))
+                snprintf(ctx->src_family, sizeof(ctx->src_family), "%s",
+                         mid->valueint >= 40 ? "AS11" : "AS10");
             const cJSON *s = cJSON_GetObjectItem(ctx->ident, "SerialNumber");
             if (s && cJSON_IsString(s))
                 snprintf(ctx->src_serial, sizeof(ctx->src_serial),
@@ -3376,12 +3509,23 @@ static void resolve_settings(edf_import_ctx_t *ctx)
 static esp_err_t process_root_pass(edf_import_ctx_t *ctx, edf_import_unit_t *u)
 {
     u->root_pass = true;
+    /* A failed root pass retains its files and may be retried on this ctx. */
+    cJSON_Delete(ctx->ident);
+    cJSON_Delete(ctx->settings);
+    ctx->ident = NULL;
+    ctx->settings = NULL;
+    ctx->src_family[0] = '\0';
+    ctx->src_serial[0] = '\0';
     resolve_ident(ctx);
     resolve_settings(ctx);
 
     struct stat st;
-    if (stat(IMP_IMPORT_DIR "/STR.edf", &st) == 0)
-        import_str_edf(IMP_IMPORT_DIR "/STR.edf", ctx, u);
+    if (stat(IMP_IMPORT_DIR "/STR.edf", &st) == 0 &&
+        import_str_edf(IMP_IMPORT_DIR "/STR.edf", ctx, u) < 0) {
+        ESP_LOGE(TAG, "import: STR processing failed; keeping root files for retry");
+        ctx->root_done = false;
+        return ESP_FAIL;
+    }
 
     /* Resolved ident/settings become the device_metadata.json snapshot
      * so sessions lacking sidecars still export correctly. */
@@ -4191,6 +4335,10 @@ static void edf_import_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(10000));
                 continue;
             }
+            if (r != ESP_OK) {
+                ESP_LOGE(TAG, "import: unit failed; retaining source files until retry");
+                break;
+            }
             idle = 0;
             if (u.root_pass)
                 ESP_LOGI(TAG, "import: root pass — ident %s settings %s, %d spool(s)",
@@ -4212,7 +4360,7 @@ static void edf_import_task(void *arg)
                 if (u.day2_label[0] &&
                     edf_gen_rebuild_day(u.day2_label) == ESP_OK)
                     uploader_on_export_complete(u.day2_label);
-            } else if (u.root_pass && u.spools_written > 0) {
+            } else if (u.root_pass && (u.spools_written > 0 || u.settings_written > 0)) {
                 /* STR-only import: one rebuild refreshes the cumulative
                  * STR.edf + Identification/SETTINGS artifacts (the STR
                  * pass scans every summaries spool). */
@@ -4258,5 +4406,3 @@ esp_err_t edf_import_start_worker(void)
 }
 
 #endif /* EDF_IMPORT_HOST */
-
-
