@@ -657,14 +657,14 @@ Wi-Fi Configuration
 <span class="step-num">2</span> Connected Medical Devices (Data Sources)
 </div>
 <div class="settings-grid-2col sta-only">
-<!-- ResMed AirSense 11 -->
+<!-- CPAP source: ResMed CPAP or SomnoBridge -->
 <div class="card" style="display:flex;flex-direction:column;justify-content:space-between">
 <div>
 <div class="card-title">
 <svg viewBox="0 0 24 24"><path d="M17.71 7.71L12 2h-1v7.59L6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 11 14.41V22h1l5.71-5.71-4.3-4.29 4.3-4.29zM13 5.83l1.88 1.88L13 9.59V5.83zm1.88 10.46L13 18.17v-3.76l1.88 1.88z"/></svg>
-ResMed AirSense 11 CPAP
+ResMed Series 11 / SomnoBridge
 </div>
-<p class="card-desc">Pair over Bluetooth to download therapy records after sleep.</p>
+<p class="card-desc">Pair a ResMed CPAP or a SomnoBridge over Bluetooth to download therapy records after sleep.</p>
 <div class="form-group">
 <div id="ble-paired" class="ble-status-paired" style="display:none">
 <span class="paired-badge">● Paired</span> with <strong id="ble-dev-name">AirSense 11</strong>
@@ -672,7 +672,7 @@ ResMed AirSense 11 CPAP
 <div id="ble-unpaired">
 <button class="btn btn-outline btn-sm" type="button" onclick="bleScan()">
 <svg viewBox="0 0 24 24" style="width:14px;height:14px"><path d="M17.65 6.35A7.96 7.96 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
-Scan for CPAP / SomnoBridge
+Scan for ResMed / SomnoBridge
 </button>
 <div class="form-group" id="ble-select-group" style="display:none;margin-top:10px">
 <label>Select Device</label>
@@ -878,7 +878,8 @@ BreathingRoom Upload
 <svg viewBox="0 0 24 24"><path d="M11 7h2v2h-2V7zm0 4h2v6h-2v-6zm1-9C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
 Upload Window
 </div>
-<p class="card-desc">How many of the most recent days are ever considered for upload. This also caps &ldquo;Reset Upload State&rdquo;, so re-syncing cannot start uploading months of history at once.</p>
+<p class="card-desc">How many of the most recent days recorded on this device are uploaded from SomnoTrace to the destinations above (SMB share, SleepHQ, Aerivue, BreathingRoom). This also caps &ldquo;Reset Upload State&rdquo;, so re-syncing cannot start uploading months of history at once.</p>
+<p class="card-desc">SomnoTrace records sleep data live over Bluetooth during therapy — it cannot import history stored on the SD card inside your CPAP machine.</p>
 <div class="form-group">
 <label for="upload-max-days">Days to keep in sync</label>
 <input type="number" class="form-control" id="upload-max-days" min="1" max="366" value="30" data-dirty="false" oninput="markDirty(this)">
@@ -1538,16 +1539,16 @@ Choose File
 <svg viewBox="0 0 24 24" style="fill:var(--warning)"><path d="M12 2L1 21h22L12 2zm0 3.83L19.53 19H4.47L12 5.83zM11 10v6h2v-6h-2zm0 8v2h2v-2h-2z"/></svg>
 Maintenance Actions
 </div>
-<p class="card-desc mt-sm">These actions modify files on the SD card and upload state. Each action requires confirmation before proceeding.</p>
+<p class="card-desc mt-sm">These actions modify files on the SomnoTrace SD card and upload state. Each action requires confirmation before proceeding.</p>
 
 <div style="display:flex;flex-direction:column;gap:12px" class="mt-md">
 
 <div class="action-item-row">
 <div>
 <div style="font-weight:600;font-size:.9rem">Reset Upload State</div>
-<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Clears upload tracking so all days re-upload from the beginning</div>
+<div style="color:var(--text-muted);font-size:.8rem;margin-top:2px">Clears upload tracking so the newest days within your upload window are re-uploaded from this device to the configured destinations</div>
 </div>
-<button class="btn btn-primary" onclick="execAction('reset-state','Clear upload state? This will reset the upload tracking for all sessions. All sleep data (CPAP, oximetry, and sleep stages) within the upload window will be re-uploaded to configured backends. Continue?')">Reset State</button>
+<button class="btn btn-primary" onclick="execAction('reset-state','Clear upload state? Upload tracking for all sessions recorded on this device will be reset, and all sleep data (CPAP, oximetry, and sleep stages) within the upload window will be re-uploaded to the configured destinations. Continue?')">Reset State</button>
 </div>
 
 <div class="action-item-row">
@@ -7700,7 +7701,8 @@ function appStart() {
       } else {
         if (picker) picker.value = todayIso;
         updateDateDisplayLabel(todayIso);
-        dashSetStatus('No sessions recorded yet');
+        dashProgHide();
+        dashSetStatus('No sessions recorded yet — SomnoTrace records live during therapy; nothing is imported from the CPAP machine’s SD card.');
       }
     });
     fetchSpo2Days().then(function() {
