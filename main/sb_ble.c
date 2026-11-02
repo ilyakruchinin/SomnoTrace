@@ -67,6 +67,7 @@
 #include "nvs.h"
 
 #include "cJSON.h"
+#include "bsp_display.h"
 #include "edf_import.h"
 #include "nvs_writer.h"
 #include "upload_sched.h"
@@ -1595,10 +1596,14 @@ static void sync_run(bool full)
 
 /* ── Status / sync task ─────────────────────────────────────────────── */
 
-static void poll_status(void)
+static void poll_status(uint32_t epoch)
 {
     cJSON *res = NULL;
-    if (json_op("GET_STATUS", NULL, &res) != ESP_OK || !res) { cJSON_Delete(res); return; }
+    if (json_op("GET_STATUS", NULL, &res) != ESP_OK || !res) {
+        bsp_display_bridge_set_card_status(epoch, false, false);
+        cJSON_Delete(res);
+        return;
+    }
     cJSON *th = cJSON_GetObjectItem(res, "therapy");
     if (th) {
         cJSON *st = cJSON_GetObjectItem(th, "state");
@@ -1606,7 +1611,9 @@ static void poll_status(void)
         s_therapy_active = cJSON_IsNumber(st) && st->valueint == 1;
         s_transfer_allowed = cJSON_IsTrue(ta);
     }
-    s_card_wifi = cJSON_IsTrue(cJSON_GetObjectItem(res, "sta_connected"));
+    cJSON *card_wifi = cJSON_GetObjectItem(res, "sta_connected");
+    s_card_wifi = cJSON_IsTrue(card_wifi);
+    bsp_display_bridge_set_card_status(epoch, cJSON_IsBool(card_wifi), s_card_wifi);
     const char *mode = cJSON_GetStringValue(cJSON_GetObjectItem(res, "mode"));
     if (mode) snprintf(s_card_mode, sizeof(s_card_mode), "%s", mode);
     cJSON_Delete(res);
@@ -1620,11 +1627,13 @@ static void sb_task(void *arg)
     /* Auto-reconnect to a bonded bridge. */
     if (peer_load(&s_peer)) {
         s_paired = true;
+        bsp_display_bridge_set_paired(true);
         ble_gap_connect(s_own_addr_type, &s_peer, 30000, NULL, sb_gap_event, NULL);
         set_state(SB_STATUS_CONNECTING);
     }
 
     int64_t last_poll = 0, last_sync = 0;
+    uint32_t last_poll_epoch = 0;
     int64_t link_up_ms = 0;
     for (;;) {
         const int64_t now = esp_timer_get_time() / 1000;
@@ -1731,9 +1740,11 @@ static void sb_task(void *arg)
          * security_initiate past the link budget) and could mask the PIN
          * mailbox during pairing. */
         if (s_conn != BLE_HS_CONN_HANDLE_NONE && s_subscribed) {
-            if (now - last_poll > SB_POLL_MS) {
+            uint32_t epoch = bsp_display_bridge_epoch();
+            if (epoch != last_poll_epoch || now - last_poll > SB_POLL_MS) {
                 last_poll = now;
-                poll_status();
+                last_poll_epoch = epoch;
+                poll_status(epoch);
                 if (time_sync_is_synced() && now - s_time_last_ms > SB_TIME_PERIOD_MS)
                     time_sync_rounds();
             }
@@ -1867,6 +1878,7 @@ static int sb_gap_event(struct ble_gap_event *event, void *arg)
     (void)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
+        bsp_display_bridge_set_connected(false);
         if (event->connect.status != 0) {
             set_error("connect failed");
             s_conn = BLE_HS_CONN_HANDLE_NONE;
@@ -1896,6 +1908,7 @@ static int sb_gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT: {
+        bsp_display_bridge_set_connected(false);
         s_pin_pending = false;
         s_sec_due_ms = 0;
         /* reason 573 = HCI 0x3d "Connection Terminated due to MIC
@@ -1925,11 +1938,13 @@ static int sb_gap_event(struct ble_gap_event *event, void *arg)
             ESP_LOGI(TAG, "link encrypted, authenticated and bonded");
             peer_save(&s_peer);
             s_paired = true;
+            bsp_display_bridge_set_connected(true);
             set_state(SB_STATUS_PAIRED);
             s_ctrl_val = s_data_val = s_ctrl_cccd = s_data_cccd = 0;
             s_subscribed = false;
             ble_gattc_disc_all_svcs(s_conn, on_svc, NULL);
         } else {
+            bsp_display_bridge_set_connected(false);
             ESP_LOGW(TAG, "encryption failed: status=%d encrypted=%d auth=%d bonded=%d",
                      event->enc_change.status,
                      desc.sec_state.encrypted, desc.sec_state.authenticated,
@@ -2201,6 +2216,7 @@ esp_err_t sb_ble_forget(void)
      * Delete only *this* peer's bond too — ble_store_clear() would wipe the
      * AS11's bond along with it. */
     s_paired = false;
+    bsp_display_bridge_set_paired(false);
     ble_addr_t peer = s_peer;
     memset(&s_peer, 0, sizeof(s_peer));
     nvs_writer_run(forget_nvs_op, NULL);
@@ -2212,6 +2228,7 @@ esp_err_t sb_ble_forget(void)
 
 esp_err_t sb_ble_disconnect(void)
 {
+    bsp_display_bridge_set_connected(false);
     if (s_conn == BLE_HS_CONN_HANDLE_NONE) return ESP_OK;
     ble_gap_terminate(s_conn, BLE_ERR_REM_USER_CONN_TERM);
     s_conn = BLE_HS_CONN_HANDLE_NONE;

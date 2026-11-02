@@ -2,7 +2,7 @@ idf_component_register(SRCS "main.c" "bsp_power.c" "bsp_display.c" "net_provisio
                            "sd_storage.c" "session_writer.c" "time_sync.c"
                            "post_therapy.c" "edf_gen.c" "edf_header.c" "edf_waveform.c" "edf_annotations.c" "edf_summary.c" "edf_import.c" "log_stream.c" "device_settings.c"
                            "psram_task.c" "bsp_audio.c" "bsp_i2c.c" "bsp_touch.c" "session_graph.c" "nvs_writer.c"
-                           "as11_time.c" "as11_events.c" "leak_roll.c"
+                           "as11_time.c" "as11_events.c" "leak_roll.c" "bridge_indicator.c"
                            "crash_diag.c"
                            "sb_ble.c" "sb_proto.c" "oximeter.c" "oximeter_oxyii.c" "oximeter_legacy.c" "legacy_file_list.c" "oximeter_store.c" "oximetry_vld3.c" "oxyii_trailer.c" "oxyii_codec.c" "oximetry_time.c" "oximetry_canonical.c" "oximetry_http.c" "web_auth.c" "web_auth_core.c"
                            "mqtt_manager.c" "http_query.c" "update_check.c" "update_check_core.c"

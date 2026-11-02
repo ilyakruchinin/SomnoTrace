@@ -157,6 +157,7 @@ run_test legacy_file_list_test -I"$SHIM" -I"$MAIN_DIR" scripts/legacy_file_list_
 run_test upload_park_test -I"$UPLOADER_DIR" scripts/upload_park_test.c
 run_test as11_reconnect_test -I"$SHIM" -I"$MAIN_DIR" scripts/as11_reconnect_test.c "$MAIN_DIR/as11_reconnect.c"
 run_test leak_roll_test     -I"$SHIM" -I"$MAIN_DIR" scripts/leak_roll_test.c "$MAIN_DIR/leak_roll.c"
+run_test bridge_indicator_test -I"$MAIN_DIR" scripts/bridge_indicator_test.c "$MAIN_DIR/bridge_indicator.c"
 # SomnoBridge wire helpers: frame header, v2 block codecs, IMPORT path mapping
 run_test sb_ble_test         -I"$SHIM" -I"$MAIN_DIR" -DSB_PROTO_HOST \
     scripts/sb_ble_test.c "$MAIN_DIR/sb_proto.c" -lz
@@ -298,4 +299,3 @@ done
 
 echo "host tests: $ran run, $failed failed, $skipped skipped"
 [ $failed = 0 ]
-

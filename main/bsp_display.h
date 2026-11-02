@@ -52,6 +52,12 @@ void bsp_display_show_lines(const char *title, const char *const *lines, int n_l
 void bsp_display_set_notice(const char *text);
 void bsp_display_set_wifi_connected(bool connected);
 void bsp_display_set_as11_paired(bool paired);
+/* Bridge status is separate from AS11 live-data state. A status reply is
+ * accepted only for the BLE connection epoch on which it was requested. */
+void bsp_display_bridge_set_paired(bool paired);
+void bsp_display_bridge_set_connected(bool connected);
+uint32_t bsp_display_bridge_epoch(void);
+void bsp_display_bridge_set_card_status(uint32_t epoch, bool valid, bool wifi);
 /* Amber download badge in the status header: a newer stable release exists
  * on the repo this firmware was built from. */
 void bsp_display_set_update_available(bool available);

@@ -82,6 +82,27 @@ The board has three physical buttons on the side. Here's what each one does:
 
 </details>
 
+<details>
+<summary><b>SomnoBridge LCD Indicators</b></summary>
+
+On the status screen, the Bluetooth icon shows the SomnoBridge link and the
+card icon shows the bridge's EZShare Wi-Fi status:
+
+| Bluetooth | Card | Meaning |
+|---|---|---|
+| Blue | Green check | Bridge connected; card Wi-Fi joined. |
+| Blue | Amber `!` | Bridge connected; card Wi-Fi disconnected. |
+| Blue | Grey `?` | Bridge connected; card status not yet known or stale. |
+| Dim | Dim `x` | Bridge paired but disconnected or reconnecting. |
+
+The card icon is shown only for SomnoBridge, not a direct AirSense connection.
+It indicates a Wi-Fi connection, not a guarantee that card files are reachable
+or that transfers are currently allowed. During a long transfer, status
+polling can be delayed and the card icon may temporarily show `?`. The Wi-Fi
+bars at the right of the screen indicate SomnoTrace's own Wi-Fi connection.
+
+</details>
+
 ---
 
 ## How It Works
