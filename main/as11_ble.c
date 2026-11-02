@@ -2933,6 +2933,22 @@ static void on_reset(int reason)
     s_host_ready = false;
 }
 
+/* NimBLE refuses a new pairing when the bond store is full
+ * (ble_sm_chk_store_overflow).  Without a store-status callback it fails
+ * with BLE_HS_ENOTSUP (8) *before* the peer is ever contacted — the
+ * failure then looks like the peer "refusing" pairing.  Make room by
+ * evicting the oldest peer bond instead. */
+static int on_store_status(struct ble_store_status_event *event, void *arg)
+{
+    (void)arg;
+    if (event->event_code == BLE_STORE_EVENT_FULL) {
+        ESP_LOGW(TAG, "bond store full (obj_type=%d) — evicting oldest peer",
+                 event->full.obj_type);
+        return ble_store_util_delete_oldest_peer();
+    }
+    return BLE_HS_ENOTSUP;
+}
+
 static void host_task(void *param)
 {
     (void)param;
@@ -3001,6 +3017,7 @@ esp_err_t as11_ble_init(void)
      * because the store-config header is not on the public include path. */
     extern void ble_store_config_init(void);
     ble_store_config_init();
+    ble_hs_cfg.store_status_cb = on_store_status;
 
     /* Quiet NimBLE's per-byte HCI hex dumps — warnings/errors only. */
     esp_log_level_set("NimBLE", ESP_LOG_WARN);

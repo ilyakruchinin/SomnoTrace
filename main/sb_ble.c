@@ -1666,10 +1666,17 @@ static void sb_task(void *arg)
             if (s_conn != BLE_HS_CONN_HANDLE_NONE) {
                 int rc = ble_gap_security_initiate(s_conn);
                 if (rc != 0) {
-                    ESP_LOGW(TAG, "security initiate failed: rc=%d (bond "
-                                  "exists on the bridge? FORGET_PEER is "
-                                  "required)", rc);
-                    set_error("bridge refused pairing");
+                    /* ENOTSUP (8) is raised locally by the SM layer before
+                     * any SMP packet is sent — the bridge never sees the
+                     * request, so it is not "refusing" anything. */
+                    ESP_LOGW(TAG, "security initiate failed: rc=%d%s", rc,
+                             rc == BLE_HS_ENOTSUP
+                                 ? " (local SM refusal — bond store full; "
+                                   "the bridge was never contacted)"
+                                 : "");
+                    set_error(rc == BLE_HS_ENOTSUP
+                                  ? "pairing blocked locally (bond store)"
+                                  : "bridge refused pairing");
                 }
             }
         }
@@ -2124,6 +2131,12 @@ esp_err_t sb_ble_start_pair_ex(const char *addr_str, uint8_t addr_type)
         vTaskDelay(pdMS_TO_TICKS(300));
     }
     int rc = ble_gap_connect(s_own_addr_type, &s_peer, 30000, NULL, sb_gap_event, NULL);
+    if (rc == BLE_HS_EBUSY) {
+        /* A cancelled connect needs a moment to tear down; retry once so a
+         * quick second press does not surface as "Pair failed". */
+        vTaskDelay(pdMS_TO_TICKS(400));
+        rc = ble_gap_connect(s_own_addr_type, &s_peer, 30000, NULL, sb_gap_event, NULL);
+    }
     if (rc != 0) {
         char msg[48];
         snprintf(msg, sizeof(msg), "connect start failed (rc=%d)", rc);

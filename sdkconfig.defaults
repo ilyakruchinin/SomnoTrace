@@ -43,7 +43,11 @@ CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10
 # CONFIG_BT_CTRL_DTM_ENABLE is not set
 CONFIG_BT_CTRL_BLE_SECURITY_ENABLE=y
 CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=4
-CONFIG_BT_NIMBLE_MAX_BONDS=1
+# Bond store: SomnoBridge bonds persist; NimBLE's capacity check counts
+# *active SMP procedures* on top of stored bonds, so a single stored bond
+# plus one live proc already trips a limit of 2 and pairing fails locally
+# with BLE_HS_ENOTSUP before the peer is contacted.  Keep headroom.
+CONFIG_BT_NIMBLE_MAX_BONDS=4
 CONFIG_BT_NIMBLE_MAX_CCCDS=4
 # NimBLE host stack: central GAP discovery and GATT notify event headroom.
 # NimBLE host task runs the LESC P-256 SMP crypto; 6144
