@@ -2786,6 +2786,9 @@ function openSbConfig() {
   document.getElementById('sb-cfg-warning').style.display = 'none';
   document.getElementById('sb-cfg-secure').style.display = 'none';
   document.getElementById('sb-cfg-newpass').value = '';
+  var sbtn = document.getElementById('sb-cfg-save-btn');
+  if (sbtn) { sbtn.textContent = 'Save & Test'; sbtn.onclick = sbCfgSave; }
+  if (sbCfgJoinTimer) { clearInterval(sbCfgJoinTimer); sbCfgJoinTimer = null; }
   sbCfgMsg('Reading bridge configuration…');
   sbOp('GET_CONFIG', {}, function(d) {
     if (d.ok && d.result) {
@@ -2938,7 +2941,13 @@ function sbCfgCheck() {
     } else if (d.ok && d.result && d.result.found) {
       warn.style.display = 'none';
       sec.style.display = 'none';
-      sbCfgMsg('Card found and the default password does not work — good.');
+      /* The factory-password probe says nothing about the password the
+       * user just saved — report the saved-credential join separately. */
+      if (d.result.saved_pass_works === false) {
+        sbCfgMsg('Card found, but the bridge could NOT join it with the password you saved — check the card password.', true);
+      } else {
+        sbCfgDone('Card found and secured — the bridge joined it. Settings saved.');
+      }
     } else {
       warn.style.display = 'none';
       sec.style.display = 'none';
@@ -3000,13 +3009,65 @@ function sbCfgSave() {
   sbOp('SET_CONFIG', args, function(d) {
     if (btn) btn.disabled = false;
     if (d.ok) {
-      sbCfgMsg('Saved — the bridge is joining "' + ssid + '".');
-      sbCfgCheck();
+      /* The security probe exists for ONE case: the card still runs the
+       * factory password (or is open). With a custom password there is
+       * nothing to warn about — verify the join instead, which needs no
+       * extra radio work (the bridge is already joining). */
+      if (pass === '88888888' || (ap && ap.open)) {
+        /* factory password, or an open card — both are insecure and
+         * worth the extra probe */
+        sbCfgMsg('Saved — checking the card\u2019s security…');
+        sbCfgCheck();
+      } else {
+        sbCfgWaitJoin();
+      }
     } else {
       var code = (d.error && d.error.code) || 'ERROR';
       sbCfgMsg('Save failed: ' + code, true);
     }
   });
+}
+
+/* Poll the bridge's link state until it joins (or gives up). This is the
+ * real answer to "did my password work?" — no probe-join needed. */
+var sbCfgJoinTimer = null;
+function sbCfgWaitJoin() {
+  if (sbCfgJoinTimer) { clearInterval(sbCfgJoinTimer); sbCfgJoinTimer = null; }
+  var tries = 0, busy = false;
+  sbCfgMsg('Saved — waiting for the bridge to join the card…');
+  sbCfgJoinTimer = setInterval(function() {
+    var ov = document.getElementById('sb-cfg-overlay');
+    if (!ov || !ov.classList.contains('show')) {   /* user closed it */
+      clearInterval(sbCfgJoinTimer); sbCfgJoinTimer = null; return;
+    }
+    if (busy) return;
+    busy = true;
+    tries++;
+    sbOp('GET_STATUS', {}, function(d) {
+      busy = false;
+      if (d.ok && d.result && d.result.sta_connected) {
+        clearInterval(sbCfgJoinTimer); sbCfgJoinTimer = null;
+        sbCfgDone('Bridge joined the card — settings saved.');
+      } else if (tries >= 12) {
+        clearInterval(sbCfgJoinTimer); sbCfgJoinTimer = null;
+        sbCfgMsg('Saved, but the bridge could not join the card — check the password.', true);
+      }
+    });
+  }, 1000);
+}
+
+/* Success: everything is fine, nothing left to configure — say OK and go. */
+function sbCfgDone(msg) {
+  sbCfgMsg(msg);
+  var btn = document.getElementById('sb-cfg-save-btn');
+  if (btn) {
+    btn.textContent = 'OK';
+    btn.onclick = closeSbConfig;
+  }
+  setTimeout(function() {
+    var ov = document.getElementById('sb-cfg-overlay');
+    if (ov && ov.classList.contains('show')) closeSbConfig();
+  }, 1400);
 }
 
 /* While a pairing attempt runs, poll fast: the bridge only shows its PIN for
