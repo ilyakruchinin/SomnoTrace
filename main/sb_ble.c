@@ -1668,11 +1668,14 @@ static void sb_task(void *arg)
                 if (rc != 0) {
                     /* ENOTSUP (8) is raised locally by the SM layer before
                      * any SMP packet is sent — the bridge never sees the
-                     * request, so it is not "refusing" anything. */
+                     * request, so it is not "refusing" anything.  It means
+                     * either SMP is compiled out (CONFIG_BT_NIMBLE_SECURITY_ENABLE)
+                     * or the bond store is at capacity with no room made. */
                     ESP_LOGW(TAG, "security initiate failed: rc=%d%s", rc,
                              rc == BLE_HS_ENOTSUP
-                                 ? " (local SM refusal — bond store full; "
-                                   "the bridge was never contacted)"
+                                 ? " (local SM refusal — SMP disabled or "
+                                   "bond store full; the bridge was never "
+                                   "contacted)"
                                  : "");
                     set_error(rc == BLE_HS_ENOTSUP
                                   ? "pairing blocked locally (bond store)"

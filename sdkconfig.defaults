@@ -172,7 +172,16 @@ CONFIG_BT_NIMBLE_PINNED_TO_CORE=1
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=32
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_SIZE=256
 CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=32
-# CONFIG_BT_NIMBLE_SECURITY_ENABLE is not set
+# NimBLE security (SMP) is REQUIRED for SomnoBridge pairing: with it
+# disabled, ble_gap_security_initiate() is a stub returning
+# BLE_HS_ENOTSUP (8) and pairing can never start.  LE Secure Connections
+# + bonding + NVS persistence match what the bridge expects (§5.2).
+# A clean build (build-dist.sh --clean deletes sdkconfig) takes these
+# from here — without them the release image cannot pair at all.
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=y
+CONFIG_BT_NIMBLE_SM_LEGACY=y
+CONFIG_BT_NIMBLE_SM_SC=y
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
 # CONFIG_BT_NIMBLE_DEBUG is not set
 # CONFIG_BT_NIMBLE_LOG_LEVEL_DEBUG is not set
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
