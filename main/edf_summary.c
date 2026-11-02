@@ -24,6 +24,7 @@
 #include "edf_summary.h"
 #include "settings_provenance.h"
 #include "edf_as10_settings.h"
+#include <time.h>
 
 static const char *TAG = "edf_sum";
 
@@ -373,9 +374,8 @@ static int on_off_to_edf(const char *s)
     return -1;
 }
 
-/* Map trigger/cycle sensitivity to EDF value.
+/* Map numeric trigger/cycle sensitivity to EDF value.
  * Export map [1,2,3,4,5,6,7] = raw_index + 1.
- * The AS11 Get RPC returns these as numbers (raw CONF indices 0-6).
  * See edf_signals.md "STR enum export maps". */
 static int trigger_cycle_to_edf(int raw)
 {
@@ -506,7 +506,7 @@ static void build_str_settings_values(int16_t *str_values, const cJSON *settings
     }
 
     /* CPAP/AutoSet settings [6-13], bi-level settings [14-58], and
-     * common comfort/settings [59-77]: from settings.json (Get RPC response
+     * common comfort/settings [59-75]: from settings.json (Get RPC response
      * captured during post-therapy).
      * Pressures are stored in cmH2O × 50, temperatures in °C × 10.
      * Ti fields use seconds × 50 (logical_scale=20, edf_output_scale=50).
@@ -1537,7 +1537,7 @@ static bool live_day_unambiguous(const char *day, const cJSON *candidate,
         memset(actual, 0xFF, sizeof(actual));
         build_str_settings_values(actual, other);
         if (!settings_provenance_is(other, SETTINGS_SOURCE_LIVE, day, sid) ||
-            !settings_provenance_session_matches(day, sid, serial) ||
+            !settings_provenance_session_matches(day, sid, serial, SETTINGS_FAMILY_AS11) ||
             !cJSON_IsObject(other_profiles) ||
             memcmp(expected + 5, actual + 5, (76 - 5) * sizeof(int16_t)) != 0) {
             valid = false;
@@ -1592,9 +1592,12 @@ static cJSON *read_daily_settings(const char *day, int family, const char *seria
                  dir_path, sid);
         settings = edf_read_json_file(session_path);
         if (settings_provenance_is(settings, SETTINGS_SOURCE_LIVE, day, sid) &&
-            live_day_unambiguous(day, settings, serial)) {
+            settings_provenance_session_matches(day, sid, serial, SETTINGS_FAMILY_AS11)) {
+            bool unambiguous = live_day_unambiguous(day, settings, serial);
             closedir(dir);
-            return settings;
+            if (unambiguous) return settings;
+            cJSON_Delete(settings);
+            return NULL;
         }
         cJSON_Delete(settings);
     }
@@ -1621,6 +1624,13 @@ static void apply_as10_settings(int16_t *values, const cJSON *settings)
         if (fabs(restored - value->valuedouble) > 0.000001) continue;
         values[field->str_index] = (int16_t)dig;
     }
+    /* Air 10 shares S.AS.* for AutoSet and AutoSet for Her; OSCAR selects
+     * S.AFH.* when mode is 11, so expose the same sourced values there. */
+    if (values[5] == 11) {
+        values[11] = values[8];
+        values[12] = values[9];
+        values[13] = values[10];
+    }
 }
 
 /* Generate multi-record STR.edf from per-day summary spool files.
@@ -1643,6 +1653,15 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
     const char *serial = cJSON_IsString(serial_item) && serial_item->valuestring
                          ? serial_item->valuestring : NULL;
     int family = settings_provenance_family(ident_json);
+    char current_day_label[16];
+    as11_time_noon_day(start_epoch_ms - clock_drift_ms, current_day_label,
+                       sizeof(current_day_label));
+    if (!settings_provenance_session_matches(current_day_label, session_id, serial, family)) {
+        /* A display identity copied from another session is not proof of the
+         * exporting machine, even if its serial matches older snapshots. */
+        serial = NULL;
+        family = SETTINGS_FAMILY_UNKNOWN;
+    }
     /* ── Scan .somnotrace/sessions/summaries/ for per-day .spool files ── */
     DIR *dir = opendir(SD_SUMMARIES_DIR);
     if (!dir) {
@@ -1650,7 +1669,7 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         return ESP_FAIL;
     }
 
-    /* First pass: collect all spool filenames, sort, keep newest 30.
+    /* First pass: collect and sort all spool filenames.
      * readdir order is non-deterministic, so we must collect all names
      * and sort to ensure deterministic day selection. */
     char (*spool_names)[15] = NULL;
@@ -1723,9 +1742,6 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
     int n_drift_entries = 0;
     session_drift_entry_t *drift_index = build_session_drift_index(&n_drift_entries);
     ESP_LOGI(TAG, "STR.edf: drift index: %d session entries", n_drift_entries);
-    char current_day_label[16];
-    as11_time_noon_day(start_epoch_ms - clock_drift_ms, current_day_label,
-                       sizeof(current_day_label));
 
     /* Second pass: parse spool files, newest first, until STR_MAX_DAYS
      * distinct days are held.  Records are sorted chronologically below. */
@@ -1780,9 +1796,14 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         /* A legacy filename and a correctly-named one can describe the same
          * period.  Keep the first and skip the duplicate, so the same night
          * cannot appear twice in STR.edf. */
+        int day_number = as11_time_day_number(as11_day_label);
+        if (day_number <= 0 || day_number > INT16_MAX) {
+            ESP_LOGW(TAG, "STR.edf: skipping %s (invalid day)", nm);
+            continue;
+        }
         bool dup = false;
         for (int k = 0; k < n_records; k++) {
-            if (records[k].period_start_as11 == period_start) { dup = true; break; }
+            if (records[k].values[0] == day_number) { dup = true; break; }
         }
         if (dup) {
             ESP_LOGD(TAG, "STR.edf: %s duplicates an already-parsed period "
@@ -1874,15 +1895,24 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         return ESP_FAIL;
     }
 
-    /* Sort records by period_start (chronological) */
+    /* Consumer dates follow the calendar index, not drift-corrected time. */
     for (int i = 0; i < n_records - 1; i++) {
         for (int j = i + 1; j < n_records; j++) {
-            if (records[j].period_start < records[i].period_start) {
+            if (records[j].values[0] < records[i].values[0]) {
                 str_day_record_t tmp = records[i];
                 records[i] = records[j];
                 records[j] = tmp;
             }
         }
+    }
+    int first_day = records[0].values[0];
+    int last_day = records[n_records - 1].values[0];
+    int calendar_days = last_day - first_day + 1;
+    if (first_day <= 0 || calendar_days <= 0 || calendar_days > EDF_STR_MAX_RECORDS) {
+        ESP_LOGE(TAG, "STR.edf: calendar span is invalid or exceeds %d days; preserving existing export",
+                 EDF_STR_MAX_RECORDS);
+        free(records); free(ctx); free(str_sigs);
+        return ESP_FAIL;
     }
 
     /* STR.edf signal definitions */
@@ -1913,18 +1943,21 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
      * signal, so it is derived from the identical AS11 noon-day label rather
      * than re-deriving it from the timestamp with different rules. */
     const char *str_start_time = "12.00.00";
-    char first_day_label[16];
-    if (records[0].period_start_as11 > 0) {
-        as11_time_noon_day_for_period_start(records[0].period_start_as11,
-                                            first_day_label,
-                                            sizeof(first_day_label));
-    } else {
-        as11_time_noon_day(records[0].period_start, first_day_label,
-                           sizeof(first_day_label));
+    time_t first_epoch = (time_t)first_day * 86400;
+    struct tm first_date;
+    if (!gmtime_r(&first_epoch, &first_date)) {
+        edf_discard_atomic_file(edf, tmp_path);
+        free(records); free(ctx); free(str_sigs);
+        return ESP_FAIL;
     }
-    int fd_y = 0, fd_m = 0, fd_d = 0;
-    if (sscanf(first_day_label, "%4d%2d%2d", &fd_y, &fd_m, &fd_d) != 3) {
-        fd_y = 2000; fd_m = 1; fd_d = 1;
+    int fd_y = first_date.tm_year + 1900;
+    int fd_m = first_date.tm_mon + 1;
+    int fd_d = first_date.tm_mday;
+    if (fd_y < 1970 || fd_y > 9999 || fd_m < 1 || fd_m > 12 ||
+        fd_d < 1 || fd_d > 31) {
+        edf_discard_atomic_file(edf, tmp_path);
+        free(records); free(ctx); free(str_sigs);
+        return ESP_FAIL;
     }
 
     char str_date[32];
@@ -1952,12 +1985,12 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         }
         snprintf(fixed_recording_id, sizeof(fixed_recording_id),
                  "Startdate %02d-%.3s-%04d%.100s",
-                 fd_d, mon_names[(fd_m - 1) % 12], fd_y, tail);
+                 fd_d, mon_names[fd_m - 1], fd_y, tail);
     }
 
     int header_bytes = edf_write_header(edf, patient_id, fixed_recording_id,
                                         str_date, str_start_time,
-                                        n_records,
+                                        calendar_days,
                                         "86400.00",
                                         "EDF", str_sigs, STR_DATA_COUNT);
     if (header_bytes < 0) {
@@ -1969,17 +2002,28 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
 
     /* Write one data record per day.
      * Each record: 171 data int16 + 1 CRC int16 = 344 bytes. */
-    for (int r = 0; r < n_records; r++) {
+    int record_index = 0;
+    for (int r = 0; r < calendar_days; r++) {
+        str_day_record_t empty;
+        const str_day_record_t *record;
+        int day = first_day + r;
+        if (record_index < n_records && records[record_index].values[0] == day) {
+            record = &records[record_index++];
+        } else {
+            memset(&empty, 0xFF, sizeof(empty));
+            empty.values[0] = (int16_t)day;
+            record = &empty;
+        }
         int16_t rec_buf[171];
         int rec_pos = 0;
         for (int i = 0; i < STR_DATA_COUNT; i++) {
             int spr = g_str_signals[i].samples_per_record;
-            rec_buf[rec_pos++] = records[r].values[i];
+            rec_buf[rec_pos++] = record->values[i];
             for (int s = 1; s < spr; s++) {
                 if (i == 1 && s - 1 < 20)
-                    rec_buf[rec_pos++] = records[r].mask_on_extra[s - 1];
+                    rec_buf[rec_pos++] = record->mask_on_extra[s - 1];
                 else if (i == 2 && s - 1 < 20)
-                    rec_buf[rec_pos++] = records[r].mask_off_extra[s - 1];
+                    rec_buf[rec_pos++] = record->mask_off_extra[s - 1];
                 else
                     rec_buf[rec_pos++] = -1;
             }
@@ -2013,7 +2057,8 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "STR.edf generated: %s (%d records)", path, n_records);
+    ESP_LOGI(TAG, "STR.edf generated: %s (%d days, %d with summaries)",
+             path, calendar_days, n_records);
 
     free(records);
     free(ctx);

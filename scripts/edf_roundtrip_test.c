@@ -97,7 +97,9 @@ static void check(bool ok, const char *fmt, ...)
 #define BRP_N    4500                     /* 3 min @ 25 Hz  */
 #define PLD_N    90                       /* 3 min @ 0.5 Hz */
 
+#ifndef SNAP_A
 #define SNAP_A "/tmp/somnotrace_rt/A"
+#endif
 
 static char g_day[16];     /* the export's DATALOG day folder in A */
 
@@ -447,15 +449,17 @@ static void as10_roundtrip(void)
     check(f != NULL, "AS10 fixture source");
     if (!f) return;
     int header = edf_write_header(f, "X X X X", "Startdate 27-FEB-2026 X X X SRN=fixture10 MID=36 VID=1",
-                                  "27.02.26", "12.00.00", 3, "86400", "EDF",
+                                  "27.02.26", "12.00.00", 5, "86400", "EDF",
                                   signals, (int)(sizeof(signals) / sizeof(signals[0])));
     check(header > 0, "write AS10 STR header");
-    int16_t rows[3][17] = {
+    int16_t rows[5][17] = {
         {(int16_t)as11_time_day_number("20260227"), 120, 0, 801, 90, 80, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 2},
         {(int16_t)as11_time_day_number("20260228"), 120, 3, -1, -1, -1, -1, 100, 65, 1, 300, 1200, 400, 2, 1, 1, 3},
         {(int16_t)as11_time_day_number("20260301"), 120, 6, -1, -1, -1, 115, -1, -1, -1, -1, 1200, 400, 2, 1, 2, 3},
+        {(int16_t)as11_time_day_number("20260302"), 120, 11, -1, -1, 80, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 2},
+        {(int16_t)as11_time_day_number("20260303"), 120, 2, -1, -1, -1, -1, 100, 65, -1, 300, -1, -1, -1, -1, 0, 2},
     };
-    for (int r = 0; r < 3; r++) {
+    for (int r = 0; r < 5; r++) {
         uint16_t crc = edf_crc16_ccitt((const uint8_t *)rows[r], sizeof(rows[r]));
         fwrite(rows[r], 1, sizeof(rows[r]), f);
         fwrite(&crc, 1, sizeof(crc), f);
@@ -464,8 +468,46 @@ static void as10_roundtrip(void)
     edf_import_ctx_t *ctx = edf_import_ctx_create();
     edf_import_unit_t unit;
     check(ctx != NULL && edf_import_process_next(ctx, &unit) == ESP_OK &&
-          unit.settings_written == 3, "import AS10 STR daily settings");
+          unit.settings_written == 5, "import AS10 STR daily settings");
+    cJSON *metadata = NULL;
+    char meta_path[400];
+    snprintf(meta_path, sizeof(meta_path), "%s", SD_DEVICE_METADATA_PATH);
+    size_t meta_len = 0;
+    uint8_t *meta_bytes = slurp(meta_path, &meta_len);
+    if (meta_bytes) {
+        char *text = malloc(meta_len + 1);
+        if (text) {
+            memcpy(text, meta_bytes, meta_len);
+            text[meta_len] = '\0';
+            metadata = cJSON_Parse(text);
+            free(text);
+        }
+        free(meta_bytes);
+    }
+    const cJSON *settings = cJSON_GetObjectItemCaseSensitive(metadata, "settings");
+    const cJSON *profiles = cJSON_GetObjectItemCaseSensitive(settings, "SettingProfiles");
+    const cJSON *active = cJSON_GetObjectItemCaseSensitive(profiles, "ActiveProfiles");
+    const cJSON *profile = cJSON_GetObjectItemCaseSensitive(active, "TherapyProfile");
+    const cJSON *therapy = cJSON_GetObjectItemCaseSensitive(profiles, "TherapyProfiles");
+    const cJSON *timed = cJSON_GetObjectItemCaseSensitive(therapy, "TimedProfile");
+    const cJSON *ipap = cJSON_GetObjectItemCaseSensitive(timed, "TargetInspiratoryPressure");
+    check(cJSON_IsString(profile) && !strcmp(profile->valuestring, "TimedProfile") &&
+          cJSON_IsNumber(ipap) && fabs(ipap->valuedouble - 10.0) < 0.001,
+          "AS10 mode 2 reconstructs timed profile using source physical scaling");
+    cJSON_Delete(metadata);
     edf_import_ctx_destroy(ctx);
+    char session_dir[400], manifest[480];
+    snprintf(session_dir, sizeof(session_dir), "%s/20260301", SD_STREAMS_DIR);
+    mkdir(session_dir, 0775);
+    snprintf(manifest, sizeof(manifest), "%s/%s_session.json", session_dir, SID);
+    FILE *mf = fopen(manifest, "w");
+    check(mf != NULL, "create verified AS10 session");
+    if (mf) {
+        fputs("{\"import_source\":\"file_import\",\"source_serial\":\"fixture10\","
+              "\"source_device_family\":\"AS10\","
+              "\"source_identity_verified\":true}", mf);
+        fclose(mf);
+    }
     mkdir(out, 0775);
     cJSON *ident = cJSON_Parse("{\"SerialNumber\":\"fixture10\",\"PlatformIdentifier\":36}");
     check(ident != NULL && edf_generate_str_edf(out, "X X X X",
@@ -486,6 +528,14 @@ static void as10_roundtrip(void)
           "AS10 unrepresentable pressure remains unknown");
     check(as10_sample(bytes, len, "S.AS.MinPress", 0) == 400,
           "AS10 AutoSet label and pressure");
+    check(as10_sample(bytes, len, "Mode", 3) == 11 &&
+          as10_sample(bytes, len, "S.AS.MinPress", 3) == 400 &&
+          as10_sample(bytes, len, "S.AFH.MinPress", 3) == 400 &&
+          as10_sample(bytes, len, "S.AFH.MaxPress", 3) == -1,
+          "AS10 for Her exposes sourced AutoSet settings to OSCAR");
+    check(as10_sample(bytes, len, "Mode", 4) == 2 &&
+          as10_sample(bytes, len, "S.BL.IPAP", 4) == 500,
+          "AS10 timed mode retains native mode and pressure");
     check(as10_sample(bytes, len, "S.VA.MinEPAP", 2) == 575,
           "AS10 VAuto pressure");
     check(as10_sample(bytes, len, "S.BL.IPAP", 1) == 500 &&
@@ -506,8 +556,8 @@ static void as10_roundtrip(void)
         char t[9] = {0};
         memcpy(t, bytes + 184, 8);
         size_t hdr = (size_t)atoi(t);
-        size_t stride = len >= hdr ? (len - hdr) / 3 : 0;
-        for (int r = 0; r < 3 && stride >= 2; r++) {
+        size_t stride = len >= hdr ? (len - hdr) / 5 : 0;
+        for (int r = 0; r < 5 && stride >= 2; r++) {
             const uint8_t *rec = bytes + hdr + (size_t)r * stride;
             uint16_t stored;
             memcpy(&stored, rec + stride - 2, 2);

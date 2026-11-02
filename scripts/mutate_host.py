@@ -84,6 +84,13 @@ TESTS = {
                              "#main/edf_gen.c"],
     "edf_properties_test":  ["main/as11_time.c", "main/settings_provenance.c", "main/edf_data_dict.h", "@cjson",
                              "#main/edf_summary.c"],
+    "edf_import_test":      ["main/edf_import.c", "main/as11_time.c",
+                             "main/settings_provenance.c", "@cjson"],
+    "edf_roundtrip_test":   ["main/edf_import.c", "main/as11_time.c",
+                             "main/settings_provenance.c", "@cjson",
+                             "#main/edf_header.c", "#main/edf_waveform.c",
+                             "#main/edf_annotations.c", "#main/edf_summary.c",
+                             "#main/edf_gen.c"],
     "vld3_decoder_test":    ["main/oximetry_vld3.c"],
     "as11_reconnect_test":  ["main/as11_reconnect.c"],
     "as11_adv_test":        ["main/as11_adv.c"],
@@ -103,18 +110,26 @@ TESTS = {
 # or mutate. "-I<dir>" is resolved against the repo root (build() runs gcc in a scratch dir).
 FLAGS = {
     "somno_stage_csv_test": ["-Icomponents/somno_ml", "-Icomponents/somno_ml/include"],
-    "upload_stage_test":    ["-Icomponents/uploader",
-                             '-DSD_MOUNT_POINT="/tmp/somnotrace_stt/sd"',
-                             '-DUPLOAD_STATE_DIR="/tmp/somnotrace_stt/ustate"'],
+    "upload_stage_test":    ["-Icomponents/uploader"],
+    "edf_import_test":      ["-DEDF_IMPORT_HOST"],
+    "edf_roundtrip_test":   ["-DEDF_IMPORT_HOST"],
     "somno_worker_test":    ["-Icomponents/somno_ml", "-Icomponents/somno_ml/include",
                              "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
                              "-Wl,--wrap=somno_feat_create", "-Wl,--wrap=somno_feat_destroy"],
 }
 
 
-def test_flags(test: str) -> list[str]:
-    return [("-I" + os.path.join(ROOT, f[2:])) if f.startswith("-I") and not os.path.isabs(f[2:]) else f
-            for f in FLAGS.get(test, [])]
+def test_flags(test: str, outdir: str) -> list[str]:
+    flags = [("-I" + os.path.join(ROOT, f[2:])) if f.startswith("-I") and not os.path.isabs(f[2:]) else f
+             for f in FLAGS.get(test, [])]
+    if test in ("edf_gen_test", "edf_import_test", "edf_roundtrip_test", "upload_stage_test"):
+        scratch = tempfile.mkdtemp(prefix=f"fs-{test}-", dir=outdir)
+        flags.append(f'-DSD_MOUNT_POINT="{scratch}/sd"')
+        if test == "edf_roundtrip_test":
+            flags.append(f'-DSNAP_A="{scratch}/A"')
+        if test == "upload_stage_test":
+            flags.append(f'-DUPLOAD_STATE_DIR="{scratch}/ustate"')
+    return flags
 
 
 def target_path(entry: str) -> str:
@@ -322,7 +337,7 @@ def build(test: str, outdir: str, coverage: bool = False) -> str | None:
     elif links_cjson and CJSON_SYS:
         cmd.append("-I" + CJSON_SYS)
     cmd += [f"-I{d}" for d in INC]
-    cmd += test_flags(test)
+    cmd += test_flags(test, outdir)
     cmd.append("-lm")
     if links_cjson and not CJSON and CJSON_SYS:
         cmd.append("-lcjson")           # -l goes after the objects that need it

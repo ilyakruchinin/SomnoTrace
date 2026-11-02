@@ -12,10 +12,11 @@
 # (y == 0 after the March-shift; z == 0 days since 0000-03-01). No AS11 timestamp reaches there.
 main/as11_time.c:58:relational:>=→>
 main/as11_time.c:68:relational:>=→>
+main/edf_import.c:138:relational:>=→>      # z == 0: 0 / 146097 and -146096 / 146097 both truncate to 0 in C
 # spool_to_edf: each mutant differs from the original only at a value where both paths agree.
-main/edf_data_dict.h:49:relational:>=→>     # prod == 0: (0+half)/den == (0-half)/den == 0 since half < den
-main/edf_data_dict.h:50:relational:>→>=     # rounded == INT16_MAX: early return and cast both yield INT16_MAX
-main/edf_data_dict.h:51:relational:<→<=     # rounded == INT16_MIN: same, at the other end
+main/edf_data_dict.h:52:relational:>=→>     # prod == 0: (0+half)/den == (0-half)/den == 0 since half < den
+main/edf_data_dict.h:53:relational:>→>=     # rounded == INT16_MAX: early return and cast both yield INT16_MAX
+main/edf_data_dict.h:54:relational:<→<=     # rounded == INT16_MIN: same, at the other end
 
 # as11_time.c — survivors of the 2026-09-04 --all run that no input can separate from the original.
 main/as11_time.c:85:relational:<→<=        # floor_div: (a < 0) vs (a <= 0) differ only at a == 0, and a == 0

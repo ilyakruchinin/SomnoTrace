@@ -93,14 +93,22 @@ for (const [version, missing] of [[1, -1], [2, -32768]]) {
   assert.strictEqual(context.buildSignalData(snore, {min: 4000, max: 6000}, 20), null);
 }
 
-context.dashSessionData = [{pldState: 'ready'}, {pldState: 'loading'}];
+context.dashSessionData = [{pldState: 'ready', brpState: 'ready'},
+                           {pldState: 'loading', brpState: 'loading'}];
 assert.strictEqual(context.dashPanelState(snore, null), 'loading');
 assert.strictEqual(context.dashPanelState(snore, {t: [1]}), 'ready');
 context.dashSessionData[1] = {pldState: 'loading', noTherapy: true};
 assert.strictEqual(context.dashPanelState(snore, null), 'empty');
 context.dashSessionData[1] = {pldState: 'unavailable'};
 assert.strictEqual(context.dashPanelState(snore, null), 'unavailable');
-assert.strictEqual(context.dashPanelState({key: 'flow'}, null), 'loading');
+assert.strictEqual(context.dashPanelState({key: 'press', src: 'pld'}, null), 'unavailable');
+assert.strictEqual(context.dashPanelState({key: 'leak', src: 'pld'}, null), 'unavailable');
+assert.strictEqual(context.dashPanelState({key: 'flow', src: 'brp'}, null), 'empty');
+context.dashSessionData = [{brpState: 'loading', pldState: 'loading'}];
+assert.strictEqual(context.dashPanelState({key: 'flow', src: 'brp'}, null), 'loading');
+assert.strictEqual(context.dashPanelState({key: 'press', src: 'pld'}, null), 'loading');
+context.dashSessionData = [{brpState: 'unavailable', pldState: 'unavailable'}];
+assert.strictEqual(context.dashPanelState({key: 'flow', src: 'brp'}, null), 'unavailable');
 
 const classes = new Set();
 const attrs = {};

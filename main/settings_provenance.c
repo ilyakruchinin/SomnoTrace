@@ -69,8 +69,46 @@ static bool add_sorted_id(cJSON *arr, const char *id)
     return true;
 }
 
+static bool manifest_matches(const cJSON *manifest, const char *day,
+                             const char *session, const char *serial,
+                             int family, bool *imported)
+{
+    if (!cJSON_IsObject(manifest)) return false;
+    const cJSON *origin = cJSON_GetObjectItemCaseSensitive(manifest, "import_source");
+    *imported = origin != NULL;
+    if (origin && (!cJSON_IsString(origin) || !origin->valuestring ||
+        (strcmp(origin->valuestring, "file_import") != 0 &&
+         strcmp(origin->valuestring, "somnobridge") != 0))) return false;
+
+    const cJSON *source = NULL;
+    cJSON *ident = NULL;
+    if (*imported) {
+        if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(manifest,
+                                                          "source_identity_verified")))
+            return false;
+        const cJSON *device_family = cJSON_GetObjectItemCaseSensitive(manifest,
+                                                                       "source_device_family");
+        const char *expected = settings_provenance_family_name(family);
+        if (!expected || !cJSON_IsString(device_family) || !device_family->valuestring ||
+            strcmp(expected, device_family->valuestring)) return false;
+        source = cJSON_GetObjectItemCaseSensitive(manifest, "source_serial");
+    } else {
+        char path[420];
+        int n = snprintf(path, sizeof(path), "%s/%s/%s_ident.json",
+                         SD_STREAMS_DIR, day, session);
+        if (n >= 0 && (size_t)n < sizeof(path)) ident = read_manifest(path);
+        if (settings_provenance_is(ident, SETTINGS_SOURCE_LIVE_IDENT, day, session) &&
+            family != SETTINGS_FAMILY_UNKNOWN && settings_provenance_family(ident) == family)
+            source = cJSON_GetObjectItemCaseSensitive(ident, "SerialNumber");
+    }
+    bool match = cJSON_IsString(source) && source->valuestring &&
+                 strcmp(source->valuestring, serial) == 0;
+    cJSON_Delete(ident);
+    return match;
+}
+
 bool settings_provenance_session_matches(const char *day, const char *session,
-                                        const char *serial)
+                                        const char *serial, int family)
 {
     if (!day || strlen(day) != 8 || !session || !session[0] ||
         strchr(session, '/') || !serial || !serial[0]) return false;
@@ -79,25 +117,16 @@ bool settings_provenance_session_matches(const char *day, const char *session,
                      SD_STREAMS_DIR, day, session);
     if (n < 0 || (size_t)n >= sizeof(path)) return false;
     cJSON *manifest = read_manifest(path);
-    if (!cJSON_IsObject(manifest)) { cJSON_Delete(manifest); return false; }
-    const cJSON *source = cJSON_GetObjectItemCaseSensitive(manifest, "source_serial");
-    cJSON *ident = NULL;
-    if (!cJSON_IsString(source) || !source->valuestring || !source->valuestring[0]) {
-        n = snprintf(path, sizeof(path), "%s/%s/%s_ident.json",
-                     SD_STREAMS_DIR, day, session);
-        if (n >= 0 && (size_t)n < sizeof(path)) ident = read_manifest(path);
-        source = cJSON_GetObjectItemCaseSensitive(ident, "SerialNumber");
-    }
-    bool match = cJSON_IsString(source) && source->valuestring &&
-                 strcmp(source->valuestring, serial) == 0;
-    cJSON_Delete(ident);
+    bool imported = false;
+    bool match = manifest_matches(manifest, day, session, serial, family, &imported);
     cJSON_Delete(manifest);
     return match;
 }
 
-static cJSON *local_session_ids(const char *day, const char *serial)
+static cJSON *local_session_ids(const char *day, const char *serial, int family)
 {
-    if (!day || strlen(day) != 8 || !serial || !serial[0]) return NULL;
+    if (!day || strlen(day) != 8 || !serial || !serial[0] ||
+        family == SETTINGS_FAMILY_UNKNOWN) return NULL;
     for (int i = 0; i < 8; i++)
         if (day[i] < '0' || day[i] > '9') return NULL;
     char dir_path[300];
@@ -135,24 +164,9 @@ static cJSON *local_session_ids(const char *day, const char *serial)
         if (!cJSON_IsObject(manifest)) { cJSON_Delete(manifest); ok = false; break; }
         memcpy(sid, entry->d_name, sid_len);
         sid[sid_len] = '\0';
-        const cJSON *imported = cJSON_GetObjectItemCaseSensitive(manifest, "import_source");
-        if (imported && (!cJSON_IsString(imported) || !imported->valuestring ||
-                   (strcmp(imported->valuestring, "file_import") != 0 &&
-                    strcmp(imported->valuestring, "somnobridge") != 0))) {
-            ok = false;
-        } else {
-            const cJSON *source = cJSON_GetObjectItemCaseSensitive(manifest, "source_serial");
-            cJSON *ident = NULL;
-            if (!cJSON_IsString(source) || !source->valuestring || !source->valuestring[0]) {
-                int n = snprintf(path, sizeof(path), "%s/%s_ident.json", dir_path, sid);
-                if (n >= 0 && (size_t)n < sizeof(path)) ident = read_manifest(path);
-                source = cJSON_GetObjectItemCaseSensitive(ident, "SerialNumber");
-            }
-            ok = cJSON_IsString(source) && source->valuestring &&
-                 strcmp(source->valuestring, serial) == 0;
-            if (ok && !imported) ok = add_sorted_id(ids, sid);
-            cJSON_Delete(ident);
-        }
+        bool imported = false;
+        ok = manifest_matches(manifest, day, sid, serial, family, &imported);
+        if (ok && !imported) ok = add_sorted_id(ids, sid);
         cJSON_Delete(manifest);
         if (!ok) break;
     }
@@ -165,11 +179,17 @@ bool settings_provenance_record_sessions(cJSON *root, const char *day)
 {
     cJSON *meta = cJSON_GetObjectItemCaseSensitive(root, SETTINGS_PROVENANCE_KEY);
     if (!cJSON_IsObject(meta)) return false;
-    cJSON *ids = local_session_ids(day, settings_provenance_serial(root));
+    cJSON *ids = local_session_ids(day, settings_provenance_serial(root),
+                                   settings_provenance_recorded_family(root));
     if (!ids) return false;
     cJSON_DeleteItemFromObjectCaseSensitive(meta, "local_sessions");
+    cJSON_DeleteItemFromObjectCaseSensitive(meta, "coverage_verified");
     if (!cJSON_AddItemToObject(meta, "local_sessions", ids)) {
         cJSON_Delete(ids);
+        return false;
+    }
+    if (!cJSON_AddBoolToObject(meta, "coverage_verified", true)) {
+        cJSON_DeleteItemFromObjectCaseSensitive(meta, "local_sessions");
         return false;
     }
     return true;
@@ -179,8 +199,10 @@ bool settings_provenance_covers_sessions(const cJSON *root, const char *day)
 {
     const cJSON *meta = cJSON_GetObjectItemCaseSensitive(root, SETTINGS_PROVENANCE_KEY);
     const cJSON *recorded = cJSON_GetObjectItemCaseSensitive(meta, "local_sessions");
-    if (!cJSON_IsArray(recorded)) return false;
-    cJSON *current = local_session_ids(day, settings_provenance_serial(root));
+    if (!cJSON_IsArray(recorded) ||
+        !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(meta, "coverage_verified"))) return false;
+    cJSON *current = local_session_ids(day, settings_provenance_serial(root),
+                                       settings_provenance_recorded_family(root));
     if (!current) return false;
     bool covered = true;
     const cJSON *sid;

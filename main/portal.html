@@ -6704,7 +6704,9 @@ function loadDashboardData() {
 
     /* Initialize per-session data slots. Each holds two independent sources:
      * brp (flow + pressure, 25 Hz) and pld (leak/snore/flowlim, 0.5 Hz). */
-    dashSessionData = dashSessions.map(function() { return {brp: null, pld: null, pldState: 'loading'}; });
+    dashSessionData = dashSessions.map(function() {
+      return {brp: null, pld: null, brpState: 'loading', pldState: 'loading'};
+    });
 
     /* Events overlay + per-session gating windows (tiny files). Awaited before
      * any waveform fetch so every sample is gated from the first paint. */
@@ -6807,10 +6809,6 @@ function loadDashboardData() {
       renderSummary();   /* leak percentiles now computable from PLD samples */
       renderStreamQuality();
       updateDashView();
-      /* Cache the overview (L1 + PLD) */
-      if (!isToday(dateStr)) {
-        dashCache.set(noonDay, {sessions: dashSessions, sessionData: dashSessionData.slice()});
-      }
       dashSetStatus('Syncing breath detail...');
       if (myLoadId === dashLoadId)
         dashProgShow('Syncing breath detail...', W_EVENTS + W_BRP_MM + W_PLD, true);
@@ -6833,6 +6831,8 @@ function loadDashboardData() {
               updateDashView();
             }
           }
+          dashSessionData[idx].brpState = dashSessionData[idx].brp ? 'ready' : 'unavailable';
+          updateDashView();
           l0Done++;
           if (myLoadId === dashLoadId)
             dashProgShow('Syncing breath detail...', W_EVENTS + W_BRP_MM + W_PLD + W_BRP * l0Done / nFetch, true);
@@ -6851,6 +6851,12 @@ function loadDashboardData() {
     });
   }).catch(function(e){
     if (myLoadId !== dashLoadId) return;
+    dashSessionData.forEach(function(s) {
+      if (!s) return;
+      if (s.brpState === 'loading') s.brpState = s.brp ? 'ready' : 'unavailable';
+      if (s.pldState === 'loading') s.pldState = s.pld ? 'ready' : 'unavailable';
+    });
+    updateDashView();
     dashSetStatus('Error: '+e.message);
     dashProgError('Error: ' + e.message);
     dashIsLoading = false;
@@ -6926,16 +6932,17 @@ function dashChartCols(chart, el) {
   return Math.max(2, Math.round(w));
 }
 
-/* An empty PLD signal is not the same as a file still being fetched. */
+/* An empty signal is not the same as a source still being fetched. */
 function dashPanelState(sig, src) {
   if (src && src.t && src.t.length > 0) return 'ready';
-  if (sig.key !== 'snore' && sig.key !== 'flowlim') return 'loading';
+  if (sig.src !== 'pld' && sig.src !== 'brp') return 'loading';
+  var stateKey = sig.src === 'pld' ? 'pldState' : 'brpState';
   var pending = false, unavailable = false;
   for (var i = 0; i < dashSessionData.length; i++) {
     var session = dashSessionData[i];
     if (!session || session.noTherapy) continue;
-    if (session.pldState === 'loading') pending = true;
-    else if (session.pldState === 'unavailable') unavailable = true;
+    if (session[stateKey] === 'loading') pending = true;
+    else if (session[stateKey] === 'unavailable') unavailable = true;
   }
   if (pending) return 'loading';
   return unavailable ? 'unavailable' : 'empty';

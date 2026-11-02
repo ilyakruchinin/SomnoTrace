@@ -27,6 +27,9 @@
 #include <stdbool.h>
 #include <limits.h>
 
+/* Bound padded STR calendars while allowing sparse histories spanning years. */
+#define EDF_STR_MAX_RECORDS 3660
+
 #ifdef __cplusplus
 extern "C" {
 #endif

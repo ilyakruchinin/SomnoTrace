@@ -1394,6 +1394,18 @@ static void test_pld_snore_missing_and_clamping(void)
     }
 }
 
+static void write_live_ident(const char *path, const char *day, const char *sid)
+{
+    cJSON *ident = cJSON_Parse("{\"SerialNumber\":\"fixture-machine\",\"PlatformIdentifier\":46}");
+    CHECK(ident && settings_provenance_set(ident, SETTINGS_SOURCE_LIVE_IDENT, day, sid),
+          "mark live identity");
+    if (ident) {
+        char *json = cJSON_PrintUnformatted(ident);
+        if (json) { write_text(path, json); free(json); }
+        cJSON_Delete(ident);
+    }
+}
+
 static void test_daily_settings_provenance(void)
 {
     const char *day = "20260301";
@@ -1432,6 +1444,11 @@ static void test_daily_settings_provenance(void)
     write_text(path, json);
     free(json);
     read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+    CHECK(read == NULL, "unmarked or backfilled identity must not establish provenance");
+    cJSON_Delete(read);
+    snprintf(path, sizeof(path), "%s/%s_ident.json", dir, sid);
+    write_live_ident(path, day, sid);
+    read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
     CHECK(read != NULL, "matching live session accepted");
     cJSON_Delete(read);
     read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "different-machine");
@@ -1448,7 +1465,7 @@ static void test_daily_settings_provenance(void)
     snprintf(path, sizeof(path), "%s/other_session.json", dir);
     write_text(path, "{}");
     snprintf(path, sizeof(path), "%s/other_ident.json", dir);
-    write_text(path, "{\"SerialNumber\":\"fixture-machine\"}");
+    write_live_ident(path, day, "other");
     read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
     CHECK(read == NULL, "day with an unverified second session accepted");
     cJSON_Delete(read);
@@ -1484,6 +1501,18 @@ static void test_daily_settings_provenance(void)
           settings_provenance_record_sessions(native, day),
           "mark native");
     if (native) {
+        cJSON *unchecked = cJSON_Duplicate(native, true);
+        cJSON *unchecked_meta = cJSON_GetObjectItemCaseSensitive(unchecked, SETTINGS_PROVENANCE_KEY);
+        cJSON_DeleteItemFromObjectCaseSensitive(unchecked_meta, "local_sessions");
+        cJSON_DeleteItemFromObjectCaseSensitive(unchecked_meta, "coverage_verified");
+        cJSON_AddArrayToObject(unchecked_meta, "local_sessions");
+        CHECK(!settings_provenance_covers_sessions(unchecked, "20260227"),
+              "empty unverified coverage is not proof");
+        cJSON_DeleteItemFromObjectCaseSensitive(unchecked_meta, "local_sessions");
+        cJSON_AddBoolToObject(unchecked_meta, "coverage_verified", true);
+        CHECK(!settings_provenance_covers_sessions(unchecked, "20260227"),
+              "absent coverage is not proof");
+        cJSON_Delete(unchecked);
         snprintf(path, sizeof(path), "%s/%s.imported.settings.json", SD_SUMMARIES_DIR, day);
         json = cJSON_PrintUnformatted(native);
         write_text(path, json);
@@ -1494,19 +1523,25 @@ static void test_daily_settings_provenance(void)
         cJSON_Delete(read);
 
         snprintf(path, sizeof(path), "%s/imported_session.json", dir);
-        write_text(path, "{\"import_source\":\"file_import\",\"source_serial\":\"fixture-machine\"}");
+        write_text(path, "{\"import_source\":\"file_import\",\"source_serial\":\"fixture-machine\","
+                         "\"source_device_family\":\"AS11\","
+                         "\"source_identity_verified\":true}");
         read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
         CHECK(read != NULL, "imported waveform session should not stale STR settings");
         cJSON_Delete(read);
-        write_text(path, "{\"import_source\":\"file_import\",\"source_serial\":\"another-machine\"}");
+        write_text(path, "{\"import_source\":\"file_import\",\"source_serial\":\"another-machine\","
+                         "\"source_device_family\":\"AS11\","
+                         "\"source_identity_verified\":true}");
         read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
         CHECK(read == NULL, "another machine must not use imported settings");
         cJSON_Delete(read);
-        write_text(path, "{\"import_source\":\"file_import\",\"source_serial\":\"fixture-machine\"}");
+        write_text(path, "{\"import_source\":\"file_import\",\"source_serial\":\"fixture-machine\","
+                         "\"source_device_family\":\"AS11\","
+                         "\"source_identity_verified\":true}");
         snprintf(path, sizeof(path), "%s/later_session.json", dir);
         write_text(path, "{}");
         snprintf(path, sizeof(path), "%s/later_ident.json", dir);
-        write_text(path, "{\"SerialNumber\":\"fixture-machine\"}");
+        write_live_ident(path, day, "later");
         read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
         CHECK(read == NULL, "new local session must stale the imported snapshot");
         cJSON_Delete(read);
@@ -1577,7 +1612,7 @@ static void test_str_settings_history_end_to_end(void)
     snprintf(path, sizeof(path), "%s/%s_session.json", dir, sid);
     write_text(path, "{}");
     snprintf(path, sizeof(path), "%s/%s_ident.json", dir, sid);
-    write_text(path, "{\"SerialNumber\":\"fixture-machine\",\"PlatformIdentifier\":46}");
+    write_live_ident(path, day, sid);
     snprintf(path, sizeof(path), "%s/20260228.settings.json", SD_SUMMARIES_DIR);
     write_text(path, "{\"SettingProfiles\":{\"ActiveProfiles\":{\"TherapyProfile\":\"CpapProfile\"}}}");
     snprintf(path, sizeof(path), "%s/20260228.spool", SD_SUMMARIES_DIR);
@@ -1587,7 +1622,7 @@ static void test_str_settings_history_end_to_end(void)
     cJSON *ident = cJSON_Parse("{\"SerialNumber\":\"fixture-machine\",\"PlatformIdentifier\":46}");
     CHECK(ident != NULL, "create exporting device identity");
 
-    for (int pass = 0; pass < 6; pass++) {
+    for (int pass = 0; pass < 8; pass++) {
         if (pass == 1) {
             cJSON *native = cJSON_Duplicate(settings, true);
             CHECK(native && settings_provenance_set(native, SETTINGS_SOURCE_IMPORTED_STR,
@@ -1630,6 +1665,12 @@ static void test_str_settings_history_end_to_end(void)
             json = cJSON_PrintUnformatted(settings);
             write_text(path, json);
             free(json);
+        } else if (pass == 6) {
+            snprintf(path, sizeof(path), "%s/%s_ident.json", dir, sid);
+            write_text(path, "{\"SerialNumber\":\"fixture-machine\",\"PlatformIdentifier\":46}");
+        } else if (pass == 7) {
+            snprintf(path, sizeof(path), "%s/%s_ident.json", dir, sid);
+            write_live_ident(path, "20260301", sid);
         }
         CHECK(edf_generate_str_edf(out, "X X X X", "Startdate 02-MAR-2026 X X X",
               "02.03.26", export_settings, ident, dir, sid, start, start + 7200000, 0) == ESP_OK,
@@ -1640,17 +1681,24 @@ static void test_str_settings_history_end_to_end(void)
         CHECK(bytes != NULL, "STR exists pass %d", pass);
         if (!bytes) continue;
         edf_t e;
-        CHECK(edf_parse(bytes, len, &e) && e.ndr == 2, "STR structure pass %d", pass);
-        if (edf_parse(bytes, len, &e) && e.ndr == 2) {
-            CHECK(edf_sample(bytes, &e, 0, 5, 0) == (pass ? 3 : -1),
+        CHECK(edf_parse(bytes, len, &e) && e.ndr == 3, "STR structure pass %d", pass);
+        if (edf_parse(bytes, len, &e) && e.ndr == 3) {
+            CHECK(edf_sample(bytes, &e, 0, 5, 0) == (pass > 0 && pass < 6 ? 3 : -1),
                   "historical Mode pass %d", pass);
-            CHECK(edf_sample(bytes, &e, 0, 7, 0) == (pass ? 400 : -1),
+            CHECK(edf_sample(bytes, &e, 0, 7, 0) == (pass > 0 && pass < 6 ? 400 : -1),
                   "historical pressure pass %d", pass);
             CHECK(edf_sample(bytes, &e, 0, 76, 0) == 1 &&
                   edf_sample(bytes, &e, 0, 77, 0) == 2,
                   "spool tube/humidifier lost pass %d", pass);
-            CHECK(edf_sample(bytes, &e, 1, 5, 0) == (pass < 3 || pass == 5 ? 3 : -1) &&
-                  edf_sample(bytes, &e, 1, 7, 0) == (pass < 3 || pass == 5 ? 400 : -1),
+            CHECK(edf_sample(bytes, &e, 1, 0, 0) ==
+                  as11_time_day_number("20260301") &&
+                  edf_sample(bytes, &e, 1, 3, 0) == -1 &&
+                  edf_sample(bytes, &e, 1, 4, 0) == -1 &&
+                  edf_sample(bytes, &e, 1, 5, 0) == -1,
+                  "calendar gap is an unknown record pass %d", pass);
+            CHECK(edf_sample(bytes, &e, 2, 0, 0) == as11_time_day_number(day) &&
+                  edf_sample(bytes, &e, 2, 5, 0) == (pass < 3 || pass == 5 ? 3 : -1) &&
+                  edf_sample(bytes, &e, 2, 7, 0) == (pass < 3 || pass == 5 ? 400 : -1),
                   "current settings provenance pass %d", pass);
             check_edf_structure("STR.edf", bytes, len, &e);
             for (int r = 0; r < e.ndr; r++) {

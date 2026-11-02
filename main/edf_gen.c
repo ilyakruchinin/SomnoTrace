@@ -431,7 +431,8 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
 
     const char *ident_serial = ident_get_serial(ident);
 
-    /* Read settings.json for STR.edf settings fields and CurrentSettings.json.
+    /* Read settings.json for CurrentSettings.json. STR history independently
+     * checks the provenance and machine identity of each daily snapshot.
      *
      * Fallback hierarchy when <session_id>_settings.json is missing:
      *   1. Another session's _settings.json in the same day folder

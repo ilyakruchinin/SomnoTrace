@@ -380,6 +380,28 @@ static void build_session_dir(const char *dir, const char *ts_wave,
     fx_write_real_ann(p, y, mo, d, eh, em, es, csl_a, csl_l, 3);
 }
 
+static void set_fixture_recording_id(const char *dir, const char *rec_id)
+{
+    DIR *d = opendir(dir);
+    struct dirent *entry;
+    CHECK(d != NULL, "open fixture directory");
+    if (!d) return;
+    while ((entry = readdir(d)) != NULL) {
+        size_t len = strlen(entry->d_name);
+        if (len < 4 || strcasecmp(entry->d_name + len - 4, ".edf")) continue;
+        char path[800], field[80];
+        snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+        FILE *f = fopen(path, "r+b");
+        CHECK(f != NULL, "open fixture EDF header");
+        if (!f) continue;
+        fx_field(field, sizeof(field), rec_id);
+        CHECK(fseek(f, 88, SEEK_SET) == 0 && fwrite(field, 1, sizeof(field), f) == sizeof(field),
+              "write fixture EDF recording identity");
+        fclose(f);
+    }
+    closedir(d);
+}
+
 static void fresh_tree(void)
 {
     rmtree(SD_MOUNT_POINT);
@@ -581,6 +603,7 @@ static void phase_b(void)
 
     build_session_dir(dir, "20240115_221007", "20240115_221000", false,
                       2024, 1, 15);
+    set_fixture_recording_id(dir, "SRN=22161122334 MID=24 VID=1");
 
     edf_import_ctx_t *c = edf_import_ctx_create();
     int units;
@@ -732,7 +755,6 @@ static void phase_e(void)
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
     build_session_dir(dir, "20240115_221007", "20240115_221000", true,
                       2024, 1, 15);
-
     /* drift = +214000 ms measured by the bridge */
     char dp[700];
     snprintf(dp, sizeof(dp), "%s/_bridge_drift.json", dir);
@@ -1274,6 +1296,7 @@ static void phase_g(void)
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
     build_session_dir(dir, "20240115_221007", "20240115_221000", true,
                       2024, 1, 15);
+    set_fixture_recording_id(dir, "SRN=22199876543 MID=46 VID=1");
 
     edf_import_ctx_t *c = edf_import_ctx_create();
     int units;
@@ -2086,12 +2109,29 @@ static void phase_o(void)
     snprintf(p, sizeof(p), "%s/20240115_221007_BRP.edf", dir);
     f = fopen(p, "wb");
     if (f) { fputs("garbage", f); fclose(f); }
+    char old_bad[760], new_bad[760], drift_path[760], crc_path[760];
+    snprintf(old_bad, sizeof(old_bad), "%s.bad", p);
+    snprintf(new_bad, sizeof(new_bad), "%s.bad.1", p);
+    f = fopen(old_bad, "w");
+    if (f) { fputs("prior quarantine", f); fclose(f); }
+    snprintf(crc_path, sizeof(crc_path), "%s/20240115_221007_BRP.crc", dir);
+    f = fopen(crc_path, "w");
+    if (f) { fputs("checksum", f); fclose(f); }
+    snprintf(drift_path, sizeof(drift_path), "%s/_bridge_drift.json", dir);
+    f = fopen(drift_path, "w");
+    if (f) { fputs("{\"source_of_truth\":{\"clock_drift_ms\":\"1000\"}}", f); fclose(f); }
     snprintf(dir, sizeof(dir), "%s/20240116", IMPORT_DIR);
     build_session_dir(dir, "20240116_221007", "20240116_221000", false, 2024, 1, 16);
     c = edf_import_ctx_create();
     t = drain(c, &units);
     CHECK(t.files_rejected >= 1, "o3: corrupt EDF quarantined");
     CHECK(t.sessions_imported == 1, "o3: the healthy day still imports");
+    f = fopen(old_bad, "r");
+    CHECK(f && fgetc(f) == 'p', "o3: previous quarantine is not overwritten");
+    if (f) fclose(f);
+    CHECK(file_exists(new_bad), "o3: new quarantine uses a distinct filename");
+    CHECK(file_exists(crc_path) && file_exists(drift_path),
+          "o3: quarantined sources keep checksum and drift sidecars");
     snprintf(h2, sizeof(h2), "%s/20240116", IMPORT_DIR);
     CHECK(!file_exists(h2), "o3: healthy day's husk removed");
     edf_import_ctx_destroy(c);
@@ -2123,9 +2163,12 @@ static void phase_p(void)
     CHECK(mkdir(blocked, 0775) == 0, "create blocked temporary path");
     edf_import_ctx_t *c = edf_import_ctx_create();
     edf_import_unit_t u;
-    CHECK(edf_import_process_next(c, &u) != ESP_OK, "failed snapshot must fail root pass");
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "failed snapshot retains root for a later scan");
     CHECK(file_exists(source), "failed root pass must retain source STR");
     CHECK(rmdir(blocked) == 0, "remove test-created blocker");
+    edf_import_ctx_destroy(c);
+    c = edf_import_ctx_create();
     CHECK(edf_import_process_next(c, &u) == ESP_OK && u.settings_written == 1,
           "retry writes imported settings");
     CHECK(!file_exists(source), "successful retry consumes source STR");
@@ -2178,8 +2221,10 @@ static void phase_q(void)
     }
     edf_import_ctx_t *c = edf_import_ctx_create();
     edf_import_unit_t u;
-    CHECK(edf_import_process_next(c, &u) != ESP_OK, "reject mismatched root identity");
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "retain mismatched root identity");
     CHECK(file_exists(source) && file_exists(ident), "retain mismatched root files");
+    edf_import_ctx_destroy(c);
 
     f = fopen(ident, "w");
     CHECK(f != NULL, "correct fixture identity");
@@ -2197,11 +2242,14 @@ static void phase_q(void)
               "\"serial\":\"22188888888\",\"local_sessions\":[]}}", f);
         fclose(f);
     }
-    CHECK(edf_import_process_next(c, &u) != ESP_OK, "reject other-machine snapshot overwrite");
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "reject other-machine snapshot overwrite");
     cJSON *old = parse_json_file(snapshot);
     CHECK(old && cJSON_GetObjectItem(old, "marker"), "preserve existing snapshot");
     cJSON_Delete(old);
     CHECK(file_exists(source), "retain STR after snapshot conflict");
+    edf_import_ctx_destroy(c);
     f = fopen(snapshot, "w");
     CHECK(f != NULL, "create same-machine snapshot");
     if (f) {
@@ -2221,13 +2269,206 @@ static void phase_q(void)
     f = fopen(ident_path, "w");
     CHECK(f != NULL, "create local other-machine identity");
     if (f) { fputs("{\"SerialNumber\":\"22188888888\"}", f); fclose(f); }
-    CHECK(edf_import_process_next(c, &u) != ESP_OK, "reject day with another machine's session");
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "reject day with another machine's session");
     old = parse_json_file(snapshot);
     CHECK(old && cJSON_GetObjectItem(old, "marker"), "preserve snapshot on session conflict");
     cJSON_Delete(old);
     CHECK(file_exists(source), "retain STR after session conflict");
     edf_import_ctx_destroy(c);
     printf("phase q OK (%d checks)\n", g_checks);
+}
+
+static void phase_r(void)
+{
+    static int16_t dates[] = {19737, 19738}, modes[] = {3, 3}, pressures[] = {400, 450};
+    const fx_sig_t signals[] = {
+        {"Date", "d", 0, 40000, 0, 40000, 1, dates, NULL, 0},
+        {"Mode", "", 0, 32, 0, 32, 1, modes, NULL, 0},
+        {"S.C.Press", "cmH2O", 0, 40, 0, 2000, 1, pressures, NULL, 0},
+    };
+    char source[700], dir[700], path[800];
+    fresh_tree();
+    snprintf(source, sizeof(source), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 2, 2, signals, 3, 0);
+    snprintf(dir, sizeof(dir), "%s/20240115", SD_STREAMS_DIR);
+    mkpath(dir);
+    snprintf(path, sizeof(path), "%s/20240115_220000_session.json", dir);
+    FILE *f = fopen(path, "w");
+    CHECK(f != NULL, "create unverified local session");
+    if (f) { fputs("{}", f); fclose(f); }
+    snprintf(dir, sizeof(dir), "%s/20240117", DATALOG_DAY);
+    build_session_dir(dir, "20240117_221007", "20240117_221000", false, 2024, 1, 17);
+
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t u;
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained &&
+          u.settings_written == 1, "ambiguous day does not prevent later STR records");
+    CHECK(file_exists(source), "retain ambiguous STR");
+    snprintf(path, sizeof(path), "%s/20240115.imported.settings.json", SD_SUMMARIES_DIR);
+    CHECK(!file_exists(path), "do not create trusted settings for ambiguous day");
+    snprintf(path, sizeof(path), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    CHECK(!file_exists(path), "do not attach another machine's summary to ambiguous day");
+    snprintf(path, sizeof(path), "%s/20240116.imported.settings.json", SD_SUMMARIES_DIR);
+    CHECK(file_exists(path), "import independent day settings");
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_imported == 1,
+          "retained root does not starve queued sessions");
+    CHECK(file_exists(source), "root remains available for recovery");
+    edf_import_ctx_destroy(c);
+
+    for (int kind = 0; kind < 5; kind++) {
+        fresh_tree();
+        snprintf(source, sizeof(source), "%s/STR.edf", IMPORT_DIR);
+        if (kind == 0) {
+            f = fopen(source, "w");
+            if (f) { fputs("not EDF", f); fclose(f); }
+        } else if (kind == 1) {
+            fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                         2024, 1, 15, 0, 0, 0, "", "86400", 2, 1, signals, 3, 0);
+        } else if (kind == 2) {
+            const fx_sig_t other[] = {
+                {"Flow.40ms", "", 0, 100, 0, 100, 1, pressures, NULL, 0},
+            };
+            fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                         2024, 1, 15, 0, 0, 0, "", "60", 1, 1, other, 1, 0);
+        } else if (kind == 3) {
+            fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                         2024, 1, 15, 0, 0, 0, "", "60", 1, 1, signals, 3, 0);
+        } else {
+            fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                         2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, signals, 1, 0);
+        }
+        snprintf(dir, sizeof(dir), "%s/20240117", DATALOG_DAY);
+        build_session_dir(dir, "20240117_221007", "20240117_221000", false, 2024, 1, 17);
+        c = edf_import_ctx_create();
+        CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+              "malformed, truncated or non-STR root retained");
+        CHECK(file_exists(source), "invalid STR not consumed");
+        CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_imported == 1,
+              "invalid root does not starve queued sessions");
+        edf_import_ctx_destroy(c);
+    }
+
+    fresh_tree();
+    f = fopen(SD_DEVICE_METADATA_PATH, "w");
+    if (f) { fputs("{\"ident\":{\"SerialNumber\":\"old\"},\"settings\":{\"old\":true}}", f); fclose(f); }
+    snprintf(dir, sizeof(dir), "%s/SETTINGS", IMPORT_DIR);
+    mkpath(dir);
+    snprintf(path, sizeof(path), "%s/CurrentSettings.json", dir);
+    f = fopen(path, "w");
+    if (f) { fputs("{\"FlowGenerator\":{\"new\":true}}", f); fclose(f); }
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "retain identity-less settings import");
+    CHECK(file_exists(path), "identity-less settings source is retained");
+    cJSON *metadata = parse_json_file(SD_DEVICE_METADATA_PATH);
+    cJSON *settings = cJSON_GetObjectItem(metadata, "settings");
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(settings, "old")) &&
+          !cJSON_GetObjectItem(settings, "new"), "do not pair unknown settings with old identity");
+    cJSON_Delete(metadata);
+    edf_import_ctx_destroy(c);
+    printf("phase r OK (%d checks)\n", g_checks);
+}
+
+static void phase_s(void)
+{
+    char ident[800], settings[800], temp[700], dir[512];
+    fresh_tree();
+    snprintf(ident, sizeof(ident), "%s/Identification.json", IMPORT_DIR);
+    FILE *f = fopen(ident, "w");
+    CHECK(f != NULL, "s1: create identification");
+    if (f) {
+        fputs("{\"FlowGenerator\":{\"IdentificationProfiles\":{\"Product\":"
+              "{\"SerialNumber\":\"22199999999\",\"PlatformIdentifier\":46}}}}", f);
+        fclose(f);
+    }
+    snprintf(dir, sizeof(dir), "%s/SETTINGS", IMPORT_DIR);
+    mkpath(dir);
+    snprintf(settings, sizeof(settings), "%s/CurrentSettings.json", dir);
+    f = fopen(settings, "w");
+    CHECK(f != NULL, "s1: create settings");
+    if (f) { fputs("{\"FlowGenerator\":{\"fixture\":true}}", f); fclose(f); }
+    snprintf(temp, sizeof(temp), "%s.tmp", SD_DEVICE_METADATA_PATH);
+    CHECK(mkdir(temp, 0775) == 0, "s1: block metadata write");
+    char queued[800];
+    snprintf(queued, sizeof(queued), "%s/20240117", DATALOG_DAY);
+    build_session_dir(queued, "20240117_221007", "20240117_221000", false, 2024, 1, 17);
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t u;
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "s1: metadata failure retains root");
+    CHECK(file_exists(ident) && file_exists(settings), "s1: failed root sources retained");
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_imported == 1,
+          "s1: failed root does not block independent day");
+    CHECK(rmdir(temp) == 0, "s1: remove fixture blocker");
+    edf_import_ctx_destroy(c);
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.root_retained,
+          "s1: retry commits root metadata");
+    CHECK(!file_exists(ident) && !file_exists(settings), "s1: committed sources consumed");
+    cJSON *metadata = parse_json_file(SD_DEVICE_METADATA_PATH);
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(cJSON_GetObjectItem(metadata, "settings"), "fixture")),
+          "s1: source settings durably saved");
+    cJSON_Delete(metadata);
+    edf_import_ctx_destroy(c);
+
+    fresh_tree();
+    f = fopen(SD_DEVICE_METADATA_PATH, "w");
+    if (f) {
+        fputs("{\"ident\":{\"SerialNumber\":\"old\",\"PlatformIdentifier\":46},"
+              "\"settings\":{\"old\":true}}", f);
+        fclose(f);
+    }
+    f = fopen(ident, "w");
+    if (f) {
+        fputs("{\"FlowGenerator\":{\"IdentificationProfiles\":{\"Product\":"
+              "{\"SerialNumber\":\"22199999999\",\"PlatformIdentifier\":46}}}}", f);
+        fclose(f);
+    }
+    mkpath(dir);
+    f = fopen(settings, "w");
+    if (f) { fputs("{\"FlowGenerator\":{\"new\":true}}", f); fclose(f); }
+    snprintf(dir, sizeof(dir), "%s/20240117", DATALOG_DAY);
+    build_session_dir(dir, "20240117_221007", "20240117_221000", false, 2024, 1, 17);
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "s2: foreign current settings retained rather than lost");
+    CHECK(file_exists(ident) && file_exists(settings), "s2: root files preserved");
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_imported == 1,
+          "s2: unrelated queued session still imports");
+    metadata = parse_json_file(SD_DEVICE_METADATA_PATH);
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(cJSON_GetObjectItem(metadata, "settings"), "old")),
+          "s2: existing cache preserved");
+    cJSON_Delete(metadata);
+    edf_import_ctx_destroy(c);
+
+    fresh_tree();
+    snprintf(dir, sizeof(dir), "%s/20240115", DATALOG_DAY);
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
+    snprintf(queued, sizeof(queued), "%s/20240116", DATALOG_DAY);
+    build_session_dir(queued, "20240116_221007", "20240116_221000", false, 2024, 1, 16);
+    snprintf(temp, sizeof(temp), "%s/20240115", SD_STREAMS_DIR);
+    mkpath(temp);
+    snprintf(temp, sizeof(temp), "%s/20240115/20240115_221000_ident.json.tmp", SD_STREAMS_DIR);
+    CHECK(mkdir(temp, 0775) == 0, "s3: block session identity write");
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_failed == 1,
+          "s3: session identity failure reported");
+    snprintf(ident, sizeof(ident), "%s/20240115_221007_BRP.edf", dir);
+    CHECK(file_exists(ident), "s3: valid input retained under its original name");
+    snprintf(queued, sizeof(queued), "%s/20240115_221007_BRP.edf.bad", dir);
+    CHECK(!file_exists(queued), "s3: I/O failure is not mislabeled corrupt");
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_imported == 1,
+          "s3: failed group does not starve later day");
+    CHECK(rmdir(temp) == 0, "s3: remove fixture blocker");
+    edf_import_ctx_destroy(c);
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_imported == 1,
+          "s3: retained session succeeds on later retry");
+    edf_import_ctx_destroy(c);
+    printf("phase s OK (%d checks)\n", g_checks);
 }
 
 int main(void)
@@ -2254,6 +2495,8 @@ int main(void)
     phase_o();
     phase_p();
     phase_q();
+    phase_r();
+    phase_s();
 
     rmtree(SD_MOUNT_POINT);
     printf("edf_import_test: %d checks, %d failures\n", g_checks, g_fail);

@@ -33,6 +33,7 @@
 #define SETTINGS_SOURCE_LIVE "live"
 #define SETTINGS_SOURCE_CACHED "cached"
 #define SETTINGS_SOURCE_IMPORTED_STR "imported_str"
+#define SETTINGS_SOURCE_LIVE_IDENT "live_ident"
 #define SETTINGS_FAMILY_UNKNOWN 0
 #define SETTINGS_FAMILY_AS10 10
 #define SETTINGS_FAMILY_AS11 11
@@ -96,6 +97,13 @@ static inline bool settings_provenance_is_family(const cJSON *root, int family)
            strcmp(value->valuestring, name) == 0;
 }
 
+static inline int settings_provenance_recorded_family(const cJSON *root)
+{
+    if (settings_provenance_is_family(root, SETTINGS_FAMILY_AS10)) return SETTINGS_FAMILY_AS10;
+    if (settings_provenance_is_family(root, SETTINGS_FAMILY_AS11)) return SETTINGS_FAMILY_AS11;
+    return SETTINGS_FAMILY_UNKNOWN;
+}
+
 /* Metadata travels in the same JSON file as the settings, so a partial write
  * cannot accidentally pair a new tree with an old trust marker. */
 static inline bool settings_provenance_set(cJSON *root, const char *source,
@@ -139,4 +147,4 @@ static inline bool settings_provenance_is(const cJSON *root, const char *source,
 bool settings_provenance_record_sessions(cJSON *root, const char *day);
 bool settings_provenance_covers_sessions(const cJSON *root, const char *day);
 bool settings_provenance_session_matches(const char *day, const char *session,
-                                        const char *serial);
+                                        const char *serial, int family);

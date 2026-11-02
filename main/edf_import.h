@@ -61,6 +61,7 @@ typedef struct {
     int  files_rejected;    /* corrupt files moved aside to *.bad */
     int  spools_written;
     int  settings_written;  /* new or changed imported daily settings */
+    bool root_retained;     /* root could not be safely consumed; days may proceed */
     bool deferred;          /* nothing processed: the next unit's files were
                              * modified within the quiescence window (a copy
                              * may still be in flight) — call again later */
