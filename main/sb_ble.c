@@ -1561,7 +1561,16 @@ static void sync_root_dir(const char *directory, const char *ledger_prefix)
                                     : (tt && ts && !strcmp(tt, ts));
             same = sz && size && !strcmp(sz, size) && ts_match;
         }
-        if (same) continue;
+        /* The importer consumes a successfully imported root file, but the
+         * ledger still records its tuple.  A ledger match alone must not
+         * suppress a re-fetch when the local copy is gone: the next root
+         * pass would have no identity/settings to verify. */
+        char local[240];
+        snprintf(local, sizeof(local), "%s/%s%s", SD_IMPORT_DIR,
+                 ledger_prefix, fn);
+        struct stat lst;
+        bool local_present = stat(local, &lst) == 0;
+        if (same && local_present) continue;
 
         ESP_LOGI(TAG, "root: pulling %s (%s bytes)", key, size);
         if (sb_get_file(directory, fn, size, ts, ts_null) != ESP_OK) {
