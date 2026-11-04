@@ -200,10 +200,19 @@ bool settings_provenance_covers_sessions(const cJSON *root, const char *day)
     const cJSON *meta = cJSON_GetObjectItemCaseSensitive(root, SETTINGS_PROVENANCE_KEY);
     const cJSON *recorded = cJSON_GetObjectItemCaseSensitive(meta, "local_sessions");
     if (!cJSON_IsArray(recorded) ||
-        !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(meta, "coverage_verified"))) return false;
+        !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(meta, "coverage_verified")))
+        return false;
     cJSON *current = local_session_ids(day, settings_provenance_serial(root),
                                        settings_provenance_recorded_family(root));
     if (!current) return false;
+    /* The root STR is imported before that day's sessions, so a snapshot
+     * with an empty recorded list is a valid pre-session snapshot once
+     * every current session matches its serial/family.  A non-empty list
+     * is a coverage promise: a new session stales it until re-import. */
+    if (cJSON_GetArraySize(recorded) == 0) {
+        cJSON_Delete(current);
+        return true;
+    }
     bool covered = true;
     const cJSON *sid;
     cJSON_ArrayForEach(sid, current) {

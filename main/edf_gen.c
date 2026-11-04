@@ -472,6 +472,31 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                      session_id, settings_path);
         }
     }
+    if (!settings && sessions_root[0] && ident) {
+        /* Bridge-imported sessions have no live snapshot; the native STR
+         * daily snapshot is their settings source.  Require the same
+         * serial/family and current-session coverage before using it. */
+        snprintf(settings_path, sizeof(settings_path),
+                 "%s/summaries/%s.imported.settings.json",
+                 sessions_root, lookup_day);
+        cJSON *imported = edf_read_json_file(settings_path);
+        int family = settings_provenance_family(ident);
+        const char *imported_serial = settings_provenance_serial(imported);
+        if (imported &&
+            settings_provenance_is(imported, SETTINGS_SOURCE_IMPORTED_STR,
+                                   lookup_day, NULL) &&
+            imported_serial && ident_serial &&
+            !strcmp(imported_serial, ident_serial) &&
+            family != SETTINGS_FAMILY_UNKNOWN &&
+            settings_provenance_is_family(imported, family) &&
+            settings_provenance_covers_sessions(imported, lookup_day)) {
+            settings = imported;
+            ESP_LOGW(TAG, "session %s has no settings.json — using imported "
+                     "STR settings %s", session_id, settings_path);
+        } else {
+            cJSON_Delete(imported);
+        }
+    }
     if (!settings && cross_day_metadata_fallback(streams_root, lookup_day, "_settings.json",
                                                  ident_serial, settings_path,
                                                  sizeof(settings_path))) {
