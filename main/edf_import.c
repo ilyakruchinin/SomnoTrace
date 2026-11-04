@@ -3036,14 +3036,21 @@ static esp_err_t augment_session(const char *dir, const char *id,
             snprintf(path, sizeof(path), "%s/%s_events.snt", dir, id);
             snprintf(tmp, sizeof(tmp), "%s.part", path);
             FILE *ef = fopen(tmp, "w");
-            bool wr = ef != NULL;
+            if (!ef) {
+                unlink(tmp);
+                line_set_free(&cand);
+                line_set_free(&kept);
+                ret = ESP_FAIL;
+                goto out;
+            }
+            bool wr = true;
             for (int i = 0; wr && i < kept.n; i++)
                 wr = fputs(kept.v[i], ef) >= 0;
             for (int i = 0; wr && i < cand.n; i++)
                 wr = fputs(cand.v[i], ef) >= 0;
             if (wr)
                 wr = imp_flush_close(ef, tmp) == ESP_OK;
-            else if (ef)
+            else
                 fclose(ef);
             if (!wr) {
                 unlink(tmp);
