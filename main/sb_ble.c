@@ -38,9 +38,11 @@
  * volatile, bridge_ledger.json decides what is re-pulled, and staged files
  * land in /somnotrace/IMPORT/ for the Phase-1 importer. */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
@@ -965,6 +967,37 @@ static void stream_pump(void)
     }
 }
 
+/* FATFS cannot rename over an existing file.  Keep the previous file
+ * until the replacement succeeds; leave a backup for recovery. */
+static int sb_rename_replace(const char *src, const char *dst)
+{
+    char backup[240];
+    int n = snprintf(backup, sizeof(backup), "%s.replace-backup", dst);
+    if (n < 0 || (size_t)n >= sizeof(backup)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    struct stat st;
+    if (stat(backup, &st) == 0) {
+        errno = EEXIST;
+        return -1;
+    }
+    if (errno != ENOENT) return -1;
+    if (rename(src, dst) == 0) return 0;
+    if (errno != EEXIST) return -1;
+    if (rename(dst, backup) != 0) return -1;
+    if (rename(src, dst) != 0) {
+        int saved = errno;
+        if (rename(backup, dst) != 0)
+            ESP_LOGE(TAG, "publish: previous file retained at %s", backup);
+        errno = saved;
+        return -1;
+    }
+    if (unlink(backup) != 0)
+        ESP_LOGW(TAG, "publish: previous file retained at %s", backup);
+    return 0;
+}
+
 /* STREAM_END: every field the bridge promises is REQUIRED — a missing
  * or malformed field is a failure, never a skipped check.  Publication
  * (rename) happens only after the byte count, wire count, residual
@@ -988,10 +1021,13 @@ static bool stream_end(cJSON *result)
 
     if (s_stream_f) {
         /* Durability before publication: a corrupt tail rename is the
-         * worst failure mode — surface a close error instead. */
-        if (fflush(s_stream_f) != 0 || fsync(fileno(s_stream_f)) != 0 ||
-            fclose(s_stream_f) != 0)
-            stream_fail("write close");
+         * worst failure mode — surface a close error instead.  Always
+         * close, even when flush/fsync fails, so the fd is not leaked. */
+        bool close_err = false;
+        if (fflush(s_stream_f) != 0) close_err = true;
+        if (fsync(fileno(s_stream_f)) != 0) close_err = true;
+        if (fclose(s_stream_f) != 0) close_err = true;
+        if (close_err) stream_fail("write close");
         s_stream_f = NULL;
     }
     if (s_sha_active) {
@@ -1033,7 +1069,8 @@ static bool stream_end(cJSON *result)
         stream_fail("expected size mismatch");
     else if (strcmp(sha, s_stream_sha) != 0)
         stream_fail("sha256 mismatch");
-    else if (s_stream_tmp[0] && rename(s_stream_tmp, s_stream_path) == 0) ok = true;
+    else if (s_stream_tmp[0] &&
+             sb_rename_replace(s_stream_tmp, s_stream_path) == 0) ok = true;
     else stream_fail("publish failed");
 
     if (!ok && s_stream_tmp[0]) unlink(s_stream_tmp);
@@ -1047,7 +1084,8 @@ static bool stream_end(cJSON *result)
 
 /* GET_FILE with v2 framing, retried on the bridge's transient errors. */
 static esp_err_t sb_get_file(const char *directory, const char *name,
-                             const char *expected_size)
+                             const char *expected_size,
+                             const char *expected_ts, bool ts_is_null)
 {
     /* `directory` is already bridge-canonical ("A:\", "A:\SETTINGS",
      * "A:\DATALOG\<day>") — ezp_logical_to_canon requires the drive
@@ -1061,6 +1099,10 @@ static esp_err_t sb_get_file(const char *directory, const char *name,
         cJSON_AddStringToObject(args, "name", name);
         if (expected_size && expected_size[0])
             cJSON_AddStringToObject(args, "expected_size", expected_size);
+        if (ts_is_null)
+            cJSON_AddNullToObject(args, "expected_timestamp_raw");
+        else if (expected_ts && expected_ts[0])
+            cJSON_AddStringToObject(args, "expected_timestamp_raw", expected_ts);
         cJSON_AddBoolToObject(args, "v2", true);
 
         /* Stream responses reuse the request id: BEGIN then END. */
@@ -1299,8 +1341,10 @@ static esp_err_t sb_get_file(const char *directory, const char *name,
 static void ledger_load(void)
 {
     if (s_ledger) return;
+    bool had_file = false;
     FILE *f = fopen(SB_LEDGER_PATH, "rb");
     if (f) {
+        had_file = true;
         fseek(f, 0, SEEK_END);
         long n = ftell(f);
         fseek(f, 0, SEEK_SET);
@@ -1312,30 +1356,59 @@ static void ledger_load(void)
         free(b);
         fclose(f);
     }
+    if (!s_ledger && had_file) {
+        /* Never silently replace an unreadable/oversized ledger with an
+         * empty one: preserve the old bytes for recovery and report it. */
+        char bad[200];
+        snprintf(bad, sizeof(bad), "%s.bad", SB_LEDGER_PATH);
+        unlink(bad);
+        if (rename(SB_LEDGER_PATH, bad) == 0)
+            ESP_LOGW(TAG, "ledger: malformed/oversized ledger moved to %s", bad);
+        else
+            ESP_LOGW(TAG, "ledger: malformed/oversized ledger retained at %s",
+                     SB_LEDGER_PATH);
+    }
     if (!s_ledger) {
         s_ledger = cJSON_CreateObject();
         cJSON_AddNumberToObject(s_ledger, "v", 1);
         cJSON_AddObjectToObject(s_ledger, "root");
         cJSON_AddObjectToObject(s_ledger, "days");
+    } else {
+        if (!cJSON_GetObjectItem(s_ledger, "root"))
+            cJSON_AddObjectToObject(s_ledger, "root");
+        if (!cJSON_GetObjectItem(s_ledger, "days"))
+            cJSON_AddObjectToObject(s_ledger, "days");
     }
 }
 
-static void ledger_save(void)
+static bool ledger_save(void)
 {
-    if (!s_ledger) return;
+    if (!s_ledger) return false;
     char *txt = cJSON_PrintUnformatted(s_ledger);
-    if (!txt) return;
+    if (!txt) return false;
     char tmp[200];
     snprintf(tmp, sizeof(tmp), "%s.tmp", SB_LEDGER_PATH);
     mkdir(SD_SESSIONS_DIR, 0775);
     FILE *f = fopen(tmp, "wb");
+    bool ok = false;
     if (f) {
-        fputs(txt, f);
-        fclose(f);
-        unlink(SB_LEDGER_PATH);
-        rename(tmp, SB_LEDGER_PATH);
+        bool wr = fputs(txt, f) >= 0;
+        bool fl = fflush(f) == 0;
+        bool fs = fsync(fileno(f)) == 0;
+        bool cl = fclose(f) == 0;
+        if (wr && fl && fs && cl &&
+            sb_rename_replace(tmp, SB_LEDGER_PATH) == 0) {
+            ok = true;
+        } else {
+            ESP_LOGW(TAG, "ledger: save failed (write=%d flush=%d fsync=%d "
+                     "close=%d)", wr, fl, fs, cl);
+            unlink(tmp);
+        }
+    } else {
+        ESP_LOGW(TAG, "ledger: cannot create %s", tmp);
     }
     free(txt);
+    return ok;
 }
 
 static cJSON *ledger_day(const char *day, bool create)
@@ -1350,25 +1423,90 @@ static cJSON *ledger_day(const char *day, bool create)
 }
 
 static bool ledger_seen(const char *day, const char *name, const char *size,
-                        const char *ts)
+                        const char *ts, bool ts_is_null)
 {
     cJSON *d = ledger_day(day, false);
     cJSON *e = d ? cJSON_GetObjectItem(d, name) : NULL;
     if (!e) return false;
     const char *sz = cJSON_GetStringValue(cJSON_GetObjectItem(e, "size"));
-    const char *tt = cJSON_GetStringValue(cJSON_GetObjectItem(e, "ts"));
-    return sz && tt && size && ts && !strcmp(sz, size) && !strcmp(tt, ts);
+    if (!sz || !size || strcmp(sz, size)) return false;
+    cJSON *tj = cJSON_GetObjectItem(e, "ts");
+    if (ts_is_null) return tj && cJSON_IsNull(tj);
+    const char *tt = cJSON_GetStringValue(tj);
+    return tt && ts && !strcmp(tt, ts);
 }
 
 static void ledger_mark(const char *day, const char *name, const char *size,
-                        const char *ts)
+                        const char *ts, bool ts_is_null)
 {
     cJSON *d = ledger_day(day, true);
     if (!d) return;
+    /* Replace the existing key; appending a duplicate makes the lookup
+     * keep seeing the old tuple and re-download the file forever. */
+    cJSON_DeleteItemFromObject(d, name);
     cJSON *e = cJSON_AddObjectToObject(d, name);
     if (!e) return;
     cJSON_AddStringToObject(e, "size", size ? size : "");
-    cJSON_AddStringToObject(e, "ts", ts ? ts : "");
+    if (ts_is_null) cJSON_AddNullToObject(e, "ts");
+    else cJSON_AddStringToObject(e, "ts", ts ? ts : "");
+}
+
+/* A listing's `ts` is either a string or JSON null; a missing/malformed
+ * field is not the same as null and must not be treated as a tuple. */
+static bool sb_ts_field(const cJSON *f, const char **ts, bool *is_null)
+{
+    cJSON *tj = cJSON_GetObjectItem(f, "ts");
+    if (!tj) return false;
+    if (cJSON_IsNull(tj)) {
+        *ts = NULL;
+        *is_null = true;
+        return true;
+    }
+    const char *s = cJSON_GetStringValue(tj);
+    if (!s) return false;
+    *ts = s;
+    *is_null = false;
+    return true;
+}
+
+static bool sb_is_transfer_residue(const char *fn)
+{
+    size_t n = strlen(fn);
+    return n > 5 &&
+           (!strcasecmp(fn + n - 5, ".part") ||
+            !strcasecmp(fn + n - 5, ".tmp"));
+}
+
+static const char *const k_day_order[] = { "EVE", "CSL", "SA2", "SAD",
+                                           "PLD", "BRP" };
+
+static bool sb_is_known_day_file(const char *fn)
+{
+    for (size_t i = 0; i < sizeof(k_day_order) / sizeof(k_day_order[0]); i++)
+        if (strstr(fn, k_day_order[i])) return true;
+    return false;
+}
+
+static bool sb_write_file_atomic(const char *path, const char *txt)
+{
+    char tmp[240];
+    int n = snprintf(tmp, sizeof(tmp), "%s.part", path);
+    if (n < 0 || (size_t)n >= sizeof(tmp)) return false;
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return false;
+    bool wr = fputs(txt, f) >= 0;
+    bool fl = fflush(f) == 0;
+    bool fs = fsync(fileno(f)) == 0;
+    bool cl = fclose(f) == 0;
+    if (!(wr && fl && fs && cl)) {
+        unlink(tmp);
+        return false;
+    }
+    if (sb_rename_replace(tmp, path) != 0) {
+        unlink(tmp);
+        return false;
+    }
+    return true;
 }
 
 /* ── Sync engine (§5.4) ─────────────────────────────────────────────── */
@@ -1387,12 +1525,21 @@ static void sync_root_dir(const char *directory, const char *ledger_prefix)
     }
 
     cJSON *files = cJSON_GetObjectItem(res, "files");
+    if (!cJSON_IsArray(files)) {
+        ESP_LOGW(TAG, "root: %s listing has no files array", directory);
+        cJSON_Delete(res);
+        return;
+    }
     cJSON *f;
     cJSON_ArrayForEach(f, files) {
         const char *fn = cJSON_GetStringValue(cJSON_GetObjectItem(f, "name"));
         const char *size = cJSON_GetStringValue(cJSON_GetObjectItem(f, "size"));
-        const char *ts = cJSON_GetStringValue(cJSON_GetObjectItem(f, "ts"));
-        if (!fn || !size) continue;
+        const char *ts = NULL;
+        bool ts_null = false;
+        if (!fn || !size || !sb_ts_field(f, &ts, &ts_null)) {
+            ESP_LOGW(TAG, "root: %s malformed file row", directory);
+            continue;
+        }
         /* Only the files the importer consumes. */
         bool want = strcmp(fn, "STR.edf") == 0 ||
                     strcmp(fn, "Identification.json") == 0 ||
@@ -1407,24 +1554,31 @@ static void sync_root_dir(const char *directory, const char *ledger_prefix)
         bool same = false;
         if (e) {
             const char *sz = cJSON_GetStringValue(cJSON_GetObjectItem(e, "size"));
-            const char *tt = cJSON_GetStringValue(cJSON_GetObjectItem(e, "ts"));
-            same = sz && tt && ts && !strcmp(sz, size) && !strcmp(tt, ts);
+            cJSON *tj = cJSON_GetObjectItem(e, "ts");
+            bool stored_null = tj && cJSON_IsNull(tj);
+            const char *tt = cJSON_GetStringValue(tj);
+            bool ts_match = ts_null ? stored_null
+                                    : (tt && ts && !strcmp(tt, ts));
+            same = sz && size && !strcmp(sz, size) && ts_match;
         }
         if (same) continue;
 
         ESP_LOGI(TAG, "root: pulling %s (%s bytes)", key, size);
-        if (sb_get_file(directory, fn, size) != ESP_OK) {
+        if (sb_get_file(directory, fn, size, ts, ts_null) != ESP_OK) {
             ESP_LOGW(TAG, "root: %s failed (%s)", key, s_last_error);
             continue;
         }
         root = cJSON_GetObjectItem(s_ledger, "root");
         if (root) {
+            cJSON_DeleteItemFromObject(root, key);
             cJSON *n = cJSON_AddObjectToObject(root, key);
             if (n) {
                 cJSON_AddStringToObject(n, "size", size);
-                cJSON_AddStringToObject(n, "ts", ts ? ts : "");
+                if (ts_null) cJSON_AddNullToObject(n, "ts");
+                else cJSON_AddStringToObject(n, "ts", ts ? ts : "");
             }
-            ledger_save();
+            if (!ledger_save())
+                ESP_LOGW(TAG, "root: ledger save failed for %s", key);
         }
         s_sync_files_done++;
     }
@@ -1487,6 +1641,20 @@ static void sync_run(bool full)
     sync_root_dir("A:\\", "");
     sync_root_dir("A:\\SETTINGS", "SETTINGS/");
     cJSON *list = cJSON_GetObjectItem(res, "days");
+    if (!cJSON_IsArray(list)) {
+        ESP_LOGW(TAG, "sync: LIST_RECENT_DAYS has no days array");
+        cJSON_Delete(res);
+        return;
+    }
+    bool catalog_complete = cJSON_IsTrue(
+        cJSON_GetObjectItem(res, "catalog_complete"));
+    bool hot_ready = cJSON_IsTrue(cJSON_GetObjectItem(res, "hot_ready"));
+    int pass_fail = 0;
+    if (!catalog_complete || !hot_ready) {
+        ESP_LOGW(TAG, "sync: catalog incomplete (complete=%d hot_ready=%d)",
+                 catalog_complete, hot_ready);
+        pass_fail++;
+    }
     int n = cJSON_GetArraySize(list);
     ESP_LOGI(TAG, "sync: %d day(s) in the %d-day window", n, days);
 
@@ -1499,21 +1667,46 @@ static void sync_run(bool full)
         cJSON_AddStringToObject(da, "day", day);
         cJSON *dres = NULL;
         if (json_op("LIST_DAY", da, &dres) != ESP_OK || !dres) {
+            pass_fail++;
+            cJSON_Delete(dres);
+            continue;
+        }
+        if (cJSON_IsTrue(cJSON_GetObjectItem(dres, "folder_stale"))) {
+            ESP_LOGW(TAG, "sync: %s listing is stale; deferred", day);
+            pass_fail++;
             cJSON_Delete(dres);
             continue;
         }
 
         /* Pending = listed entries the ledger has not recorded verbatim. */
         cJSON *files = cJSON_GetObjectItem(dres, "files");
+        if (!cJSON_IsArray(files)) {
+            ESP_LOGW(TAG, "sync: %s LIST_DAY has no files array", day);
+            pass_fail++;
+            cJSON_Delete(dres);
+            continue;
+        }
         int pending = 0;
+        bool day_bad = false;
         cJSON *f;
         cJSON_ArrayForEach(f, files) {
             const char *fn = cJSON_GetStringValue(cJSON_GetObjectItem(f, "name"));
             const char *size = cJSON_GetStringValue(cJSON_GetObjectItem(f, "size"));
-            const char *ts = cJSON_GetStringValue(cJSON_GetObjectItem(f, "ts"));
-            if (!fn || !size) continue;
-            if (!ledger_seen(day, fn, size, ts)) pending++;
+            const char *ts = NULL;
+            bool ts_null = false;
+            if (!fn || !size || !sb_ts_field(f, &ts, &ts_null)) {
+                ESP_LOGW(TAG, "sync: %s malformed file row", day);
+                day_bad = true;
+                continue;
+            }
+            if (sb_is_transfer_residue(fn)) continue;
+            if (!sb_is_known_day_file(fn)) {
+                ESP_LOGW(TAG, "sync: %s/%s unsupported; not counted", day, fn);
+                continue;
+            }
+            if (!ledger_seen(day, fn, size, ts, ts_null)) pending++;
         }
+        if (day_bad) { pass_fail++; cJSON_Delete(dres); continue; }
         if (pending == 0) { cJSON_Delete(dres); continue; }
 
         /* Pre-warm the bridge's freshness guard. */
@@ -1529,27 +1722,40 @@ static void sync_run(bool full)
         cJSON_Delete(pres);
 
         /* Smallest first, BRP last (its BRP is the big one). */
-        static const char *const order[] = { "EVE", "CSL", "SA2", "SAD",
-                                             "PLD", "BRP" };
         int day_fail = 0;
-        for (size_t k = 0; k < sizeof(order) / sizeof(order[0]); k++) {
+        for (size_t k = 0; k < sizeof(k_day_order) / sizeof(k_day_order[0]); k++) {
             cJSON_ArrayForEach(f, files) {
                 const char *fn = cJSON_GetStringValue(cJSON_GetObjectItem(f, "name"));
                 const char *size = cJSON_GetStringValue(cJSON_GetObjectItem(f, "size"));
-                const char *ts = cJSON_GetStringValue(cJSON_GetObjectItem(f, "ts"));
-                if (!fn || !size || !strstr(fn, order[k])) continue;
-                if (ledger_seen(day, fn, size, ts)) continue;
-                if (s_conn == BLE_HS_CONN_HANDLE_NONE) { cJSON_Delete(dres); return; }
+                const char *ts = NULL;
+                bool ts_null = false;
+                if (!fn || !size || !sb_ts_field(f, &ts, &ts_null)) continue;
+                if (sb_is_transfer_residue(fn)) continue;
+                if (!strstr(fn, k_day_order[k])) continue;
+                if (ledger_seen(day, fn, size, ts, ts_null)) continue;
+                if (s_conn == BLE_HS_CONN_HANDLE_NONE) {
+                    cJSON_Delete(dres);
+                    cJSON_Delete(res);
+                    return;
+                }
                 char fdir[48];
                 snprintf(fdir, sizeof(fdir), "A:\\DATALOG\\%s", day);
-                if (sb_get_file(fdir, fn, size) != ESP_OK) {
+                if (sb_get_file(fdir, fn, size, ts, ts_null) != ESP_OK) {
                     day_fail++;
                     ESP_LOGW(TAG, "sync: %s/%s failed (%s)", day, fn, s_last_error);
-                    if (strstr(s_last_error, "THERAPY")) { cJSON_Delete(dres); return; }
+                    if (strstr(s_last_error, "THERAPY") ||
+                        strstr(s_last_error, "therapy")) {
+                        cJSON_Delete(dres);
+                        cJSON_Delete(res);
+                        return;
+                    }
                     continue;
                 }
-                ledger_mark(day, fn, size, ts);
-                ledger_save();
+                ledger_mark(day, fn, size, ts, ts_null);
+                if (!ledger_save()) {
+                    day_fail++;
+                    ESP_LOGW(TAG, "sync: %s/%s ledger save failed", day, fn);
+                }
                 s_sync_files_done++;
             }
         }
@@ -1559,25 +1765,36 @@ static void sync_run(bool full)
          * (current estimate or previous-session fallback) — without it the
          * field stays null even when a usable candidate exists. */
         cJSON *ga = cJSON_CreateObject();
-        char gdir[48];
-        snprintf(gdir, sizeof(gdir), "/DATALOG/%s", day);
-        cJSON_AddStringToObject(ga, "directory", gdir);
+        cJSON_AddStringToObject(ga, "day", day);
         cJSON_AddBoolToObject(ga, "best_available", true);
         cJSON *gres = NULL;
+        char dp[200];
+        snprintf(dp, sizeof(dp),
+                 SD_IMPORT_DIR "/DATALOG/%s/_bridge_drift.json", day);
         if (json_op("GET_DRIFT", ga, &gres) == ESP_OK && gres) {
-            char p[200];
-            snprintf(p, sizeof(p), SD_IMPORT_DIR "/DATALOG/%s/_bridge_drift.json", day);
             char *txt = cJSON_PrintUnformatted(gres);
             if (txt) {
-                FILE *df = fopen(p, "wb");
-                if (df) { fputs(txt, df); fclose(df); }
+                if (!sb_write_file_atomic(dp, txt))
+                    ESP_LOGW(TAG, "sync: %s drift sidecar write failed", day);
                 free(txt);
+            }
+        } else {
+            /* Keep somnobridge provenance when drift metadata is
+             * unavailable, but never overwrite a known-good sidecar. */
+            struct stat st;
+            if (stat(dp, &st) != 0) {
+                const char *pending =
+                    "{\"schema\":5,\"pending\":true,"
+                    "\"reason\":\"metadata_unavailable\"}";
+                if (!sb_write_file_atomic(dp, pending))
+                    ESP_LOGW(TAG, "sync: %s pending drift write failed", day);
             }
         }
         cJSON_Delete(gres);
         cJSON_Delete(dres);
 
         s_sync_days_done++;
+        pass_fail += day_fail;
         if (day_fail)
             ESP_LOGW(TAG, "sync: %s staged PARTIAL (%d day(s) done, %d file(s) failed)",
                      day, s_sync_days_done, day_fail);
@@ -1587,11 +1804,16 @@ static void sync_run(bool full)
 
     drift_probe_log();
     cJSON_Delete(res);
-    s_last_sync_ms = esp_timer_get_time() / 1000;
+    if (pass_fail == 0)
+        s_last_sync_ms = esp_timer_get_time() / 1000;
+    else
+        ESP_LOGW(TAG, "sync: pass incomplete (%d issue(s)); last-success unchanged",
+                 pass_fail);
 
-    /* Hand the staged files to the Phase-1 importer (it deletes them after a
-     * durable commit and rebuilds/upload the day). */
-    if (s_sync_files_done > 0 && s_import_kick) s_import_kick();
+    /* Hand staged files to the importer.  The pending check covers files
+     * staged by an earlier pass that this pass did not re-download. */
+    if (s_import_kick && (s_sync_files_done > 0 || edf_import_pending()))
+        s_import_kick();
 }
 
 /* ── Status / sync task ─────────────────────────────────────────────── */
@@ -1600,16 +1822,28 @@ static void poll_status(uint32_t epoch)
 {
     cJSON *res = NULL;
     if (json_op("GET_STATUS", NULL, &res) != ESP_OK || !res) {
+        s_therapy_active = false;
+        s_transfer_allowed = false;
         bsp_display_bridge_set_card_status(epoch, false, false);
         cJSON_Delete(res);
         return;
     }
     cJSON *th = cJSON_GetObjectItem(res, "therapy");
-    if (th) {
-        cJSON *st = cJSON_GetObjectItem(th, "state");
-        cJSON *ta = cJSON_GetObjectItem(th, "transfer_allowed");
-        s_therapy_active = cJSON_IsNumber(st) && st->valueint == 1;
-        s_transfer_allowed = cJSON_IsTrue(ta);
+    cJSON *st = th ? cJSON_GetObjectItem(th, "state") : NULL;
+    cJSON *ta = th ? cJSON_GetObjectItem(th, "transfer_allowed") : NULL;
+    cJSON *ts = th ? cJSON_GetObjectItem(th, "stale") : NULL;
+    bool valid = cJSON_IsNumber(st) &&
+                 st->valuedouble >= 0 && st->valuedouble <= 2 &&
+                 st->valuedouble == (double)(int)st->valuedouble &&
+                 cJSON_IsBool(ta) && cJSON_IsBool(ts);
+    if (valid) {
+        s_therapy_active = st->valueint == 1;
+        s_transfer_allowed = cJSON_IsTrue(ta) && !cJSON_IsTrue(ts) &&
+                             st->valueint == 2;
+    } else {
+        s_therapy_active = false;
+        s_transfer_allowed = false;
+        ESP_LOGW(TAG, "status: invalid therapy fields; permission cleared");
     }
     cJSON *card_wifi = cJSON_GetObjectItem(res, "sta_connected");
     s_card_wifi = cJSON_IsTrue(card_wifi);
