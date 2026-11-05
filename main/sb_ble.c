@@ -76,7 +76,10 @@
 #include "psram_task.h"
 #include "sb_ble.h"
 #include "sb_proto.h"
+#include "sb_root.h"
 #include "sd_storage.h"
+#include "source_store.h"
+#include "tx_log.h"
 #include "time_sync.h"
 
 static const char *TAG = "sb_ble";
@@ -138,6 +141,7 @@ static const ble_uuid128_t UUID_DATA =
 #define SB_NVS_NS         "sbble"
 #define SB_NVS_ADDR       "addr"
 #define SB_LEDGER_PATH    SD_SESSIONS_DIR "/bridge_ledger.json"
+#define SB_TX_LOG_PATH    SD_SESSIONS_DIR "/bridge_tx.log"
 
 /* ── State ──────────────────────────────────────────────────────────── */
 
@@ -245,9 +249,12 @@ static bool     s_card_wifi;    /* bridge STA joined the card        */
 static char     s_card_mode[8]; /* bridge netw mode: STA/AP/DOWN     */
 static char     s_last_error[64];
 static int64_t  s_last_sync_ms;
+static int64_t  s_last_sync_attempt_ms;
 static int      s_sync_days_done, s_sync_files_done;
 static bool     s_sync_running;
 static bool     s_sync_full;
+static bool     s_source_store_ready;
+static uint32_t s_root_obs_seq;
 static sb_import_kick_fn_t s_import_kick;
 
 /* Ledger (loaded during a sync pass, freed at the end) */
@@ -1190,6 +1197,7 @@ static esp_err_t sb_get_file(const char *directory, const char *name,
          * ceil-rounded into — stream_end applies the within-listing
          * rule: listed == ceil(exact/unit)*unit, not an exact count).   */
         bool fields_ok = false;
+        char begin_err[64] = "";
         if (admitted) {
             const cJSON *wire = cJSON_GetObjectItem(bres, "wire");
             const cJSON *us = cJSON_GetObjectItem(bres, "size_unit_shift");
@@ -1200,14 +1208,16 @@ static esp_err_t sb_get_file(const char *directory, const char *name,
                 us->valuedouble == (double)(int)us->valuedouble) {
                 s_stream_wire_ver = (uint8_t)wire->valuedouble;
                 s_stream_unit_shift = (uint8_t)us->valuedouble;
-                fields_ok = true;
+                fields_ok = sb_stream_begin_matches(
+                    bres, dir, name, expected_size, expected_ts, ts_is_null,
+                    begin_err, sizeof(begin_err));
             }
         }
         cJSON_Delete(broot);
         if (!admitted || !fields_ok) {
             const char *why = !admitted
                 ? ((bkind == SB_RSP_ERROR) ? bcode : "bad STREAM_BEGIN")
-                : "bad STREAM_BEGIN";
+                : (begin_err[0] ? begin_err : "bad STREAM_BEGIN");
             s_stream_rsp_rid = 0;
             xSemaphoreGive(s_req_mtx);
             stream_fail(why);
@@ -1514,43 +1524,241 @@ static bool sb_write_file_atomic(const char *path, const char *txt)
 /* Root + SETTINGS bundle: Identification.{json,tgt}, CurrentSettings.json and
  * STR.edf.  The importer needs them for identity, settings and the multi-day
  * summary, so they are refreshed before the day files. */
-static void sync_root_dir(const char *directory, const char *ledger_prefix)
+typedef struct {
+    bool listing_ok;
+    bool files_array_ok;
+    bool deferred;
+    int malformed;
+    int ambiguous;
+    int failed;
+    int pulled;
+} root_sync_result_t;
+
+/* Therapy/busy/stale refusals are expected deferrals, not a broken card. */
+static bool root_error_deferred(void)
 {
+    return !strcasecmp(s_last_code, "THERAPY_ACTIVE") ||
+           !strcasecmp(s_last_code, "THERAPY_UNKNOWN") ||
+           !strcasecmp(s_last_code, "SETUP_ACTIVE") ||
+           !strcasecmp(s_last_code, "BUSY") ||
+           !strcasecmp(s_last_code, "STALE");
+}
+
+/* Find a root ledger entry by canonical key, falling back to a legacy key
+ * that differs only by case.  The returned key is used for migration. */
+static cJSON *root_ledger_entry(const char *key, char *found, size_t cap)
+{
+    cJSON *root = cJSON_GetObjectItem(s_ledger, "root");
+    if (!root) return NULL;
+    cJSON *exact = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (exact) {
+        if (found) snprintf(found, cap, "%s", key);
+        return exact;
+    }
+    const char *slash = strrchr(key, '/');
+    const char *base = slash ? slash + 1 : key;
+    size_t prefix_len = slash ? (size_t)(base - key) : 0;
+    for (cJSON *it = root->child; it; it = it->next) {
+        if (!it->string) continue;
+        const char *it_base = strrchr(it->string, '/');
+        it_base = it_base ? it_base + 1 : it->string;
+        if (strcasecmp(it_base, base) != 0) continue;
+        if (prefix_len && strncasecmp(it->string, key, prefix_len) != 0) continue;
+        if (found) snprintf(found, cap, "%s", it->string);
+        return it;
+    }
+    return NULL;
+}
+
+static bool root_ledger_rekey(const char *canonical_key, const char *found_key)
+{
+    if (!found_key[0] || strcmp(canonical_key, found_key) == 0) return true;
+    cJSON *root = cJSON_GetObjectItem(s_ledger, "root");
+    if (!root) return false;
+    cJSON *item = cJSON_DetachItemFromObjectCaseSensitive(root, found_key);
+    if (!item) return false;
+    cJSON_DeleteItemFromObjectCaseSensitive(root, canonical_key);
+    if (!cJSON_AddItemToObject(root, canonical_key, item)) {
+        cJSON_Delete(item);
+        return false;
+    }
+    return true;
+}
+
+static bool root_ledger_store(const char *key, const char *size,
+                              const char *ts, bool ts_null)
+{
+    cJSON *root = cJSON_GetObjectItem(s_ledger, "root");
+    if (!root) return false;
+    cJSON_DeleteItemFromObjectCaseSensitive(root, key);
+    cJSON *n = cJSON_AddObjectToObject(root, key);
+    if (!n) return false;
+    cJSON_AddStringToObject(n, "size", size ? size : "");
+    if (ts_null) cJSON_AddNullToObject(n, "ts");
+    else cJSON_AddStringToObject(n, "ts", ts ? ts : "");
+    return ledger_save();
+}
+
+/* Retain a pulled root file as immutable evidence.  This does not yet
+ * replace the re-fetch policy: same-tuple rewrites remain possible until
+ * D5c is implemented, so the staging copy is still authoritative. */
+static void root_retain_source(const char *key, const char *path,                               const char *size, const char *ts,
+                               bool ts_null, const char *alias,
+                               const char *directory)
+{
+    if (!s_source_store_ready) return;
+    source_store_put_result_t put;
+    if (source_store_put_path("root", path, &put) != ESP_OK) {
+        ESP_LOGW(TAG, "source store: cannot retain %s", key);
+        return;
+    }
+    char existing[SOURCE_STORE_ID_HEX + 1] = "";
+    char existing_obs[128] = "";
+    esp_err_t found = source_store_find("root", key, size, ts, ts_null,
+                                        existing, sizeof(existing),
+                                        existing_obs, sizeof(existing_obs));
+    if (found == ESP_OK && !strcmp(existing, put.id)) return;
+    if (found == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "source store: ambiguous evidence for %s", key);
+        return;
+    }
+    cJSON *obs = cJSON_CreateObject();
+    if (!obs) return;
+    bool ok = cJSON_AddStringToObject(obs, "key", key) &&
+              cJSON_AddStringToObject(obs, "size", size) &&
+              (ts_null ? cJSON_AddNullToObject(obs, "ts")
+                       : cJSON_AddStringToObject(obs, "ts", ts)) &&
+              cJSON_AddStringToObject(obs, "alias", alias) &&
+              cJSON_AddStringToObject(obs, "directory", directory) &&
+              cJSON_AddNumberToObject(obs, "observed_at_ms",
+                                      (double)(esp_timer_get_time() / 1000));
+    if (!ok) {
+        cJSON_Delete(obs);
+        return;
+    }
+    char obs_id[96];
+    snprintf(obs_id, sizeof(obs_id), "%lld-%lu",
+             (long long)(esp_timer_get_time() / 1000),
+             (unsigned long)s_root_obs_seq++);
+    if (source_store_observe(put.id, obs_id, "root", obs) != ESP_OK)
+        ESP_LOGW(TAG, "source store: cannot record observation for %s", key);
+    cJSON_Delete(obs);
+}
+
+/* Root pull transactions (WP3).  Each attempt gets a unique id because the
+ * log refuses a second PREPARE for the same id.  A failed log write never
+ * blocks a pull: the existing staging/ledger path still runs. */
+static tx_log_t *s_tx;
+static uint32_t  s_tx_seq;
+
+static bool root_tx_begin(const char *key, const char *size, const char *ts,
+                          bool ts_null, char *id, size_t cap)
+{
+    if (!s_tx) return false;
+    if (snprintf(id, cap, "%s#%lu", key, (unsigned long)s_tx_seq++) >= (int)cap)
+        return false;
+    char pl[256];
+    snprintf(pl, sizeof(pl), "%s|%s", size ? size : "", ts_null ? "null" : (ts ? ts : ""));
+    if (tx_log_append(s_tx, TX_PREPARE, id, pl, strlen(pl)) == ESP_OK) return true;
+    ESP_LOGW(TAG, "tx: cannot record PREPARE for %s", key);
+    id[0] = '\0';
+    return false;
+}
+
+static void root_tx_end(const char *id, bool ok)
+{
+    if (!s_tx || !id[0]) return;
+    if (tx_log_append(s_tx, ok ? TX_COMMIT : TX_ABORT, id, NULL, 0) != ESP_OK)
+        ESP_LOGW(TAG, "tx: cannot record %s for %s", ok ? "COMMIT" : "ABORT", id);
+}
+
+static root_sync_result_t sync_root_dir(const char *directory,
+                                        const char *ledger_prefix)
+{
+    root_sync_result_t r = {0};
+    mkdir(SD_IMPORT_DIR, 0775);
+    mkdir(SD_IMPORT_DIR "/SETTINGS", 0775);
     cJSON *args = cJSON_CreateObject();
     cJSON_AddStringToObject(args, "directory", directory);
     cJSON *res = NULL;
     if (json_op("LIST_DIRECTORY", args, &res) != ESP_OK || !res) {
+        r.deferred = root_error_deferred();
+        if (!r.deferred) r.failed++;
+        ESP_LOGW(TAG, "root: %s listing failed (%s)", directory,
+                 s_last_code[0] ? s_last_code : "transport");
         cJSON_Delete(res);
-        return;
+        return r;
     }
+    r.listing_ok = true;
 
     cJSON *files = cJSON_GetObjectItem(res, "files");
     if (!cJSON_IsArray(files)) {
         ESP_LOGW(TAG, "root: %s listing has no files array", directory);
+        r.failed++;
         cJSON_Delete(res);
-        return;
+        return r;
     }
+    r.files_array_ok = true;
+
+    /* Diagnostic: log the exact names the card reports for this directory,
+     * bounded so a large listing cannot flood the log.  No extra card I/O. */
+    int shown = 0;
+    cJSON *lf;
+    cJSON_ArrayForEach(lf, files) {
+        if (shown++ >= 64) {
+            ESP_LOGI(TAG, "root listing %s: further entries omitted", directory);
+            break;
+        }
+        ESP_LOGI(TAG, "root listing %s: name=\"%s\" size=%s ts=%s", directory,
+                 cJSON_GetStringValue(cJSON_GetObjectItem(lf, "name")) ?: "?",
+                 cJSON_GetStringValue(cJSON_GetObjectItem(lf, "size")) ?: "?",
+                 cJSON_IsNull(cJSON_GetObjectItem(lf, "ts")) ? "null"
+                     : (cJSON_GetStringValue(cJSON_GetObjectItem(lf, "ts")) ?: "?"));
+    }
+
+    /* Reject ambiguous aliases before touching any of them: the contract
+     * says never pick one of two names that resolve to the same resource. */
+    int counts[SB_ROOT_NAME_COUNT] = {0};
     cJSON *f;
+    cJSON_ArrayForEach(f, files) {
+        const char *fn = cJSON_GetStringValue(cJSON_GetObjectItem(f, "name"));
+        int idx = sb_root_name_index(fn);
+        if (idx >= 0) counts[idx]++;
+    }
+    bool ambiguous[SB_ROOT_NAME_COUNT] = {0};
+    for (int i = 0; i < SB_ROOT_NAME_COUNT; i++) {
+        if (counts[i] > 1) {
+            ambiguous[i] = true;
+            r.ambiguous += counts[i];
+            r.failed++;
+            ESP_LOGW(TAG, "root: %s has %d aliases for %s; not choosing one",
+                     directory, counts[i], sb_root_name_at(i));
+        }
+    }
+
     cJSON_ArrayForEach(f, files) {
         const char *fn = cJSON_GetStringValue(cJSON_GetObjectItem(f, "name"));
         const char *size = cJSON_GetStringValue(cJSON_GetObjectItem(f, "size"));
         const char *ts = NULL;
         bool ts_null = false;
-        if (!fn || !size || !sb_ts_field(f, &ts, &ts_null)) {
+        int idx = sb_root_name_index(fn);
+        if (idx < 0) continue;
+        if (ambiguous[idx]) continue;
+        if (sb_root_name_has_path_separator(fn) ||
+            !size || !sb_ts_field(f, &ts, &ts_null)) {
             ESP_LOGW(TAG, "root: %s malformed file row", directory);
+            r.malformed++;
+            r.failed++;
             continue;
         }
-        /* Only the files the importer consumes. */
-        bool want = strcmp(fn, "STR.edf") == 0 ||
-                    strcmp(fn, "Identification.json") == 0 ||
-                    strcmp(fn, "Identification.tgt") == 0 ||
-                    strcmp(fn, "CurrentSettings.json") == 0;
-        if (!want) continue;
+        const char *canonical = sb_root_canonical_name(fn);
 
-        char key[96];
+        char key[96], canonical_key[96], found_key[96] = "";
         snprintf(key, sizeof(key), "%s%s", ledger_prefix, fn);
-        cJSON *root = cJSON_GetObjectItem(s_ledger, "root");
-        cJSON *e = root ? cJSON_GetObjectItem(root, key) : NULL;
+        snprintf(canonical_key, sizeof(canonical_key), "%s%s",
+                 ledger_prefix, canonical);
+        cJSON *e = root_ledger_entry(canonical_key, found_key,
+                                     sizeof(found_key));
         bool same = false;
         if (e) {
             const char *sz = cJSON_GetStringValue(cJSON_GetObjectItem(e, "size"));
@@ -1561,37 +1769,88 @@ static void sync_root_dir(const char *directory, const char *ledger_prefix)
                                     : (tt && ts && !strcmp(tt, ts));
             same = sz && size && !strcmp(sz, size) && ts_match;
         }
+
         /* The importer consumes a successfully imported root file, but the
          * ledger still records its tuple.  A ledger match alone must not
-         * suppress a re-fetch when the local copy is gone: the next root
-         * pass would have no identity/settings to verify. */
-        char local[240];
+         * suppress a re-fetch when the canonical local copy is gone. */
+        char local[240], canonical_local[240];
         snprintf(local, sizeof(local), "%s/%s%s", SD_IMPORT_DIR,
                  ledger_prefix, fn);
+        snprintf(canonical_local, sizeof(canonical_local), "%s/%s%s",
+                 SD_IMPORT_DIR, ledger_prefix, canonical);
         struct stat lst;
-        bool local_present = stat(local, &lst) == 0;
-        if (same && local_present) continue;
-
-        ESP_LOGI(TAG, "root: pulling %s (%s bytes)", key, size);
-        if (sb_get_file(directory, fn, size, ts, ts_null) != ESP_OK) {
-            ESP_LOGW(TAG, "root: %s failed (%s)", key, s_last_error);
+        bool local_present = stat(canonical_local, &lst) == 0;
+        if (same && local_present) {
+            if (!root_ledger_rekey(canonical_key, found_key) || !ledger_save()) {
+                ESP_LOGW(TAG, "root: ledger migration failed for %s", canonical_key);
+                r.failed++;
+            }
             continue;
         }
-        root = cJSON_GetObjectItem(s_ledger, "root");
-        if (root) {
-            cJSON_DeleteItemFromObject(root, key);
-            cJSON *n = cJSON_AddObjectToObject(root, key);
-            if (n) {
-                cJSON_AddStringToObject(n, "size", size);
-                if (ts_null) cJSON_AddNullToObject(n, "ts");
-                else cJSON_AddStringToObject(n, "ts", ts ? ts : "");
+
+        ESP_LOGI(TAG, "root: pulling %s as %s (%s bytes)", key, canonical, size);
+        char tx_id[96] = "";
+        if (!local_present && s_source_store_ready) {
+            char stored_id[SOURCE_STORE_ID_HEX + 1];
+            esp_err_t sf = source_store_find("root", canonical_key, size, ts,
+                                             ts_null, stored_id,
+                                             sizeof(stored_id), NULL, 0);
+            if (sf == ESP_OK) {
+                root_tx_begin(canonical_key, size, ts, ts_null, tx_id, sizeof(tx_id));
+                bool restored = source_store_copy_to(stored_id, canonical_local) == ESP_OK;
+                if (restored) {
+                    ESP_LOGI(TAG, "root: restored %s from source store (%s)",
+                             canonical_key, stored_id);
+                    if (!root_ledger_store(canonical_key, size, ts, ts_null)) {
+                        ESP_LOGW(TAG, "root: ledger save failed for %s", canonical_key);
+                        r.failed++;
+                    }
+                }
+                root_tx_end(tx_id, restored);
+                if (!restored) goto network_pull;
+
+                r.pulled++;
+                s_sync_files_done++;
+                continue;
             }
-            if (!ledger_save())
-                ESP_LOGW(TAG, "root: ledger save failed for %s", key);
+            if (sf == ESP_ERR_INVALID_STATE)
+                ESP_LOGW(TAG, "root: ambiguous source evidence for %s", canonical_key);
         }
+network_pull:
+        root_tx_begin(canonical_key, size, ts, ts_null, tx_id, sizeof(tx_id));
+        if (sb_get_file(directory, fn, size, ts, ts_null) != ESP_OK) {
+            ESP_LOGW(TAG, "root: %s failed (%s)", key, s_last_error);
+            root_tx_end(tx_id, false);
+            r.failed++;
+            continue;
+        }
+        /* sb_get_file() stages under the exposed alias; the importer reads
+         * the canonical name, so publish it under that name here. */
+        if (strcmp(fn, canonical) != 0 &&
+            sb_rename_replace(local, canonical_local) != 0) {
+            ESP_LOGW(TAG, "root: cannot rename %s to %s", local, canonical_local);
+            root_tx_end(tx_id, false);
+            r.failed++;
+            continue;
+        }
+        root_retain_source(canonical_key, canonical_local, size, ts, ts_null,
+                           fn, directory);
+
+        if (found_key[0] && strcmp(found_key, canonical_key) != 0) {
+            cJSON *root = cJSON_GetObjectItem(s_ledger, "root");
+            if (root) cJSON_DeleteItemFromObjectCaseSensitive(root, found_key);
+        }
+        bool ledger_ok = root_ledger_store(canonical_key, size, ts, ts_null);
+        if (!ledger_ok) {
+            ESP_LOGW(TAG, "root: ledger save failed for %s", canonical_key);
+            r.failed++;
+        }
+        root_tx_end(tx_id, ledger_ok);
+        r.pulled++;
         s_sync_files_done++;
     }
     cJSON_Delete(res);
+    return r;
 }
 
 /* One-line drift-health probe at the end of every sync pass.  The per-day
@@ -1635,6 +1894,7 @@ static void drift_probe_log(void)
 /* One sync pass: days newest-first, files smallest-first, BRP last. */
 static void sync_run(bool full)
 {
+    s_last_sync_attempt_ms = esp_timer_get_time() / 1000;
     /* normal sync follows the configured "days to keep in sync" window
      * so bridge pull and upload depth can't diverge; full stays 365  */
     const int days = full ? SB_SYNC_DAYS_FULL : uploader_max_days();
@@ -1647,8 +1907,36 @@ static void sync_run(bool full)
     }
 
     ledger_load();
-    sync_root_dir("A:\\", "");
-    sync_root_dir("A:\\SETTINGS", "SETTINGS/");
+    {
+        struct stat txst;
+        if (stat(SB_TX_LOG_PATH, &txst) == 0)
+            ESP_LOGI(TAG, "tx: log present, %ld bytes", (long)txst.st_size);
+        else
+            ESP_LOGW(TAG, "tx: log absent (errno=%d)", errno);
+    }
+    if (!s_tx) {
+        bool torn = false;
+        mkdir(SD_SESSIONS_DIR, 0775);
+        if (tx_log_open(SB_TX_LOG_PATH, &s_tx, &torn) != ESP_OK) {
+            ESP_LOGW(TAG, "tx: log unavailable; root pulls run without transaction records");
+            s_tx = NULL;
+        } else if (torn) {
+            ESP_LOGW(TAG, "tx: torn tail truncated in %s", SB_TX_LOG_PATH);
+        }
+    }
+    if (!s_source_store_ready) {
+        s_source_store_ready = source_store_init(NULL) == ESP_OK;
+        if (!s_source_store_ready)
+            ESP_LOGW(TAG, "source store unavailable; root evidence will not be retained");
+    }
+    int pass_fail = 0;
+    root_sync_result_t root_a = sync_root_dir("A:\\", "");
+    root_sync_result_t root_s = sync_root_dir("A:\\SETTINGS", "SETTINGS/");
+    if (root_a.deferred || root_s.deferred) {
+        ESP_LOGW(TAG, "sync: root checks deferred (therapy/busy)");
+        pass_fail++;
+    }
+    pass_fail += root_a.failed + root_s.failed;
     cJSON *list = cJSON_GetObjectItem(res, "days");
     if (!cJSON_IsArray(list)) {
         ESP_LOGW(TAG, "sync: LIST_RECENT_DAYS has no days array");
@@ -1658,7 +1946,6 @@ static void sync_run(bool full)
     bool catalog_complete = cJSON_IsTrue(
         cJSON_GetObjectItem(res, "catalog_complete"));
     bool hot_ready = cJSON_IsTrue(cJSON_GetObjectItem(res, "hot_ready"));
-    int pass_fail = 0;
     if (!catalog_complete || !hot_ready) {
         ESP_LOGW(TAG, "sync: catalog incomplete (complete=%d hot_ready=%d)",
                  catalog_complete, hot_ready);
@@ -2539,6 +2826,7 @@ cJSON *sb_ble_status_json(void)
     if (s_error[0]) cJSON_AddStringToObject(o, "error", s_error);
     if (s_last_error[0]) cJSON_AddStringToObject(o, "last_error", s_last_error);
     cJSON_AddNumberToObject(o, "last_sync_s", s_last_sync_ms / 1000);
+    cJSON_AddNumberToObject(o, "last_sync_attempt_s", s_last_sync_attempt_ms / 1000);
     cJSON_AddNumberToObject(o, "sync_days", s_sync_days_done);
     cJSON_AddNumberToObject(o, "sync_files", s_sync_files_done);
     /* live stream counters — lets the UI/diag tell a slow fetch from

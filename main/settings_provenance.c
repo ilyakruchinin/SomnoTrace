@@ -107,6 +107,41 @@ static bool manifest_matches(const cJSON *manifest, const char *day,
     return match;
 }
 
+/* A bridge-imported session whose manifest predates verified identity.  It
+ * carries no serial or family that could contradict the card, so the card's
+ * own native record for the day is the only evidence it can rely on. */
+static bool manifest_bridge_unverified(const cJSON *manifest, const char *serial, int family)
+{
+    if (!cJSON_IsObject(manifest)) return false;
+    const cJSON *origin = cJSON_GetObjectItemCaseSensitive(manifest, "import_source");
+    if (!cJSON_IsString(origin) || !origin->valuestring ||
+        strcmp(origin->valuestring, "somnobridge") != 0) return false;
+    if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(manifest, "source_identity_verified")))
+        return false;
+    const cJSON *sn = cJSON_GetObjectItemCaseSensitive(manifest, "source_serial");
+    if (cJSON_IsString(sn) && sn->valuestring && sn->valuestring[0] &&
+        (!serial || strcmp(sn->valuestring, serial) != 0)) return false;
+    const cJSON *fam = cJSON_GetObjectItemCaseSensitive(manifest, "source_device_family");
+    const char *want = settings_provenance_family_name(family);
+    if (cJSON_IsString(fam) && fam->valuestring && fam->valuestring[0] &&
+        (!want || strcmp(fam->valuestring, want) != 0)) return false;
+    return true;
+}
+
+bool settings_provenance_session_is_bridge_unverified(const char *day, const char *session,
+                                                      const char *serial, int family)
+{
+    if (!day || strlen(day) != 8 || !session || !session[0] || strchr(session, '/')) return false;
+    char path[420];
+    int n = snprintf(path, sizeof(path), "%s/%s/%s_session.json",
+                     SD_STREAMS_DIR, day, session);
+    if (n < 0 || (size_t)n >= sizeof(path)) return false;
+    cJSON *manifest = read_manifest(path);
+    bool result = manifest_bridge_unverified(manifest, serial, family);
+    cJSON_Delete(manifest);
+    return result;
+}
+
 bool settings_provenance_session_matches(const char *day, const char *session,
                                         const char *serial, int family)
 {
@@ -123,7 +158,8 @@ bool settings_provenance_session_matches(const char *day, const char *session,
     return match;
 }
 
-static cJSON *local_session_ids(const char *day, const char *serial, int family)
+static cJSON *local_session_ids_mode(const char *day, const char *serial, int family,
+                                     bool tolerant)
 {
     if (!day || strlen(day) != 8 || !serial || !serial[0] ||
         family == SETTINGS_FAMILY_UNKNOWN) return NULL;
@@ -166,6 +202,11 @@ static cJSON *local_session_ids(const char *day, const char *serial, int family)
         sid[sid_len] = '\0';
         bool imported = false;
         ok = manifest_matches(manifest, day, sid, serial, family, &imported);
+        if (!ok && tolerant && manifest_bridge_unverified(manifest, serial, family)) {
+            ok = true;
+            imported = true;
+            /* Counted as covered by the native record, not as local evidence. */
+        }
         if (ok && !imported) ok = add_sorted_id(ids, sid);
         cJSON_Delete(manifest);
         if (!ok) break;
@@ -175,12 +216,17 @@ static cJSON *local_session_ids(const char *day, const char *serial, int family)
     return ids;
 }
 
+static cJSON *local_session_ids(const char *day, const char *serial, int family)
+{
+    return local_session_ids_mode(day, serial, family, false);
+}
+
 bool settings_provenance_record_sessions(cJSON *root, const char *day)
 {
     cJSON *meta = cJSON_GetObjectItemCaseSensitive(root, SETTINGS_PROVENANCE_KEY);
     if (!cJSON_IsObject(meta)) return false;
-    cJSON *ids = local_session_ids(day, settings_provenance_serial(root),
-                                   settings_provenance_recorded_family(root));
+    cJSON *ids = local_session_ids_mode(day, settings_provenance_serial(root),
+                                        settings_provenance_recorded_family(root), true);
     if (!ids) return false;
     cJSON_DeleteItemFromObjectCaseSensitive(meta, "local_sessions");
     cJSON_DeleteItemFromObjectCaseSensitive(meta, "coverage_verified");
@@ -202,17 +248,12 @@ bool settings_provenance_covers_sessions(const cJSON *root, const char *day)
     if (!cJSON_IsArray(recorded) ||
         !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(meta, "coverage_verified")))
         return false;
-    cJSON *current = local_session_ids(day, settings_provenance_serial(root),
-                                       settings_provenance_recorded_family(root));
+    cJSON *current = local_session_ids_mode(day, settings_provenance_serial(root),
+                                            settings_provenance_recorded_family(root), true);
     if (!current) return false;
-    /* The root STR is imported before that day's sessions, so a snapshot
-     * with an empty recorded list is a valid pre-session snapshot once
-     * every current session matches its serial/family.  A non-empty list
-     * is a coverage promise: a new session stales it until re-import. */
-    if (cJSON_GetArraySize(recorded) == 0) {
-        cJSON_Delete(current);
-        return true;
-    }
+    /* Compare the current local-session set against the recorded set.  An
+     * empty recorded list covers only an empty current list: a later local
+     * session must stale the snapshot until a re-import records it. */
     bool covered = true;
     const cJSON *sid;
     cJSON_ArrayForEach(sid, current) {

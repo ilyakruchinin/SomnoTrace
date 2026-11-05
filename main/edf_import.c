@@ -1998,6 +1998,7 @@ static void overlay_as10_profile(cJSON *root, const cJSON *native, int mode)
 
 typedef enum {
     STR_IMPORT_OK,
+    STR_IMPORT_PARTIAL,   /* some days ambiguous; valid days imported, source kept */
     STR_IMPORT_RETAIN,
     STR_IMPORT_RETRY,
 } str_import_result_t;
@@ -2061,7 +2062,7 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
     if (!rec || !d) { free(rec); free(d); fclose(f); free(e); return STR_IMPORT_RETRY; }
 
     int written = 0, settings_written = 0;
-    bool retry = false, retain = false;
+    bool retry = false, retain = false, ambiguous_any = false;
     cJSON *latest = NULL;   /* newest S.* reconstruction (no CurrentSettings) */
     for (int64_t r = 0; r < e->n_records; r++) {
         if (!imp_edf_read_rec(e, f, r, rec)) { retry = true; break; }
@@ -2106,14 +2107,14 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
                 if (old && (!old_serial || strcmp(old_serial, ctx->src_serial) != 0 ||
                             !settings_provenance_is_family(old, as10 ? SETTINGS_FAMILY_AS10 : SETTINGS_FAMILY_AS11))) {
                     ESP_LOGE(TAG, "import: daily settings belong to another or unknown machine");
-                    retain = ambiguous = true;
+                    ambiguous_any = ambiguous = true;
                 } else if (!settings_provenance_set(native, SETTINGS_SOURCE_IMPORTED_STR, day, NULL) ||
                            !settings_provenance_set_serial(native, ctx->src_serial) ||
                            !settings_provenance_set_family(native, as10 ? SETTINGS_FAMILY_AS10 : SETTINGS_FAMILY_AS11)) {
                     retry = true;
                 } else if (!settings_provenance_record_sessions(native, day)) {
                     ESP_LOGW(TAG, "import: daily settings coverage is unverified");
-                    retain = ambiguous = true;
+                    ambiguous_any = ambiguous = true;
                 } else if ((applied > 0 || old) && (!old || !cJSON_Compare(old, native, true))) {
                     mkdir(SD_SESSIONS_DIR, 0775);
                     mkdir(SD_SUMMARIES_DIR, 0775);
@@ -2140,7 +2141,10 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
     free(e);
     u->spools_written += written;
     u->settings_written += settings_written;
-    return retry ? STR_IMPORT_RETRY : retain ? STR_IMPORT_RETAIN : STR_IMPORT_OK;
+    /* A single ambiguous day must not discard the whole source or the
+     * root identity needed by independent days (WP3). */
+    return retry ? STR_IMPORT_RETRY : retain ? STR_IMPORT_RETAIN :
+           ambiguous_any ? STR_IMPORT_PARTIAL : STR_IMPORT_OK;
 }
 
 /* Refresh device_metadata.json when the root pass resolved ident or
@@ -3694,9 +3698,19 @@ static esp_err_t process_root_pass(edf_import_ctx_t *ctx, edf_import_unit_t *u)
                               settings_provenance_family(ctx->ident) != SETTINGS_FAMILY_UNKNOWN;
     if (stat(IMP_IMPORT_DIR "/STR.edf", &st) == 0) {
         str_import_result_t result = import_str_edf(IMP_IMPORT_DIR "/STR.edf", ctx, u);
-        if (result != STR_IMPORT_OK) {
+        if (result == STR_IMPORT_RETAIN || result == STR_IMPORT_RETRY) {
             ESP_LOGW(TAG, "import: STR retained for retry");
             retain_root_for_next_run(ctx, u);
+            return ESP_OK;
+        }
+        if (result == STR_IMPORT_PARTIAL) {
+            /* Valid days were written above.  Keep the source files and the
+             * resolved identity/settings in memory so the same ctx can still
+             * import independent day groups; never clear identity here. */
+            ESP_LOGW(TAG, "import: STR has ambiguous days; keeping source, "
+                     "independent days imported");
+            ctx->root_retained = true;
+            u->root_retained = true;
             return ESP_OK;
         }
     }

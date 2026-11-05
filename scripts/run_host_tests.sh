@@ -165,7 +165,7 @@ run_test leak_roll_test     -I"$SHIM" -I"$MAIN_DIR" scripts/leak_roll_test.c "$M
 run_test bridge_indicator_test -I"$MAIN_DIR" scripts/bridge_indicator_test.c "$MAIN_DIR/bridge_indicator.c"
 # SomnoBridge wire helpers: frame header, v2 block codecs, IMPORT path mapping
 run_test sb_ble_test         -I"$SHIM" -I"$MAIN_DIR" -DSB_PROTO_HOST \
-    scripts/sb_ble_test.c "$MAIN_DIR/sb_proto.c" -lz
+    scripts/sb_ble_test.c "$MAIN_DIR/sb_proto.c" "$MAIN_DIR/sb_root.c" -lz
 # ntfy credential encoding: Basic/Bearer headers + the ?auth= query form
 run_test alert_auth_test     -I"$SHIM" -Icomponents/therapy_alert scripts/alert_auth_test.c components/therapy_alert/alert_auth.c
 run_test as11_adv_test       -I"$SHIM" -I"$MAIN_DIR" scripts/as11_adv_test.c "$MAIN_DIR/as11_adv.c"
@@ -197,6 +197,7 @@ else
     CJ_INC=""
     skip_test edf_gen_test "no cJSON (apt install libcjson-dev, or set CJSON_DIR=<dir with cJSON.c/.h>)"
     skip_test edf_properties_test "no cJSON"
+    skip_test source_store_test "no cJSON"
     skip_test upload_ox_test "no cJSON"
     skip_test upload_stage_test "no cJSON"
     skip_test br_parse_test "no cJSON"
@@ -208,10 +209,22 @@ fi
 if [ -n "$CJ_INC" ]; then
     run_test edf_gen_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
         "-DSD_MOUNT_POINT=\"$OUT/edf_gen_card\"" \
-        scripts/edf_gen_test.c "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" $CJ_SRC $CJ_LIB -lm
+        scripts/edf_gen_test.c "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" "$MAIN_DIR/settings_resolver.c" $CJ_SRC $CJ_LIB -lm
     # upstream's EDF pipeline property suite (54ae598)
     run_test edf_properties_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
-        scripts/edf_properties_test.c "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" $CJ_SRC $CJ_LIB -lm
+        scripts/edf_properties_test.c "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" "$MAIN_DIR/settings_resolver.c" $CJ_SRC $CJ_LIB -lm
+    # WP3 append-only transaction log: commit/replay, illegal transitions,
+    # torn-tail truncation, middle corruption, fault injection, backup restore.
+    run_test tx_log_test -I"$SHIM" -I"$MAIN_DIR" -DTX_LOG_FAULT_INJECT \
+        scripts/tx_log_test.c "$MAIN_DIR/tx_log.c"
+    # Pure WP4 resolver: identity gate, native/live/conflict decisions and
+    # the deterministic revision key.  No file or JSON I/O.
+    run_test settings_resolver_test -I"$SHIM" -I"$MAIN_DIR" \
+        scripts/settings_resolver_test.c "$MAIN_DIR/settings_resolver.c"
+    # Immutable source objects/observations: dedup, idempotence, corruption,
+    # orphan pruning.  Host hash is a deterministic test identity.
+    run_test source_store_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" -DSOURCE_STORE_HOST \
+        scripts/source_store_test.c "$MAIN_DIR/source_store.c" $CJ_SRC $CJ_LIB
     # Oximetry upload-state store: the 64-slot-table overflow that kept
     # re-uploading the same recording.  Needs real cJSON (the shim's Parse
     # returns NULL) and scratch dirs under /tmp for a fake card + state tree.
@@ -253,7 +266,7 @@ if [ -n "$CJ_INC" ]; then
     run_test edf_roundtrip_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
         -DEDF_IMPORT_HOST '-DSD_MOUNT_POINT="/tmp/somnotrace_rt/sd"' \
         scripts/edf_roundtrip_test.c "$MAIN_DIR/edf_import.c" \
-        "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" $CJ_SRC $CJ_LIB -lm
+        "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" "$MAIN_DIR/settings_resolver.c" $CJ_SRC $CJ_LIB -lm
 fi
 
 # The mutation harness's TEXTUAL layer has nothing else to catch a mistake in it. Every

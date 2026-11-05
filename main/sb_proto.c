@@ -24,6 +24,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "cJSON.h"
 #include "sb_proto.h"
@@ -197,6 +198,91 @@ sb_rsp_kind_t sb_rsp_classify(const struct cJSON *root, struct cJSON **result,
     if (!ec) return SB_RSP_BAD;
     if (code && code_cap) snprintf(code, code_cap, "%s", ec);
     return SB_RSP_ERROR;
+}
+
+/* Normalise a directory to the bridge's logical form: "/", "/SETTINGS",
+ * "/DATALOG/<day>".  Accepts drive-prefixed backslash paths ("A:\\SETTINGS")
+ * from the client and the bridge's own logical output alike.            */
+static bool sb_dir_norm(const char *in, char *out, size_t cap)
+{
+    if (!in || !out || cap < 2) return false;
+    const char *p = in;
+    if ((p[0] == 'A' || p[0] == 'a') && p[1] == ':') p += 2;
+    size_t n = 0;
+    out[n++] = '/';
+    for (; *p; p++) {
+        char c = (*p == '\\') ? '/' : *p;
+        if (c == '/' && n > 0 && out[n - 1] == '/') continue;
+        if (n + 1 >= cap) return false;
+        out[n++] = c;
+    }
+    while (n > 1 && out[n - 1] == '/') n--;
+    out[n] = '\0';
+    return true;
+}
+
+static bool sb_dir_same(const char *a, const char *b)
+{
+    char na[96], nb[96];
+    if (!sb_dir_norm(a, na, sizeof(na)) || !sb_dir_norm(b, nb, sizeof(nb)))
+        return false;
+    return strcasecmp(na, nb) == 0;
+}
+
+static bool json_field_eq(const struct cJSON *obj, const char *key,
+                          const char *want)
+{
+    const struct cJSON *v = cJSON_GetObjectItem(obj, key);
+    return cJSON_IsString(v) && v->valuestring && want &&
+           strcmp(v->valuestring, want) == 0;
+}
+
+bool sb_stream_begin_matches(const struct cJSON *result,
+                             const char *directory, const char *name,
+                             const char *expected_size,
+                             const char *expected_ts, bool ts_is_null,
+                             char *err, size_t err_cap)
+{
+    if (err && err_cap) err[0] = '\0';
+    if (!cJSON_IsObject(result) || !directory || !name) {
+        if (err && err_cap) snprintf(err, err_cap, "bad STREAM_BEGIN");
+        return false;
+    }
+    const struct cJSON *dir = cJSON_GetObjectItem(result, "directory");
+    if (!cJSON_IsString(dir) || !dir->valuestring ||
+        !sb_dir_same(dir->valuestring, directory)) {
+        if (err && err_cap) snprintf(err, err_cap, "begin directory");
+        return false;
+    }
+    const struct cJSON *nm = cJSON_GetObjectItem(result, "name");
+    if (!cJSON_IsString(nm) || !nm->valuestring ||
+        strcmp(nm->valuestring, name) != 0) {
+        if (err && err_cap) snprintf(err, err_cap, "begin name");
+        return false;
+    }
+    if (!expected_size || !expected_size[0]) return true;
+    if (!json_field_eq(result, "listed_size", expected_size)) {
+        if (err && err_cap) snprintf(err, err_cap, "begin listed size");
+        return false;
+    }
+    const struct cJSON *before = cJSON_GetObjectItem(result, "source_before");
+    if (!cJSON_IsObject(before) ||
+        !json_field_eq(before, "size", expected_size)) {
+        if (err && err_cap) snprintf(err, err_cap, "begin source size");
+        return false;
+    }
+    const struct cJSON *ts = cJSON_GetObjectItem(before, "ts");
+    if (ts_is_null) {
+        if (!cJSON_IsNull(ts)) {
+            if (err && err_cap) snprintf(err, err_cap, "begin source timestamp");
+            return false;
+        }
+    } else if (!cJSON_IsString(ts) || !ts->valuestring ||
+               !expected_ts || strcmp(ts->valuestring, expected_ts) != 0) {
+        if (err && err_cap) snprintf(err, err_cap, "begin source timestamp");
+        return false;
+    }
+    return true;
 }
 
 unsigned sb_stream_retry_ms(const char *code)

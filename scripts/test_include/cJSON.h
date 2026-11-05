@@ -88,6 +88,11 @@ static inline bool cJSON_IsNumber(const cJSON *i)
     return i && i->type == cJSON_Number;
 }
 
+static inline bool cJSON_IsNull(const cJSON *i)
+{
+    return i && i->type == cJSON_NULL;
+}
+
 static inline bool cJSON_IsArray(const cJSON *i)
 {
     return i && i->type == cJSON_Array;
@@ -181,6 +186,7 @@ static inline void cJSON_AddNullToObject(cJSON *obj, const char *name)
     if (!obj) return;
     cJSON *item = (cJSON *)calloc(1, sizeof(cJSON));
     if (!item) return;
+    item->type = cJSON_NULL;
     if (name) item->string = _test_strdup(name);
     cJSON_AddItemToArray(obj, item);
 }

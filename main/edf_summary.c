@@ -23,6 +23,7 @@
 
 #include "edf_summary.h"
 #include "settings_provenance.h"
+#include "settings_resolver.h"
 #include "edf_as10_settings.h"
 #include <time.h>
 
@@ -1605,6 +1606,114 @@ static cJSON *read_daily_settings(const char *day, int family, const char *seria
     return NULL;
 }
 
+/* WP4 authority gate.  The scoped resolver decides whether the daily record
+ * found by read_daily_settings() may supply settings for a day.  It is
+ * fail-closed: it can withhold a settings source but never adds one, so a
+ * resolver "unknown" overrides the legacy lookup. */
+#define RESOLVER_MAX_SESSIONS 64
+
+static uint64_t resolver_hash_str(uint64_t h, const char *s)
+{
+    for (; s && *s; s++) {
+        h ^= (uint8_t)*s;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static bool resolver_authorises_day(const char *day, int family, const char *serial,
+                                    const cJSON *day_settings)
+{
+    if (!day || strlen(day) != 8) return false;
+    resolver_session_t sessions[RESOLVER_MAX_SESSIONS];
+    size_t n = 0;
+    char dir_path[300];
+    snprintf(dir_path, sizeof(dir_path), "%s/%s", SD_STREAMS_DIR, day);
+    DIR *dir = opendir(dir_path);
+    if (dir) {
+        struct dirent *ent;
+        const char suffix[] = "_session.json";
+        while ((ent = readdir(dir)) != NULL) {
+            size_t len = strlen(ent->d_name), tail = sizeof(suffix) - 1;
+            if (len <= tail || strcmp(ent->d_name + len - tail, suffix) != 0) continue;
+            if (n >= RESOLVER_MAX_SESSIONS || len - tail >= 100) { n = SIZE_MAX; break; }
+            char sid[100];
+            memcpy(sid, ent->d_name, len - tail);
+            sid[len - tail] = '\0';
+            resolver_session_t *s = &sessions[n];
+            memset(s, 0, sizeof(*s));
+            s->id_hash = resolver_hash_str(0xcbf29ce484222325ULL, sid);
+            s->verified = settings_provenance_session_matches(day, sid, serial, family);
+            s->serial_match = s->family_match = s->verified;
+            if (!s->verified && settings_provenance_session_is_bridge_unverified(day, sid, serial, family)) {
+                s->bridge_unverified = true;
+                s->serial_match = s->family_match = true;
+            }
+            char sp[420];
+            snprintf(sp, sizeof(sp), "%s/%s.live.settings.json", dir_path, sid);
+            cJSON *live = edf_read_json_file(sp);
+            s->live_capture = settings_provenance_is(live, SETTINGS_SOURCE_LIVE, day, sid);
+            if (live) {
+                cJSON *profiles = cJSON_GetObjectItem(live, "SettingProfiles");
+                char *txt = profiles ? cJSON_PrintUnformatted(profiles) : NULL;
+                s->settings_digest = txt ? resolver_hash_str(0xcbf29ce484222325ULL, txt) : 0;
+                free(txt);
+                cJSON_Delete(live);
+            }
+            n++;
+        }
+        closedir(dir);
+    }
+    if (n == SIZE_MAX) {
+        ESP_LOGW(TAG, "resolver: day=%s has more than %d sessions; daily settings withheld",
+                 day, RESOLVER_MAX_SESSIONS);
+        return false;
+    }
+
+    resolver_input_t in;
+    memset(&in, 0, sizeof(in));
+    in.export_identity_known = serial && serial[0] && family != SETTINGS_FAMILY_UNKNOWN;
+    in.native_present = day_settings != NULL &&
+        settings_provenance_is(day_settings, SETTINGS_SOURCE_IMPORTED_STR, day, NULL);
+    const char *ns = settings_provenance_serial(day_settings);
+    in.native_verified = in.native_present && ns && serial && strcmp(ns, serial) == 0 &&
+                         settings_provenance_is_family(day_settings, family);
+    in.native_serial_match = in.native_verified;
+    in.native_family_match = in.native_verified;
+    in.native_window_covers_all = in.native_present &&
+        settings_provenance_covers_sessions(day_settings, day);
+    in.sessions = sessions;
+    in.n_sessions = n;
+
+    resolver_state_t st = settings_resolve_day(&in);
+    bool authorised = st == RES_APPLY_NATIVE || st == RES_APPLY_LIVE;
+    if (authorised) {
+        ESP_LOGI(TAG, "resolver day=%s state=%s sessions=%u", day,
+                 settings_resolver_state_name(st), (unsigned)n);
+    } else if (!day_settings) {
+        ESP_LOGI(TAG, "resolver day=%s state=%s sessions=%u: no daily record (unknown)",
+                 day, settings_resolver_state_name(st), (unsigned)n);
+    } else {
+        ESP_LOGW(TAG, "resolver day=%s state=%s sessions=%u: daily settings withheld",
+                 day, settings_resolver_state_name(st), (unsigned)n);
+    }
+    return authorised;
+}
+
+/* Gate a daily record found by read_daily_settings().  Takes ownership.  Every
+ * STR day is evaluated and logged, including days with no record; a missing
+ * record stays NULL, so output for those days is unchanged. */
+static cJSON *resolver_gate_daily(const char *day, int family, const char *serial,
+                                  cJSON *day_settings)
+{
+    bool authorised = resolver_authorises_day(day, family, serial, day_settings);
+    if (day_settings && !authorised) {
+        cJSON_Delete(day_settings);
+        return NULL;
+    }
+    return day_settings;
+}
+
 static void apply_as10_settings(int16_t *values, const cJSON *settings)
 {
     const cJSON *fields = cJSON_GetObjectItemCaseSensitive(settings, "_as10_edf_settings");
@@ -1818,7 +1927,8 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         build_str_mask_events(ctx, rec->values, rec->mask_on_extra,
                               rec->mask_off_extra, period_start, record_drift_ms);
 
-        cJSON *day_settings = read_daily_settings(as11_day_label, family, serial);
+        cJSON *day_settings = resolver_gate_daily(as11_day_label, family, serial,
+                                                  read_daily_settings(as11_day_label, family, serial));
         const cJSON *settings_to_use = day_settings;
         if (!settings_to_use && family == SETTINGS_FAMILY_AS11 &&
             strcmp(as11_day_label, current_day_label) == 0 &&
@@ -1872,7 +1982,8 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
     if (!current_day_found && n_records < STR_MAX_DAYS + 1) {
         ESP_LOGI(TAG, "STR.edf: synthesizing current day record (day=%s)",
                  current_day_label);
-        cJSON *day_settings = read_daily_settings(current_day_label, family, serial);
+        cJSON *day_settings = resolver_gate_daily(current_day_label, family, serial,
+                                                  read_daily_settings(current_day_label, family, serial));
         const cJSON *current_settings = day_settings;
         if (!current_settings && family == SETTINGS_FAMILY_AS11 &&
             settings_provenance_is(settings_json, SETTINGS_SOURCE_LIVE,

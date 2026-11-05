@@ -42,6 +42,7 @@
 
 #include "cJSON.h"
 #include "sb_proto.h"
+#include "sb_root.h"
 
 static int checks, fails;
 
@@ -422,6 +423,116 @@ static void test_hex_str_ok(void)
     CHECK(sb_hex_str_ok("", 0), "empty with n=0 vacuously true");
 }
 
+static void test_root_names(void)
+{
+    CHECK(sb_root_name_index("STR.edf") == 0, "canonical STR index");
+    CHECK(sb_root_name_index("str.EDF") == 0, "mixed-case STR index");
+    CHECK_STR(sb_root_canonical_name("str.EDF"), "STR.edf",
+              "mixed-case STR canonical name");
+    CHECK_STR(sb_root_canonical_name("IDENTIFICATION.JSON"), "Identification.json",
+              "mixed-case identification canonical name");
+    CHECK_STR(sb_root_canonical_name("currentsettings.json"), "CurrentSettings.json",
+              "mixed-case settings canonical name");
+    CHECK(sb_root_canonical_name("other.edf") == NULL, "unknown root name");
+    CHECK(sb_root_name_index("") == -1, "empty root name");
+    CHECK(sb_root_name_index(NULL) == -1, "NULL root name");
+    CHECK(sb_root_name_has_path_separator("A/STR.edf"), "slash rejected");
+    CHECK(sb_root_name_has_path_separator("A\\STR.edf"), "backslash rejected");
+    CHECK(!sb_root_name_has_path_separator("STR.edf"), "plain name accepted");
+}
+
+static void test_stream_begin_match(void)
+{
+    char err[64];
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddStringToObject(r, "directory", "A:\\");
+    cJSON_AddStringToObject(r, "name", "STR.EDF");
+    cJSON_AddStringToObject(r, "listed_size", "1024");
+    cJSON *before = cJSON_CreateObject();
+    cJSON_AddStringToObject(before, "size", "1024");
+    cJSON_AddStringToObject(before, "ts", "2026-01-01");
+    cJSON_AddItemToObject(r, "source_before", before);
+
+    CHECK(sb_stream_begin_matches(r, "a:\\", "STR.EDF", "1024",
+                                  "2026-01-01", false, err, sizeof(err)),
+          "matching begin accepted");
+    CHECK(!sb_stream_begin_matches(r, "A:\\", "STR.edf", "1024",
+                                   "2026-01-01", false, err, sizeof(err)),
+          "name is matched exactly");
+    CHECK(!sb_stream_begin_matches(r, "A:\\", "STR.EDF", "2048",
+                                   "2026-01-01", false, err, sizeof(err)),
+          "listed size mismatch rejected");
+    CHECK(!sb_stream_begin_matches(r, "A:\\", "STR.EDF", "1024",
+                                   "2026-01-02", false, err, sizeof(err)),
+          "source timestamp mismatch rejected");
+    CHECK(!sb_stream_begin_matches(r, "A:\\", "STR.EDF", "1024",
+                                   NULL, true, err, sizeof(err)),
+          "non-null source timestamp rejected when null expected");
+    cJSON_Delete(r);
+
+    cJSON *n = cJSON_CreateObject();
+    cJSON_AddStringToObject(n, "directory", "A:\\");
+    cJSON_AddStringToObject(n, "name", "STR.edf");
+    cJSON_AddStringToObject(n, "listed_size", "1024");
+    cJSON *nb = cJSON_CreateObject();
+    cJSON_AddStringToObject(nb, "size", "1024");
+    cJSON_AddNullToObject(nb, "ts");
+    cJSON_AddItemToObject(n, "source_before", nb);
+    CHECK(sb_stream_begin_matches(n, "A:\\", "STR.edf", "1024",
+                                  NULL, true, err, sizeof(err)),
+          "null source timestamp accepted");
+    CHECK(!sb_stream_begin_matches(n, "A:\\", "STR.edf", "1024",
+                                   "2026-01-01", false, err, sizeof(err)),
+          "null source timestamp rejected when a value is expected");
+    cJSON_Delete(n);
+
+    /* The bridge reports directories in logical form ("/", "/SETTINGS",
+     * "/DATALOG/<day>") while the client requests drive-prefixed paths. */
+    cJSON *d = cJSON_CreateObject();
+    cJSON_AddStringToObject(d, "directory", "/SETTINGS");
+    cJSON_AddStringToObject(d, "name", "CurrentSettings.json");
+    cJSON_AddStringToObject(d, "listed_size", "3072");
+    cJSON *db = cJSON_CreateObject();
+    cJSON_AddStringToObject(db, "size", "3072");
+    cJSON_AddNullToObject(db, "ts");
+    cJSON_AddItemToObject(d, "source_before", db);
+    CHECK(sb_stream_begin_matches(d, "A:\\SETTINGS", "CurrentSettings.json",
+                                  "3072", NULL, true, err, sizeof(err)),
+          "logical SETTINGS directory matches drive-prefixed request");
+    CHECK(!sb_stream_begin_matches(d, "A:\\", "CurrentSettings.json",
+                                   "3072", NULL, true, err, sizeof(err)),
+          "SETTINGS listing does not match root request");
+    cJSON_Delete(d);
+
+    cJSON *rl = cJSON_CreateObject();
+    cJSON_AddStringToObject(rl, "directory", "/");
+    cJSON_AddStringToObject(rl, "name", "STR.edf");
+    cJSON_AddStringToObject(rl, "listed_size", "1024");
+    cJSON *rb = cJSON_CreateObject();
+    cJSON_AddStringToObject(rb, "size", "1024");
+    cJSON_AddStringToObject(rb, "ts", "2026-01-01 00:00:00");
+    cJSON_AddItemToObject(rl, "source_before", rb);
+    CHECK(sb_stream_begin_matches(rl, "A:\\", "STR.edf", "1024",
+                                  "2026-01-01 00:00:00", false,
+                                  err, sizeof(err)),
+          "logical root directory matches A:\\ request");
+
+    cJSON *dd = cJSON_CreateObject();
+    cJSON_AddStringToObject(dd, "directory", "/DATALOG/20240101");
+    cJSON_AddStringToObject(dd, "name", "20240101_220000_BRP.edf");
+    cJSON_AddStringToObject(dd, "listed_size", "1024");
+    cJSON *db2 = cJSON_CreateObject();
+    cJSON_AddStringToObject(db2, "size", "1024");
+    cJSON_AddStringToObject(db2, "ts", "t");
+    cJSON_AddItemToObject(dd, "source_before", db2);
+    CHECK(sb_stream_begin_matches(dd, "A:\\DATALOG\\20240101",
+                                  "20240101_220000_BRP.edf", "1024", "t",
+                                  false, err, sizeof(err)),
+          "logical day directory matches DATALOG request");
+    cJSON_Delete(dd);
+    cJSON_Delete(rl);
+}
+
 int main(void)
 {
     test_header();
@@ -429,10 +540,12 @@ int main(void)
     test_codecs();
     test_paths();
     test_rsp_classify();
+    test_stream_begin_match();
     test_retry_policy();
     test_seq_class();
     test_parse_u64();
     test_hex_str_ok();
+    test_root_names();
     printf("sb_ble_test: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

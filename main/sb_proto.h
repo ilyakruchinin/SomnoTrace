@@ -87,6 +87,15 @@ typedef enum {
 sb_rsp_kind_t sb_rsp_classify(const struct cJSON *root, struct cJSON **result,
                               char *code, size_t code_cap);
 
+/* Validate a STREAM_BEGIN result against the requested source tuple before
+ * granting credit.  `expected_size`/`expected_ts` may be NULL when the caller
+ * has no listing tuple; the directory/name check still applies. */
+bool sb_stream_begin_matches(const struct cJSON *result,
+                             const char *directory, const char *name,
+                             const char *expected_size,
+                             const char *expected_ts, bool ts_is_null,
+                             char *err, size_t err_cap);
+
 /* How long to wait before retrying a transient stream error: STALE means
  * the bridge queued a day rescan (~10 s); BUSY means the previous stream
  * is still tearing down.  Local transport terminations (sequence gap,

@@ -146,5 +146,7 @@ static inline bool settings_provenance_is(const cJSON *root, const char *source,
  * recorded after the import. Track which local sessions existed at import. */
 bool settings_provenance_record_sessions(cJSON *root, const char *day);
 bool settings_provenance_covers_sessions(const cJSON *root, const char *day);
+bool settings_provenance_session_is_bridge_unverified(const char *day, const char *session,
+                                                      const char *serial, int family);
 bool settings_provenance_session_matches(const char *day, const char *session,
                                         const char *serial, int family);

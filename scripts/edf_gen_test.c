@@ -175,9 +175,10 @@ static uint8_t *read_file(const char *path, size_t *len)
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    uint8_t *buf = malloc(n > 0 ? (size_t)n : 1);
+    uint8_t *buf = malloc((size_t)n + 1);
     assert(buf);
     if (n > 0 && fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); fclose(f); return NULL; }
+    buf[n] = '\0';
     fclose(f);
     *len = (size_t)n;
     return buf;
@@ -1406,6 +1407,22 @@ static void write_live_ident(const char *path, const char *day, const char *sid)
     }
 }
 
+/* The host suite uses the fixed /somnotrace tree, so a previous run can
+ * leave a trusted daily snapshot behind.  Reset only this test's day. */
+static void reset_day_state(const char *day)
+{
+    char dir[400], path[600];
+    snprintf(dir, sizeof(dir), "%s/%s", SD_STREAMS_DIR, day);
+    rmtree(dir);
+    mk("%s", dir);
+    snprintf(path, sizeof(path), "%s/%s.settings.json", SD_SUMMARIES_DIR, day);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/%s.live.settings.json", SD_SUMMARIES_DIR, day);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/%s.imported.settings.json", SD_SUMMARIES_DIR, day);
+    unlink(path);
+}
+
 static void test_daily_settings_provenance(void)
 {
     const char *day = "20260301";
@@ -1416,8 +1433,8 @@ static void test_daily_settings_provenance(void)
     mk("%s", SD_SESSIONS_DIR);
     mk("%s", SD_STREAMS_DIR);
     mk("%s", SD_SUMMARIES_DIR);
+    reset_day_state(day);
     snprintf(dir, sizeof(dir), "%s/%s", SD_STREAMS_DIR, day);
-    mk("%s", dir);
 
     cJSON *settings = cJSON_Parse(
         "{\"SettingProfiles\":{\"ActiveProfiles\":{\"TherapyProfile\":\"CpapProfile\"},"
@@ -1512,6 +1529,12 @@ static void test_daily_settings_provenance(void)
         cJSON_AddBoolToObject(unchecked_meta, "coverage_verified", true);
         CHECK(!settings_provenance_covers_sessions(unchecked, "20260227"),
               "absent coverage is not proof");
+        cJSON_DeleteItemFromObjectCaseSensitive(unchecked_meta, "local_sessions");
+        cJSON_AddArrayToObject(unchecked_meta, "local_sessions");
+        CHECK(settings_provenance_covers_sessions(unchecked, "20260228"),
+              "empty recorded coverage covers an empty day");
+        CHECK(!settings_provenance_covers_sessions(unchecked, day),
+              "empty recorded coverage must not cover a later local session");
         cJSON_Delete(unchecked);
         snprintf(path, sizeof(path), "%s/%s.imported.settings.json", SD_SUMMARIES_DIR, day);
         json = cJSON_PrintUnformatted(native);
@@ -1592,8 +1615,9 @@ static void test_str_settings_history_end_to_end(void)
     const char *day = "20260302";
     const int64_t start = START_MS + 86400000LL;
     char dir[400], path[600], out[400], current_spool[600];
+    reset_day_state(day);
+    reset_day_state("20260228");
     snprintf(dir, sizeof(dir), "%s/%s", SD_STREAMS_DIR, day);
-    mk("%s", dir);
     snprintf(out, sizeof(out), "%s/str_provenance", g_root);
     mk("%s", out);
 
@@ -1711,6 +1735,72 @@ static void test_str_settings_history_end_to_end(void)
         free(bytes);
         cJSON_Delete(borrowed);
     }
+
+    /* A historical-day rebuild must refresh the cumulative STR without
+     * replacing the card's current identity/settings. */
+    snprintf(path, sizeof(path), "%s/%s_ident.json", dir, sid);
+    write_live_ident(path, day, sid);
+    char ident_out[500], cs_out[500];
+    snprintf(ident_out, sizeof(ident_out), "%s/Identification.json", out);
+    snprintf(cs_out, sizeof(cs_out), "%s/SETTINGS/CurrentSettings.json", out);
+    mk("%s/SETTINGS", out);
+    write_text(ident_out, "sentinel-ident");
+    write_text(cs_out, "sentinel-settings");
+    CHECK(edf_gen_generate_ex(out, dir, sid, start, start + 7200000, 0,
+                              EDF_GEN_SHARED_HISTORICAL) == ESP_OK,
+          "historical shared pass");
+    size_t ident_len = 0, cs_len = 0;
+    uint8_t *ident_bytes = read_file(ident_out, &ident_len);
+    uint8_t *cs_bytes = read_file(cs_out, &cs_len);
+    CHECK(ident_bytes && ident_len == strlen("sentinel-ident") &&
+          memcmp(ident_bytes, "sentinel-ident", ident_len) == 0,
+          "historical rebuild preserves current Identification.json");
+    CHECK(cs_bytes && cs_len == strlen("sentinel-settings") &&
+          memcmp(cs_bytes, "sentinel-settings", cs_len) == 0,
+          "historical rebuild preserves current CurrentSettings.json");
+    free(ident_bytes);
+    free(cs_bytes);
+
+    /* Exporting a provenance-marked live capture must not publish the
+     * internal marker in the device-compatible root artifacts. */
+    CHECK(edf_gen_generate_ex(out, dir, sid, start, start + 7200000, 0,
+                              EDF_GEN_SHARED) == ESP_OK,
+          "current shared pass");
+    ident_bytes = read_file(ident_out, &ident_len);
+    cs_bytes = read_file(cs_out, &cs_len);
+    cJSON *published_ident = ident_bytes ? cJSON_Parse((char *)ident_bytes) : NULL;
+    cJSON *published_settings = cs_bytes ? cJSON_Parse((char *)cs_bytes) : NULL;
+    CHECK(published_ident &&
+          cJSON_GetObjectItem(published_ident, SETTINGS_PROVENANCE_KEY) == NULL,
+          "Identification.json must not publish provenance");
+    CHECK(published_settings &&
+          cJSON_GetObjectItem(published_settings, SETTINGS_PROVENANCE_KEY) == NULL,
+          "CurrentSettings.json must not publish provenance");
+    cJSON_Delete(published_ident);
+    cJSON_Delete(published_settings);
+    free(ident_bytes);
+    free(cs_bytes);
+
+    /* Historical daily evidence must not replace CurrentSettings even when
+     * it is the only settings source available for the rebuild. */
+    snprintf(path, sizeof(path), "%s/%s.live.settings.json", dir, sid);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/%s_settings.json", dir, sid);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/%s.settings.json", SD_SUMMARIES_DIR, day);
+    char *legacy = cJSON_PrintUnformatted(settings);
+    write_text(path, legacy);
+    free(legacy);
+    write_text(cs_out, "sentinel-current");
+    CHECK(edf_gen_generate_ex(out, dir, sid, start, start + 7200000, 0,
+                              EDF_GEN_SHARED) == ESP_OK,
+          "legacy settings shared pass");
+    cs_bytes = read_file(cs_out, &cs_len);
+    CHECK(cs_bytes && cs_len == strlen("sentinel-current") &&
+          memcmp(cs_bytes, "sentinel-current", cs_len) == 0,
+          "historical settings must not replace CurrentSettings.json");
+    free(cs_bytes);
+
     cJSON_Delete(ident);
     cJSON_Delete(settings);
 }
@@ -2414,6 +2504,38 @@ static void test_annotation_dedup_orders_and_keeps_distinct(void)
     CHECK(sort_and_dedup_events(ev, 0) == 0, "an empty list is handled");
 }
 
+static void test_resolver_gates_daily_settings(void)
+{
+    set_tz("UTC");
+    const char *day = "20260310";
+    char path[600];
+    reset_day_state(day);
+    cJSON *native = cJSON_Parse(
+        "{\"SettingProfiles\":{\"ActiveProfiles\":{\"TherapyProfile\":\"CpapProfile\"}}}");
+    CHECK(native && settings_provenance_set(native, SETTINGS_SOURCE_IMPORTED_STR, day, NULL) &&
+          settings_provenance_set_serial(native, "fixture-machine") &&
+          settings_provenance_set_family(native, SETTINGS_FAMILY_AS11) &&
+          settings_provenance_record_sessions(native, day), "gate: native record");
+    if (!native) return;
+    snprintf(path, sizeof(path), "%s/%s/unverified_session.json", SD_STREAMS_DIR, day);
+    write_text(path, "{}");
+    CHECK(!resolver_authorises_day(day, SETTINGS_FAMILY_AS11, "fixture-machine", native),
+          "gate: unverified local session withholds the native record");
+    unlink(path);
+    CHECK(resolver_authorises_day(day, SETTINGS_FAMILY_AS11, "fixture-machine", native),
+          "gate: verified native record with no local sessions applies");
+    snprintf(path, sizeof(path), "%s/%s/bridge_session.json", SD_STREAMS_DIR, day);
+    write_text(path, "{\"import_source\":\"somnobridge\"}");
+    CHECK(resolver_authorises_day(day, SETTINGS_FAMILY_AS11, "fixture-machine", native),
+          "gate: bridge import without identity is covered by the verified native record");
+    unlink(path);
+    CHECK(!resolver_authorises_day(day, SETTINGS_FAMILY_AS11, "other-machine", native),
+          "gate: native record from another machine is withheld");
+    cJSON_Delete(native);
+    CHECK(resolver_gate_daily(day, SETTINGS_FAMILY_AS11, "fixture-machine", NULL) == NULL,
+          "gate: no record stays unknown");
+}
+
 int main(void)
 {
     snprintf(g_root, sizeof(g_root), "%s/snt_edf_test_XXXXXX",
@@ -2471,6 +2593,8 @@ int main(void)
         test_daily_settings_provenance, NULL);
     run("STR settings history preserves unknowns and trusted snapshots",
         test_str_settings_history_end_to_end, NULL);
+    run("the resolver gates daily settings fail-closed",
+        test_resolver_gates_daily_settings, NULL);
 
     run("crc32 matches the published CRC-32/ISO-HDLC check vector",
         test_crc32_matches_the_published_check_vector, NULL);

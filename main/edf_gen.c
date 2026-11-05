@@ -443,6 +443,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     snprintf(self_settings_path, sizeof(self_settings_path), "%s/%s_settings.json",
              session_dir, session_id);
     char settings_path[420];
+    bool settings_historical = false;
     snprintf(settings_path, sizeof(settings_path), "%s/%s.live.settings.json",
              session_dir, session_id);
     cJSON *settings = edf_read_json_file(settings_path);
@@ -450,6 +451,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         snprintf(settings_path, sizeof(settings_path), "%s/%s.cached.settings.json",
                  session_dir, session_id);
         settings = edf_read_json_file(settings_path);
+        settings_historical = settings != NULL;
     }
     if (!settings) {
         strlcpy(settings_path, self_settings_path, sizeof(settings_path));
@@ -458,6 +460,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     if (!settings && day_metadata_fallback(session_dir, session_id, "_settings.json",
                                            settings_path, sizeof(settings_path))) {
         settings = edf_read_json_file(settings_path);
+        settings_historical = settings != NULL;
         if (settings) {
             ESP_LOGW(TAG, "session %s has no settings.json — using %s from the same day",
                      session_id, settings_path);
@@ -467,6 +470,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         snprintf(settings_path, sizeof(settings_path), "%s/summaries/%s.settings.json",
                  sessions_root, lookup_day);
         settings = edf_read_json_file(settings_path);
+        settings_historical = settings != NULL;
         if (settings) {
             ESP_LOGW(TAG, "session %s has no settings.json — using %s",
                      session_id, settings_path);
@@ -491,6 +495,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
             settings_provenance_is_family(imported, family) &&
             settings_provenance_covers_sessions(imported, lookup_day)) {
             settings = imported;
+            settings_historical = true;
             ESP_LOGW(TAG, "session %s has no settings.json — using imported "
                      "STR settings %s", session_id, settings_path);
         } else {
@@ -501,6 +506,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                                                  ident_serial, settings_path,
                                                  sizeof(settings_path))) {
         settings = edf_read_json_file(settings_path);
+        settings_historical = settings != NULL;
         if (settings) {
             ESP_LOGW(TAG, "session %s has no settings.json — using %s from another day",
                      session_id, settings_path);
@@ -508,6 +514,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     }
     if (!settings) {
         settings = device_snapshot_fallback(sessions_root, "settings", ident_serial);
+        settings_historical = settings != NULL;
         if (settings) {
             ESP_LOGW(TAG, "session %s has no settings.json — using device_metadata.json snapshot",
                      session_id);
@@ -900,7 +907,7 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     /* ── Generate STR.edf from per-day summary spool files ──
      * STR.edf goes in the SDCARD root (not inside DATALOG/) — it is a
      * multi-day cumulative file with one record per day. */
-    if ((flags & EDF_GEN_SHARED) &&
+    if ((flags & (EDF_GEN_SHARED | EDF_GEN_SHARED_HISTORICAL)) &&
         edf_generate_str_edf(out_root, patient_id, recording_id,
                          "", settings, ident,
                          session_dir, session_id,
@@ -957,8 +964,24 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     /* ── Copy settings to SDCARD/SETTINGS/CurrentSettings.json ──
      * The device returns {"SettingProfiles":{...}} but AS11 nests this under
      * a "FlowGenerator" wrapper: {"FlowGenerator":{"SettingProfiles":{...}}}.
-     * Strip internal provenance before publishing the device-compatible JSON. */
-    if ((flags & EDF_GEN_SHARED) && settings) {
+     * Strip internal provenance before publishing the device-compatible JSON.
+     * Only a current raw card capture or this session's live capture may
+     * replace CurrentSettings; imported/legacy/borrowed daily evidence is
+     * historical and must not be advertised as the device's current state. */
+    bool publish_current = settings && !settings_historical;
+    if (publish_current) {
+        const cJSON *meta = cJSON_GetObjectItem(settings, SETTINGS_PROVENANCE_KEY);
+        if (cJSON_IsObject(meta)) {
+            char current_day[16];
+            as11_time_noon_day(start_epoch_ms - clock_drift_ms, current_day,
+                               sizeof(current_day));
+            publish_current = settings_provenance_is(settings, SETTINGS_SOURCE_LIVE,
+                                                     current_day, session_id);
+        }
+    }
+    if ((flags & EDF_GEN_SHARED) && settings && !publish_current)
+        ESP_LOGW(TAG, "not publishing borrowed/historical settings as CurrentSettings.json");
+    if ((flags & EDF_GEN_SHARED) && settings && publish_current) {
         cJSON *cs_root = cJSON_CreateObject();
         cJSON *cs_settings = cJSON_Duplicate(settings, true);
         if (!cs_root || !cs_settings) {
@@ -1248,6 +1271,31 @@ static bool rebuild_read_manifest(const char *day_path, const char *fname,
     return ok;
 }
 
+/* The newest streams day is the one whose rebuild may refresh the current
+ * root artifacts.  If it cannot be determined, fail closed: generate only
+ * the cumulative STR and never overwrite current identity/settings from an
+ * older day. */
+static bool newest_streams_day(char out[9])
+{
+    DIR *d = opendir(SD_STREAMS_DIR);
+    if (!d) return false;
+    char best[9] = "";
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *n = ent->d_name;
+        if (strlen(n) != 8) continue;
+        bool digits = true;
+        for (int i = 0; i < 8; i++)
+            if (n[i] < '0' || n[i] > '9') { digits = false; break; }
+        if (!digits) continue;
+        if (!best[0] || strcmp(n, best) > 0) memcpy(best, n, 9);
+    }
+    closedir(d);
+    if (!best[0]) return false;
+    memcpy(out, best, 9);
+    return true;
+}
+
 esp_err_t edf_gen_rebuild_day(const char *day_folder)
 {
     if (!day_folder || strlen(day_folder) != 8) return ESP_ERR_INVALID_ARG;
@@ -1410,14 +1458,24 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
      * STR.edf is multi-day and cumulative, and its current-day record is
      * synthesised from the session given here — so it must be the newest
      * session of the day, not an arbitrary one.  Identification and
-     * CurrentSettings likewise come from the newest session's captured data. */
+     * CurrentSettings likewise come from the newest session's captured data,
+     * but only when this is the newest day: rebuilding an older day must not
+     * replace the card's current identity/settings. */
     const rebuild_session_t *newest = &sessions[n - 1];
+    char newest_day[9] = "";
+    bool is_newest = newest_streams_day(newest_day) &&
+                     strcmp(newest_day, day_folder) == 0;
+    if (!is_newest)
+        ESP_LOGI(TAG, "rebuild %s: historical day — preserving current "
+                 "identity/settings", day_folder);
+    uint32_t shared_flags = is_newest ? EDF_GEN_SHARED
+                                      : EDF_GEN_SHARED_HISTORICAL;
     esp_err_t shared = edf_gen_generate_ex(SD_SDCARD_DIR, day_path,
                                           newest->session_id,
                                           newest->start_epoch_ms,
                                           newest->end_epoch_ms,
                                           newest->clock_drift_ms,
-                                          EDF_GEN_SHARED);
+                                          shared_flags);
     if (shared != ESP_OK) {
         /* The day's per-session files are published and correct; only the
          * cumulative/shared files are stale.  Report it without claiming the

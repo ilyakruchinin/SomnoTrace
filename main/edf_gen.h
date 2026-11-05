@@ -109,6 +109,9 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
  * SHARED exactly once. */
 #define EDF_GEN_PER_SESSION   (1u << 0)
 #define EDF_GEN_SHARED        (1u << 1)
+/* Rebuild the cumulative STR for a historical day without replacing the
+ * current Identification/CurrentSettings artifacts. */
+#define EDF_GEN_SHARED_HISTORICAL (1u << 2)
 #define EDF_GEN_ALL           (EDF_GEN_PER_SESSION | EDF_GEN_SHARED)
 
 /* As edf_gen_generate(), but writes into out_root and honours the pass
