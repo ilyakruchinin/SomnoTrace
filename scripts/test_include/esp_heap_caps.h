@@ -36,11 +36,17 @@
  * device, so the caller's plain-malloc fallback actually runs.  Weak, so every
  * test that does not define it links unchanged and gets plain malloc. */
 extern int host_heap_caps_malloc_fail __attribute__((weak));
+extern int host_heap_caps_calloc_fail __attribute__((weak));
+extern int host_heap_caps_realloc_fail __attribute__((weak));
 #define heap_caps_malloc(size, caps)                                         \
     ((&host_heap_caps_malloc_fail && host_heap_caps_malloc_fail)             \
          ? NULL : malloc(size))
-#define heap_caps_calloc(n, size, caps)     calloc((n), (size))
-#define heap_caps_realloc(p, size, caps)    realloc((p), (size))
+#define heap_caps_calloc(n, size, caps)                                      \
+    ((&host_heap_caps_calloc_fail && host_heap_caps_calloc_fail)             \
+         ? NULL : calloc((n), (size)))
+#define heap_caps_realloc(p, size, caps)                                    \
+    ((&host_heap_caps_realloc_fail && host_heap_caps_realloc_fail)           \
+         ? NULL : realloc((p), (size)))
 #define heap_caps_free(p)                   free(p)
 #define heap_caps_get_free_size(caps)           ((size_t)(64u << 20))
 #define heap_caps_get_largest_free_block(caps)  ((size_t)(64u << 20))

@@ -26,6 +26,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* The root resources the importer consumes.  Bridge listings may expose a
  * different case (FAT short names), so classification is case-insensitive
@@ -36,3 +37,12 @@ const char *sb_root_canonical_name(const char *name);
 const char *sb_root_name_at(int index);
 int sb_root_name_index(const char *name);
 bool sb_root_name_has_path_separator(const char *name);
+
+#define SB_ROOT_RECHECK_MS (6LL * 60 * 60 * 1000)
+typedef enum {
+    SB_ROOT_RESTORE,
+    SB_ROOT_SKIP_COMMITTED,
+    SB_ROOT_RECHECK,
+} sb_root_cache_action_t;
+sb_root_cache_action_t sb_root_cache_action(bool tuple_matches, bool committed,
+                                            int64_t now_ms, int64_t *last_check_ms);

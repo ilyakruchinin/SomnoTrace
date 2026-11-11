@@ -78,11 +78,38 @@ bool edf_write_all(FILE *f, const void *data, size_t len)
     return fwrite(data, 1, len, f) == len;
 }
 
+/* FAT cannot replace an existing destination with rename().  A backup
+ * bridges the two renames and is recovered before the next attempt. */
+static int edf_recover_replace(const char *path, char *backup, size_t backup_len)
+{
+    int n = snprintf(backup, backup_len, "%s.replace-backup", path);
+    if (n < 0 || (size_t)n >= backup_len) { errno = ENAMETOOLONG; return -1; }
+    struct stat st;
+    if (stat(backup, &st) != 0) return errno == ENOENT ? 0 : -1;
+    if (!S_ISREG(st.st_mode)) { errno = EINVAL; return -1; }
+    if (stat(path, &st) == 0) {
+        if (!S_ISREG(st.st_mode)) { errno = EINVAL; return -1; }
+        if (unlink(path) != 0) return -1;
+    } else if (errno != ENOENT) return -1;
+    return rename(backup, path);
+}
+
+esp_err_t edf_recover_atomic_file(const char *path)
+{
+    char backup[512];
+    return edf_recover_replace(path, backup, sizeof(backup)) == 0 ? ESP_OK : ESP_FAIL;
+}
+
 FILE *edf_open_atomic_file(const char *path, char *tmp_path, size_t tmp_path_len)
 {
     int written = snprintf(tmp_path, tmp_path_len, "%s.tmp", path);
     if (written < 0 || (size_t)written >= tmp_path_len) {
         errno = ENAMETOOLONG;
+        return NULL;
+    }
+    char backup[512];
+    if (edf_recover_replace(path, backup, sizeof(backup)) != 0) {
+        ESP_LOGE(TAG, "cannot recover previous export %s: %s", path, strerror(errno));
         return NULL;
     }
     unlink(tmp_path);
@@ -92,18 +119,39 @@ FILE *edf_open_atomic_file(const char *path, char *tmp_path, size_t tmp_path_len
 esp_err_t edf_finalize_atomic_file(FILE *f, const char *tmp_path, const char *path)
 {
     int saved_errno = 0;
-    if (fflush(f) != 0 || fsync(fileno(f)) != 0 || fclose(f) != 0) {
+    if (fflush(f) != 0) saved_errno = errno;
+    if (!saved_errno && fsync(fileno(f)) != 0) saved_errno = errno;
+    if (fclose(f) != 0 && !saved_errno) saved_errno = errno;
+    if (saved_errno) {
+        unlink(tmp_path);
+        errno = saved_errno;
+        return ESP_FAIL;
+    }
+    if (rename(tmp_path, path) == 0) return ESP_OK;
+    if (errno != EEXIST) {
         saved_errno = errno;
         unlink(tmp_path);
         errno = saved_errno;
         return ESP_FAIL;
     }
-    /* FATFS does not support rename-over-existing — remove target first. */
-    unlink(path);
-    if (rename(tmp_path, path) != 0) {
+    char backup[512];
+    if (edf_recover_replace(path, backup, sizeof(backup)) != 0 ||
+        rename(path, backup) != 0) {
         saved_errno = errno;
         unlink(tmp_path);
         errno = saved_errno;
+        return ESP_FAIL;
+    }
+    if (rename(tmp_path, path) != 0) {
+        saved_errno = errno;
+        if (rename(backup, path) != 0)
+            ESP_LOGE(TAG, "previous export retained at %s", backup);
+        unlink(tmp_path);
+        errno = saved_errno;
+        return ESP_FAIL;
+    }
+    if (unlink(backup) != 0) {
+        ESP_LOGE(TAG, "previous export retained at %s; retry required", backup);
         return ESP_FAIL;
     }
     return ESP_OK;
@@ -121,12 +169,17 @@ cJSON *edf_read_json_file(const char *path)
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *buf = malloc(fsize + 1);
+    if (fsize < 0 || fsize > 1024 * 1024 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    char *buf = heap_caps_malloc((size_t)fsize + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf && fsize <= 4096) buf = malloc((size_t)fsize + 1);
     if (!buf) { fclose(f); return NULL; }
     size_t rd = fread(buf, 1, fsize, f);
     buf[rd] = '\0';
     fclose(f);
+    if (rd != (size_t)fsize) { free(buf); return NULL; }
     cJSON *json = cJSON_Parse(buf);
     free(buf);
     return json;
@@ -156,7 +209,8 @@ uint8_t *edf_read_bin_file(const char *path, size_t *out_len)
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (fsize <= 0) { fclose(f); return NULL; }
-    uint8_t *buf = malloc(fsize);
+    uint8_t *buf = heap_caps_malloc((size_t)fsize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf && fsize <= 4096) buf = malloc((size_t)fsize);
     if (!buf) { fclose(f); return NULL; }
     size_t rd = fread(buf, 1, fsize, f);
     fclose(f);
@@ -203,7 +257,8 @@ int edf_write_header(FILE *f, const char *patient_id,
     /* ── Per-signal header blocks (256 bytes per signal) ── */
     int total = total_signals;
     size_t sigblock_size = 256 * total;
-    char *sigblock = malloc(sigblock_size);
+    char *sigblock = heap_caps_malloc(sigblock_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!sigblock && sigblock_size <= 4096) sigblock = malloc(sigblock_size);
     if (!sigblock) {
         ESP_LOGE(TAG, "edf_write_header: malloc sigblock %u failed",
                  (unsigned)sigblock_size);

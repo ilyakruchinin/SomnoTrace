@@ -40,6 +40,10 @@ typedef struct {
     bool     existed;
 } source_store_put_result_t;
 
+/* Serialize compound store operations shared by the importer and bridge. */
+bool source_store_lock(void);
+void source_store_unlock(void);
+
 /* Initialise the store under `root`; NULL selects
  * SD_SESSIONS_DIR "/sources".  Creates objects/ and observations/. */
 esp_err_t source_store_init(const char *root);
@@ -67,6 +71,10 @@ esp_err_t source_store_verify(const char *id, uint64_t expected_len);
  * is idempotent; a different envelope under the same id is rejected. */
 esp_err_t source_store_observe(const char *id, const char *observation_id,
                                const char *kind, const cJSON *observation);
+
+/* Caller holds the store lock. */
+bool source_store_has_observation(const char *id, const char *observation_id,
+                                  const char *kind);
 
 /* Find the newest observation for a source tuple.  The observation JSON must
  * carry `key`, `size`, `ts` (string or null) and ideally `observed_at_ms`.

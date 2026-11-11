@@ -216,9 +216,63 @@ static cJSON *local_session_ids_mode(const char *day, const char *serial, int fa
     return ids;
 }
 
-static cJSON *local_session_ids(const char *day, const char *serial, int family)
+/* Missing provenance is not a conflict, but an explicit foreign identity is. */
+bool settings_provenance_day_conflicts(const char *day, const char *serial, int family)
 {
-    return local_session_ids_mode(day, serial, family, false);
+    if (!day || strlen(day) != 8 || !serial || !serial[0] ||
+        !settings_provenance_family_name(family)) return true;
+    char dir_path[300];
+    snprintf(dir_path, sizeof(dir_path), "%s/%s", SD_STREAMS_DIR, day);
+    DIR *dir = opendir(dir_path);
+    if (!dir) return errno != ENOENT;
+    bool conflict = false;
+    struct dirent *ent;
+    const char suffix[] = "_session.json";
+    for (;;) {
+        errno = 0;
+        ent = readdir(dir);
+        if (!ent) {
+            if (errno != 0) conflict = true;
+            break;
+        }
+        size_t len = strlen(ent->d_name), tail = sizeof(suffix) - 1;
+        if (len <= tail || strcmp(ent->d_name + len - tail, suffix)) continue;
+        char path[420];
+        int n = snprintf(path, sizeof(path), "%s/%s", dir_path, ent->d_name);
+        cJSON *manifest = n >= 0 && (size_t)n < sizeof(path) ? read_manifest(path) : NULL;
+        if (!cJSON_IsObject(manifest)) {
+            cJSON_Delete(manifest);
+            conflict = true;
+            break;
+        }
+        const cJSON *sn = cJSON_GetObjectItemCaseSensitive(manifest, "source_serial");
+        const cJSON *fam = cJSON_GetObjectItemCaseSensitive(manifest, "source_device_family");
+        if ((sn && !cJSON_IsNull(sn) && (!cJSON_IsString(sn) || !sn->valuestring ||
+                    (sn->valuestring[0] && strcmp(sn->valuestring, serial)))) ||
+            (fam && !cJSON_IsNull(fam) && (!cJSON_IsString(fam) || !fam->valuestring ||
+                     (fam->valuestring[0] &&
+                      strcmp(fam->valuestring, settings_provenance_family_name(family)))))) {
+            conflict = true;
+        }
+        cJSON_Delete(manifest);
+        if (conflict) break;
+        size_t sid_len = len - tail;
+        if (sid_len >= 100) { conflict = true; break; }
+        char sid[100];
+        memcpy(sid, ent->d_name, sid_len);
+        sid[sid_len] = '\0';
+        n = snprintf(path, sizeof(path), "%s/%s_ident.json", dir_path, sid);
+        cJSON *ident = n >= 0 && (size_t)n < sizeof(path) ? read_manifest(path) : NULL;
+        if (settings_provenance_is(ident, SETTINGS_SOURCE_LIVE_IDENT, day, sid)) {
+            const cJSON *is = cJSON_GetObjectItemCaseSensitive(ident, "SerialNumber");
+            if (!cJSON_IsString(is) || !is->valuestring || strcmp(is->valuestring, serial) ||
+                settings_provenance_family(ident) != family) conflict = true;
+        }
+        cJSON_Delete(ident);
+        if (conflict) break;
+    }
+    closedir(dir);
+    return conflict;
 }
 
 bool settings_provenance_record_sessions(cJSON *root, const char *day)

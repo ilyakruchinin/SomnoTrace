@@ -72,8 +72,9 @@ esp_err_t tx_log_state(tx_log_t *log, const char *id, tx_state_t *state);
 /* Number of records currently in the log and the last sequence written. */
 esp_err_t tx_log_count(tx_log_t *log, uint64_t *records, uint64_t *last_seq);
 
-/* Test hook: make the Nth subsequent durable write fail (0 = never).  Only
- * built when TX_LOG_FAULT_INJECT is defined. */
+/* Test hooks: fail the Nth subsequent write or allocation (0 = never).
+ * Only built when TX_LOG_FAULT_INJECT is defined. */
 #ifdef TX_LOG_FAULT_INJECT
 void tx_log_fault_after(int writes_until_failure);
+void tx_log_alloc_fault_after(int allocations_until_failure);
 #endif

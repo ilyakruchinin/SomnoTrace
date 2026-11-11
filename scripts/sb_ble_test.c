@@ -441,6 +441,23 @@ static void test_root_names(void)
     CHECK(!sb_root_name_has_path_separator("STR.edf"), "plain name accepted");
 }
 
+static void test_root_cache_action(void)
+{
+    int64_t checked = 0;
+    CHECK(sb_root_cache_action(true, false, 100, &checked) == SB_ROOT_RESTORE,
+          "uncommitted root is restored for retry");
+    CHECK(sb_root_cache_action(false, true, 100, &checked) == SB_ROOT_RESTORE,
+          "changed tuple is not skipped");
+    CHECK(sb_root_cache_action(true, true, 100, &checked) == SB_ROOT_SKIP_COMMITTED &&
+          checked == 100, "committed root starts bounded recheck window");
+    CHECK(sb_root_cache_action(true, true, 101, &checked) == SB_ROOT_SKIP_COMMITTED,
+          "unchanged committed root is not pulled again");
+    CHECK(sb_root_cache_action(true, true, 100 + SB_ROOT_RECHECK_MS, &checked) == SB_ROOT_RECHECK,
+          "same tuple is periodically rechecked for rewrites");
+    CHECK(sb_root_cache_action(true, true, 20, &checked) == SB_ROOT_SKIP_COMMITTED &&
+          checked == 20, "clock restart begins a new recheck window");
+}
+
 static void test_stream_begin_match(void)
 {
     char err[64];
@@ -546,6 +563,7 @@ int main(void)
     test_parse_u64();
     test_hex_str_ok();
     test_root_names();
+    test_root_cache_action();
     printf("sb_ble_test: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

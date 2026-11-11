@@ -33,6 +33,7 @@
 #define SETTINGS_SOURCE_LIVE "live"
 #define SETTINGS_SOURCE_CACHED "cached"
 #define SETTINGS_SOURCE_IMPORTED_STR "imported_str"
+#define SETTINGS_SOURCE_NATIVE_DAY "native_str_day"
 #define SETTINGS_SOURCE_LIVE_IDENT "live_ident"
 #define SETTINGS_FAMILY_UNKNOWN 0
 #define SETTINGS_FAMILY_AS10 10
@@ -146,6 +147,7 @@ static inline bool settings_provenance_is(const cJSON *root, const char *source,
  * recorded after the import. Track which local sessions existed at import. */
 bool settings_provenance_record_sessions(cJSON *root, const char *day);
 bool settings_provenance_covers_sessions(const cJSON *root, const char *day);
+bool settings_provenance_day_conflicts(const char *day, const char *serial, int family);
 bool settings_provenance_session_is_bridge_unverified(const char *day, const char *session,
                                                       const char *serial, int family);
 bool settings_provenance_session_matches(const char *day, const char *session,

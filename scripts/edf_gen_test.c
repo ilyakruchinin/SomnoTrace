@@ -43,9 +43,19 @@
 /* v2.0.0 split the converter into five modules. All are #included so the tests still
  * reach the static helpers (spool_to_edf, build_str_data_values) they exercise. */
 /* Each module defines its own static TAG; rename per include so they coexist. */
+#include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+static int edf_test_rename(const char *from, const char *to);
+static bool test_fat_rename, test_fail_install, test_fail_restore;
+int host_heap_caps_realloc_fail;
+#define rename edf_test_rename
 #define TAG TAG_hdr
 #include "edf_header.c"       /* found via -I<main dir>, see run_host_tests.sh */
 #undef TAG
+#undef rename
 #define TAG TAG_wav
 #include "edf_waveform.c"
 #undef TAG
@@ -68,6 +78,15 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+
+static int edf_test_rename(const char *from, const char *to)
+{
+    struct stat st;
+    if (test_fat_rename && stat(to, &st) == 0) { errno = EEXIST; return -1; }
+    if (test_fail_install && strstr(from, ".tmp")) { errno = EIO; return -1; }
+    if (test_fail_restore && strstr(from, ".replace-backup")) { errno = EIO; return -1; }
+    return rename(from, to);
+}
 
 /* ── link stubs for the storage arbitration edf_gen.c calls ─────────── */
 bool sd_storage_is_ready(void) { return true; }
@@ -1421,6 +1440,8 @@ static void reset_day_state(const char *day)
     unlink(path);
     snprintf(path, sizeof(path), "%s/%s.imported.settings.json", SD_SUMMARIES_DIR, day);
     unlink(path);
+    snprintf(path, sizeof(path), "%s/%s.native.settings.json", SD_SUMMARIES_DIR, day);
+    unlink(path);
 }
 
 static void test_daily_settings_provenance(void)
@@ -1566,7 +1587,7 @@ static void test_daily_settings_provenance(void)
         snprintf(path, sizeof(path), "%s/later_ident.json", dir);
         write_live_ident(path, day, "later");
         read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
-        CHECK(read == NULL, "new local session must stale the imported snapshot");
+        CHECK(read == NULL, "new local session must stale the legacy imported snapshot");
         cJSON_Delete(read);
         CHECK(settings_provenance_record_sessions(native, day),
               "refresh imported coverage after re-import");
@@ -1577,6 +1598,25 @@ static void test_daily_settings_provenance(void)
         read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
         CHECK(read != NULL, "re-import covers the later session");
         cJSON_Delete(read);
+        CHECK(cJSON_AddObjectToObject(native, "_as11_edf_settings") &&
+              settings_provenance_set(native, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) &&
+              settings_provenance_set_serial(native, "fixture-machine") &&
+              settings_provenance_set_family(native, SETTINGS_FAMILY_AS11),
+              "create independent native daily record");
+        snprintf(path, sizeof(path), "%s/%s.native.settings.json", SD_SUMMARIES_DIR, day);
+        json = cJSON_PrintUnformatted(native);
+        write_text(path, json);
+        free(json);
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+        CHECK(read && settings_provenance_is(read, SETTINGS_SOURCE_NATIVE_DAY, day, NULL),
+              "new native daily evidence takes precedence over v1");
+        cJSON_Delete(read);
+        write_text(path, "broken JSON");
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+        CHECK(!read && native_day_blocked(day, SETTINGS_FAMILY_AS11, "fixture-machine", read),
+              "corrupt native day does not fall back to old evidence");
+        cJSON_Delete(read);
+        unlink(path);
         cJSON_Delete(native);
     }
     cJSON_Delete(settings);
@@ -1606,6 +1646,138 @@ static void write_test_summary(const char *path, int64_t noon_ms)
         test_pb_varint(f, (uint64_t)vals[i].value);
     }
     fclose(f);
+}
+
+static void test_atomic_export_recovery(void)
+{
+    char path[400], tmp[440], backup[440];
+    snprintf(path, sizeof(path), "%s/atomic.edf", g_root);
+    snprintf(backup, sizeof(backup), "%s.replace-backup", path);
+    write_text(path, "old");
+    FILE *f = edf_open_atomic_file(path, tmp, sizeof(tmp));
+    CHECK(f != NULL, "open staged export");
+    if (!f) return;
+    fputs("new", f);
+    test_fat_rename = true;
+    test_fail_install = true;
+    CHECK(edf_finalize_atomic_file(f, tmp, path) != ESP_OK, "failed FAT install is reported");
+    size_t n = 0;
+    uint8_t *data = read_file(path, &n);
+    CHECK(data && n == 3 && !memcmp(data, "old", 3), "failed install restores old export");
+    CHECK(access(backup, F_OK) != 0, "restored export has no backup residue");
+    free(data);
+
+    f = edf_open_atomic_file(path, tmp, sizeof(tmp));
+    CHECK(f != NULL, "open staged export again");
+    if (!f) goto done;
+    fputs("new", f);
+    test_fail_restore = true;
+    CHECK(edf_finalize_atomic_file(f, tmp, path) != ESP_OK, "restore failure is reported");
+    CHECK(access(backup, F_OK) == 0, "restore failure preserves backup");
+    test_fail_install = test_fail_restore = false;
+    f = edf_open_atomic_file(path, tmp, sizeof(tmp));
+    CHECK(f != NULL, "restart recovers backup before writing");
+    if (f) edf_discard_atomic_file(f, tmp);
+    data = read_file(path, &n);
+    CHECK(data && n == 3 && !memcmp(data, "old", 3), "restart recovers old export");
+    free(data);
+
+    f = edf_open_atomic_file(path, tmp, sizeof(tmp));
+    CHECK(f != NULL, "open successful staged export");
+    if (!f) goto done;
+    fputs("new", f);
+    CHECK(edf_finalize_atomic_file(f, tmp, path) == ESP_OK, "FAT replacement succeeds");
+    data = read_file(path, &n);
+    CHECK(data && n == 3 && !memcmp(data, "new", 3), "replacement publishes new export");
+    free(data);
+    CHECK(access(backup, F_OK) != 0, "successful replacement clears backup");
+
+    write_text(backup, "old");
+    f = edf_open_atomic_file(path, tmp, sizeof(tmp));
+    CHECK(f != NULL, "restart rolls back interrupted replacement");
+    if (f) edf_discard_atomic_file(f, tmp);
+    data = read_file(path, &n);
+    CHECK(data && n == 3 && !memcmp(data, "old", 3), "previous export wins after restart");
+    free(data);
+    CHECK(access(backup, F_OK) != 0, "restart restores backup");
+
+    f = fopen("/dev/full", "w");
+    if (f) {
+        fputs("write failure", f);
+        CHECK(edf_finalize_atomic_file(f, tmp, path) != ESP_OK, "flush failure is reported");
+        data = read_file(path, &n);
+        CHECK(data && n == 3 && !memcmp(data, "old", 3), "flush failure preserves export");
+        free(data);
+    }
+done:
+    test_fat_rename = test_fail_install = test_fail_restore = false;
+}
+
+static void test_drift_index_allocation_failure(void)
+{
+    char dir[400], path[600];
+    snprintf(dir, sizeof(dir), "%s/20330517", SD_STREAMS_DIR);
+    mk("%s", dir);
+    snprintf(path, sizeof(path), "%s/20330517_220000_session.json", dir);
+    write_text(path, "{\"start_epoch_ms\":2000000000000,\"clock_drift_ms\":214000}");
+    session_drift_entry_t *entries = NULL;
+    int count = 0;
+    host_heap_caps_realloc_fail = 1;
+    CHECK(build_session_drift_index(&entries, &count) != ESP_OK &&
+          entries == NULL && count == 0,
+          "incomplete drift index is rejected on PSRAM exhaustion");
+    host_heap_caps_realloc_fail = 0;
+    CHECK(build_session_drift_index(&entries, &count) == ESP_OK && count > 0,
+          "drift index succeeds after allocation recovers");
+    free(entries);
+    unlink(path);
+    rmdir(dir);
+}
+
+static void test_spool_metric_bounds(void)
+{
+    summary_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    CHECK(ctx != NULL, "allocate summary context");
+    if (!ctx) return;
+    const uint8_t data[] = {0x78, 0x01}; /* metric subfield 15 is unsupported */
+    pb_field_t field = {.field = 12, .wire = 2, .data = data, .len = sizeof(data)};
+    ctx->metrics[13].val[6] = 12345;
+    summary_field_cb(&field, ctx);
+    CHECK(ctx->metrics[13].val[6] == 12345,
+          "unknown metric subfield does not overwrite the next metric");
+    free(ctx);
+}
+
+static void test_rebuild_sentinel_safety(void)
+{
+    mk("%s", SD_SDCARD_DIR);
+    if (access(REBUILD_SENTINEL, F_OK) == 0) {
+        CHECK(false, "unexpected pre-existing rebuild sentinel");
+        return;
+    }
+    CHECK(edf_gen_rebuild_day("20/60301") == ESP_ERR_INVALID_ARG,
+          "rebuild refuses a non-date path");
+    CHECK(rebuild_write_sentinel("20260301") == ESP_OK, "write recovery marker");
+    CHECK(rebuild_write_sentinel("20260302") != ESP_OK,
+          "another day's recovery marker cannot be overwritten");
+    size_t n = 0;
+    uint8_t *contents = read_file(REBUILD_SENTINEL, &n);
+    CHECK(contents && n == 9 && !memcmp(contents, "20260301\n", 9),
+          "existing recovery marker remains intact");
+    free(contents);
+    char interrupted[16];
+    CHECK(edf_gen_take_interrupted_rebuild(interrupted, sizeof(interrupted)) &&
+          !strcmp(interrupted, "20260301") && access(REBUILD_SENTINEL, F_OK) == 0,
+          "boot recovery leaves the marker until rebuild succeeds");
+    CHECK(rebuild_write_sentinel("20260301") == ESP_OK,
+          "the same interrupted day can be retried");
+    CHECK(unlink(REBUILD_SENTINEL) == 0, "remove test-owned marker");
+    char tmp[400];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", REBUILD_SENTINEL);
+    CHECK(mkdir(tmp, 0775) == 0, "create test marker-write blocker");
+    CHECK(rebuild_write_sentinel("20260301") != ESP_OK,
+          "marker write failure aborts publication");
+    CHECK(rmdir(tmp) == 0, "remove test marker-write blocker");
 }
 
 static void test_str_settings_history_end_to_end(void)
@@ -2593,6 +2765,14 @@ int main(void)
         test_daily_settings_provenance, NULL);
     run("STR settings history preserves unknowns and trusted snapshots",
         test_str_settings_history_end_to_end, NULL);
+    run("atomic EDF publication preserves and recovers prior exports",
+        test_atomic_export_recovery, NULL);
+    run("a partial drift index is rejected when PSRAM is exhausted",
+        test_drift_index_allocation_failure, NULL);
+    run("unexpected summary metric numbers stay in bounds",
+        test_spool_metric_bounds, NULL);
+    run("day rebuild markers protect interrupted publication",
+        test_rebuild_sentinel_safety, NULL);
     run("the resolver gates daily settings fail-closed",
         test_resolver_gates_daily_settings, NULL);
 

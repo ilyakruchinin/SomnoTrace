@@ -38,19 +38,45 @@
 /* Host tests need no crypto library; production uses SHA-256 below. */
 #else
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "mbedtls/sha256.h"
 #endif
 
 static char s_root[320];
 static uint64_t s_budget = SOURCE_STORE_DEFAULT_BUDGET;
+#ifndef SOURCE_STORE_HOST
+static portMUX_TYPE s_store_spin = portMUX_INITIALIZER_UNLOCKED;
+static StaticSemaphore_t s_store_mutex_buffer;
+static SemaphoreHandle_t s_store_mutex;
+#endif
+
+bool source_store_lock(void)
+{
+#ifdef SOURCE_STORE_HOST
+    return true;
+#else
+    portENTER_CRITICAL(&s_store_spin);
+    if (!s_store_mutex)
+        s_store_mutex = xSemaphoreCreateMutexStatic(&s_store_mutex_buffer);
+    portEXIT_CRITICAL(&s_store_spin);
+    return s_store_mutex && xSemaphoreTake(s_store_mutex, portMAX_DELAY) == pdTRUE;
+#endif
+}
+
+void source_store_unlock(void)
+{
+#ifndef SOURCE_STORE_HOST
+    if (s_store_mutex) xSemaphoreGive(s_store_mutex);
+#endif
+}
 
 static void *store_alloc(size_t n)
 {
 #ifdef SOURCE_STORE_HOST
     return malloc(n);
 #else
-    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return p ? p : malloc(n);
+    return heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 #endif
 }
 
@@ -366,6 +392,31 @@ esp_err_t source_store_observe(const char *id, const char *observation_id,
     esp_err_t w = write_file_atomic(path, text, strlen(text));
     free(text);
     return w;
+}
+
+bool source_store_has_observation(const char *id, const char *observation_id,
+                                  const char *kind)
+{
+    if (!s_root[0] || !id_valid(id) || !safe_component(observation_id) || !kind)
+        return false;
+    char path[420], object_path_buf[360];
+    if (observation_path(id, observation_id, path, sizeof(path)) != 0 ||
+        object_path(id, object_path_buf, sizeof(object_path_buf)) != 0)
+        return false;
+    struct stat st;
+    if (stat(object_path_buf, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    uint8_t *text = NULL;
+    size_t len = 0;
+    if (read_file(path, &text, &len) != ESP_OK) return false;
+    cJSON *root = cJSON_Parse((char *)text);
+    free(text);
+    const char *object = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, "object"));
+    const char *obs = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, "observation_id"));
+    const char *stored_kind = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(root, "kind"));
+    bool valid = object && !strcmp(object, id) && obs && !strcmp(obs, observation_id) &&
+                 stored_kind && !strcmp(stored_kind, kind);
+    cJSON_Delete(root);
+    return valid;
 }
 
 static bool observation_str_eq(const cJSON *obs, const char *key,

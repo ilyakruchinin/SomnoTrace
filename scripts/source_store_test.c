@@ -111,6 +111,10 @@ static void test_observations(void)
           "write observation");
     CHECK(source_store_observe(p.id, "obs-1", "str", obs) == ESP_OK,
           "idempotent observation");
+    CHECK(source_store_has_observation(p.id, "obs-1", "str"),
+          "committed observation can be found");
+    CHECK(!source_store_has_observation(p.id, "obs-1", "other"),
+          "observation kind must match");
     cJSON *other = cJSON_Parse("{\"origin\":\"bridge\",\"serial\":\"other\"}");
     CHECK(other != NULL, "second observation JSON");
     CHECK(source_store_observe(p.id, "obs-1", "str", other) == ESP_ERR_INVALID_STATE,

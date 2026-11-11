@@ -28,6 +28,7 @@
 #include "edf_waveform.h"
 #include "edf_annotations.h"
 #include "edf_summary.h"
+#include <strings.h>
 
 static const char *TAG = "edf_gen";
 
@@ -56,6 +57,167 @@ static void format_recording_id_from_ident(char *out, size_t out_len,
         }
     }
     as11_time_format_recording_id(out, out_len, epoch_ms, srn, mid, vid);
+}
+
+static bool ident_matches_native(const cJSON *ident)
+{
+    cJSON *native = edf_read_json_file(SD_SUMMARIES_DIR "/native.ident.json");
+    const cJSON *marker = cJSON_GetObjectItemCaseSensitive(native, "_somnotrace_native_source");
+    const cJSON *a = cJSON_GetObjectItemCaseSensitive(native, "SerialNumber");
+    const cJSON *b = cJSON_GetObjectItemCaseSensitive(ident, "SerialNumber");
+    int family = settings_provenance_family(native);
+    bool match = cJSON_IsString(marker) && marker->valuestring &&
+                 !strcmp(marker->valuestring, "native_str") &&
+                 cJSON_IsString(a) && a->valuestring && a->valuestring[0] &&
+                 cJSON_IsString(b) && b->valuestring &&
+                 !strcmp(a->valuestring, b->valuestring) &&
+                 family != SETTINGS_FAMILY_UNKNOWN &&
+                 settings_provenance_family(ident) == family;
+    cJSON_Delete(native);
+    return match;
+}
+
+static bool exported_datalog_exists(void)
+{
+    DIR *root = opendir(SD_SDCARD_DATALOG);
+    if (!root) return errno != ENOENT;
+    bool found = false;
+    struct dirent *day;
+    while ((day = readdir(root)) != NULL && !found) {
+        if (day->d_name[0] == '.') continue;
+        char path[400];
+        int n = snprintf(path, sizeof(path), "%s/%s", SD_SDCARD_DATALOG, day->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path)) { found = true; break; }
+        DIR *d = opendir(path);
+        if (!d) { found = true; break; }
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            size_t len = strlen(ent->d_name);
+            if (len > 4 && !strcasecmp(ent->d_name + len - 4, ".edf")) {
+                found = true;
+                break;
+            }
+        }
+        closedir(d);
+    }
+    closedir(root);
+    return found;
+}
+
+static bool exported_identity_compatible(const cJSON *native)
+{
+    const char *path = SD_SDCARD_DIR "/Identification.json";
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        if (errno != ENOENT) return false;
+        if (stat(SD_SDCARD_DIR "/STR.edf", &st) == 0 || errno != ENOENT)
+            return false;
+        return !exported_datalog_exists();
+    }
+    cJSON *published = edf_read_json_file(path);
+    const cJSON *fg = cJSON_GetObjectItemCaseSensitive(published, "FlowGenerator");
+    const cJSON *profiles = cJSON_GetObjectItemCaseSensitive(fg, "IdentificationProfiles");
+    const cJSON *product = cJSON_GetObjectItemCaseSensitive(profiles, "Product");
+    const cJSON *software = cJSON_GetObjectItemCaseSensitive(profiles, "Software");
+    const cJSON *existing = cJSON_GetObjectItemCaseSensitive(product, "SerialNumber");
+    const cJSON *expected = cJSON_GetObjectItemCaseSensitive(native, "SerialNumber");
+    int family = settings_provenance_family(native);
+    bool match = cJSON_IsString(existing) && existing->valuestring &&
+                 cJSON_IsString(expected) && expected->valuestring &&
+                 !strcmp(existing->valuestring, expected->valuestring) &&
+                 family != SETTINGS_FAMILY_UNKNOWN &&
+                 settings_provenance_family(software) == family;
+    cJSON_Delete(published);
+    return match;
+}
+
+static esp_err_t ensure_identification_crc(void)
+{
+    const char *json_path = SD_SDCARD_DIR "/Identification.json";
+    const char *crc_path = SD_SDCARD_DIR "/Identification.crc";
+    FILE *f = fopen(json_path, "rb");
+    if (!f || fseek(f, 0, SEEK_END) != 0) { if (f) fclose(f); return ESP_FAIL; }
+    long size = ftell(f);
+    if (size <= 0 || size > 65536 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    uint8_t *data = heap_caps_malloc((size_t)size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!data) { fclose(f); return ESP_ERR_NO_MEM; }
+    bool read_ok = fread(data, 1, (size_t)size, f) == (size_t)size && !ferror(f);
+    fclose(f);
+    uint32_t crc = read_ok ? edf_crc32_ieee(data, (size_t)size) : 0;
+    free(data);
+    if (!read_ok) return ESP_FAIL;
+    uint8_t expected[4] = {crc & 0xff, (crc >> 8) & 0xff,
+                           (crc >> 16) & 0xff, (crc >> 24) & 0xff};
+    uint8_t actual[5];
+    f = fopen(crc_path, "rb");
+    if (f) {
+        size_t n = fread(actual, 1, sizeof(actual), f);
+        bool ok = !ferror(f) && n == sizeof(expected) &&
+                  !memcmp(actual, expected, sizeof(expected));
+        fclose(f);
+        if (ok) return ESP_OK;
+        ESP_LOGE(TAG, "native STR: Identification.crc is invalid; preserving existing export");
+        return ESP_FAIL;
+    }
+    if (errno != ENOENT) return ESP_FAIL;
+    ESP_LOGW(TAG, "native STR: repairing missing Identification.crc");
+    char tmp[380];
+    f = edf_open_atomic_file(crc_path, tmp, sizeof(tmp));
+    if (!f) return ESP_FAIL;
+    if (!edf_write_all(f, expected, sizeof(expected))) {
+        edf_discard_atomic_file(f, tmp);
+        return ESP_FAIL;
+    }
+    return edf_finalize_atomic_file(f, tmp, crc_path);
+}
+
+static esp_err_t rebuild_native_from_latest_session(bool *has_session);
+
+esp_err_t edf_gen_rebuild_native_str(void)
+{
+    if (!sd_storage_is_ready()) return ESP_ERR_INVALID_STATE;
+    if (!sd_storage_lease_acquire(SD_LEASE_EXPORT, 120000)) return ESP_ERR_TIMEOUT;
+    esp_err_t result = ESP_FAIL;
+    const char *native_path = SD_SUMMARIES_DIR "/native.ident.json";
+    cJSON *native = edf_read_json_file(native_path);
+    const cJSON *marker = cJSON_GetObjectItemCaseSensitive(native, "_somnotrace_native_source");
+    const cJSON *serial = cJSON_GetObjectItemCaseSensitive(native, "SerialNumber");
+    int family = settings_provenance_family(native);
+    if (!cJSON_IsString(marker) || !marker->valuestring ||
+        strcmp(marker->valuestring, "native_str") ||
+        !cJSON_IsString(serial) || !serial->valuestring || !serial->valuestring[0] ||
+        family == SETTINGS_FAMILY_UNKNOWN) goto done;
+
+    mkdir(SD_SDCARD_DIR, 0775);
+    mkdir(SD_SDCARD_DATALOG, 0775);
+    if (edf_recover_atomic_file(SD_SDCARD_DIR "/Identification.json") != ESP_OK ||
+        edf_recover_atomic_file(SD_SDCARD_DIR "/Identification.crc") != ESP_OK ||
+        edf_recover_atomic_file(SD_SDCARD_DIR "/STR.edf") != ESP_OK)
+        goto done;
+    if (!exported_identity_compatible(native)) {
+        ESP_LOGE(TAG, "native STR: existing export identity differs or is unavailable");
+        goto done;
+    }
+    struct stat st;
+    if (stat(SD_SDCARD_DIR "/Identification.json", &st) != 0) {
+        if (edf_generate_identification_files(SD_SDCARD_DIR, native_path) != ESP_OK)
+            goto done;
+    }
+    if (ensure_identification_crc() != ESP_OK) goto done;
+    bool has_session = false;
+    result = rebuild_native_from_latest_session(&has_session);
+    if (result != ESP_OK || has_session) goto done;
+    char recording_id[128];
+    format_recording_id_from_ident(recording_id, sizeof(recording_id), 0, native);
+    result = edf_generate_str_edf(SD_SDCARD_DIR, "X X X X 0000 0000", recording_id,
+                                  "", NULL, native, NULL, NULL, 0, 0, 0);
+done:
+    cJSON_Delete(native);
+    sd_storage_lease_release(SD_LEASE_EXPORT);
+    return result;
 }
 
 esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
@@ -413,8 +575,9 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         if (ident) {
             ESP_LOGW(TAG, "session %s has no ident.json — using %s from another day",
                      session_id, ident_path);
-            if (edf_write_json_file(self_ident_path, ident) == ESP_OK) {
-                strlcpy(ident_path, self_ident_path, sizeof(ident_path));
+            if (!(flags & EDF_GEN_REQUIRE_NATIVE_ID)) {
+                if (edf_write_json_file(self_ident_path, ident) == ESP_OK)
+                    strlcpy(ident_path, self_ident_path, sizeof(ident_path));
             }
         }
     }
@@ -423,12 +586,19 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         if (ident) {
             ESP_LOGW(TAG, "session %s has no ident.json — using device_metadata.json snapshot",
                      session_id);
-            if (edf_write_json_file(self_ident_path, ident) == ESP_OK) {
-                strlcpy(ident_path, self_ident_path, sizeof(ident_path));
+            if (!(flags & EDF_GEN_REQUIRE_NATIVE_ID)) {
+                if (edf_write_json_file(self_ident_path, ident) == ESP_OK)
+                    strlcpy(ident_path, self_ident_path, sizeof(ident_path));
             }
         }
     }
 
+    if ((flags & EDF_GEN_REQUIRE_NATIVE_ID) && !ident_matches_native(ident)) {
+        ESP_LOGE(TAG, "session %s identity does not match native STR", session_id);
+        cJSON_Delete(ident);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return ESP_ERR_INVALID_STATE;
+    }
     const char *ident_serial = ident_get_serial(ident);
 
     /* Read settings.json for CurrentSettings.json. STR history independently
@@ -1146,6 +1316,33 @@ after_current_settings:
  * folder itself is deleted during publication. */
 #define REBUILD_SENTINEL      SD_SDCARD_DIR "/.rebuilding"
 
+static esp_err_t rebuild_write_sentinel(const char *day)
+{
+    FILE *existing = fopen(REBUILD_SENTINEL, "r");
+    if (existing) {
+        char saved[16] = "";
+        bool same = fgets(saved, sizeof(saved), existing) &&
+                    !strncmp(saved, day, 8) &&
+                    (saved[8] == '\n' || saved[8] == '\0');
+        fclose(existing);
+        if (!same) {
+            ESP_LOGE(TAG, "rebuild: another interrupted day is pending recovery");
+            return ESP_ERR_INVALID_STATE;
+        }
+        return ESP_OK;
+    }
+    if (errno != ENOENT) return ESP_FAIL;
+    char tmp[380], text[16];
+    int len = snprintf(text, sizeof(text), "%s\n", day);
+    FILE *f = edf_open_atomic_file(REBUILD_SENTINEL, tmp, sizeof(tmp));
+    if (!f) return ESP_FAIL;
+    if (len < 0 || (size_t)len >= sizeof(text) || !edf_write_all(f, text, (size_t)len)) {
+        edf_discard_atomic_file(f, tmp);
+        return ESP_FAIL;
+    }
+    return edf_finalize_atomic_file(f, tmp, REBUILD_SENTINEL);
+}
+
 typedef struct {
     char    session_id[40];
     int64_t start_epoch_ms;
@@ -1296,9 +1493,94 @@ static bool newest_streams_day(char out[9])
     return true;
 }
 
-esp_err_t edf_gen_rebuild_day(const char *day_folder)
+/* Ignore empty streams directories when finding the latest real session.
+ * A present but unreadable manifest is not silently treated as no session. */
+static esp_err_t newest_manifest_day(char out[9])
+{
+    out[0] = '\0';
+    DIR *root = opendir(SD_STREAMS_DIR);
+    if (!root) return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    struct dirent *ent;
+    bool failed = false;
+    for (;;) {
+        errno = 0;
+        ent = readdir(root);
+        if (!ent) { failed = errno != 0; break; }
+        const char *name = ent->d_name;
+        if (strlen(name) != 8 || strcmp(name, out) <= 0) continue;
+        bool digits = true;
+        for (int i = 0; i < 8; i++)
+            if (name[i] < '0' || name[i] > '9') digits = false;
+        if (!digits) continue;
+        char path[300];
+        snprintf(path, sizeof(path), "%s/%s", SD_STREAMS_DIR, name);
+        DIR *day = opendir(path);
+        if (!day) { failed = true; break; }
+        struct dirent *item;
+        bool have_manifest = false, day_failed = false;
+        for (;;) {
+            errno = 0;
+            item = readdir(day);
+            if (!item) { day_failed = errno != 0; break; }
+            size_t n = strlen(item->d_name);
+            const char suffix[] = "_session.json";
+            if (n > sizeof(suffix) - 1 &&
+                !strcmp(item->d_name + n - (sizeof(suffix) - 1), suffix)) {
+                have_manifest = true;
+                break;
+            }
+        }
+        closedir(day);
+        if (day_failed) { failed = true; break; }
+        if (have_manifest) memcpy(out, name, 9);
+    }
+    closedir(root);
+    if (failed) return ESP_FAIL;
+    return out[0] ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+/* Use the same newest-session fallback drift as a normal day rebuild, but
+ * refresh only the cumulative STR; native settings do not change DATALOG. */
+static esp_err_t rebuild_native_from_latest_session(bool *has_session)
+{
+    *has_session = false;
+    char day[9], day_path[300];
+    esp_err_t found_day = newest_manifest_day(day);
+    if (found_day == ESP_ERR_NOT_FOUND) return ESP_OK;
+    if (found_day != ESP_OK) return found_day;
+    *has_session = true;
+    snprintf(day_path, sizeof(day_path), "%s/%s", SD_STREAMS_DIR, day);
+    DIR *dir = opendir(day_path);
+    if (!dir) return ESP_FAIL;
+    rebuild_session_t newest = {0}, candidate;
+    bool found = false, read_error = false;
+    struct dirent *ent;
+    for (;;) {
+        errno = 0;
+        ent = readdir(dir);
+        if (!ent) { read_error = errno != 0; break; }
+        if (rebuild_read_manifest(day_path, ent->d_name, &candidate) &&
+            (!found || candidate.start_epoch_ms > newest.start_epoch_ms)) {
+            newest = candidate;
+            found = true;
+        }
+    }
+    closedir(dir);
+    if (read_error || !found) {
+        ESP_LOGW(TAG, "native STR: newest streams day has no readable session");
+        return ESP_FAIL;
+    }
+    return edf_gen_generate_ex(SD_SDCARD_DIR, day_path, newest.session_id,
+                               newest.start_epoch_ms, newest.end_epoch_ms,
+                               newest.clock_drift_ms,
+                               EDF_GEN_SHARED_HISTORICAL | EDF_GEN_REQUIRE_NATIVE_ID);
+}
+
+static esp_err_t rebuild_day(const char *day_folder, bool require_native)
 {
     if (!day_folder || strlen(day_folder) != 8) return ESP_ERR_INVALID_ARG;
+    for (int i = 0; i < 8; i++)
+        if (day_folder[i] < '0' || day_folder[i] > '9') return ESP_ERR_INVALID_ARG;
     if (!sd_storage_is_ready()) return ESP_ERR_INVALID_STATE;
 
     /* Hold the lease for the entire transaction: no other export, no upload
@@ -1306,6 +1588,17 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
     if (!sd_storage_lease_acquire(SD_LEASE_EXPORT, 120000)) {
         ESP_LOGE(TAG, "rebuild %s: storage busy", day_folder);
         return ESP_ERR_TIMEOUT;
+    }
+
+    if (require_native) {
+        cJSON *native = edf_read_json_file(SD_SUMMARIES_DIR "/native.ident.json");
+        bool compatible = ident_matches_native(native) && exported_identity_compatible(native);
+        cJSON_Delete(native);
+        if (!compatible) {
+            ESP_LOGE(TAG, "rebuild %s: export identity differs from native STR", day_folder);
+            sd_storage_lease_release(SD_LEASE_EXPORT);
+            return ESP_ERR_INVALID_STATE;
+        }
     }
 
     ESP_LOGI(TAG, "=== REBUILD DAY %s ===", day_folder);
@@ -1327,6 +1620,11 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
         struct dirent *ent;
         while ((ent = readdir(d)) != NULL) {
             if (ent->d_type != DT_REG) continue;
+            size_t len = strlen(ent->d_name);
+            const char suffix[] = "_session.json";
+            if (len <= sizeof(suffix) - 1 ||
+                strcmp(ent->d_name + len - (sizeof(suffix) - 1), suffix) != 0)
+                continue;
             if (n >= REBUILD_MAX_SESSIONS) { truncated = true; break; }
             if (rebuild_read_manifest(day_path, ent->d_name, &sessions[n])) n++;
         }
@@ -1376,7 +1674,8 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
                                          sessions[i].start_epoch_ms,
                                          sessions[i].end_epoch_ms,
                                          sessions[i].clock_drift_ms,
-                                         EDF_GEN_PER_SESSION);
+                                         EDF_GEN_PER_SESSION |
+                                         (require_native ? EDF_GEN_REQUIRE_NATIVE_ID : 0));
         if (r != ESP_OK) {
             if (sessions[i].interrupted) {
                 /* A crash-recovered fragment can be damaged in ways no amount
@@ -1427,19 +1726,13 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
     mkdir(SD_SDCARD_DIR, 0775);
     mkdir(SD_SDCARD_DATALOG, 0775);
 
-    /* Mark the day as mid-publication before anything is destroyed, so an
-     * interruption from here on is detectable on the next boot. */
-    {
-        FILE *sf = fopen(REBUILD_SENTINEL, "w");
-        if (sf) {
-            fprintf(sf, "%s\n", day_folder);
-            fflush(sf);
-            fsync(fileno(sf));
-            fclose(sf);
-        } else {
-            ESP_LOGW(TAG, "rebuild %s: could not write publish sentinel — an "
-                     "interrupted publish will not self-heal", day_folder);
-        }
+    /* Never start the non-atomic day swap without a durable recovery marker. */
+    if (rebuild_write_sentinel(day_folder) != ESP_OK) {
+        ESP_LOGE(TAG, "rebuild %s: cannot create recovery marker; preserving day", day_folder);
+        rebuild_rmtree(REBUILD_STAGING_DIR);
+        free(sessions);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return ESP_FAIL;
     }
 
     rebuild_rmtree(live_day);
@@ -1470,6 +1763,7 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
                  "identity/settings", day_folder);
     uint32_t shared_flags = is_newest ? EDF_GEN_SHARED
                                       : EDF_GEN_SHARED_HISTORICAL;
+    if (require_native) shared_flags |= EDF_GEN_REQUIRE_NATIVE_ID;
     esp_err_t shared = edf_gen_generate_ex(SD_SDCARD_DIR, day_path,
                                           newest->session_id,
                                           newest->start_epoch_ms,
@@ -1504,6 +1798,16 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
     return ESP_OK;
 }
 
+esp_err_t edf_gen_rebuild_day(const char *day_folder)
+{
+    return rebuild_day(day_folder, false);
+}
+
+esp_err_t edf_gen_rebuild_day_for_native(const char *day_folder)
+{
+    return rebuild_day(day_folder, true);
+}
+
 bool edf_gen_take_interrupted_rebuild(char *out_day, size_t out_len)
 {
     if (!out_day || out_len < 9) return false;
@@ -1526,14 +1830,15 @@ bool edf_gen_take_interrupted_rebuild(char *out_day, size_t out_len)
         if (buf[i] < '0' || buf[i] > '9') valid = false;
     }
 
-    /* Consume it either way: a malformed sentinel would otherwise be reported
-     * on every boot for ever. */
-    unlink(REBUILD_SENTINEL);
     if (!valid) {
+        /* A malformed sentinel cannot identify a day to retry. */
+        unlink(REBUILD_SENTINEL);
         ESP_LOGW(TAG, "discarding malformed publish sentinel");
         return false;
     }
 
+    /* Keep the marker until a successful rebuild, including if power fails
+     * before the caller has durably queued the retry. */
     strlcpy(out_day, buf, out_len);
     return true;
 }

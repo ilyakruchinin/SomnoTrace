@@ -33,6 +33,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifndef TX_LOG_HOST
+#include "esp_heap_caps.h"
+#endif
+
 static const char *TAG = "tx_log";
 
 #define TX_MAGIC 0x54584c47u   /* "TXLG" */
@@ -47,7 +51,9 @@ struct tx_log {
 
 #ifdef TX_LOG_FAULT_INJECT
 static int s_fault_countdown;
+static int s_alloc_fault_countdown;
 void tx_log_fault_after(int writes_until_failure) { s_fault_countdown = writes_until_failure; }
+void tx_log_alloc_fault_after(int allocations_until_failure) { s_alloc_fault_countdown = allocations_until_failure; }
 static bool fault_hit(void)
 {
     if (s_fault_countdown <= 0) return false;
@@ -56,6 +62,19 @@ static bool fault_hit(void)
 #else
 static bool fault_hit(void) { return false; }
 #endif
+
+static void *tx_alloc(size_t size)
+{
+#ifdef TX_LOG_FAULT_INJECT
+    if (s_alloc_fault_countdown > 0 && --s_alloc_fault_countdown == 0)
+        return NULL;
+#endif
+#ifdef TX_LOG_HOST
+    return malloc(size);
+#else
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+}
 
 static uint32_t crc32_bytes(const uint8_t *d, size_t n)
 {
@@ -155,7 +174,7 @@ static esp_err_t scan(const char *path, uint8_t **data_out, size_t *len_out,
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return ESP_FAIL; }
     long n = ftell(f);
     if (n < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return ESP_FAIL; }
-    uint8_t *buf = malloc((size_t)n + 1);
+    uint8_t *buf = tx_alloc((size_t)n + 1);
     if (!buf) { fclose(f); return ESP_ERR_NO_MEM; }
     size_t got = n > 0 ? fread(buf, 1, (size_t)n, f) : 0;
     fclose(f);
@@ -163,32 +182,47 @@ static esp_err_t scan(const char *path, uint8_t **data_out, size_t *len_out,
     *data_out = buf;
     *len_out = (size_t)n;
 
+    if (n == 0) return ESP_OK;
+
+    /* Replay can run on the 8 KiB bridge task stack.  Keep the bounded
+     * transaction table in PSRAM, with no internal-RAM fallback. */
+    id_state_t *table = tx_alloc(256 * sizeof(*table));
+    if (!table) return ESP_ERR_NO_MEM;
+    esp_err_t result = ESP_OK;
     size_t off = 0;
-    id_state_t table[256];
     size_t n_ids = 0;
     while (off < (size_t)n) {
         tx_rec_t r;
         rec_status_t st = parse_record(buf + off, (size_t)n - off, &r);
         if (st == REC_INCOMPLETE) { *torn = true; break; }
-        if (st == REC_BAD) return ESP_ERR_INVALID_CRC;
-        if (r.seq != *last_seq + 1) return ESP_ERR_INVALID_CRC;
+        if (st == REC_BAD || r.seq != *last_seq + 1) {
+            result = ESP_ERR_INVALID_CRC;
+            break;
+        }
         size_t i = 0;
         while (i < n_ids && strcmp(table[i].id, r.id) != 0) i++;
         if (i == n_ids) {
-            if (n_ids >= 256) return ESP_ERR_INVALID_SIZE;
+            if (n_ids >= 256) {
+                result = ESP_ERR_INVALID_SIZE;
+                break;
+            }
             snprintf(table[n_ids].id, sizeof(table[n_ids].id), "%s", r.id);
             table[n_ids].state = TX_STATE_NONE;
             n_ids++;
         }
         bool legal;
         table[i].state = next_state(table[i].state, r.type, &legal);
-        if (!legal) return ESP_ERR_INVALID_STATE;
+        if (!legal) {
+            result = ESP_ERR_INVALID_STATE;
+            break;
+        }
         off += r.length;
         *last_seq = r.seq;
         (*records)++;
         *valid_out = off;
     }
-    return ESP_OK;
+    free(table);
+    return result;
 }
 
 /* Replace path with its valid prefix, keeping the old file until the new one
@@ -240,8 +274,9 @@ esp_err_t tx_log_open(const char *path, tx_log_t **out, bool *torn_tail)
     }
     free(data);
 
-    tx_log_t *log = calloc(1, sizeof(*log));
+    tx_log_t *log = tx_alloc(sizeof(*log));
     if (!log) return ESP_ERR_NO_MEM;
+    memset(log, 0, sizeof(*log));
     snprintf(log->path, sizeof(log->path), "%s", path);
     log->last_seq = last_seq;
     log->records = records;

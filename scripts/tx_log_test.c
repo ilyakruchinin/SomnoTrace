@@ -23,7 +23,6 @@
  */
 
 #define _XOPEN_SOURCE 700
-#define TX_LOG_FAULT_INJECT
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -207,7 +206,7 @@ static void test_recovers_from_interrupted_truncation(void)
 
     /* Simulate a crash between the two renames: the valid log sits at .bak
      * and the live path is missing. */
-    char bak[320];
+    char bak[324];
     snprintf(bak, sizeof(bak), "%s.bak", path);
     CHECK(rename(path, bak) == 0, "stage backup");
     log = NULL;
@@ -219,6 +218,76 @@ static void test_recovers_from_interrupted_truncation(void)
     cleanup();
 }
 
+static void test_replay_allocation_failure(void)
+{
+    fresh();
+    tx_log_t *log = NULL;
+    bool torn;
+    CHECK(tx_log_open(path, &log, &torn) == ESP_OK, "open");
+    if (!log) { cleanup(); return; }
+    CHECK(tx_log_append(log, TX_PREPARE, "alloc", NULL, 0) == ESP_OK,
+          "prepare allocation test record");
+    long before = file_size(path);
+
+    tx_state_t st;
+    tx_log_alloc_fault_after(2);
+    CHECK(tx_log_state(log, "alloc", &st) == ESP_ERR_NO_MEM,
+          "replay table allocation failure reported");
+    tx_log_alloc_fault_after(2);
+    CHECK(tx_log_append(log, TX_COMMIT, "alloc", NULL, 0) == ESP_ERR_NO_MEM,
+          "append refuses to proceed when replay allocation fails");
+    CHECK(file_size(path) == before, "failed replay does not change log");
+    CHECK(tx_log_state(log, "alloc", &st) == ESP_OK && st == TX_STATE_PREPARED,
+          "state remains intact after allocation failure");
+    tx_log_close(log);
+
+    for (int allocation = 1; allocation <= 3; allocation++) {
+        log = NULL;
+        tx_log_alloc_fault_after(allocation);
+        CHECK(tx_log_open(path, &log, &torn) == ESP_ERR_NO_MEM && !log,
+              "open reports allocation failure without returning a handle");
+        CHECK(file_size(path) == before, "failed open leaves log untouched");
+    }
+    CHECK(tx_log_open(path, &log, &torn) == ESP_OK && log,
+          "open succeeds after allocation failures");
+    if (log) {
+        CHECK(tx_log_state(log, "alloc", &st) == ESP_OK && st == TX_STATE_PREPARED,
+              "record survives allocation failures");
+        tx_log_close(log);
+    }
+    cleanup();
+}
+
+static void test_full_replay_table(void)
+{
+    fresh();
+    tx_log_t *log = NULL;
+    bool torn;
+    CHECK(tx_log_open(path, &log, &torn) == ESP_OK, "open");
+    if (!log) { cleanup(); return; }
+    bool ok = true;
+    for (int i = 0; i < 256; i++) {
+        char id[16];
+        snprintf(id, sizeof(id), "id-%03d", i);
+        if (tx_log_append(log, TX_PREPARE, id, NULL, 0) != ESP_OK) {
+            ok = false;
+            break;
+        }
+    }
+    CHECK(ok, "populate all 256 replay table entries");
+    tx_log_close(log);
+    log = NULL;
+    CHECK(tx_log_open(path, &log, &torn) == ESP_OK && log && !torn,
+          "reopen full replay table");
+    if (log) {
+        tx_state_t st;
+        CHECK(tx_log_state(log, "id-255", &st) == ESP_OK && st == TX_STATE_PREPARED,
+              "last replay table entry is intact");
+        tx_log_close(log);
+    }
+    cleanup();
+}
+
 int main(void)
 {
     test_commit_and_state();
@@ -227,6 +296,8 @@ int main(void)
     test_middle_corruption_is_not_skipped();
     test_append_failure_leaves_no_committed_record();
     test_recovers_from_interrupted_truncation();
+    test_replay_allocation_failure();
+    test_full_replay_table();
     printf("tx_log_test: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

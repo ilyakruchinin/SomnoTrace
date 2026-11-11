@@ -99,6 +99,12 @@ void edf_import_ctx_set_quiesce(edf_import_ctx_t *ctx, int seconds);
  *                       to call again. */
 esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out);
 
+#ifdef EDF_IMPORT_HOST
+/* Test the retained-root retry gate with a synthetic monotonic clock. */
+void edf_import_test_mark_root_retry(int64_t now_us);
+bool edf_import_test_defer_root_retry(int64_t now_us, bool groups_pending);
+#endif
+
 #ifndef EDF_IMPORT_HOST
 /* Spawn the background import worker: waits for SD + settles FTP/quiescence
  * windows, drains the inbox unit-by-unit under the EXPORT lease, and kicks

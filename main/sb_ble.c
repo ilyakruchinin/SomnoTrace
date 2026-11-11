@@ -255,6 +255,10 @@ static bool     s_sync_running;
 static bool     s_sync_full;
 static bool     s_source_store_ready;
 static uint32_t s_root_obs_seq;
+static int64_t s_root_recheck_ms[SB_ROOT_NAME_COUNT];
+static const char *const s_root_processed_ids[SB_ROOT_NAME_COUNT] = {
+    "str-v1", "ident-json-v1", "ident-tgt-v1", "current-settings-v1"
+};
 static sb_import_kick_fn_t s_import_kick;
 
 /* Ledger (loaded during a sync pass, freed at the end) */
@@ -1607,23 +1611,27 @@ static void root_retain_source(const char *key, const char *path,               
                                const char *directory)
 {
     if (!s_source_store_ready) return;
+    if (!source_store_lock()) {
+        ESP_LOGW(TAG, "source store: lock failed for %s", key);
+        return;
+    }
     source_store_put_result_t put;
     if (source_store_put_path("root", path, &put) != ESP_OK) {
         ESP_LOGW(TAG, "source store: cannot retain %s", key);
-        return;
+        goto done;
     }
     char existing[SOURCE_STORE_ID_HEX + 1] = "";
     char existing_obs[128] = "";
     esp_err_t found = source_store_find("root", key, size, ts, ts_null,
                                         existing, sizeof(existing),
                                         existing_obs, sizeof(existing_obs));
-    if (found == ESP_OK && !strcmp(existing, put.id)) return;
+    if (found == ESP_OK && !strcmp(existing, put.id)) goto done;
     if (found == ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "source store: ambiguous evidence for %s", key);
-        return;
+        goto done;
     }
     cJSON *obs = cJSON_CreateObject();
-    if (!obs) return;
+    if (!obs) goto done;
     bool ok = cJSON_AddStringToObject(obs, "key", key) &&
               cJSON_AddStringToObject(obs, "size", size) &&
               (ts_null ? cJSON_AddNullToObject(obs, "ts")
@@ -1634,7 +1642,7 @@ static void root_retain_source(const char *key, const char *path,               
                                       (double)(esp_timer_get_time() / 1000));
     if (!ok) {
         cJSON_Delete(obs);
-        return;
+        goto done;
     }
     char obs_id[96];
     snprintf(obs_id, sizeof(obs_id), "%lld-%lu",
@@ -1643,6 +1651,8 @@ static void root_retain_source(const char *key, const char *path,               
     if (source_store_observe(put.id, obs_id, "root", obs) != ESP_OK)
         ESP_LOGW(TAG, "source store: cannot record observation for %s", key);
     cJSON_Delete(obs);
+done:
+    source_store_unlock();
 }
 
 /* Root pull transactions (WP3).  Each attempt gets a unique id because the
@@ -1770,9 +1780,7 @@ static root_sync_result_t sync_root_dir(const char *directory,
             same = sz && size && !strcmp(sz, size) && ts_match;
         }
 
-        /* The importer consumes a successfully imported root file, but the
-         * ledger still records its tuple.  A ledger match alone must not
-         * suppress a re-fetch when the canonical local copy is gone. */
+        /* A tuple alone is not proof that the importer committed the file. */
         char local[240], canonical_local[240];
         snprintf(local, sizeof(local), "%s/%s%s", SD_IMPORT_DIR,
                  ledger_prefix, fn);
@@ -1787,17 +1795,39 @@ static root_sync_result_t sync_root_dir(const char *directory,
             }
             continue;
         }
+        if (local_present) {
+            /* The staged file may still be unprocessed or deliberately
+             * retained. Do not replace it with a newer bridge version. */
+            ESP_LOGI(TAG, "root: deferring changed %s while staged input remains",
+                     canonical_key);
+            r.deferred = true;
+            continue;
+        }
 
-        ESP_LOGI(TAG, "root: pulling %s as %s (%s bytes)", key, canonical, size);
         char tx_id[96] = "";
-        if (!local_present && s_source_store_ready) {
+        if (!local_present && s_source_store_ready && source_store_lock()) {
             char stored_id[SOURCE_STORE_ID_HEX + 1];
             esp_err_t sf = source_store_find("root", canonical_key, size, ts,
                                              ts_null, stored_id,
                                              sizeof(stored_id), NULL, 0);
             if (sf == ESP_OK) {
+                int64_t now = esp_timer_get_time() / 1000;
+                bool committed = same && source_store_has_observation(
+                    stored_id, s_root_processed_ids[idx], "processed_root");
+                sb_root_cache_action_t action = sb_root_cache_action(
+                    same, committed, now, &s_root_recheck_ms[idx]);
+                if (action == SB_ROOT_SKIP_COMMITTED) {
+                    source_store_unlock();
+                    continue;
+                }
+                if (action == SB_ROOT_RECHECK) {
+                    source_store_unlock();
+                    goto network_pull;
+                }
+                ESP_LOGI(TAG, "root: restoring %s as %s (%s bytes)", key, canonical, size);
                 root_tx_begin(canonical_key, size, ts, ts_null, tx_id, sizeof(tx_id));
                 bool restored = source_store_copy_to(stored_id, canonical_local) == ESP_OK;
+                source_store_unlock();
                 if (restored) {
                     ESP_LOGI(TAG, "root: restored %s from source store (%s)",
                              canonical_key, stored_id);
@@ -1813,10 +1843,12 @@ static root_sync_result_t sync_root_dir(const char *directory,
                 s_sync_files_done++;
                 continue;
             }
+            source_store_unlock();
             if (sf == ESP_ERR_INVALID_STATE)
                 ESP_LOGW(TAG, "root: ambiguous source evidence for %s", canonical_key);
         }
 network_pull:
+        ESP_LOGI(TAG, "root: pulling %s as %s (%s bytes)", key, canonical, size);
         root_tx_begin(canonical_key, size, ts, ts_null, tx_id, sizeof(tx_id));
         if (sb_get_file(directory, fn, size, ts, ts_null) != ESP_OK) {
             ESP_LOGW(TAG, "root: %s failed (%s)", key, s_last_error);
@@ -1835,6 +1867,7 @@ network_pull:
         }
         root_retain_source(canonical_key, canonical_local, size, ts, ts_null,
                            fn, directory);
+        s_root_recheck_ms[idx] = esp_timer_get_time() / 1000;
 
         if (found_key[0] && strcmp(found_key, canonical_key) != 0) {
             cJSON *root = cJSON_GetObjectItem(s_ledger, "root");
@@ -1925,7 +1958,10 @@ static void sync_run(bool full)
         }
     }
     if (!s_source_store_ready) {
-        s_source_store_ready = source_store_init(NULL) == ESP_OK;
+        if (source_store_lock()) {
+            s_source_store_ready = source_store_init(NULL) == ESP_OK;
+            source_store_unlock();
+        }
         if (!s_source_store_ready)
             ESP_LOGW(TAG, "source store unavailable; root evidence will not be retained");
     }

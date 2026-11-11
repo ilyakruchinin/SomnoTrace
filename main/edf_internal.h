@@ -59,6 +59,8 @@ void edf_write_field(char *buf, int width, const char *text);
 bool edf_write_all(FILE *f, const void *data, size_t len);
 
 FILE *edf_open_atomic_file(const char *path, char *tmp_path, size_t tmp_path_len);
+/* Recover an interrupted FAT replacement without creating a new file. */
+esp_err_t edf_recover_atomic_file(const char *path);
 esp_err_t edf_finalize_atomic_file(FILE *f, const char *tmp_path, const char *path);
 void edf_discard_atomic_file(FILE *f, const char *tmp_path);
 

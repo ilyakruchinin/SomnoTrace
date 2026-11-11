@@ -215,7 +215,8 @@ if [ -n "$CJ_INC" ]; then
         scripts/edf_properties_test.c "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" "$MAIN_DIR/settings_resolver.c" $CJ_SRC $CJ_LIB -lm
     # WP3 append-only transaction log: commit/replay, illegal transitions,
     # torn-tail truncation, middle corruption, fault injection, backup restore.
-    run_test tx_log_test -I"$SHIM" -I"$MAIN_DIR" -DTX_LOG_FAULT_INJECT \
+    run_test tx_log_test -I"$SHIM" -I"$MAIN_DIR" -DTX_LOG_HOST -DTX_LOG_FAULT_INJECT \
+        -Werror=frame-larger-than=4096 \
         scripts/tx_log_test.c "$MAIN_DIR/tx_log.c"
     # Pure WP4 resolver: identity gate, native/live/conflict decisions and
     # the deterministic revision key.  No file or JSON I/O.
@@ -256,16 +257,16 @@ if [ -n "$CJ_INC" ]; then
     # the FreeRTOS worker + edf_gen/uploader hooks out; SD_MOUNT_POINT is
     # redirected to scratch space under /tmp.
     run_test edf_import_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
-        -DEDF_IMPORT_HOST '-DSD_MOUNT_POINT="/tmp/somnotrace_imp/sd"' \
-        scripts/edf_import_test.c "$MAIN_DIR/edf_import.c" \
+        -DEDF_IMPORT_HOST -DSOURCE_STORE_HOST '-DSD_MOUNT_POINT="/tmp/somnotrace_imp/sd"' \
+        scripts/edf_import_test.c "$MAIN_DIR/edf_import.c" "$MAIN_DIR/source_store.c" \
         "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" $CJ_SRC $CJ_LIB -lm
     # Round trip: a live night exported by edf_gen, staged as an IMPORT/ card
     # image, imported, and exported again must be byte-identical.  edf_gen's
     # output is the real-card reference, so this catches layout assumptions
     # (e.g. EVE/CSL 0.00 s records) that hand-written fixtures cannot.
     run_test edf_roundtrip_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
-        -DEDF_IMPORT_HOST '-DSD_MOUNT_POINT="/tmp/somnotrace_rt/sd"' \
-        scripts/edf_roundtrip_test.c "$MAIN_DIR/edf_import.c" \
+        -DEDF_IMPORT_HOST -DSOURCE_STORE_HOST '-DSD_MOUNT_POINT="/tmp/somnotrace_rt/sd"' \
+        scripts/edf_roundtrip_test.c "$MAIN_DIR/edf_import.c" "$MAIN_DIR/source_store.c" \
         "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" "$MAIN_DIR/settings_resolver.c" $CJ_SRC $CJ_LIB -lm
 fi
 

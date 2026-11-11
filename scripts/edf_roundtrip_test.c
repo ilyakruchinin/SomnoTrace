@@ -69,6 +69,9 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+int host_heap_caps_calloc_fail;
+int host_heap_caps_realloc_fail;
+
 /* storage arbitration edf_gen.c calls — single-threaded host, always free */
 bool sd_storage_is_ready(void) { return true; }
 bool sd_storage_lease_acquire(sd_lease_t role, uint32_t timeout_ms)
@@ -132,6 +135,35 @@ static uint8_t *slurp(const char *path, size_t *n)
     fclose(f);
     *n = (size_t)sz;
     return b;
+}
+
+/* Golden hashes captured from the pre-change live export using the synthetic
+ * New York fixture below. They cover filenames, timestamps and every byte. */
+static void check_live_golden(void)
+{
+    static const struct { const char *path; uint64_t hash; } golden[] = {
+        {"Identification.crc", UINT64_C(0xdee735cb95b8f785)},
+        {"Identification.json", UINT64_C(0x27530f8d96dae0b0)},
+        {"STR.edf", UINT64_C(0x9436d4b9601cc593)},
+        {"SETTINGS/CurrentSettings.crc", UINT64_C(0xe9a5f920b2d8b6fa)},
+        {"SETTINGS/CurrentSettings.json", UINT64_C(0x4dda3749430208bb)},
+        {"DATALOG/20260301/20260301_170000_CSL.edf", UINT64_C(0x456ce4a823399e6d)},
+        {"DATALOG/20260301/20260301_170000_EVE.edf", UINT64_C(0xe962382e50ddd1c1)},
+        {"DATALOG/20260301/20260301_170010_BRP.edf", UINT64_C(0x8b183c4f43c719b2)},
+        {"DATALOG/20260301/20260301_170010_PLD.edf", UINT64_C(0xc914174bad057d10)},
+        {"DATALOG/20260301/20260301_170010_SA2.edf", UINT64_C(0x8be4cd938fc52b6d)},
+    };
+    for (size_t i = 0; i < sizeof(golden) / sizeof(golden[0]); i++) {
+        char path[500];
+        snprintf(path, sizeof(path), "%s/%s", SNAP_A, golden[i].path);
+        size_t n = 0;
+        uint8_t *bytes = slurp(path, &n);
+        uint64_t hash = UINT64_C(14695981039346656037);
+        for (size_t j = 0; bytes && j < n; j++)
+            hash = (hash ^ bytes[j]) * UINT64_C(1099511628211);
+        check(bytes && hash == golden[i].hash, "pre-change live export golden");
+        free(bytes);
+    }
 }
 
 static void write_snt(const char *path, uint8_t n_ch, uint16_t hz_x10,
@@ -369,9 +401,12 @@ static void roundtrip(const char *label, const char *tz, const char *tz_off,
           imported, failed, skipped, rejected);
     check(nd == 1 && !strcmp(days[0], g_day), "%s: imported day %s (export day %s)", label,
           nd ? days[0] : "(none)", g_day);
-    check(!edf_import_pending(), "%s: inbox drained", label);
+    check(edf_import_pending(), "%s: native STR rebuild remains pending", label);
     for (int i = 0; i < nd; i++)
         check(edf_gen_rebuild_day(days[i]) == ESP_OK, "%s: re-export of %s failed", label, days[i]);
+    check(unlink(SD_SUMMARIES_DIR "/native-str.needs_rebuild") == 0,
+          "%s: clear completed test rebuild marker", label);
+    check(!edf_import_pending(), "%s: inbox drained after rebuild", label);
 
     /* A == B: same file set, same bytes */
     char b_files[16][80];
@@ -414,6 +449,377 @@ static int as10_sample(const uint8_t *bytes, size_t len, const char *label, int 
     int16_t value;
     memcpy(&value, bytes + pos, 2);
     return value;
+}
+
+static int signal_index(const uint8_t *bytes, size_t len, const char *label, int *ns_out)
+{
+    if (!bytes || len < 256) return -1;
+    char text[5] = {0};
+    memcpy(text, bytes + 252, 4);
+    int ns = atoi(text);
+    if (ns <= 0 || (size_t)(256 + ns * 256) > len) return -1;
+    *ns_out = ns;
+    for (int i = 0; i < ns; i++) {
+        char name[17];
+        memcpy(name, bytes + 256 + i * 16, 16);
+        name[16] = '\0';
+        for (int j = 15; j >= 0 && name[j] == ' '; j--) name[j] = '\0';
+        if (!strcmp(name, label)) return i;
+    }
+    return -1;
+}
+
+static bool signal_headers_match(const uint8_t *a, size_t alen,
+                                 const uint8_t *b, size_t blen,
+                                 const char *label)
+{
+    int an = 0, bn = 0;
+    int ai = signal_index(a, alen, label, &an);
+    int bi = signal_index(b, blen, label, &bn);
+    if (ai < 0 || bi < 0) return false;
+    static const int offsets[] = {96, 104, 112, 120, 128, 216};
+    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++)
+        if (memcmp(a + 256 + offsets[i] * an + ai * 8,
+                   b + 256 + offsets[i] * bn + bi * 8, 8)) return false;
+    return true;
+}
+
+/* Exercise every field in the supported family tables through real EDF
+ * parsing, native daily persistence and EDF generation. */
+static void native_field_matrix(bool as10)
+{
+    setenv("TZ", "UTC", 1);
+    tzset();
+    sh("rm -rf '%s'; mkdir -p '%s' '%s' '%s'",
+       SD_MOUNT_POINT, SD_IMPORT_DIR, SD_STREAMS_DIR, SD_SUMMARIES_DIR);
+    edf_signal_def_t signals[74];
+    int16_t values[74];
+    int n = 0;
+    signals[n] = g_str_signals[0];
+    values[n++] = (int16_t)as11_time_day_number("20260301");
+    signals[n] = g_str_signals[4];
+    values[n++] = 120;
+    int fields = as10 ? (int)(sizeof(g_as10_setting_fields) / sizeof(g_as10_setting_fields[0]))
+                      : 71;
+    for (int i = 0; i < fields; i++) {
+        int idx = as10 ? g_as10_setting_fields[i].str_index : i + 5;
+        signals[n] = g_str_signals[idx];
+        if (as10) signals[n].label = g_as10_setting_fields[i].label;
+        values[n] = idx == 5 ? 2 :
+            (int16_t)((signals[n].dig_min + signals[n].dig_max) / 2);
+        n++;
+    }
+    char source[400];
+    snprintf(source, sizeof(source), "%s/STR.edf", SD_IMPORT_DIR);
+    FILE *f = fopen(source, "wb");
+    check(f != NULL, "create synthetic settings matrix");
+    if (!f) return;
+    const char *recording = as10 ? "SRN=matrix10 MID=36 VID=1"
+                                 : "SRN=matrix11 MID=46 VID=1";
+    check(edf_write_header(f, "X X X X", recording, "01.03.26", "12.00.00",
+                           1, "86400", "EDF", signals, n) > 0,
+          "write settings matrix header");
+    uint16_t crc = edf_crc16_ccitt((const uint8_t *)values, (size_t)n * 2);
+    fwrite(values, 2, (size_t)n, f);
+    fwrite(&crc, 2, 1, f);
+    fclose(f);
+    size_t source_len = 0;
+    uint8_t *source_bytes = slurp(source, &source_len);
+    edf_import_ctx_t *ctx = edf_import_ctx_create();
+    edf_import_unit_t unit;
+    check(ctx && edf_import_process_next(ctx, &unit) == ESP_OK &&
+          unit.settings_written == 1 && !unit.root_retained,
+          "import settings matrix");
+    edf_import_ctx_destroy(ctx);
+    check(edf_gen_rebuild_native_str() == ESP_OK, "export settings matrix");
+    size_t generated_len = 0;
+    uint8_t *generated = slurp(SD_SDCARD_DIR "/STR.edf", &generated_len);
+    for (int i = 2; i < n; i++) {
+        check(as10_sample(generated, generated_len, signals[i].label, 0) == values[i],
+              "%s %s round-trip value", as10 ? "AS10" : "AS11", signals[i].label);
+        check(signal_headers_match(source_bytes, source_len, generated, generated_len,
+                                   signals[i].label),
+              "%s %s EDF header", as10 ? "AS10" : "AS11", signals[i].label);
+    }
+    free(source_bytes);
+    free(generated);
+}
+
+static void write_history_spool(int64_t noon_ms, char path[400])
+{
+    time_t sec = (time_t)(noon_ms / 1000);
+    struct tm date;
+    gmtime_r(&sec, &date);
+    char label[16];
+    strftime(label, sizeof(label), "%Y%m%d", &date);
+    snprintf(path, 400, "%s/%s.spool", SD_SUMMARIES_DIR, label);
+    FILE *f = fopen(path, "wb");
+    check(f != NULL, "create history spool");
+    if (!f) return;
+    const uint64_t vals[] = {
+        (uint64_t)SUM_F_PERIOD_START << 3, (uint64_t)noon_ms,
+        (uint64_t)SUM_F_PERIOD_END << 3, (uint64_t)(noon_ms + 86400000LL)
+    };
+    for (size_t i = 0; i < sizeof(vals) / sizeof(vals[0]); i++) {
+        uint64_t v = vals[i];
+        while (v >= 128) { fputc((int)((v & 127) | 128), f); v >>= 7; }
+        fputc((int)v, f);
+    }
+    fclose(f);
+}
+
+static void history_limits(void)
+{
+    setenv("TZ", "UTC", 1);
+    tzset();
+    sh("rm -rf '%s'; mkdir -p '%s' '%s' '%s'",
+       SD_MOUNT_POINT, SD_SUMMARIES_DIR, SD_STREAMS_DIR, SD_SDCARD_DIR);
+    put(SD_SUMMARIES_DIR "/native.ident.json",
+        "{\"SerialNumber\":\"fixture11\",\"PlatformIdentifier\":46,"
+        "\"_somnotrace_native_source\":\"native_str\"}");
+    const int64_t start = 1577880000000LL; /* 2020-01-01 12:00 UTC */
+    char path[400];
+    for (int i = 0; i < 367; i++)
+        write_history_spool(start + (int64_t)i * 86400000LL, path);
+    check(edf_gen_rebuild_native_str() == ESP_OK, "export 367 spool days");
+    size_t len = 0;
+    uint8_t *bytes = slurp(SD_SDCARD_DIR "/STR.edf", &len);
+    char count[9] = {0};
+    if (bytes && len >= 244) memcpy(count, bytes + 236, 8);
+    check(atoi(count) == 365 &&
+          as10_sample(bytes, len, "Date", 0) == as11_time_day_number("20200103") &&
+          as10_sample(bytes, len, "Date", 364) == as11_time_day_number("20210101"),
+          "365-day selection keeps the newest distinct days");
+    host_heap_caps_calloc_fail = 1;
+    check(edf_gen_rebuild_native_str() != ESP_OK, "PSRAM exhaustion aborts STR generation");
+    host_heap_caps_calloc_fail = 0;
+    size_t failed_len = 0;
+    uint8_t *failed_bytes = slurp(SD_SDCARD_DIR "/STR.edf", &failed_len);
+    check(bytes && failed_bytes && len == failed_len && !memcmp(bytes, failed_bytes, len),
+          "allocation failure preserves previous STR");
+    free(failed_bytes);
+    host_heap_caps_realloc_fail = 1;
+    check(edf_gen_rebuild_native_str() != ESP_OK, "spool index allocation failure aborts");
+    host_heap_caps_realloc_fail = 0;
+    failed_bytes = slurp(SD_SDCARD_DIR "/STR.edf", &failed_len);
+    check(bytes && failed_bytes && len == failed_len && !memcmp(bytes, failed_bytes, len),
+          "spool index failure preserves previous STR");
+    free(failed_bytes);
+    char saved_spool[440];
+    snprintf(path, sizeof(path), "%s/20210101.spool", SD_SUMMARIES_DIR);
+    snprintf(saved_spool, sizeof(saved_spool), "%s.test-backup", path);
+    check(rename(path, saved_spool) == 0, "save test spool before corruption");
+    FILE *bad = fopen(path, "wb");
+    check(bad != NULL, "create truncated spool");
+    if (bad) { fputc(0x80, bad); fclose(bad); }
+    check(edf_gen_rebuild_native_str() != ESP_OK, "truncated spool aborts generation");
+    failed_bytes = slurp(SD_SDCARD_DIR "/STR.edf", &failed_len);
+    check(bytes && failed_bytes && len == failed_len && !memcmp(bytes, failed_bytes, len),
+          "truncated spool preserves previous STR");
+    free(failed_bytes);
+    write_history_spool(start + 366LL * 86400000LL, path);
+    bad = fopen(path, "ab");
+    check(bad != NULL, "open nested-corruption fixture");
+    if (bad) {
+        const uint8_t nested[] = {0x32, 0x02, 0x0a, 0x7f};
+        fwrite(nested, 1, sizeof(nested), bad);
+        fclose(bad);
+    }
+    check(edf_gen_rebuild_native_str() != ESP_OK, "invalid nested session length aborts");
+    failed_bytes = slurp(SD_SDCARD_DIR "/STR.edf", &failed_len);
+    check(bytes && failed_bytes && len == failed_len && !memcmp(bytes, failed_bytes, len),
+          "nested spool corruption preserves previous STR");
+    free(failed_bytes);
+    check(unlink(path) == 0 && rename(saved_spool, path) == 0,
+          "restore test-owned spool");
+    free(bytes);
+    for (int i = 0; i < 367; i++) {
+        time_t sec = (time_t)((start + (int64_t)i * 86400000LL) / 1000);
+        struct tm date;
+        gmtime_r(&sec, &date);
+        char label[16];
+        strftime(label, sizeof(label), "%Y%m%d", &date);
+        snprintf(path, sizeof(path), "%s/%s.spool", SD_SUMMARIES_DIR, label);
+        check(unlink(path) == 0, "remove test-owned history spool");
+    }
+    write_history_spool(start, path);
+    write_history_spool(start + (EDF_STR_MAX_RECORDS - 1LL) * 86400000LL, path);
+    check(edf_gen_rebuild_native_str() == ESP_OK, "maximum calendar span is accepted");
+    bytes = slurp(SD_SDCARD_DIR "/STR.edf", &len);
+    memset(count, 0, sizeof(count));
+    if (bytes && len >= 244) memcpy(count, bytes + 236, 8);
+    check(atoi(count) == EDF_STR_MAX_RECORDS, "calendar gaps are padded to the limit");
+    check(unlink(path) == 0, "remove test-owned last spool");
+    write_history_spool(start + (int64_t)EDF_STR_MAX_RECORDS * 86400000LL, path);
+    check(edf_gen_rebuild_native_str() != ESP_OK, "span over the limit is rejected");
+    size_t after_len = 0;
+    uint8_t *after = slurp(SD_SDCARD_DIR "/STR.edf", &after_len);
+    check(bytes && after && len == after_len && !memcmp(bytes, after, len),
+          "over-limit span leaves previous export untouched");
+    free(after);
+    free(bytes);
+}
+
+static void as11_native_roundtrip(void)
+{
+    setenv("TZ", "UTC", 1);
+    tzset();
+    sh("rm -rf '%s'; mkdir -p '%s' '%s' '%s'",
+       SD_MOUNT_POINT, SD_IMPORT_DIR, SD_STREAMS_DIR, SD_SUMMARIES_DIR);
+    const edf_signal_def_t signals[] = {
+        {"Date", "", "", 0, 24836, 0, 24836, "", 1},
+        {"MaskOn", "", "min", 0, 1440, 0, 1440, "", 2},
+        {"MaskOff", "", "min", 0, 1440, 0, 1440, "", 2},
+        {"Duration", "", "min", 0, 1440, 0, 1440, "", 1},
+        {"Mode", "", "", 0, 16, 0, 16, "", 1},
+        {"S.C.Press", "", "cmH2O", 0, 30, 0, 3000, "", 1},
+        {"S.A.MinPress", "", "cmH2O", 0, 30, 0, 300, "", 1},
+        {"S.A.MaxPress", "", "cmH2O", 0, 30, 0, 300, "", 1},
+        {"S.EPR.Level", "", "cmH2O", 0, 3, 0, 300, "", 1},
+        {"S.EPR.EPREnable", "", "", 0, 16, 0, 16, "", 1},
+        {"S.RampEnable", "", "", 0, 16, 0, 16, "", 1},
+        {"S.RampTime", "", "min", 0, 60, 0, 60, "", 1},
+        {"S.HumLevel", "", "bad-unit", 0, 8, 0, 8, "", 1},
+    };
+    const int16_t rows[][15] = {
+        {(int16_t)as11_time_day_number("20260301"), 600, 800, 660, 860,
+         120, 3, 850, -1, -1, 200, 2, 2, 20, 6},
+        {(int16_t)as11_time_day_number("20260302"), 700, -1, 760, -1,
+         60, 1, -1, 70, 150, 100, 1, 3, -1, -1},
+        {(int16_t)as11_time_day_number("20260303"), -1, -1, -1, -1,
+         0, 3, 875, -1, -1, -1, -1, -1, -1, -1},
+    };
+    const char *source = SD_IMPORT_DIR "/STR.edf";
+    const char *copy = SD_MOUNT_POINT "/original-str.edf";
+    FILE *f = fopen(source, "wb");
+    check(f != NULL, "AS11 fixture source");
+    if (!f) return;
+    check(edf_write_header(f, "X X X X",
+          "Startdate 01-MAR-2026 X X X SRN=fixture11 MID=46 VID=1",
+          "01.03.26", "12.00.00", 3, "86400", "EDF",
+          signals, (int)(sizeof(signals) / sizeof(signals[0]))) > 0,
+          "write AS11 STR header");
+    for (int i = 0; i < 3; i++) {
+        uint16_t crc = edf_crc16_ccitt((const uint8_t *)rows[i], sizeof(rows[i]));
+        fwrite(rows[i], 1, sizeof(rows[i]), f);
+        fwrite(&crc, 1, sizeof(crc), f);
+    }
+    fclose(f);
+    sh("cp '%s' '%s'", source, copy);
+    edf_import_ctx_t *ctx = edf_import_ctx_create();
+    edf_import_unit_t unit;
+    check(ctx && edf_import_process_next(ctx, &unit) == ESP_OK &&
+          unit.settings_written == 3 && unit.spools_written == 3 && !unit.root_retained,
+          "import independent AS11 daily records");
+    edf_import_ctx_destroy(ctx);
+    check(edf_import_pending(), "rebuild request survives context destruction");
+    check(edf_gen_rebuild_native_str() == ESP_OK, "publish AS11 STR with no session");
+    size_t len = 0;
+    uint8_t *bytes = slurp(SD_SDCARD_DIR "/STR.edf", &len);
+    check(as10_sample(bytes, len, "Mode", 0) == 3 &&
+          as10_sample(bytes, len, "S.C.Press", 0) == 425 &&
+          as10_sample(bytes, len, "Mode", 1) == 1 &&
+          as10_sample(bytes, len, "S.A.MinPress", 1) == 350 &&
+          as10_sample(bytes, len, "S.A.MaxPress", 1) == 750,
+          "daily AS11 modes and pressures use source physical scaling");
+    check(as10_sample(bytes, len, "S.EPR.Level", 0) == 100 &&
+          as10_sample(bytes, len, "S.EPR.EPREnable", 0) == 2 &&
+          as10_sample(bytes, len, "S.RampEnable", 0) == 2 &&
+          as10_sample(bytes, len, "S.RampTime", 0) == 20,
+          "AS11 EPR and ramp settings retained");
+    check(as10_sample(bytes, len, "S.HumLevel", 0) == -1 &&
+          as10_sample(bytes, len, "S.C.Press", 1) == -1 &&
+          as10_sample(bytes, len, "S.RampTime", 1) == -1,
+          "unsupported and missing settings stay unknown");
+    check(as10_sample(bytes, len, "S.C.Press", 2) == 438,
+          "AS11 pressure quantizes to within half a destination step");
+    check(as10_sample(bytes, len, "MaskOn", 0) == 600 &&
+          as10_sample(bytes, len, "MaskOff", 0) == 660 &&
+          as10_sample(bytes, len, "MaskOn", 1) == 700 &&
+          as10_sample(bytes, len, "MaskOff", 1) == 760,
+          "native mask timing remains unchanged");
+    check(access(SD_SDCARD_SETTINGS "/CurrentSettings.json", F_OK) != 0,
+          "historical settings do not create CurrentSettings");
+    check(rename(SD_SDCARD_DIR "/Identification.json",
+                 SD_SDCARD_DIR "/Identification.json.replace-backup") == 0 &&
+          rename(SD_SDCARD_DIR "/STR.edf",
+                 SD_SDCARD_DIR "/STR.edf.replace-backup") == 0 &&
+          unlink(SD_SDCARD_DIR "/Identification.crc") == 0,
+          "simulate interrupted root publication");
+    check(edf_gen_rebuild_native_str() == ESP_OK,
+          "restart recovers root files and missing identity checksum");
+    size_t ident_len = 0, crc_len = 0;
+    uint8_t *ident_bytes = slurp(SD_SDCARD_DIR "/Identification.json", &ident_len);
+    uint8_t *crc_bytes = slurp(SD_SDCARD_DIR "/Identification.crc", &crc_len);
+    uint32_t crc = ident_bytes ? edf_crc32_ieee(ident_bytes, ident_len) : 0;
+    check(crc_bytes && crc_len == 4 && crc_bytes[0] == (crc & 0xff) &&
+          crc_bytes[1] == ((crc >> 8) & 0xff) &&
+          crc_bytes[2] == ((crc >> 16) & 0xff) &&
+          crc_bytes[3] == ((crc >> 24) & 0xff),
+          "recovered identity checksum matches published JSON");
+    free(ident_bytes);
+    free(crc_bytes);
+    put(SD_SDCARD_DIR "/Identification.crc", "bad");
+    check(edf_gen_rebuild_native_str() != ESP_OK,
+          "invalid existing identity checksum is not silently rewritten");
+    check(unlink(SD_SDCARD_DIR "/Identification.crc") == 0 &&
+          edf_gen_rebuild_native_str() == ESP_OK,
+          "a missing checksum is repaired on retry");
+    check(unlink(SD_SUMMARIES_DIR "/native-str.needs_rebuild") == 0,
+          "clear completed test rebuild");
+    sh("cp '%s' '%s'", copy, source);
+    ctx = edf_import_ctx_create();
+    check(ctx && edf_import_process_next(ctx, &unit) == ESP_OK &&
+          !unit.root_retained && unit.settings_written == 0 && unit.spools_written == 0,
+          "unchanged AS11 import does not rewrite daily evidence");
+    edf_import_ctx_destroy(ctx);
+    check(!edf_import_pending(), "unchanged AS11 import does not request rebuild");
+    sh("mkdir -p '%s/20260304'", SD_STREAMS_DIR);
+    check(edf_gen_rebuild_native_str() == ESP_OK,
+          "empty streams directories do not block native-only export");
+    sh("mkdir -p '%s/20260301'", SD_STREAMS_DIR);
+    put(SD_STREAMS_DIR "/20260301/test_session.json",
+        "{\"start_epoch_ms\":1772402400000,\"end_epoch_ms\":1772406000000}");
+    put(SD_STREAMS_DIR "/20260301/test_ident.json",
+        "{\"SerialNumber\":\"foreign\",\"PlatformIdentifier\":46}");
+    check(edf_gen_rebuild_day_for_native("20260301") != ESP_OK,
+          "native rebuild refuses a session with a different identity");
+    check(edf_gen_rebuild_native_str() != ESP_OK,
+          "STR-only refresh refuses a different session identity");
+    put(SD_STREAMS_DIR "/20260301/test_ident.json",
+        "{\"SerialNumber\":\"fixture11\",\"PlatformIdentifier\":46}");
+    sh("mkdir -p '%s/20260301'", SD_SDCARD_DATALOG);
+    put(SD_SDCARD_DATALOG "/20260301/keep.edf", "unchanged test waveform");
+    check(edf_gen_rebuild_native_str() == ESP_OK,
+          "STR-only refresh uses the latest session");
+    size_t wave_len = 0;
+    uint8_t *wave = slurp(SD_SDCARD_DATALOG "/20260301/keep.edf", &wave_len);
+    check(wave && wave_len == strlen("unchanged test waveform") &&
+          !memcmp(wave, "unchanged test waveform", wave_len),
+          "STR-only refresh leaves DATALOG files untouched");
+    free(wave);
+    size_t refreshed_len = 0;
+    uint8_t *refreshed = slurp(SD_SDCARD_DIR "/STR.edf", &refreshed_len);
+    check(as10_sample(refreshed, refreshed_len, "MaskOn", 0) == 600 &&
+          as10_sample(refreshed, refreshed_len, "MaskOff", 0) == 660 &&
+          as10_sample(refreshed, refreshed_len, "S.C.Press", 0) == 425,
+          "STR-only refresh preserves existing daily timing and settings");
+    free(bytes);
+    bytes = refreshed;
+    len = refreshed_len;
+    put(SD_SDCARD_DIR "/Identification.json",
+        "{\"FlowGenerator\":{\"IdentificationProfiles\":{\"Product\":"
+        "{\"SerialNumber\":\"foreign\"},\"Software\":{\"PlatformIdentifier\":46}}}}");
+    check(edf_gen_rebuild_day_for_native("20260301") != ESP_OK,
+          "native day rebuild refuses another machine's exported card");
+    check(edf_gen_rebuild_native_str() != ESP_OK,
+          "native-only export refuses another machine's card identity");
+    size_t after_len = 0;
+    uint8_t *after = slurp(SD_SDCARD_DIR "/STR.edf", &after_len);
+    check(bytes && after && len == after_len && !memcmp(bytes, after, len),
+          "identity conflict leaves previous STR untouched");
+    free(after);
+    free(bytes);
 }
 
 /* Independent synthetic Air 10 card -> importer -> actual STR generator. */
@@ -484,18 +890,18 @@ static void as10_roundtrip(void)
         }
         free(meta_bytes);
     }
-    const cJSON *settings = cJSON_GetObjectItemCaseSensitive(metadata, "settings");
-    const cJSON *profiles = cJSON_GetObjectItemCaseSensitive(settings, "SettingProfiles");
-    const cJSON *active = cJSON_GetObjectItemCaseSensitive(profiles, "ActiveProfiles");
-    const cJSON *profile = cJSON_GetObjectItemCaseSensitive(active, "TherapyProfile");
-    const cJSON *therapy = cJSON_GetObjectItemCaseSensitive(profiles, "TherapyProfiles");
-    const cJSON *timed = cJSON_GetObjectItemCaseSensitive(therapy, "TimedProfile");
-    const cJSON *ipap = cJSON_GetObjectItemCaseSensitive(timed, "TargetInspiratoryPressure");
-    check(cJSON_IsString(profile) && !strcmp(profile->valuestring, "TimedProfile") &&
-          cJSON_IsNumber(ipap) && fabs(ipap->valuedouble - 10.0) < 0.001,
-          "AS10 mode 2 reconstructs timed profile using source physical scaling");
+    check(metadata && !cJSON_GetObjectItemCaseSensitive(metadata, "settings"),
+          "historical STR does not become current settings");
     cJSON_Delete(metadata);
     edf_import_ctx_destroy(ctx);
+    check(edf_gen_rebuild_native_str() == ESP_OK,
+          "publish native-only STR without a local session");
+    size_t native_len = 0;
+    uint8_t *native_bytes = slurp(SD_SDCARD_DIR "/STR.edf", &native_len);
+    check(as10_sample(native_bytes, native_len, "S.C.Press", 0) == 450 &&
+          as10_sample(native_bytes, native_len, "S.BL.IPAP", 1) == 500,
+          "native-only export preserves multi-day AS10 settings");
+    free(native_bytes);
     char session_dir[400], manifest[480];
     snprintf(session_dir, sizeof(session_dir), "%s/20260301", SD_STREAMS_DIR);
     mkdir(session_dir, 0775);
@@ -503,9 +909,7 @@ static void as10_roundtrip(void)
     FILE *mf = fopen(manifest, "w");
     check(mf != NULL, "create verified AS10 session");
     if (mf) {
-        fputs("{\"import_source\":\"file_import\",\"source_serial\":\"fixture10\","
-              "\"source_device_family\":\"AS10\","
-              "\"source_identity_verified\":true}", mf);
+        fputs("{}", mf);
         fclose(mf);
     }
     mkdir(out, 0775);
@@ -592,7 +996,12 @@ int main(void)
     roundtrip("Melbourne (AEDT)", "Australia/Melbourne", "+11:00", 0, false);
     roundtrip("Melbourne (AEDT), clock slow by 214 s", "Australia/Melbourne", "+11:00", 214000, false);
     roundtrip("New York (EST)", "America/New_York", "-05:00", 0, true);
+    check_live_golden();
+    as11_native_roundtrip();
     as10_roundtrip();
+    native_field_matrix(false);
+    native_field_matrix(true);
+    history_limits();
     printf("edf_roundtrip_test: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -54,3 +54,15 @@ bool sb_root_name_has_path_separator(const char *name)
 {
     return name && (strchr(name, '/') || strchr(name, '\\'));
 }
+
+sb_root_cache_action_t sb_root_cache_action(bool tuple_matches, bool committed,
+                                            int64_t now_ms, int64_t *last_check_ms)
+{
+    if (!tuple_matches || !committed || !last_check_ms) return SB_ROOT_RESTORE;
+    if (*last_check_ms <= 0 || now_ms < *last_check_ms) {
+        *last_check_ms = now_ms > 0 ? now_ms : 1;
+        return SB_ROOT_SKIP_COMMITTED;
+    }
+    return now_ms - *last_check_ms >= SB_ROOT_RECHECK_MS
+           ? SB_ROOT_RECHECK : SB_ROOT_SKIP_COMMITTED;
+}

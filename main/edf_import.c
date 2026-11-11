@@ -59,6 +59,7 @@
 #include "snt_format.h"
 #include "as11_time.h"
 #include "settings_provenance.h"
+#include "source_store.h"
 #include "edf_as10_settings.h"
 #include "edf_data_dict.h"
 
@@ -67,6 +68,7 @@
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include "psram_task.h"
+#include "esp_timer.h"
 #include "edf_gen.h"
 #include "somno_ml.h"
 #include "uploader.h"
@@ -81,21 +83,32 @@ static const char *TAG = "edf_import";
 static inline void *imp_malloc(size_t sz) { return malloc(sz); }
 static inline void *imp_calloc(size_t n, size_t sz) { return calloc(n, sz); }
 static inline void *imp_realloc(void *p, size_t sz) { return realloc(p, sz); }
+static inline void *imp_psram_malloc(size_t sz) { return malloc(sz); }
+static inline void *imp_psram_calloc(size_t n, size_t sz) { return calloc(n, sz); }
 #else
 static inline void *imp_malloc(size_t sz)
 {
     void *p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return p ? p : malloc(sz);
+    return p || sz > 4096 ? p : malloc(sz);
 }
 static inline void *imp_calloc(size_t n, size_t sz)
 {
+    if (n && sz > SIZE_MAX / n) return NULL;
     void *p = heap_caps_calloc(n, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return p ? p : calloc(n, sz);
+    return p || n * sz > 4096 ? p : calloc(n, sz);
 }
 static inline void *imp_realloc(void *p, size_t sz)
 {
     void *r = heap_caps_realloc(p, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return r ? r : realloc(p, sz);
+    return r || sz > 4096 ? r : realloc(p, sz);
+}
+static inline void *imp_psram_malloc(size_t sz)
+{
+    return heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+static inline void *imp_psram_calloc(size_t n, size_t sz)
+{
+    return heap_caps_calloc(n, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 #endif
 
@@ -110,6 +123,7 @@ static inline void *imp_realloc(void *p, size_t sz)
 #define IMP_CLUSTER_MS      2000  /* same-cluster timestamp tolerance */
 #define IMP_SESS_DUP_MS     45000 /* existing-session duplicate window */
 #define IMP_LINE_MAX        470   /* keep event JSON lines < consumer buffers */
+#define IMP_NATIVE_DIRTY    SD_SUMMARIES_DIR "/native-str.needs_rebuild"
 
 /* SomnoBridge drift sidecar */
 #define IMP_DRIFT_FILE      "_bridge_drift.json"
@@ -183,14 +197,24 @@ static void imp_epoch_to_local_iso(int64_t epoch_ms, char *out, size_t out_len)
 
 /* FATFS cannot rename over an existing file. Keep the previous file until
  * the replacement succeeds, and leave the backup available after a crash. */
+static int imp_recover_replace(const char *dst, char *backup, size_t backup_len)
+{
+    int n = snprintf(backup, backup_len, "%s.replace-backup", dst);
+    if (n < 0 || (size_t)n >= backup_len) { errno = ENAMETOOLONG; return -1; }
+    struct stat st;
+    if (stat(backup, &st) != 0) return errno == ENOENT ? 0 : -1;
+    if (!S_ISREG(st.st_mode)) { errno = EINVAL; return -1; }
+    if (stat(dst, &st) == 0) {
+        if (!S_ISREG(st.st_mode)) { errno = EINVAL; return -1; }
+        if (unlink(dst) != 0) return -1;
+    } else if (errno != ENOENT) return -1;
+    return rename(backup, dst);
+}
+
 static int imp_rename_replace(const char *src, const char *dst)
 {
     char backup[700];
-    int n = snprintf(backup, sizeof(backup), "%s.replace-backup", dst);
-    if (n < 0 || (size_t)n >= sizeof(backup)) { errno = ENAMETOOLONG; return -1; }
-    struct stat st;
-    if (stat(backup, &st) == 0) { errno = EEXIST; return -1; }
-    if (errno != ENOENT) return -1;
+    if (imp_recover_replace(dst, backup, sizeof(backup)) != 0) return -1;
     if (rename(src, dst) == 0) return 0;
     if (errno != EEXIST) return -1;
     if (rename(dst, backup) != 0) return -1;
@@ -201,8 +225,10 @@ static int imp_rename_replace(const char *src, const char *dst)
         errno = saved;
         return -1;
     }
-    if (unlink(backup) != 0)
-        ESP_LOGW(TAG, "import: previous file retained at %s", backup);
+    if (unlink(backup) != 0) {
+        ESP_LOGE(TAG, "import: previous file retained at %s; retry required", backup);
+        return -1;
+    }
     return 0;
 }
 
@@ -252,6 +278,7 @@ typedef struct {
 typedef struct {
     char      path[300];
     int64_t   ts_dev_ms;      /* header startdate+starttime → device epoch ms */
+    int       header_day;     /* civil day number from the EDF header */
     int64_t   n_records;      /* clamped to whole records actually on disk */
     int64_t   n_declared;     /* n_records as written in the header */
     double    rdur_s;
@@ -343,8 +370,12 @@ static esp_err_t imp_edf_open(imp_edf_t *e, const char *path)
             sscanf(stime, "%2d.%2d.%2d", &hh, &mi, &ss) == 3) {
             int year = (yy >= 85) ? 1900 + yy : 2000 + yy;
             e->ts_dev_ms = imp_civil_to_dev_ms(year, mm, dd, hh, mi, ss);
+            char label[16];
+            snprintf(label, sizeof(label), "%04d%02d%02d", year, mm, dd);
+            e->header_day = as11_time_day_number(label);
         } else {
             e->ts_dev_ms = -1;
+            e->header_day = -1;
         }
     }
 
@@ -1628,30 +1659,6 @@ struct edf_import_ctx {
     imp_edf_t *scratch;     /* reusable header buffer */
 };
 
-/* STR Mode digital → ActiveTherapyProfile name (inverse of MODE_MAP). */
-static const char *mode_to_profile(int dig, bool as10)
-{
-    if (as10) {
-        static const char *const profiles[] = {
-            "CpapProfile", "AutoSetProfile", "TimedProfile", "SpontProfile", "STProfile",
-            "TimedProfile", "VAutoProfile", "ASVProfile", "ASVAutoProfile",
-            "iVAPSProfile", "PACProfile", "AutoSetForHerProfile",
-        };
-        return dig >= 0 && dig < (int)(sizeof(profiles) / sizeof(profiles[0]))
-               ? profiles[dig] : NULL;
-    }
-    /* AS11 MODE_MAP = {3,1,2,4,10,16,8,6,7,5,9}: profile index → dig. */
-    static const struct { int dig; const char *name; } T[] = {
-        {3, "CpapProfile"}, {1, "AutoSetProfile"}, {2, "AutoSetForHerProfile"},
-        {4, "SpontProfile"}, {10, "STProfile"}, {16, "TimedProfile"},
-        {8, "VAutoProfile"}, {6, "ASVProfile"}, {7, "ASVAutoProfile"},
-        {5, "iVAPSProfile"}, {9, "PACProfile"},
-    };
-    for (size_t i = 0; i < sizeof(T) / sizeof(T[0]); i++)
-        if (T[i].dig == dig) return T[i].name;
-    return NULL;
-}
-
 /* Convert a source signal's physical unit to the canonical unit in our STR
  * header. Unknown units remain absent rather than being guessed. */
 static bool as10_unit_factor(as10_setting_unit_t kind, const char *unit, double *factor)
@@ -1687,7 +1694,7 @@ static bool as10_unit_factor(as10_setting_unit_t kind, const char *unit, double 
 /* Preserve physical values from the AS10 card's own EDF header and labels.
  * The exporter maps these into a family-specific header without interpreting
  * the raw device enum values. */
-static cJSON *as10_str_settings(const imp_edf_t *e, const uint8_t *rec)
+static cJSON *as10_str_settings(const imp_edf_t *e, const uint8_t *rec, int *unsupported)
 {
     cJSON *root = cJSON_CreateObject();
     cJSON *fields = root ? cJSON_AddObjectToObject(root, "_as10_edf_settings") : NULL;
@@ -1701,22 +1708,101 @@ static cJSON *as10_str_settings(const imp_edf_t *e, const uint8_t *rec)
                 break;
             }
         }
-        if (!sig || sig->spr != 1 || sig->dmax <= sig->dmin ||
-            !isfinite(sig->pmin) || !isfinite(sig->pmax) || sig->pmax <= sig->pmin)
-            continue;
+        if (!sig) continue;
         int16_t dig = str_dig_at(rec, sig, 0);
         double factor;
-        if (dig == -1 || dig == INT16_MIN || dig < sig->dmin || dig > sig->dmax ||
-            !as10_unit_factor(field->unit, sig->unit, &factor)) continue;
+        if (dig == -1 || dig == INT16_MIN) continue;
+        if (sig->spr != 1 || sig->dmax <= sig->dmin ||
+            !isfinite(sig->pmin) || !isfinite(sig->pmax) || sig->pmax <= sig->pmin ||
+            dig < sig->dmin || dig > sig->dmax ||
+            !as10_unit_factor(field->unit, sig->unit, &factor)) {
+            (*unsupported)++;
+            continue;
+        }
         double physical = (sig->pmin + (dig - sig->dmin) *
                            (sig->pmax - sig->pmin) / (sig->dmax - sig->dmin)) * factor;
-        if (!isfinite(physical)) continue;
+        if (!isfinite(physical)) { (*unsupported)++; continue; }
         if (!cJSON_AddNumberToObject(fields, field->label, physical)) {
             cJSON_Delete(root);
             return NULL;
         }
     }
     return root;
+}
+
+/* Preserve AS11 native settings in the destination signals' physical units.
+ * This avoids assuming the source card uses our digital ranges. */
+static cJSON *as11_str_settings(const imp_edf_t *e, const uint8_t *rec,
+                                 int *unsupported)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *fields = root ? cJSON_AddObjectToObject(root, "_as11_edf_settings") : NULL;
+    if (!fields) { cJSON_Delete(root); return NULL; }
+    for (int i = 5; i <= 75; i++) {
+        const edf_signal_def_t *target = &g_str_signals[i];
+        int si = imp_sig_find(e, target->label);
+        if (si < 0) continue;
+        const imp_sig_t *sig = &e->sigs[si];
+        int16_t dig = str_dig_at(rec, sig, 0);
+        if (dig == -1 || dig == INT16_MIN) continue;
+        double factor = 1.0;
+        bool unit_ok;
+        if (!strcmp(target->unit, "cmH2O"))
+            unit_ok = as10_unit_factor(AS10_UNIT_PRESSURE, sig->unit, &factor);
+        else if (!strcmp(target->unit, "seconds"))
+            unit_ok = as10_unit_factor(AS10_UNIT_SECONDS, sig->unit, &factor);
+        else if (!strcmp(target->unit, "msec"))
+            unit_ok = as10_unit_factor(AS10_UNIT_MILLISECONDS, sig->unit, &factor);
+        else if (!strcmp(target->unit, "min."))
+            unit_ok = as10_unit_factor(AS10_UNIT_MINUTES, sig->unit, &factor);
+        else if (!strcmp(target->unit, "Celsius"))
+            unit_ok = as10_unit_factor(AS10_UNIT_CELSIUS, sig->unit, &factor);
+        else if (!target->unit[0])
+            unit_ok = as10_unit_factor(AS10_UNIT_ENUM, sig->unit, &factor);
+        else
+            unit_ok = !strcasecmp(target->unit, sig->unit);
+        if (sig->spr != 1 || sig->dmax <= sig->dmin ||
+            !isfinite(sig->pmin) || !isfinite(sig->pmax) || sig->pmax <= sig->pmin ||
+            dig < sig->dmin || dig > sig->dmax || !unit_ok) {
+            (*unsupported)++;
+            continue;
+        }
+        double value = (sig->pmin + (dig - sig->dmin) *
+                        (sig->pmax - sig->pmin) / (sig->dmax - sig->dmin)) * factor;
+        if (!isfinite(value)) { (*unsupported)++; continue; }
+        if (!cJSON_AddNumberToObject(fields, target->label, value)) {
+            cJSON_Delete(root);
+            return NULL;
+        }
+    }
+    return root;
+}
+
+static void warn_unsupported_setting_labels(const imp_edf_t *e, bool as10)
+{
+    int count = 0;
+    char examples[112] = "";
+    for (int i = 0; i < e->n_sigs; i++) {
+        const char *label = e->sigs[i].label;
+        if (strncmp(label, "S.", 2)) continue;
+        bool known = false;
+        if (as10) {
+            for (size_t j = 0; j < sizeof(g_as10_setting_fields) / sizeof(g_as10_setting_fields[0]); j++)
+                if (!strcmp(label, g_as10_setting_fields[j].label)) { known = true; break; }
+        } else {
+            for (int j = 5; j <= 75; j++)
+                if (!strcmp(label, g_str_signals[j].label)) { known = true; break; }
+        }
+        if (known) continue;
+        if (count < 3) {
+            size_t used = strlen(examples);
+            snprintf(examples + used, sizeof(examples) - used, "%s%s", count ? ", " : "", label);
+        }
+        count++;
+    }
+    if (count)
+        ESP_LOGW(TAG, "import: %d unsupported STR settings label(s), e.g. %s; original retained",
+                 count, examples);
 }
 
 /* Write summaries/<day>.spool (atomic) for one decoded STR day. */
@@ -1733,6 +1819,9 @@ static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite, bool *w
     char spool_path[330];
     snprintf(spool_path, sizeof(spool_path), "%s/%s.spool",
              SD_SUMMARIES_DIR, label);
+    char backup[700];
+    if (imp_recover_replace(spool_path, backup, sizeof(backup)) != 0)
+        return ESP_FAIL;
     if (!overwrite) {
         struct stat st;
         if (stat(spool_path, &st) == 0) return ESP_OK;   /* live/imported wins */
@@ -1764,238 +1853,6 @@ static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite, bool *w
     return ret;
 }
 
-/* cJSON convenience helpers: get-or-create a child object, and
- * set-or-replace a scalar member (STR overlay may rewrite existing
- * CurrentSettings fields with that record's values). */
-static cJSON *jget_or_add_obj(cJSON *o, const char *k)
-{
-    cJSON *v = cJSON_GetObjectItem(o, k);
-    if (cJSON_IsObject(v)) return v;
-    cJSON *n = cJSON_CreateObject();
-    if (n) cJSON_AddItemToObject(o, k, n);
-    return n;
-}
-
-static void jset_num(cJSON *o, const char *k, double v)
-{
-    if (cJSON_GetObjectItem(o, k))
-        cJSON_ReplaceItemInObject(o, k, cJSON_CreateNumber(v));
-    else
-        cJSON_AddNumberToObject(o, k, v);
-}
-
-static void jset_str(cJSON *o, const char *k, const char *v)
-{
-    if (cJSON_GetObjectItem(o, k))
-        cJSON_ReplaceItemInObject(o, k, cJSON_CreateString(v));
-    else
-        cJSON_AddStringToObject(o, k, v);
-}
-
-/* STR "S.*" signal → SettingProfiles field, the exact inverse of
- * build_str_data_values() in edf_summary.c (spec/0002 §4.3.4).
- * div: numeric scale — JSON value = dig / div.
- * enums: NULL → numeric field; else raw index → JSON string.
- * off11: AS11 stores raw+off11 (1 for most enums, 2 for S.Mask);
- *        AS10 carries the raw 0-indexed enum directly. */
-static const char *const EN_ON_OFF[]      = { "Off", "On", NULL };
-static const char *const EN_ON_OFF_AUTO[] = { "Off", "On", "Auto", NULL };
-static const char *const EN_EPR_TYPE[]    = { "RampOnly", "FullTime", NULL };
-static const char *const EN_PATVIEW[]     = { "Advanced", "Basic", NULL };
-static const char *const EN_YESNO[]       = { "No", "Yes", NULL };
-static const char *const EN_MASK[] =
-    { "Pillows", "FullFace", "Nasal", "Pediatric", NULL };
-static const char *const EN_TUBE[] =
-    { "SlimLine", "Standard", "15mmNonHeated", "19mmNonHeated", NULL };
-static const char *const EN_CLIMATE[]     = { "Auto", "Manual", NULL };
-
-typedef struct {
-    const char *label;
-    bool        feature;        /* false → TherapyProfiles, true → FeatureProfiles */
-    const char *profile;
-    const char *field;
-    int16_t     div;
-    const char *const *enums;
-    int8_t      off11;
-    bool        clamp;          /* out-of-range raw clamps to last enum (sparse maps) */
-} str_set_map_t;
-
-static const str_set_map_t STR_SETTINGS[] = {
-    /* [6-13] CPAP / AutoSet / AFH pressures (cmH2O × 50) */
-    { "S.C.StartPress",   false, "CpapProfile",          "StartPressure",   50, NULL, 0, false },
-    { "S.C.Press",        false, "CpapProfile",          "SetPressure",     50, NULL, 0, false },
-    { "S.A.StartPress",   false, "AutoSetProfile",       "StartPressure",   50, NULL, 0, false },
-    { "S.A.MaxPress",     false, "AutoSetProfile",       "MaxPressure",     50, NULL, 0, false },
-    { "S.A.MinPress",     false, "AutoSetProfile",       "MinPressure",     50, NULL, 0, false },
-    { "S.AFH.StartPress", false, "AutoSetForHerProfile", "StartPressure",   50, NULL, 0, false },
-    { "S.AFH.MaxPress",   false, "AutoSetForHerProfile", "MaxPressure",     50, NULL, 0, false },
-    { "S.AFH.MinPress",   false, "AutoSetForHerProfile", "MinPressure",     50, NULL, 0, false },
-    /* [14-21] VAuto */
-    { "S.VA.StartPress",  false, "VAutoProfile", "StartPressure",          50, NULL, 0, false },
-    { "S.VA.MaxIPAP",     false, "VAutoProfile", "MaxInspiratoryPressure", 50, NULL, 0, false },
-    { "S.VA.MinEPAP",     false, "VAutoProfile", "MinExpiratoryPressure",  50, NULL, 0, false },
-    { "S.VA.PS",          false, "VAutoProfile", "SetPressureSupport",     50, NULL, 0, false },
-    { "S.VA.TiMax",       false, "VAutoProfile", "SetMaxInspiratoryTime",  50, NULL, 0, false },
-    { "S.VA.TiMin",       false, "VAutoProfile", "SetMinInspiratoryTime",  50, NULL, 0, false },
-    { "S.VA.Trigger",     false, "VAutoProfile", "TriggerSensitivity",      1, NULL, 1, false },
-    { "S.VA.Cycle",       false, "VAutoProfile", "CycleSensitivity",        1, NULL, 1, false },
-    /* [22-32] Spont (S) */
-    { "S.S.StartPress",   false, "SpontProfile", "StartPressure",             50, NULL, 0, false },
-    { "S.S.IPAP",         false, "SpontProfile", "TargetInspiratoryPressure",50, NULL, 0, false },
-    { "S.S.EPAP",         false, "SpontProfile", "TargetExpiratoryPressure", 50, NULL, 0, false },
-    { "S.S.EasyBreathe",  false, "SpontProfile", "EasyBreatheEnable",          1, EN_ON_OFF, 1, false },
-    { "S.S.RespRateEn",   false, "SpontProfile", "RespiratoryRateEnable",      1, EN_ON_OFF, 1, true },
-    { "S.S.TiMax",        false, "SpontProfile", "SetMaxInspiratoryTime",     50, NULL, 0, false },
-    { "S.S.TiMin",        false, "SpontProfile", "SetMinInspiratoryTime",     50, NULL, 0, false },
-    { "S.S.RiseEnable",   false, "SpontProfile", "RiseTimeEnable",             1, EN_ON_OFF, 1, false },
-    { "S.S.RiseTime",     false, "SpontProfile", "RiseTime",                   1, NULL, 0, false },
-    { "S.S.Trigger",      false, "SpontProfile", "TriggerSensitivity",         1, NULL, 1, false },
-    { "S.S.Cycle",        false, "SpontProfile", "CycleSensitivity",           1, NULL, 1, false },
-    /* [33-42] ST */
-    { "S.ST.StartPress",  false, "STProfile", "StartPressure",             50, NULL, 0, false },
-    { "S.ST.IPAP",        false, "STProfile", "TargetInspiratoryPressure", 50, NULL, 0, false },
-    { "S.ST.EPAP",        false, "STProfile", "TargetExpiratoryPressure",  50, NULL, 0, false },
-    { "S.ST.RespRate",    false, "STProfile", "SetRespiratoryRate",         5, NULL, 0, false },
-    { "S.ST.TiMax",       false, "STProfile", "SetMaxInspiratoryTime",     50, NULL, 0, false },
-    { "S.ST.TiMin",       false, "STProfile", "SetMinInspiratoryTime",     50, NULL, 0, false },
-    { "S.ST.RiseEnable",  false, "STProfile", "RiseTimeEnable",             1, EN_ON_OFF, 1, false },
-    { "S.ST.RiseTime",    false, "STProfile", "RiseTime",                   1, NULL, 0, false },
-    { "S.ST.Trigger",     false, "STProfile", "TriggerSensitivity",         1, NULL, 1, false },
-    { "S.ST.Cycle",       false, "STProfile", "CycleSensitivity",           1, NULL, 1, false },
-    /* [43-49] Timed (T) */
-    { "S.T.StartPress",   false, "TimedProfile", "StartPressure",             50, NULL, 0, false },
-    { "S.T.IPAP",         false, "TimedProfile", "TargetInspiratoryPressure", 50, NULL, 0, false },
-    { "S.T.EPAP",         false, "TimedProfile", "TargetExpiratoryPressure",  50, NULL, 0, false },
-    { "S.T.RespRate",     false, "TimedProfile", "SetRespiratoryRate",         5, NULL, 0, false },
-    { "S.T.Ti",           false, "TimedProfile", "SetInspiratoryTime",        50, NULL, 0, false },
-    { "S.T.RiseEnable",   false, "TimedProfile", "RiseTimeEnable",             1, EN_ON_OFF, 1, false },
-    { "S.T.RiseTime",     false, "TimedProfile", "RiseTime",                   1, NULL, 0, false },
-    /* [50-58] ASV / ASVAuto */
-    { "S.AV.StartPress",  false, "ASVProfile", "StartPressure",             50, NULL, 0, false },
-    { "S.AV.EPAP",        false, "ASVProfile", "TargetExpiratoryPressure",  50, NULL, 0, false },
-    { "S.AV.MaxPS",       false, "ASVProfile", "MaxPressureSupport",        50, NULL, 0, false },
-    { "S.AV.MinPS",       false, "ASVProfile", "MinPressureSupport",        50, NULL, 0, false },
-    { "S.AA.StartPress",  false, "ASVAutoProfile", "StartPressure",           50, NULL, 0, false },
-    { "S.AA.MaxEPAP",     false, "ASVAutoProfile", "MaxExpiratoryPressure",   50, NULL, 0, false },
-    { "S.AA.MinEPAP",     false, "ASVAutoProfile", "MinExpiratoryPressure",   50, NULL, 0, false },
-    { "S.AA.MaxPS",       false, "ASVAutoProfile", "MaxPressureSupport",      50, NULL, 0, false },
-    { "S.AA.MinPS",       false, "ASVAutoProfile", "MinPressureSupport",      50, NULL, 0, false },
-    /* [59-75] Comfort / ramp / EPR / smart / circuit / climate features */
-    { "S.AS.Comfort",     true, "ComfortFeature",        "AutoSetComfort",          1, EN_ON_OFF,      1, false },
-    { "S.RampEnable",     true, "AutoRampFeature",       "RampEnable",              1, EN_ON_OFF_AUTO, 1, false },
-    { "S.RampTime",       true, "AutoRampFeature",       "RampTime",                1, NULL,           0, false },
-    { "S.EPR.ClinEnable", true, "EprFeature",            "EprEnablePatientAccess",  1, EN_ON_OFF,      1, false },
-    { "S.EPR.EPREnable",  true, "EprFeature",            "EprEnable",               1, EN_ON_OFF,      1, false },
-    { "S.EPR.Level",      true, "EprFeature",            "EprPressure",            50, NULL,           0, false },
-    { "S.EPR.EPRType",    true, "EprFeature",            "EprType",                 1, EN_EPR_TYPE,    1, false },
-    { "S.SmartStart",     true, "SmartStartStopFeature", "SmartStart",              1, EN_ON_OFF,      1, false },
-    { "S.PtAccess",       true, "PatientViewFeature",    "PatientView",             1, EN_PATVIEW,     1, false },
-    { "S.ABFilter",       true, "CircuitFeature",        "AntiBacterialFilter",     1, EN_YESNO,       1, false },
-    { "S.Mask",           true, "CircuitFeature",        "MaskType",                1, EN_MASK,        2, false },
-    { "S.Tube",           true, "CircuitFeature",        "TubeType",                1, EN_TUBE,        1, false },
-    { "S.ClimateControl", true, "ClimateFeature",        "ClimateControl",          1, EN_CLIMATE,     1, false },
-    { "S.HumEnable",      true, "ClimateFeature",        "HumidifierSettingEnable", 1, EN_ON_OFF,      1, false },
-    { "S.HumLevel",       true, "ClimateFeature",        "HumidifierLevel",         1, NULL,           0, false },
-    { "S.TempEnable",     true, "ClimateFeature",        "HeatedTubeSettingEnable", 1, EN_ON_OFF_AUTO, 1, false },
-    { "S.Temp",           true, "ClimateFeature",        "HeatedTubeTemperature",  10, NULL,           0, false },
-};
-
-/* Overlay one STR record's S.* settings channels onto a SettingProfiles
- * tree (inverse of build_str_data_values).  Only channels the record
- * actually carries are written; absent channels keep whatever the tree
- * already had (e.g. the card's CurrentSettings).  Returns the number of
- * S.* fields applied — 0 means the tree gained no settings content. */
-static int overlay_str_settings(cJSON *root, const imp_edf_t *e,
-                                const uint8_t *rec, int mode_dig, bool as10)
-{
-    cJSON *sp = jget_or_add_obj(root, "SettingProfiles");
-    if (!sp) return 0;
-    int applied = 0;
-    const char *prof = mode_to_profile(mode_dig, as10);
-    if (prof) {
-        cJSON *ap = jget_or_add_obj(sp, "ActiveProfiles");
-        if (ap) { jset_str(ap, "TherapyProfile", prof); applied++; }
-    }
-    cJSON *tp = NULL, *fp = NULL;
-    for (size_t i = 0; i < sizeof(STR_SETTINGS) / sizeof(STR_SETTINGS[0]); i++) {
-        const str_set_map_t *mp = &STR_SETTINGS[i];
-        int si = imp_sig_find(e, mp->label);
-        if (si < 0) continue;
-        int16_t dig = str_dig_at(rec, &e->sigs[si], 0);
-        if (dig == -1 || dig == INT16_MIN) continue;
-        cJSON *po;
-        if (mp->feature) {
-            if (!fp) fp = jget_or_add_obj(sp, "FeatureProfiles");
-            po = fp ? jget_or_add_obj(fp, mp->profile) : NULL;
-        } else {
-            if (!tp) tp = jget_or_add_obj(sp, "TherapyProfiles");
-            po = tp ? jget_or_add_obj(tp, mp->profile) : NULL;
-        }
-        if (!po) continue;
-        if (mp->enums) {
-            int raw = as10 ? (int)dig : (int)dig - mp->off11;
-            if (raw < 0) continue;
-            int last = 0;
-            while (mp->enums[last]) last++;
-            last--;
-            if (raw > last) {
-                if (!mp->clamp) continue;
-                raw = last;
-            }
-            jset_str(po, mp->field, mp->enums[raw]);
-        } else if (mp->off11) {
-            /* Numeric enum index (Trigger/Cycle sensitivity, 0..6). */
-            int raw = as10 ? (int)dig : (int)dig - mp->off11;
-            if (raw < 0 || raw > 6) continue;
-            jset_num(po, mp->field, raw);
-        } else {
-            jset_num(po, mp->field, (double)dig / (double)mp->div);
-        }
-        applied++;
-    }
-    return applied;
-}
-
-/* Reconstructed current-settings metadata for Air 10 must use the source
- * header's physical scaling, not the different Air 11 digital scales. */
-static void overlay_as10_profile(cJSON *root, const cJSON *native, int mode)
-{
-    const char *profile = mode_to_profile(mode, true);
-    if (!profile) return;
-    const cJSON *fields = cJSON_GetObjectItemCaseSensitive(native, "_as10_edf_settings");
-    cJSON *sp = jget_or_add_obj(root, "SettingProfiles");
-    cJSON *active = sp ? jget_or_add_obj(sp, "ActiveProfiles") : NULL;
-    cJSON *profiles = sp ? jget_or_add_obj(sp, "TherapyProfiles") : NULL;
-    cJSON *therapy = profiles ? jget_or_add_obj(profiles, profile) : NULL;
-    if (!active || !therapy || !cJSON_IsObject(fields)) return;
-    jset_str(active, "TherapyProfile", profile);
-    static const struct { const char *label, *key; unsigned modes; } map[] = {
-        {"S.C.StartPress", "StartPressure", 1u << 0},
-        {"S.C.Press", "SetPressure", 1u << 0},
-        {"S.AS.StartPress", "StartPressure", (1u << 1) | (1u << 11)},
-        {"S.AS.MinPress", "MinPressure", (1u << 1) | (1u << 11)},
-        {"S.AS.MaxPress", "MaxPressure", (1u << 1) | (1u << 11)},
-        {"S.BL.StartPress", "StartPressure", (1u << 2) | (1u << 3) | (1u << 4)},
-        {"S.BL.IPAP", "TargetInspiratoryPressure", (1u << 2) | (1u << 3) | (1u << 4)},
-        {"S.BL.EPAP", "TargetExpiratoryPressure", (1u << 2) | (1u << 3) | (1u << 4)},
-        {"S.TiMax", "SetMaxInspiratoryTime", (1u << 3) | (1u << 4) | (1u << 6)},
-        {"S.TiMin", "SetMinInspiratoryTime", (1u << 3) | (1u << 4) | (1u << 6)},
-        {"S.Trigger", "TriggerSensitivity", (1u << 3) | (1u << 4) | (1u << 6)},
-        {"S.Cycle", "CycleSensitivity", (1u << 3) | (1u << 4) | (1u << 6)},
-        {"S.RiseTime", "RiseTime", (1u << 2) | (1u << 3) | (1u << 4)},
-        {"S.VA.StartPress", "StartPressure", 1u << 6},
-        {"S.VA.MaxIPAP", "MaxInspiratoryPressure", 1u << 6},
-        {"S.VA.MinEPAP", "MinExpiratoryPressure", 1u << 6},
-        {"S.VA.PS", "SetPressureSupport", 1u << 6},
-    };
-    if (mode < 0 || mode >= 32) return;
-    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
-        const cJSON *value = cJSON_GetObjectItemCaseSensitive(fields, map[i].label);
-        if ((map[i].modes & (1u << mode)) && cJSON_IsNumber(value))
-            jset_num(therapy, map[i].key, value->valuedouble);
-    }
-}
-
 typedef enum {
     STR_IMPORT_OK,
     STR_IMPORT_PARTIAL,   /* some days ambiguous; valid days imported, source kept */
@@ -2003,12 +1860,103 @@ typedef enum {
     STR_IMPORT_RETRY,
 } str_import_result_t;
 
+/* Keep the original accessible even after the staging file is consumed. */
+static esp_err_t retain_native_str(const char *path)
+{
+    mkdir(SD_SESSIONS_DIR, 0775);
+    if (!source_store_lock()) return ESP_FAIL;
+    esp_err_t err = source_store_init(NULL);
+    if (err != ESP_OK) goto done;
+    source_store_put_result_t put;
+    err = source_store_put_path("native_str_import", path, &put);
+    if (err != ESP_OK) goto done;
+    cJSON *observation = cJSON_CreateObject();
+    if (!observation) { err = ESP_ERR_NO_MEM; goto done; }
+    err = source_store_observe(put.id, "native-str", "native_str_import", observation);
+    cJSON_Delete(observation);
+done:
+    source_store_unlock();
+    return err;
+}
+
+static void mark_root_processed(const char *path, const char *id)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    if (!source_store_lock()) return;
+    source_store_put_result_t put;
+    cJSON *observation = NULL;
+    esp_err_t err = source_store_init(NULL);
+    if (err == ESP_OK) err = source_store_put_path("processed_root", path, &put);
+    if (err == ESP_OK) {
+        observation = cJSON_CreateObject();
+        err = observation ? source_store_observe(put.id, id, "processed_root", observation)
+                          : ESP_ERR_NO_MEM;
+    }
+    cJSON_Delete(observation);
+    source_store_unlock();
+    if (err != ESP_OK) ESP_LOGW(TAG, "import: cannot record processed root source (error %d)", (int)err);
+}
+
+static esp_err_t save_native_identity(const edf_import_ctx_t *ctx)
+{
+    const char *path = SD_SUMMARIES_DIR "/native.ident.json";
+    const cJSON *serial = cJSON_GetObjectItemCaseSensitive(ctx->ident, "SerialNumber");
+    int family = settings_provenance_family(ctx->ident);
+    if (!cJSON_IsString(serial) || !serial->valuestring || !serial->valuestring[0] ||
+        strcmp(serial->valuestring, ctx->src_serial) ||
+        family == SETTINGS_FAMILY_UNKNOWN ||
+        strcmp(settings_provenance_family_name(family), ctx->src_family))
+        return ESP_ERR_INVALID_STATE;
+
+    char backup[700];
+    if (imp_recover_replace(path, backup, sizeof(backup)) != 0) return ESP_FAIL;
+    struct stat st;
+    cJSON *old = read_json_file(path);
+    if (!old && (stat(path, &st) == 0 || errno != ENOENT)) return ESP_FAIL;
+    if (old) {
+        const cJSON *old_serial = cJSON_GetObjectItemCaseSensitive(old, "SerialNumber");
+        const cJSON *source = cJSON_GetObjectItemCaseSensitive(old, "_somnotrace_native_source");
+        bool same = cJSON_IsString(source) && source->valuestring &&
+                    !strcmp(source->valuestring, "native_str") &&
+                    cJSON_IsString(old_serial) && old_serial->valuestring &&
+                    !strcmp(old_serial->valuestring, serial->valuestring) &&
+                    settings_provenance_family(old) == family;
+        cJSON_Delete(old);
+        if (!same) return ESP_ERR_INVALID_STATE;
+        return ESP_OK;
+    }
+    cJSON *root = cJSON_Duplicate(ctx->ident, true);
+    if (!root || !cJSON_AddStringToObject(root, "_somnotrace_native_source", "native_str")) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    mkdir(SD_SESSIONS_DIR, 0775);
+    mkdir(SD_SUMMARIES_DIR, 0775);
+    esp_err_t err = write_json_atomic(path, root);
+    cJSON_Delete(root);
+    return err;
+}
+
+/* Set before changing any day, so a reset cannot lose the rebuild request. */
+static esp_err_t mark_native_dirty(void)
+{
+    struct stat st;
+    if (stat(IMP_NATIVE_DIRTY, &st) == 0) return ESP_OK;
+    if (errno != ENOENT) return ESP_FAIL;
+    cJSON *marker = cJSON_CreateObject();
+    if (!marker) return ESP_ERR_NO_MEM;
+    esp_err_t err = write_json_atomic(IMP_NATIVE_DIRTY, marker);
+    cJSON_Delete(marker);
+    return err;
+}
+
 /* Treat each explicitly imported AS11 STR record as the source for that day.
  * Absent fields remain unknown rather than inheriting CurrentSettings. */
 static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ctx,
                                           edf_import_unit_t *u)
 {
-    imp_edf_t *e = imp_malloc(sizeof(imp_edf_t));
+    imp_edf_t *e = imp_psram_malloc(sizeof(imp_edf_t));
     if (!e) return STR_IMPORT_RETRY;
     esp_err_t opened = imp_edf_open(e, path);
     if (opened != ESP_OK) {
@@ -2018,7 +1966,7 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
     }
     int date_sig = imp_sig_find(e, "Date");
     if (e->incomplete || e->n_records > IMP_MAX_STR_REC ||
-        date_sig < 0 || e->sigs[date_sig].spr != 1 ||
+        date_sig < 0 || e->sigs[date_sig].spr != 1 || e->header_day <= 0 ||
         fabs(e->rdur_s - 86400.0) > 0.001 ||
         (imp_sig_find(e, "Duration") < 0 && imp_sig_find(e, "Mode") < 0 &&
          imp_sig_find(e, "MaskOn") < 0) ||
@@ -2052,46 +2000,54 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
         else cJSON_Delete(rid);
     }
     bool as10 = !strcmp(ctx->src_family, "AS10");
-    if (!ctx->src_serial[0])
-        ESP_LOGW(TAG, "import: STR source serial unknown; daily settings will remain unknown");
-
+    warn_unsupported_setting_labels(e, as10);
     FILE *f = fopen(path, "rb");
     if (!f) { free(e); return STR_IMPORT_RETRY; }
-    uint8_t *rec = imp_malloc((size_t)e->rec_stride);
-    str_day_t *d = imp_calloc(1, sizeof(*d));
+    uint8_t *rec = imp_psram_malloc((size_t)e->rec_stride);
+    str_day_t *d = imp_psram_calloc(1, sizeof(*d));
     if (!rec || !d) { free(rec); free(d); fclose(f); free(e); return STR_IMPORT_RETRY; }
 
-    int written = 0, settings_written = 0;
-    bool retry = false, retain = false, ambiguous_any = false;
-    cJSON *latest = NULL;   /* newest S.* reconstruction (no CurrentSettings) */
+    int written = 0, settings_written = 0, conflicting_days = 0, unsupported = 0;
+    bool retry = false, retain = false, ambiguous_any = false, identity_saved = false;
     for (int64_t r = 0; r < e->n_records; r++) {
         if (!imp_edf_read_rec(e, f, r, rec)) { retry = true; break; }
         if (!imp_edf_rec_crc_ok(e, rec)) { retain = true; continue; }
         decode_str_record(e, rec, d);
         if (d->day_number <= 0) { retain = true; continue; }
+        if (d->day_number != e->header_day + r) {
+            ESP_LOGW(TAG, "import: STR record %lld disagrees with its header date",
+                     (long long)r);
+            retain = true;
+            continue;
+        }
+        if (!identity_saved) {
+            esp_err_t identity = save_native_identity(ctx);
+            if (identity != ESP_OK) {
+                ESP_LOGW(TAG, "import: STR identity unknown or conflicting (error %d)", (int)identity);
+                if (identity == ESP_ERR_INVALID_STATE) retain = true;
+                else retry = true;
+                break;
+            }
+            identity_saved = true;
+        }
         int y, mo, dd;
         imp_civil_from_days(d->day_number, &y, &mo, &dd);
         char day[9], spath[340];
         snprintf(day, sizeof(day), "%04d%02d%02d", y, mo, dd);
-        cJSON *root = ctx->settings ? cJSON_Duplicate(ctx->settings, true)
-                                    : cJSON_CreateObject();
-        if (!root) { retry = true; break; }
-        if (!as10) overlay_str_settings(root, e, rec, d->mode_dig, false);
         bool ambiguous = false;
 
         if (ctx->src_serial[0] &&
             (!strcmp(ctx->src_family, "AS11") || as10)) {
-            cJSON *native = as10 ? as10_str_settings(e, rec) : cJSON_CreateObject();
-            int applied = 0;
-            if (native && as10) {
-                overlay_as10_profile(root, native, d->mode_dig);
-                const cJSON *fields = cJSON_GetObjectItemCaseSensitive(native, "_as10_edf_settings");
-                applied = cJSON_GetArraySize(fields);
-            } else if (native) {
-                applied = overlay_str_settings(native, e, rec, d->mode_dig, false);
-            }
-            snprintf(spath, sizeof(spath), "%s/%s.imported.settings.json",
+            cJSON *native = as10 ? as10_str_settings(e, rec, &unsupported)
+                                 : as11_str_settings(e, rec, &unsupported);
+            snprintf(spath, sizeof(spath), "%s/%s.native.settings.json",
                      SD_SUMMARIES_DIR, day);
+            char backup[700];
+            if (imp_recover_replace(spath, backup, sizeof(backup)) != 0) {
+                cJSON_Delete(native);
+                retry = true;
+                break;
+            }
             cJSON *old = read_json_file(spath);
             struct stat existing;
             int stat_result = stat(spath, &existing);
@@ -2104,43 +2060,55 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
                 retry = true;
             } else {
                 const char *old_serial = settings_provenance_serial(old);
-                if (old && (!old_serial || strcmp(old_serial, ctx->src_serial) != 0 ||
+                if (old && (!settings_provenance_is(old, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) ||
+                            !old_serial || strcmp(old_serial, ctx->src_serial) != 0 ||
                             !settings_provenance_is_family(old, as10 ? SETTINGS_FAMILY_AS10 : SETTINGS_FAMILY_AS11))) {
                     ESP_LOGE(TAG, "import: daily settings belong to another or unknown machine");
                     ambiguous_any = ambiguous = true;
-                } else if (!settings_provenance_set(native, SETTINGS_SOURCE_IMPORTED_STR, day, NULL) ||
+                } else if (!settings_provenance_set(native, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) ||
                            !settings_provenance_set_serial(native, ctx->src_serial) ||
                            !settings_provenance_set_family(native, as10 ? SETTINGS_FAMILY_AS10 : SETTINGS_FAMILY_AS11)) {
                     retry = true;
-                } else if (!settings_provenance_record_sessions(native, day)) {
-                    ESP_LOGW(TAG, "import: daily settings coverage is unverified");
-                    ambiguous_any = ambiguous = true;
-                } else if ((applied > 0 || old) && (!old || !cJSON_Compare(old, native, true))) {
+                } else if (!old || !cJSON_Compare(old, native, true)) {
                     mkdir(SD_SESSIONS_DIR, 0775);
                     mkdir(SD_SUMMARIES_DIR, 0775);
-                    if (write_json_atomic(spath, native) == ESP_OK) settings_written++;
+                    if (mark_native_dirty() == ESP_OK &&
+                        write_json_atomic(spath, native) == ESP_OK) settings_written++;
                     else retry = true;
                 }
             }
             cJSON_Delete(old);
             cJSON_Delete(native);
         }
+        if (!retry && settings_provenance_day_conflicts(
+                day, ctx->src_serial, as10 ? SETTINGS_FAMILY_AS10 : SETTINGS_FAMILY_AS11)) {
+            conflicting_days++;
+            ambiguous_any = ambiguous = true;
+        }
         if (!retry && !ambiguous) {
             bool spool_new = false;
-            if (write_spool_for_day(d, false, &spool_new) != ESP_OK) retry = true;
+            char spool_path[330];
+            struct stat spool_st;
+            snprintf(spool_path, sizeof(spool_path), "%s/%s.spool", SD_SUMMARIES_DIR, day);
+            int spool_status = stat(spool_path, &spool_st);
+            if ((spool_status != 0 && (errno != ENOENT || mark_native_dirty() != ESP_OK)) ||
+                write_spool_for_day(d, false, &spool_new) != ESP_OK) retry = true;
             else if (spool_new) written++;
         }
-        if (!ctx->settings && !ambiguous && !retry) { cJSON_Delete(latest); latest = root; }
-        else cJSON_Delete(root);
         if (retry) break;
     }
-    if (latest) ctx->settings = latest;
     free(d);
     free(rec);
     fclose(f);
     free(e);
     u->spools_written += written;
     u->settings_written += settings_written;
+    if (conflicting_days)
+        ESP_LOGW(TAG, "import: %d day(s) have conflicting or unreadable session identity",
+                 conflicting_days);
+    if (unsupported)
+        ESP_LOGW(TAG, "import: %d native settings samples have unsupported units or ranges; "
+                 "the original STR is retained", unsupported);
     /* A single ambiguous day must not discard the whole source or the
      * root identity needed by independent days (WP3). */
     return retry ? STR_IMPORT_RETRY : retain ? STR_IMPORT_RETAIN :
@@ -2163,6 +2131,9 @@ static metadata_result_t write_device_metadata(const edf_import_ctx_t *ctx)
     if (!ctx->ident || !ctx->src_serial[0] ||
         settings_provenance_family(ctx->ident) == SETTINGS_FAMILY_UNKNOWN)
         return METADATA_RETAIN;
+    char backup[700];
+    if (imp_recover_replace(SD_DEVICE_METADATA_PATH, backup, sizeof(backup)) != 0)
+        return METADATA_RETRY;
     cJSON *existing = read_json_file(SD_DEVICE_METADATA_PATH);
     struct stat st;
     int status = stat(SD_DEVICE_METADATA_PATH, &st);
@@ -3697,18 +3668,23 @@ static esp_err_t process_root_pass(edf_import_ctx_t *ctx, edf_import_unit_t *u)
     bool ident_source_valid = ctx->ident && ctx->src_serial[0] &&
                               settings_provenance_family(ctx->ident) != SETTINGS_FAMILY_UNKNOWN;
     if (stat(IMP_IMPORT_DIR "/STR.edf", &st) == 0) {
+        esp_err_t stored = retain_native_str(IMP_IMPORT_DIR "/STR.edf");
+        if (stored != ESP_OK) {
+            ESP_LOGW(TAG, "import: source store unavailable (error %d); "
+                     "processing STR but retaining staged source", (int)stored);
+        }
         str_import_result_t result = import_str_edf(IMP_IMPORT_DIR "/STR.edf", ctx, u);
         if (result == STR_IMPORT_RETAIN || result == STR_IMPORT_RETRY) {
             ESP_LOGW(TAG, "import: STR retained for retry");
             retain_root_for_next_run(ctx, u);
             return ESP_OK;
         }
-        if (result == STR_IMPORT_PARTIAL) {
+        if (result == STR_IMPORT_PARTIAL || stored != ESP_OK) {
             /* Valid days were written above.  Keep the source files and the
              * resolved identity/settings in memory so the same ctx can still
              * import independent day groups; never clear identity here. */
-            ESP_LOGW(TAG, "import: STR has ambiguous days; keeping source, "
-                     "independent days imported");
+            ESP_LOGW(TAG, "import: STR source retained (%d new settings, %d new spools)",
+                     u->settings_written, u->spools_written);
             ctx->root_retained = true;
             u->root_retained = true;
             return ESP_OK;
@@ -3739,6 +3715,10 @@ static esp_err_t process_root_pass(edf_import_ctx_t *ctx, edf_import_unit_t *u)
     /* Consume the sources — after this point the resolved trees live in
      * ctx and per-session sidecars; EDF recording_id remains as a
      * fallback for days imported in later runs. */
+    mark_root_processed(IMP_IMPORT_DIR "/STR.edf", "str-v1");
+    mark_root_processed(IMP_IMPORT_DIR "/Identification.json", "ident-json-v1");
+    mark_root_processed(IMP_IMPORT_DIR "/Identification.tgt", "ident-tgt-v1");
+    mark_root_processed(IMP_IMPORT_DIR "/SETTINGS/CurrentSettings.json", "current-settings-v1");
     unlink(IMP_IMPORT_DIR "/STR.edf");
     unlink(IMP_IMPORT_DIR "/Identification.json");
     unlink(IMP_IMPORT_DIR "/Identification.tgt");
@@ -3774,6 +3754,9 @@ static esp_err_t synthesize_day_spool(const char *day, bool *out_wrote)
     if (out_wrote) *out_wrote = false;
     char spool_path[300];
     snprintf(spool_path, sizeof(spool_path), "%s/%s.spool", SD_SUMMARIES_DIR, day);
+    char backup[700];
+    if (imp_recover_replace(spool_path, backup, sizeof(backup)) != 0)
+        return ESP_FAIL;
     struct stat st;
     if (stat(spool_path, &st) == 0) return ESP_OK;   /* live/STR coverage wins */
 
@@ -4363,7 +4346,7 @@ void edf_import_ctx_destroy(edf_import_ctx_t *ctx)
  * husks, *.bad quarantine, in-flight *.part and stray sidecars don't
  * count: pending() must go false once everything usable was consumed so
  * the worker actually stops rescheduling itself. */
-static bool dir_has_pending(const char *path, int depth)
+static bool dir_has_pending(const char *path, int depth, bool skip_root_str)
 {
     DIR *d = opendir(path);
     if (!d) return false;
@@ -4373,17 +4356,70 @@ static bool dir_has_pending(const char *path, int depth)
         const char *nm = ent->d_name;
         size_t nl = strlen(nm);
         if (nl >= 1 && nm[0] == '.') continue;
-        if (nl > 4 && !strcasecmp(nm + nl - 4, ".edf")) { any = true; break; }
+        if (nl > 4 && !strcasecmp(nm + nl - 4, ".edf")) {
+            if (skip_root_str && !strcasecmp(nm, "STR.edf")) continue;
+            any = true;
+            break;
+        }
         if (depth <= 0) continue;
         char full[400];
         snprintf(full, sizeof(full), "%s/%s", path, nm);
         struct stat st;
         if (stat(full, &st) == 0 && S_ISDIR(st.st_mode) &&
-            dir_has_pending(full, depth - 1)) { any = true; break; }
+            dir_has_pending(full, depth - 1, false)) { any = true; break; }
     }
     closedir(d);
     return any;
 }
+
+/* Retained root input is retried hourly, or sooner when observable inputs
+ * change. A same-size, same-mtime rewrite is detected by the hourly retry. */
+#define IMP_ROOT_RETRY_US (60LL * 60 * 1000000)
+static uint64_t s_root_retry_signature;
+static int64_t s_root_retry_until;
+
+static uint64_t root_retry_signature(void)
+{
+    static const char *const paths[] = {
+        IMP_IMPORT_DIR "/STR.edf",
+        IMP_IMPORT_DIR "/Identification.json",
+        IMP_IMPORT_DIR "/Identification.tgt",
+        IMP_IMPORT_DIR "/SETTINGS/CurrentSettings.json",
+        SD_STREAMS_DIR,
+        SD_SUMMARIES_DIR,
+    };
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        struct stat st;
+        bool exists = stat(paths[i], &st) == 0;
+        h = (h ^ (uint64_t)exists) * UINT64_C(1099511628211);
+        if (exists) {
+            h = (h ^ (uint64_t)st.st_size) * UINT64_C(1099511628211);
+            h = (h ^ (uint64_t)st.st_mtime) * UINT64_C(1099511628211);
+        }
+    }
+    return h;
+}
+
+static void root_retry_mark(int64_t now_us)
+{
+    s_root_retry_signature = root_retry_signature();
+    s_root_retry_until = now_us + IMP_ROOT_RETRY_US;
+}
+
+static bool root_retry_defer(int64_t now_us, bool groups_pending)
+{
+    return !groups_pending && s_root_retry_until > now_us &&
+           s_root_retry_signature == root_retry_signature();
+}
+
+#ifdef EDF_IMPORT_HOST
+void edf_import_test_mark_root_retry(int64_t now_us) { root_retry_mark(now_us); }
+bool edf_import_test_defer_root_retry(int64_t now_us, bool groups_pending)
+{
+    return root_retry_defer(now_us, groups_pending);
+}
+#endif
 
 /* Deferred spool synthesis flags (<day>.needs_spool in summaries/) are
  * import work too — keep the worker alive until the sweep clears them. */
@@ -4406,36 +4442,12 @@ static bool needs_spool_pending(void)
 
 bool edf_import_pending(void)
 {
+    struct stat st;
+    if (stat(IMP_NATIVE_DIRTY, &st) == 0) return true;
     if (root_files_pending()) return true;
-    if (dir_has_pending(IMP_IMPORT_DIR, 2)) return true;
+    if (dir_has_pending(IMP_IMPORT_DIR, 2, false)) return true;
     return needs_spool_pending();
 }
-
-#ifndef EDF_IMPORT_HOST
-/* Newest streams day "YYYYMMDD" (for the STR-only root-pass rebuild —
- * regenerating any day also refreshes the cumulative STR.edf + root
- * artifacts, since edf_generate_str_edf scans every summaries spool). */
-static bool find_newest_streams_day(char *out, size_t len)
-{
-    DIR *d = opendir(SD_STREAMS_DIR);
-    if (!d) return false;
-    char best[9] = "";
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        const char *nm = ent->d_name;
-        if (strlen(nm) != 8 || strcmp(nm, best) <= 0) continue;
-        char p[300];
-        snprintf(p, sizeof(p), "%s/%s", SD_STREAMS_DIR, nm);
-        struct stat st;
-        if (stat(p, &st) == 0 && S_ISDIR(st.st_mode))
-            memcpy(best, nm, 9);
-    }
-    closedir(d);
-    if (!best[0]) return false;
-    snprintf(out, len, "%s", best);
-    return true;
-}
-#endif /* EDF_IMPORT_HOST */
 
 /* Final sweep: days the run imported but whose spool synthesis never
  * landed (e.g. interrupted mid-unit) are flagged <day>.needs_spool in
@@ -4554,7 +4566,7 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
     /* EDFs are visible to the cheap pending check but no group could be
      * built from them — say so rather than reporting a clean empty inbox
      * (that silence is what made #338 hard to diagnose). */
-    if (dir_has_pending(IMP_IMPORT_DIR, 2))
+    if (dir_has_pending(IMP_IMPORT_DIR, 2, ctx->root_retained))
         ESP_LOGW(TAG, "import: EDFs remain in %s but no importable day group "
                  "was found (unsupported names or a folder with no session?)",
                  IMP_IMPORT_DIR);
@@ -4582,6 +4594,7 @@ static void edf_import_task(void *arg)
     bool any_imported = false;
     int idle = 0;
     int defer_ms = 0;
+    bool root_deferred = false;
     if (ctx) {
         for (;;) {
             if (!sd_storage_is_ready() || sd_storage_recording_active()) break;
@@ -4619,8 +4632,18 @@ static void edf_import_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(30000));
                 continue;
             }
+            if (!ctx->root_done && root_retry_defer(
+                    esp_timer_get_time(), dir_has_pending(IMP_IMPORT_DIR, 2, true))) {
+                ctx->root_done = true;
+                ctx->root_retained = true;
+                root_deferred = true;
+            }
             edf_import_unit_t u;
             esp_err_t r = edf_import_process_next(ctx, &u);
+            if (r == ESP_OK && u.root_pass && !u.deferred) {
+                if (u.root_retained) root_retry_mark(esp_timer_get_time());
+                else s_root_retry_until = 0;
+            }
             sd_storage_lease_release(SD_LEASE_EXPORT);
 
             if (r == ESP_OK && u.deferred) {
@@ -4635,6 +4658,19 @@ static void edf_import_task(void *arg)
             }
             defer_ms = 0;
             if (r == ESP_ERR_NOT_FOUND) {
+                struct stat dirty;
+                if (stat(IMP_NATIVE_DIRTY, &dirty) == 0) {
+                    if (root_deferred) break;
+                    esp_err_t rebuilt = edf_gen_rebuild_native_str();
+                    if (rebuilt == ESP_OK) {
+                        if (unlink(IMP_NATIVE_DIRTY) != 0 && errno != ENOENT)
+                            ESP_LOGW(TAG, "import: cannot clear native STR rebuild marker");
+                        uploader_request_scan();
+                    } else {
+                        ESP_LOGW(TAG, "import: native STR rebuild pending (error %d)", (int)rebuilt);
+                    }
+                    break;
+                }
                 if (ctx->root_retained) break;
                 if (++idle >= 3) break;
                 vTaskDelay(pdMS_TO_TICKS(10000));
@@ -4642,12 +4678,6 @@ static void edf_import_task(void *arg)
             }
             if (r != ESP_OK) {
                 ESP_LOGE(TAG, "import: unit failed; retaining source files until retry");
-                if (u.root_pass && (u.spools_written > 0 || u.settings_written > 0)) {
-                    char day[9];
-                    if (find_newest_streams_day(day, sizeof(day)) &&
-                        edf_gen_rebuild_day(day) == ESP_OK)
-                        uploader_on_export_complete(day);
-                }
                 break;
             }
             idle = 0;
@@ -4666,19 +4696,17 @@ static void edf_import_task(void *arg)
              * nudged when the rebuild actually published. */
             if (u.day_label[0] && u.sessions_imported > 0) {
                 any_imported = true;
-                if (edf_gen_rebuild_day(u.day_label) == ESP_OK)
+                struct stat native_dirty;
+                bool native_pending = stat(IMP_NATIVE_DIRTY, &native_dirty) == 0;
+                esp_err_t rebuilt = native_pending ? edf_gen_rebuild_day_for_native(u.day_label)
+                                                   : edf_gen_rebuild_day(u.day_label);
+                if (rebuilt == ESP_OK)
                     uploader_on_export_complete(u.day_label);
-                if (u.day2_label[0] &&
-                    edf_gen_rebuild_day(u.day2_label) == ESP_OK)
-                    uploader_on_export_complete(u.day2_label);
-            } else if (u.root_pass && (u.spools_written > 0 || u.settings_written > 0)) {
-                /* STR-only import: one rebuild refreshes the cumulative
-                 * STR.edf + Identification/SETTINGS artifacts (the STR
-                 * pass scans every summaries spool). */
-                char day[9];
-                if (find_newest_streams_day(day, sizeof(day)) &&
-                    edf_gen_rebuild_day(day) == ESP_OK)
-                    uploader_on_export_complete(day);
+                if (u.day2_label[0]) {
+                    rebuilt = native_pending ? edf_gen_rebuild_day_for_native(u.day2_label)
+                                             : edf_gen_rebuild_day(u.day2_label);
+                    if (rebuilt == ESP_OK) uploader_on_export_complete(u.day2_label);
+                }
             }
             vTaskDelay(pdMS_TO_TICKS(200));   /* yield between units */
         }
