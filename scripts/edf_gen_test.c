@@ -1648,6 +1648,45 @@ static void write_test_summary(const char *path, int64_t noon_ms)
     fclose(f);
 }
 
+static void test_imported_spool_selection(void)
+{
+    const char *day = "20991130";
+    char base[400], imported[400], native[400], chosen[400];
+    mk("%s", SD_MOUNT_POINT);
+    mk("%s", SD_APP_DIR);
+    mk("%s", SD_SESSIONS_DIR);
+    mk("%s", SD_SUMMARIES_DIR);
+    snprintf(base, sizeof(base), "%s/%s.spool", SD_SUMMARIES_DIR, day);
+    snprintf(imported, sizeof(imported), "%s/%s.imported.spool", SD_SUMMARIES_DIR, day);
+    snprintf(native, sizeof(native), "%s/%s.native.spool", SD_SUMMARIES_DIR, day);
+    struct stat st;
+    if (stat(base, &st) == 0 || stat(imported, &st) == 0 || stat(native, &st) == 0) {
+        CHECK(false, "spool fixture already exists; refusing to overwrite it");
+        return;
+    }
+    write_test_summary(base, 4105032000000LL);
+    FILE *f = fopen(base, "ab");
+    CHECK(f != NULL, "open synthetic spool marker");
+    if (!f) return;
+    CHECK(fwrite(IMPORT_SPOOL_MARKER, 1, IMPORT_SPOOL_MARKER_LEN, f) ==
+          IMPORT_SPOOL_MARKER_LEN, "append synthetic marker");
+    fclose(f);
+    CHECK(select_summary_spool(day, chosen, sizeof(chosen)) == ESP_OK &&
+          !strcmp(chosen, base), "synthetic base used when no refresh exists");
+    write_test_summary(imported, 4105032000000LL);
+    CHECK(select_summary_spool(day, chosen, sizeof(chosen)) == ESP_OK &&
+          !strcmp(chosen, imported), "refreshed imported summary is selected");
+    write_test_summary(native, 4105032000000LL);
+    CHECK(select_summary_spool(day, chosen, sizeof(chosen)) == ESP_OK &&
+          !strcmp(chosen, native), "native STR summary supersedes synthetic summary");
+    write_test_summary(base, 4105032000000LL);
+    CHECK(select_summary_spool(day, chosen, sizeof(chosen)) == ESP_OK &&
+          !strcmp(chosen, base), "live summary supersedes all imported overlays");
+    unlink(base);
+    unlink(imported);
+    unlink(native);
+}
+
 static void test_atomic_export_recovery(void)
 {
     char path[400], tmp[440], backup[440];
@@ -2767,6 +2806,8 @@ int main(void)
         test_str_settings_history_end_to_end, NULL);
     run("atomic EDF publication preserves and recovers prior exports",
         test_atomic_export_recovery, NULL);
+    run("live and native summaries take precedence over synthetic imports",
+        test_imported_spool_selection, NULL);
     run("a partial drift index is rejected when PSRAM is exhausted",
         test_drift_index_allocation_failure, NULL);
     run("unexpected summary metric numbers stay in bounds",

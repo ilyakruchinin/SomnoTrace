@@ -25,9 +25,32 @@
 #include "settings_provenance.h"
 #include "settings_resolver.h"
 #include "edf_as10_settings.h"
+#include "import_spool_marker.h"
 #include <time.h>
 
 static const char *TAG = "edf_sum";
+
+/* Native/live spools always win. Only a spool explicitly created by the EDF
+ * importer may be replaced for reading by its newer derived or native copy. */
+static esp_err_t select_summary_spool(const char *day, char *path, size_t cap)
+{
+    snprintf(path, cap, "%s/%s.spool", SD_SUMMARIES_DIR, day);
+    if (!import_spool_is_synthetic(path)) return ESP_OK;
+    const char *suffixes[] = { "native.spool", "imported.spool" };
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        char candidate[300];
+        snprintf(candidate, sizeof(candidate), "%s/%s.%s", SD_SUMMARIES_DIR,
+                 day, suffixes[i]);
+        struct stat st;
+        if (stat(candidate, &st) == 0) {
+            if (!S_ISREG(st.st_mode)) return ESP_FAIL;
+            snprintf(path, cap, "%s", candidate);
+            return ESP_OK;
+        }
+        if (errno != ENOENT) return ESP_FAIL;
+    }
+    return ESP_OK;
+}
 
 /* ════════════════════════════════════════════════════════════════════
  *  Section 2: Minimal protobuf wire-format decoder
@@ -1471,7 +1494,8 @@ esp_err_t edf_gen_summary_json(const char *noon_day, char **out_json)
     *out_json = NULL;
 
     char spool_path[300];
-    snprintf(spool_path, sizeof(spool_path), "%s/%s.spool", SD_SUMMARIES_DIR, noon_day);
+    if (select_summary_spool(noon_day, spool_path, sizeof(spool_path)) != ESP_OK)
+        return ESP_FAIL;
     size_t spool_len = 0;
     uint8_t *spool_data = edf_read_bin_file(spool_path, &spool_len);
     if (!spool_data || spool_len == 0) {
@@ -2021,7 +2045,14 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
 
         /* Read the spool file */
         char spool_path[300];
-        snprintf(spool_path, sizeof(spool_path), "%s/%s", SD_SUMMARIES_DIR, nm);
+        char spool_day[9];
+        memcpy(spool_day, nm, 8);
+        spool_day[8] = '\0';
+        if (select_summary_spool(spool_day, spool_path, sizeof(spool_path)) != ESP_OK) {
+            free(spool_names); free(drift_index);
+            free(records); free(ctx); free(str_sigs);
+            return ESP_FAIL;
+        }
         size_t spool_len = 0;
         uint8_t *spool_data = edf_read_bin_file(spool_path, &spool_len);
         if (!spool_data || spool_len == 0) {

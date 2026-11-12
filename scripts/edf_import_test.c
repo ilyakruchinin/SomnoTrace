@@ -75,6 +75,7 @@
 #include "source_store.h"
 #include "snt_format.h"
 #include "sd_storage.h"
+#include "import_spool_marker.h"
 
 /* ── Micro test framework ──────────────────────────────────────────── */
 static int g_checks, g_fail;
@@ -2618,6 +2619,677 @@ static void phase_native_corruption(void)
     printf("native corruption recovery OK (%d checks)\n", g_checks);
 }
 
+static void remove_fixture_kind(const char *dir, const char *prefix, const char *kind)
+{
+    char path[640];
+    snprintf(path, sizeof(path), "%s/%s_%s.edf", dir, prefix, kind);
+    CHECK(unlink(path) == 0, "remove synthetic fixture");
+}
+
+static void write_growing_brp(const char *dir, int records, bool changed_prefix)
+{
+    char path[640];
+    int16_t flow[25 * 180] = {0}, press[25 * 180] = {0};
+    if (changed_prefix) flow[0] = 100;
+    const fx_sig_t sig[] = {
+        { "Flow.40ms", "L/s", -2.0, 3.0, -1000, 1500, 25, flow, NULL, 0 },
+        { "Press.40ms", "cmH2O", 0, 40, 0, 2000, 25, press, NULL, 0 },
+    };
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    fx_write_edf(path, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 22, 10, 7, "", "1",
+                 records, records, sig, 2, 0);
+}
+
+static void write_brp_with_extra(const char *dir, int records, bool changed_prefix)
+{
+    char path[640];
+    int16_t flow[150] = {0}, press[150] = {0}, extra[6] = {0};
+    if (changed_prefix) extra[0] = 100;
+    const fx_sig_t sig[] = {
+        { "Flow.40ms", "L/s", -2.0, 3.0, -1000, 1500, 25, flow, NULL, 0 },
+        { "Press.40ms", "cmH2O", 0, 40, 0, 2000, 25, press, NULL, 0 },
+        { "ExtraSignal", "", 0, 100, 0, 100, 1, extra, NULL, 0 },
+    };
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    fx_write_edf(path, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 22, 10, 7, "", "1",
+                 records, records, sig, 3, 0);
+}
+
+static void write_mask_str(bool split, bool incomplete)
+{
+    static int16_t date[] = {19737}, mode[] = {3};
+    int16_t on[] = {610, split ? 637 : -1};
+    int16_t off[] = {incomplete ? -1 : (split ? 620 : 700), split ? 700 : -1};
+    const fx_sig_t sig[] = {
+        { "Date", "d", 0, 32767, 0, 32767, 1, date, NULL, 0 },
+        { "Mode", "", 0, 32, 0, 32, 1, mode, NULL, 0 },
+        { "MaskOn", "min", 0, 1440, 0, 1440, 2, on, NULL, 0 },
+        { "MaskOff", "min", 0, 1440, 0, 1440, 2, off, NULL, 0 },
+    };
+    char path[640];
+    snprintf(path, sizeof(path), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(path, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, sig, 4, 0);
+}
+
+static void write_near_mask_str(void)
+{
+    int16_t date[] = {19737}, mode[] = {3};
+    int16_t on[] = {609, 610}, off[] = {610, 700};
+    const fx_sig_t sig[] = {
+        { "Date", "d", 0, 32767, 0, 32767, 1, date, NULL, 0 },
+        { "Mode", "", 0, 32, 0, 32, 1, mode, NULL, 0 },
+        { "MaskOn", "min", 0, 1440, 0, 1440, 2, on, NULL, 0 },
+        { "MaskOff", "min", 0, 1440, 0, 1440, 2, off, NULL, 0 },
+    };
+    char path[640];
+    snprintf(path, sizeof(path), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(path, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, sig, 4, 0);
+}
+
+static void phase_incremental_sources(void)
+{
+    char dir[300], path[700], mp[700];
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+    snprintf(mp, sizeof(mp), "%s/%s/20240115_221000_session.json",
+             SD_STREAMS_DIR, DAY);
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    int units;
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t t = drain(c, &units);
+    CHECK(t.sessions_imported == 1 && file_exists(mp),
+          "annotation-only session created with source anchors");
+    edf_import_ctx_destroy(c);
+
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    snprintf(path, sizeof(path), "%s/_bridge_drift.json", dir);
+    FILE *f = fopen(path, "w");
+    CHECK(f != NULL, "open synthetic drift sidecar");
+    if (f) {
+        fputs("{\"source_of_truth\":{\"clock_drift_ms\":\"14400000\","
+              "\"half_ms\":300,\"valid\":true}}", f);
+        fclose(f);
+    }
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    CHECK(t.sessions_imported == 1 && t.sessions_failed == 0,
+          "late waveforms augment the annotation session");
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240116_021007_session.json",
+             SD_STREAMS_DIR, DAY);
+    CHECK(!file_exists(path), "changed drift does not create another session");
+    cJSON *m = parse_json_file(mp);
+    CHECK(m != NULL, "augmented manifest parses");
+    if (m) {
+        cJSON *v = cJSON_GetObjectItem(m, "brp_samples");
+        CHECK(cJSON_IsNumber(v) && v->valueint == 75, "late flow retained");
+        v = cJSON_GetObjectItem(m, "clock_drift_ms");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 0,
+              "existing session clock domain stays consistent");
+        v = cJSON_GetObjectItem(m, "waveform_offset_ms");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 7000,
+              "late waveform offset retained");
+    }
+    cJSON_Delete(m);
+    snprintf(path, sizeof(path), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    CHECK(import_spool_is_synthetic(path), "synthetic spool carries its provenance");
+    snprintf(path, sizeof(path), "%s/20240115.imported.spool", SD_SUMMARIES_DIR);
+    CHECK(file_exists(path), "late waveforms refresh a separate imported summary");
+    write_mask_str(false, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115.native.spool", SD_SUMMARIES_DIR);
+    CHECK(file_exists(path), "late native STR gets a separate authoritative summary");
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "EVE-only session imports");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240115_221000_events.snt",
+             SD_STREAMS_DIR, DAY);
+    char *late_csl_events = read_text(path);
+    CHECK(t.sessions_imported == 1 && late_csl_events &&
+          strstr(late_csl_events, "ObstructiveApneaEnd") &&
+          strstr(late_csl_events, "CsrStart"),
+          "late CSL augments EVE without discarding earlier events");
+    free(late_csl_events);
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    set_fixture_recording_id(dir, "Unknown machine");
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "unidentified annotation session imports");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    set_fixture_recording_id(dir, "Unknown machine");
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    char late_manifest[700];
+    snprintf(late_manifest, sizeof(late_manifest), "%s/%s/20240115_221007_session.json",
+             SD_STREAMS_DIR, DAY);
+    CHECK(t.sessions_imported == 0 && file_exists(path) && !file_exists(late_manifest),
+          "unverified late waveforms stay staged instead of creating a duplicate");
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "waveform-first session imports");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240115_221007_session.json",
+             SD_STREAMS_DIR, DAY);
+    m = parse_json_file(path);
+    CHECK(t.sessions_imported == 1 && m && !file_exists(mp),
+          "earlier annotation augments waveform-first session");
+    if (m) {
+        cJSON *v = cJSON_GetObjectItem(m, "start_epoch_ms");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 1705356600000.0,
+              "session start follows annotation anchor");
+        v = cJSON_GetObjectItem(m, "waveform_offset_ms");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 7000,
+              "waveform remains at its original timestamp");
+    }
+    cJSON_Delete(m);
+
+    fresh_tree();
+    mkpath(dir);
+    write_growing_brp(dir, 60, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    size_t spool_len = 0;
+    uint8_t *spool = read_bin(path, &spool_len);
+    CHECK(spool && pb_find_varint(spool, spool_len, 5) == 1,
+          "initial derived summary records one minute");
+    free(spool);
+    mkpath(dir);
+    write_growing_brp(dir, 120, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115.imported.spool", SD_SUMMARIES_DIR);
+    spool = read_bin(path, &spool_len);
+    CHECK(spool && pb_find_varint(spool, spool_len, 5) == 2,
+          "growing waveform refreshes derived summary duration");
+    free(spool);
+    snprintf(path, sizeof(path), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    spool = read_bin(path, &spool_len);
+    CHECK(spool && pb_find_varint(spool, spool_len, 5) == 1,
+          "summary refresh leaves the original spool untouched");
+    free(spool);
+
+    fresh_tree();
+    mkpath(dir);
+    write_brp_with_extra(dir, 3, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "source with extra signal imports");
+    mkpath(dir);
+    write_brp_with_extra(dir, 6, true);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    CHECK(file_exists(path) && t.sessions_imported == 0,
+          "growing source with changed unconverted prefix stays staged");
+    snprintf(path, sizeof(path), "%s/%s/20240115_221007_session.json",
+             SD_STREAMS_DIR, DAY);
+    m = parse_json_file(path);
+    CHECK(m && cJSON_GetObjectItem(m, "brp_samples")->valueint == 75,
+          "unconverted conflict leaves previous waveform intact");
+    cJSON_Delete(m);
+    write_brp_with_extra(dir, 6, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(path);
+    CHECK(t.sessions_imported == 1 && m &&
+          cJSON_GetObjectItem(m, "brp_samples")->valueint == 150,
+          "verified original EDF prefix permits an append");
+    cJSON_Delete(m);
+    mkpath(dir);
+    write_brp_with_extra(dir, 6, true);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    CHECK(t.sessions_imported == 0 && file_exists(path),
+          "same-length unconverted source change stays staged");
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    snprintf(path, sizeof(path), "%s/_bridge_drift.json", dir);
+    f = fopen(path, "w");
+    CHECK(f != NULL, "create synthetic embedded drift evidence");
+    if (f) {
+        fputs("{\"padding\":\"", f);
+        for (int i = 0; i < 1000; i++) fputc('x', f);
+        fputs("\"}", f);
+        fclose(f);
+    }
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(mp);
+    CHECK(t.sessions_imported == 1 && m &&
+          cJSON_IsObject(cJSON_GetObjectItem(m, "somnobridge_drift")),
+          "initial manifest contains embedded drift evidence");
+    if (m) {
+        char *text = cJSON_PrintUnformatted(m);
+        size_t used = text ? strlen(text) : 0;
+        free(text);
+        size_t pad_len = used < 3400 ? 3400 - used : 0;
+        char *pad = malloc(pad_len + 1);
+        CHECK(pad != NULL && pad_len > 0, "reserve synthetic manifest padding");
+        if (pad) {
+            memset(pad, 'y', pad_len);
+            pad[pad_len] = '\0';
+            cJSON_AddStringToObject(m, "test_padding", pad);
+            free(pad);
+            text = cJSON_PrintUnformatted(m);
+            f = fopen(mp, "w");
+            CHECK(text && f && fputs(text, f) >= 0, "write synthetic near-cap manifest");
+            if (f) fclose(f);
+            free(text);
+        }
+    }
+    cJSON_Delete(m);
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(mp);
+    cJSON *ref = cJSON_GetObjectItem(m, "somnobridge_drift_file");
+    snprintf(path, sizeof(path), "%s/%s/20240115_221000_bridge_drift.json",
+             SD_STREAMS_DIR, DAY);
+    CHECK(t.sessions_imported == 1 && cJSON_IsString(ref) && file_exists(path),
+          "growing manifest relocates rather than discards embedded drift");
+    cJSON *saved_drift = parse_json_file(path);
+    cJSON *padding = cJSON_GetObjectItem(saved_drift, "padding");
+    CHECK(cJSON_IsString(padding) && strlen(padding->valuestring) == 1000,
+          "relocated drift retains original evidence");
+    cJSON_Delete(saved_drift);
+    cJSON_Delete(m);
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    write_growing_brp(dir, 3, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "initial synthetic recording imported");
+    mkpath(dir);
+    write_growing_brp(dir, 6, false);
+    char blocker[720], pending[720];
+    snprintf(blocker, sizeof(blocker), "%s.tmp", mp);
+    snprintf(pending, sizeof(pending), "%s/%s/20240115_221000_augment.pending",
+             SD_STREAMS_DIR, DAY);
+    CHECK(mkdir(blocker, 0775) == 0, "block manifest commit for fault injection");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    CHECK(t.sessions_failed > 0 && file_exists(path) && file_exists(pending),
+          "failed manifest commit retains source and recovery marker");
+    CHECK(rmdir(blocker) == 0, "remove synthetic write blocker");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(mp);
+    CHECK(t.sessions_imported == 1 && m, "growing waveform updates existing session");
+    CHECK(!file_exists(pending), "successful retry clears recovery marker");
+    if (m) {
+        cJSON *v = cJSON_GetObjectItem(m, "brp_samples");
+        CHECK(cJSON_IsNumber(v) && v->valueint == 150, "extended samples preserved");
+    }
+    cJSON_Delete(m);
+    mkpath(dir);
+    write_growing_brp(dir, 6, true);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    CHECK(file_exists(path) && t.sessions_imported == 0,
+          "conflicting rewrite remains staged without replacing samples");
+    m = parse_json_file(mp);
+    if (m) {
+        cJSON *v = cJSON_GetObjectItem(m, "brp_samples");
+        CHECK(cJSON_IsNumber(v) && v->valueint == 150, "conflict leaves session intact");
+    }
+    cJSON_Delete(m);
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    mkpath(dir);
+    static const char e0[] = "+0\x15" "0\x14" "Recording starts\x14\x00";
+    static const char e1[] = "+2.1\x15" "9.4\x14" "Obstructive Apnea\x14\x00";
+    static const char e2[] = "+5.0\x15" "10\x14" "Hypopnea\x14\x00";
+    static const char e3[] = "+25\x15" "10\x14" "Central Apnea\x14\x00";
+    const char *const anns[] = {e0, e1, e2, e3};
+    const int lens[] = {sizeof(e0)-1, sizeof(e1)-1, sizeof(e2)-1, sizeof(e3)-1};
+    snprintf(path, sizeof(path), "%s/20240115_221000_EVE.edf", dir);
+    fx_write_real_ann(path, 2024, 1, 15, 22, 10, 0, anns, lens, 4);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240115_221000_events.snt",
+             SD_STREAMS_DIR, DAY);
+    char *events = read_text(path);
+    CHECK(t.sessions_imported == 1 && events &&
+          strstr(events, "CentralApneaEnd") && strstr(events, "CsrStart"),
+          "updated EVE adds events without losing existing CSL");
+    free(events);
+    mkpath(dir);
+    const char *const changed_anns[] = {e0, e2, e3};
+    const int changed_lens[] = {sizeof(e0)-1, sizeof(e2)-1, sizeof(e3)-1};
+    snprintf(path, sizeof(path), "%s/20240115_221000_EVE.edf", dir);
+    fx_write_real_ann(path, 2024, 1, 15, 22, 10, 0, changed_anns, changed_lens, 3);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 0 && file_exists(path),
+          "annotation rewrite removing an existing event is retained");
+    snprintf(path, sizeof(path), "%s/%s/20240115_221000_events.snt",
+             SD_STREAMS_DIR, DAY);
+    events = read_text(path);
+    CHECK(events && strstr(events, "ObstructiveApneaEnd") &&
+          strstr(events, "CentralApneaEnd") && strstr(events, "CsrStart"),
+          "conflicting annotation rewrite leaves previous events intact");
+    free(events);
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    snprintf(path, sizeof(path), "%s/20240115_221000_EVE.edf", dir);
+    f = fopen(path, "r+b");
+    CHECK(f != NULL, "open annotation for synthetic CRC failure");
+    if (f) {
+        CHECK(fseek(f, 768, SEEK_SET) == 0, "seek to annotation record");
+        int ch = fgetc(f);
+        CHECK(ch != EOF && fseek(f, -1, SEEK_CUR) == 0 &&
+              fputc(ch ^ 1, f) != EOF, "corrupt annotation record");
+        fclose(f);
+    }
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_failed > 0 && file_exists(path),
+          "bad annotation CRC retains all source files for retry");
+    CHECK(!file_exists(mp), "bad annotation does not publish a session");
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    build_session_dir(dir, "20240115_221020", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240115_221020_session.json",
+             SD_STREAMS_DIR, DAY);
+    CHECK(t.sessions_imported == 1 && file_exists(path),
+          "distinct nearby waveform anchors stay separate");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_221000_EVE.edf", dir);
+    CHECK(t.sessions_imported == 0 && file_exists(path),
+          "ambiguous annotation stays staged rather than merging two sessions");
+
+    fresh_tree();
+    mkpath(dir);
+    static const char long_event[] = "+1800\x15" "10\x14" "Hypopnea\x14\x00";
+    const char *const long_anns[] = {e0, long_event};
+    const int long_lens[] = {sizeof(e0)-1, sizeof(long_event)-1};
+    snprintf(path, sizeof(path), "%s/20240115_221000_EVE.edf", dir);
+    fx_write_real_ann(path, 2024, 1, 15, 22, 10, 0, long_anns, long_lens, 2);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    build_session_dir(dir, "20240115_223715", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_223715_BRP.edf", dir);
+    CHECK(t.sessions_imported == 0 && file_exists(path),
+          "ambiguous long-gap overlap is retained instead of split");
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_223715", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    const char *const start_only[] = {e0};
+    const int start_len[] = {sizeof(e0)-1};
+    snprintf(path, sizeof(path), "%s/20240115_221000_EVE.edf", dir);
+    fx_write_real_ann(path, 2024, 1, 15, 22, 10, 0, start_only, start_len, 1);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_223715_BRP.edf", dir);
+    CHECK(t.sessions_imported == 1 && file_exists(mp) && file_exists(path),
+          "27-minute gap without STR evidence remains staged");
+
+    fresh_tree();
+    write_mask_str(false, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115.native.mask-intervals.json",
+             SD_SUMMARIES_DIR);
+    m = parse_json_file(path);
+    CHECK(m && cJSON_IsTrue(cJSON_GetObjectItem(m, "complete")),
+          "native STR interval retained as machine-specific evidence");
+    cJSON_Delete(m);
+    build_session_dir(dir, "20240115_223715", "20240115_221000", true,
+                      2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240115_223715_session.json",
+             SD_STREAMS_DIR, DAY);
+    m = parse_json_file(mp);
+    CHECK(t.sessions_imported == 2 && m && !file_exists(path),
+          "native mask evidence reconciles 27-minute staggered anchors");
+    if (m) {
+        cJSON *v = cJSON_GetObjectItem(m, "waveform_offset_ms");
+        CHECK(cJSON_IsNumber(v) && v->valueint == 1635000,
+              "long-gap reconciliation preserves original waveform time");
+    }
+    cJSON_Delete(m);
+    build_session_dir(dir, "20240115_223715", "20240115_221000", true,
+                      2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 0 && t.sessions_skipped > 0,
+          "long-gap source replay is idempotent");
+
+    fresh_tree();
+    write_mask_str(true, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    build_session_dir(dir, "20240115_223715", "20240115_221000", true,
+                      2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 2 && file_exists(mp) && file_exists(path),
+          "distinct native mask intervals stay separate");
+
+    fresh_tree();
+    write_near_mask_str();
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    build_session_dir(dir, "20240115_221030", "20240115_220950", true,
+                      2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240115_221030_session.json",
+             SD_STREAMS_DIR, DAY);
+    snprintf(pending, sizeof(pending), "%s/%s/20240115_220950_session.json",
+             SD_STREAMS_DIR, DAY);
+    CHECK(t.sessions_imported == 2 && file_exists(path) && file_exists(pending),
+          "separate mask intervals override a 40-second filename match");
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_120007", "20240115_115950", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_120007", "BRP");
+    remove_fixture_kind(dir, "20240115_120007", "PLD");
+    remove_fixture_kind(dir, "20240115_120007", "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240114/20240115_115950_session.json",
+             SD_STREAMS_DIR);
+    CHECK(t.sessions_imported == 1 && file_exists(path),
+          "pre-noon annotation lands in the previous reporting day");
+    build_session_dir(dir, "20240115_120007", "20240115_115950", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_115950", "EVE");
+    remove_fixture_kind(dir, "20240115_115950", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_120007_BRP.edf", dir);
+    snprintf(pending, sizeof(pending), "%s/20240115/20240115_120007_session.json",
+             SD_STREAMS_DIR);
+    CHECK(t.sessions_imported == 0 && file_exists(path) && !file_exists(pending),
+          "cross-noon possible match remains staged without a duplicate");
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_140000", "20240115_110000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_140000", "BRP");
+    remove_fixture_kind(dir, "20240115_140000", "PLD");
+    remove_fixture_kind(dir, "20240115_140000", "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "long-gap pre-noon annotation imports");
+    build_session_dir(dir, "20240115_140000", "20240115_110000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_110000", "EVE");
+    remove_fixture_kind(dir, "20240115_110000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_140000_BRP.edf", dir);
+    CHECK(t.sessions_imported == 0 && file_exists(path),
+          "long-gap cross-noon possible match remains staged");
+
+    fresh_tree();
+    write_mask_str(false, true);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115.native.mask-intervals.json",
+             SD_SUMMARIES_DIR);
+    m = parse_json_file(path);
+    CHECK(!m || cJSON_IsFalse(cJSON_GetObjectItem(m, "complete")),
+          "incomplete mask interval is not treated as evidence");
+    cJSON_Delete(m);
+
+    fresh_tree();
+    write_mask_str(false, false);
+    f = fopen(path, "wb");
+    CHECK(f != NULL, "create corrupt synthetic mask evidence");
+    if (f) {
+        for (int i = 0; i < 512; i++) fputc(0, f);
+        fclose(f);
+    }
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(path);
+    snprintf(pending, sizeof(pending), "%s.bad", path);
+    CHECK(m && cJSON_IsTrue(cJSON_GetObjectItem(m, "complete")) &&
+          file_exists(pending), "corrupt derived masks are quarantined and recovered");
+    cJSON_Delete(m);
+    printf("incremental source reconciliation OK (%d checks)\n", g_checks);
+}
+
 int main(void)
 {
     setenv("TZ", "UTC", 1);
@@ -2646,6 +3318,7 @@ int main(void)
     phase_s();
     phase_native_corruption();
     phase_store_budget();
+    phase_incremental_sources();
 
     rmtree(SD_MOUNT_POINT);
     printf("edf_import_test: %d checks, %d failures\n", g_checks, g_fail);
