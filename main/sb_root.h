@@ -28,6 +28,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct cJSON;
+
 /* The root resources the importer consumes.  Bridge listings may expose a
  * different case (FAT short names), so classification is case-insensitive
  * while the exact exposed alias is retained for GET_FILE. */
@@ -45,4 +47,13 @@ typedef enum {
     SB_ROOT_RECHECK,
 } sb_root_cache_action_t;
 sb_root_cache_action_t sb_root_cache_action(bool tuple_matches, bool committed,
+                                            bool needed_for_staged_input,
                                             int64_t now_ms, int64_t *last_check_ms);
+
+/* Duplicate ledger keys are possible in older ledgers. The last entry is
+ * returned for diagnostics; callers must not trust conflicting duplicates
+ * to identify a staged file without independent source evidence. */
+struct cJSON *sb_root_ledger_latest(struct cJSON *root, const char *key,
+                                    size_t *count);
+bool sb_root_ledger_replace(struct cJSON *root, const char *key,
+                            const char *size, const char *ts, bool ts_null);

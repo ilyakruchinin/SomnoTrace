@@ -305,6 +305,21 @@ esp_err_t source_store_put_path(const char *kind, const char *path,
     return r;
 }
 
+esp_err_t source_store_path_matches(const char *id, const char *path)
+{
+    if (!id_valid(id) || !path || !path[0]) return ESP_ERR_INVALID_ARG;
+    uint8_t *data = NULL;
+    size_t len = 0;
+    esp_err_t r = read_file(path, &data, &len);
+    if (r != ESP_OK) return r;
+    uint8_t hash[32];
+    content_hash(data, len, hash);
+    free(data);
+    char got[SOURCE_STORE_ID_HEX + 1];
+    hex_encode(hash, sizeof(hash), got);
+    return strcmp(got, id) == 0 ? ESP_OK : ESP_ERR_INVALID_CRC;
+}
+
 esp_err_t source_store_get(const char *id, uint8_t *buf, size_t cap,
                            size_t *len_out)
 {

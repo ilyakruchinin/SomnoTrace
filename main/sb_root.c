@@ -56,13 +56,14 @@ bool sb_root_name_has_path_separator(const char *name)
 }
 
 sb_root_cache_action_t sb_root_cache_action(bool tuple_matches, bool committed,
+                                            bool needed_for_staged_input,
                                             int64_t now_ms, int64_t *last_check_ms)
 {
     if (!tuple_matches || !committed || !last_check_ms) return SB_ROOT_RESTORE;
     if (*last_check_ms <= 0 || now_ms < *last_check_ms) {
         *last_check_ms = now_ms > 0 ? now_ms : 1;
-        return SB_ROOT_SKIP_COMMITTED;
+        return needed_for_staged_input ? SB_ROOT_RESTORE : SB_ROOT_SKIP_COMMITTED;
     }
-    return now_ms - *last_check_ms >= SB_ROOT_RECHECK_MS
-           ? SB_ROOT_RECHECK : SB_ROOT_SKIP_COMMITTED;
+    if (now_ms - *last_check_ms >= SB_ROOT_RECHECK_MS) return SB_ROOT_RECHECK;
+    return needed_for_staged_input ? SB_ROOT_RESTORE : SB_ROOT_SKIP_COMMITTED;
 }

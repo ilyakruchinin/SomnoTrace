@@ -1389,6 +1389,53 @@ static cJSON *read_json_file(const char *path)
     return j;
 }
 
+/* Native day snapshots are durable evidence: reject short reads, embedded
+ * NULs and trailing junk instead of accepting a valid JSON prefix. */
+static cJSON *read_native_day_json(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz <= 0 || sz > 256 * 1024 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    char *buf = imp_malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    bool ok = rd == (size_t)sz && !ferror(f);
+    if (fclose(f) != 0) ok = false;
+    buf[sz] = '\0';
+    cJSON *j = ok && !memchr(buf, '\0', (size_t)sz)
+               ? cJSON_ParseWithLengthOpts(buf, (size_t)sz + 1, NULL, true) : NULL;
+    free(buf);
+    return j;
+}
+
+/* A parse failure can also be an allocation or I/O failure. Only quarantine
+ * bytes which cannot be JSON regardless of parser memory availability. */
+static bool json_file_provably_corrupt(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    unsigned char buf[256];
+    size_t n;
+    bool nonspace = false, invalid = false;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            unsigned char ch = buf[i];
+            if (ch < 0x20 && ch != '\t' && ch != '\r' && ch != '\n')
+                invalid = true;
+            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n')
+                nonspace = true;
+        }
+    }
+    bool complete = !ferror(f);
+    if (fclose(f) != 0) complete = false;
+    return complete && (invalid || !nonspace);
+}
+
 static esp_err_t write_json_atomic(const char *path, const cJSON *j)
 {
     char *s = cJSON_PrintUnformatted(j);
@@ -1951,6 +1998,8 @@ static esp_err_t mark_native_dirty(void)
     return err;
 }
 
+static bool quarantine_source(const char *path);
+
 /* Treat each explicitly imported AS11 STR record as the source for that day.
  * Absent fields remain unknown rather than inheriting CurrentSettings. */
 static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ctx,
@@ -2048,12 +2097,15 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
                 retry = true;
                 break;
             }
-            cJSON *old = read_json_file(spath);
+            cJSON *old = read_native_day_json(spath);
             struct stat existing;
             int stat_result = stat(spath, &existing);
             bool unreadable = (stat_result == 0 && !old) ||
                               (stat_result != 0 && errno != ENOENT);
-            if (unreadable) {
+            bool corrupt = unreadable && stat_result == 0 &&
+                           S_ISREG(existing.st_mode) &&
+                           json_file_provably_corrupt(spath);
+            if (unreadable && !corrupt) {
                 ESP_LOGE(TAG, "import: cannot safely read existing daily settings");
                 retry = true;
             } else if (!native) {
@@ -2073,8 +2125,17 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
                     mkdir(SD_SESSIONS_DIR, 0775);
                     mkdir(SD_SUMMARIES_DIR, 0775);
                     if (mark_native_dirty() == ESP_OK &&
-                        write_json_atomic(spath, native) == ESP_OK) settings_written++;
-                    else retry = true;
+                        (!corrupt || quarantine_source(spath)) &&
+                        write_json_atomic(spath, native) == ESP_OK) {
+                        cJSON *written = read_native_day_json(spath);
+                        if (written && cJSON_Compare(written, native, true))
+                            settings_written++;
+                        else
+                            retry = true;
+                        cJSON_Delete(written);
+                    } else retry = true;
+                    if (corrupt && !retry)
+                        ESP_LOGW(TAG, "import: recovered corrupt native settings for %s; original quarantined", day);
                 }
             }
             cJSON_Delete(old);

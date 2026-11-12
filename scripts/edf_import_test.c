@@ -2513,6 +2513,111 @@ static void phase_s(void)
     printf("phase s OK (%d checks)\n", g_checks);
 }
 
+static void phase_native_corruption(void)
+{
+    static int16_t dates[] = {19737, 19738}, modes[] = {3, 3}, pressures[] = {400, 450};
+    const fx_sig_t signals[] = {
+        {"Date", "d", 0, 40000, 0, 40000, 1, dates, NULL, 0},
+        {"Mode", "", 0, 32, 0, 32, 1, modes, NULL, 0},
+        {"S.C.Press", "cmH2O", 0, 40, 0, 2000, 1, pressures, NULL, 0},
+    };
+    char source[700], snapshot[700], bad[750], previous[750], next_day[700], temp[750];
+    snprintf(source, sizeof(source), "%s/STR.edf", IMPORT_DIR);
+    snprintf(snapshot, sizeof(snapshot), "%s/20240115.native.settings.json", SD_SUMMARIES_DIR);
+    snprintf(bad, sizeof(bad), "%s.bad.1", snapshot);
+    snprintf(previous, sizeof(previous), "%s.bad", snapshot);
+    snprintf(next_day, sizeof(next_day), "%s/20240116.native.settings.json", SD_SUMMARIES_DIR);
+    snprintf(temp, sizeof(temp), "%s.tmp", snapshot);
+
+    fresh_tree();
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 2, 2, signals, 3, 0);
+    FILE *f = fopen(snapshot, "wb");
+    CHECK(f != NULL, "create zeroed native snapshot");
+    if (f) {
+        for (int i = 0; i < 512; i++) fputc(0, f);
+        fputs("damaged tail", f);
+        fclose(f);
+    }
+    f = fopen(previous, "wb");
+    if (f) { fputs("previous quarantine", f); fclose(f); }
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t u;
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.root_retained &&
+          u.settings_written == 2, "recover damaged day and continue to later day");
+    CHECK(!file_exists(source) && file_exists(next_day),
+          "successful recovery consumes source and imports later day");
+    cJSON *recovered = parse_json_file(snapshot);
+    cJSON *fields = cJSON_GetObjectItem(recovered, "_as11_edf_settings");
+    CHECK(cJSON_IsObject(fields) && cJSON_IsNumber(cJSON_GetObjectItem(fields, "Mode")),
+          "recovered snapshot contains native settings");
+    cJSON_Delete(recovered);
+    f = fopen(bad, "rb");
+    CHECK(f && fgetc(f) == 0, "corrupt bytes preserved in a distinct quarantine");
+    if (f) fclose(f);
+    char *old = read_text(previous);
+    CHECK(old && !strcmp(old, "previous quarantine"), "earlier quarantine is preserved");
+    free(old);
+    edf_import_ctx_destroy(c);
+
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 2, 2, signals, 3, 0);
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.root_retained &&
+          u.settings_written == 0, "reimport after recovery is idempotent");
+    edf_import_ctx_destroy(c);
+
+    fresh_tree();
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 2, 2, signals, 3, 0);
+    f = fopen(snapshot, "wb");
+    if (f) { fputc(0, f); fclose(f); }
+    CHECK(mkdir(temp, 0775) == 0, "block recovery temporary file");
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained &&
+          file_exists(source) && file_exists(previous),
+          "failed recovery preserves source and quarantined bytes");
+    edf_import_ctx_destroy(c);
+    CHECK(rmdir(temp) == 0, "remove test-created write blocker");
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.root_retained &&
+          file_exists(snapshot) && file_exists(previous),
+          "retry after interrupted recovery reconstructs snapshot");
+    edf_import_ctx_destroy(c);
+
+    fresh_tree();
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 2, 2, signals, 3, 0);
+    f = fopen(snapshot, "wb");
+    if (f) { fputs("{\"incomplete\":", f); fclose(f); }
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained &&
+          file_exists(snapshot) && !file_exists(previous),
+          "uncertain parse failure is retained rather than misclassified");
+    edf_import_ctx_destroy(c);
+
+    fresh_tree();
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 2, 2, signals, 3, 0);
+    f = fopen(source, "r+b");
+    CHECK(f != NULL, "open synthetic STR for checksum failure");
+    if (f) {
+        fseek(f, 256 + 256 * 4, SEEK_SET);
+        int ch = fgetc(f);
+        fseek(f, -1, SEEK_CUR);
+        fputc(ch ^ 1, f);
+        fclose(f);
+    }
+    f = fopen(snapshot, "wb");
+    if (f) { fputc(0, f); fclose(f); }
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained &&
+          file_exists(snapshot) && !file_exists(previous),
+          "bad STR record cannot repair or quarantine existing snapshot");
+    edf_import_ctx_destroy(c);
+    printf("native corruption recovery OK (%d checks)\n", g_checks);
+}
+
 int main(void)
 {
     setenv("TZ", "UTC", 1);
@@ -2539,6 +2644,7 @@ int main(void)
     phase_q();
     phase_r();
     phase_s();
+    phase_native_corruption();
     phase_store_budget();
 
     rmtree(SD_MOUNT_POINT);

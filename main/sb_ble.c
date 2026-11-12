@@ -1548,59 +1548,41 @@ static bool root_error_deferred(void)
            !strcasecmp(s_last_code, "STALE");
 }
 
-/* Find a root ledger entry by canonical key, falling back to a legacy key
- * that differs only by case.  The returned key is used for migration. */
-static cJSON *root_ledger_entry(const char *key, char *found, size_t cap)
+/* Older ledgers can contain repeated keys. Keep the latest entry visible,
+ * but require independent evidence before associating it with staged data. */
+static cJSON *root_ledger_entry(const char *key, size_t *count)
 {
     cJSON *root = cJSON_GetObjectItem(s_ledger, "root");
-    if (!root) return NULL;
-    cJSON *exact = cJSON_GetObjectItemCaseSensitive(root, key);
-    if (exact) {
-        if (found) snprintf(found, cap, "%s", key);
-        return exact;
-    }
-    const char *slash = strrchr(key, '/');
-    const char *base = slash ? slash + 1 : key;
-    size_t prefix_len = slash ? (size_t)(base - key) : 0;
-    for (cJSON *it = root->child; it; it = it->next) {
-        if (!it->string) continue;
-        const char *it_base = strrchr(it->string, '/');
-        it_base = it_base ? it_base + 1 : it->string;
-        if (strcasecmp(it_base, base) != 0) continue;
-        if (prefix_len && strncasecmp(it->string, key, prefix_len) != 0) continue;
-        if (found) snprintf(found, cap, "%s", it->string);
-        return it;
-    }
-    return NULL;
-}
-
-static bool root_ledger_rekey(const char *canonical_key, const char *found_key)
-{
-    if (!found_key[0] || strcmp(canonical_key, found_key) == 0) return true;
-    cJSON *root = cJSON_GetObjectItem(s_ledger, "root");
-    if (!root) return false;
-    cJSON *item = cJSON_DetachItemFromObjectCaseSensitive(root, found_key);
-    if (!item) return false;
-    cJSON_DeleteItemFromObjectCaseSensitive(root, canonical_key);
-    if (!cJSON_AddItemToObject(root, canonical_key, item)) {
-        cJSON_Delete(item);
-        return false;
-    }
-    return true;
+    return sb_root_ledger_latest(root, key, count);
 }
 
 static bool root_ledger_store(const char *key, const char *size,
                               const char *ts, bool ts_null)
 {
     cJSON *root = cJSON_GetObjectItem(s_ledger, "root");
-    if (!root) return false;
-    cJSON_DeleteItemFromObjectCaseSensitive(root, key);
-    cJSON *n = cJSON_AddObjectToObject(root, key);
-    if (!n) return false;
-    cJSON_AddStringToObject(n, "size", size ? size : "");
-    if (ts_null) cJSON_AddNullToObject(n, "ts");
-    else cJSON_AddStringToObject(n, "ts", ts ? ts : "");
-    return ledger_save();
+    return sb_root_ledger_replace(root, key, size, ts, ts_null) && ledger_save();
+}
+
+static bool staged_settings_need_identity(void)
+{
+    struct stat st;
+    return stat(SD_IMPORT_DIR "/SETTINGS/CurrentSettings.json", &st) == 0 &&
+           stat(SD_IMPORT_DIR "/Identification.json", &st) != 0 &&
+           stat(SD_IMPORT_DIR "/Identification.tgt", &st) != 0;
+}
+
+/* A tuple in an old ledger does not prove which duplicate describes the
+ * staged file. Match its bytes to the observation for this listing first. */
+static bool staged_root_matches(const char *key, const char *size,
+                                const char *ts, bool ts_null, const char *path)
+{
+    if (!s_source_store_ready || !source_store_lock()) return false;
+    char id[SOURCE_STORE_ID_HEX + 1];
+    bool matches = source_store_find("root", key, size, ts, ts_null,
+                                     id, sizeof(id), NULL, 0) == ESP_OK &&
+                   source_store_path_matches(id, path) == ESP_OK;
+    source_store_unlock();
+    return matches;
 }
 
 /* Retain a pulled root file as immutable evidence.  This does not yet
@@ -1763,12 +1745,12 @@ static root_sync_result_t sync_root_dir(const char *directory,
         }
         const char *canonical = sb_root_canonical_name(fn);
 
-        char key[96], canonical_key[96], found_key[96] = "";
+        char key[96], canonical_key[96];
         snprintf(key, sizeof(key), "%s%s", ledger_prefix, fn);
         snprintf(canonical_key, sizeof(canonical_key), "%s%s",
                  ledger_prefix, canonical);
-        cJSON *e = root_ledger_entry(canonical_key, found_key,
-                                     sizeof(found_key));
+        size_t ledger_count = 0;
+        cJSON *e = root_ledger_entry(canonical_key, &ledger_count);
         bool same = false;
         if (e) {
             const char *sz = cJSON_GetStringValue(cJSON_GetObjectItem(e, "size"));
@@ -1788,17 +1770,23 @@ static root_sync_result_t sync_root_dir(const char *directory,
                  SD_IMPORT_DIR, ledger_prefix, canonical);
         struct stat lst;
         bool local_present = stat(canonical_local, &lst) == 0;
-        if (same && local_present) {
-            if (!root_ledger_rekey(canonical_key, found_key) || !ledger_save()) {
-                ESP_LOGW(TAG, "root: ledger migration failed for %s", canonical_key);
-                r.failed++;
-            }
-            continue;
-        }
         if (local_present) {
+            bool proven = same && ledger_count == 1;
+            if (!proven)
+                proven = staged_root_matches(canonical_key, size, ts, ts_null,
+                                             canonical_local);
+            if (proven) {
+                if ((!same || ledger_count != 1 || !e ||
+                     strcmp(e->string, canonical_key)) &&
+                    !root_ledger_store(canonical_key, size, ts, ts_null)) {
+                    ESP_LOGW(TAG, "root: ledger reconciliation failed for %s", canonical_key);
+                    r.failed++;
+                }
+                continue;
+            }
             /* The staged file may still be unprocessed or deliberately
              * retained. Do not replace it with a newer bridge version. */
-            ESP_LOGI(TAG, "root: deferring changed %s while staged input remains",
+            ESP_LOGI(TAG, "root: deferring %s while unverified staged input remains",
                      canonical_key);
             r.deferred = true;
             continue;
@@ -1815,7 +1803,8 @@ static root_sync_result_t sync_root_dir(const char *directory,
                 bool committed = same && source_store_has_observation(
                     stored_id, s_root_processed_ids[idx], "processed_root");
                 sb_root_cache_action_t action = sb_root_cache_action(
-                    same, committed, now, &s_root_recheck_ms[idx]);
+                    same, committed, (idx == 1 || idx == 2) &&
+                    staged_settings_need_identity(), now, &s_root_recheck_ms[idx]);
                 if (action == SB_ROOT_SKIP_COMMITTED) {
                     source_store_unlock();
                     continue;
@@ -1869,10 +1858,6 @@ network_pull:
                            fn, directory);
         s_root_recheck_ms[idx] = esp_timer_get_time() / 1000;
 
-        if (found_key[0] && strcmp(found_key, canonical_key) != 0) {
-            cJSON *root = cJSON_GetObjectItem(s_ledger, "root");
-            if (root) cJSON_DeleteItemFromObjectCaseSensitive(root, found_key);
-        }
         bool ledger_ok = root_ledger_store(canonical_key, size, ts, ts_null);
         if (!ledger_ok) {
             ESP_LOGW(TAG, "root: ledger save failed for %s", canonical_key);

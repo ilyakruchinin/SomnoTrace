@@ -225,7 +225,7 @@ if [ -n "$CJ_INC" ]; then
     # Immutable source objects/observations: dedup, idempotence, corruption,
     # orphan pruning.  Host hash is a deterministic test identity.
     run_test source_store_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" -DSOURCE_STORE_HOST \
-        scripts/source_store_test.c "$MAIN_DIR/source_store.c" $CJ_SRC $CJ_LIB
+        scripts/source_store_test.c "$MAIN_DIR/source_store.c" "$MAIN_DIR/sb_root_ledger.c" $CJ_SRC $CJ_LIB
     # Oximetry upload-state store: the 64-slot-table overflow that kept
     # re-uploading the same recording.  Needs real cJSON (the shim's Parse
     # returns NULL) and scratch dirs under /tmp for a fake card + state tree.

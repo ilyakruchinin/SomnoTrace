@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #include "cJSON.h"
+#include "sb_root.h"
 #include "source_store.h"
 
 static int checks, fails;
@@ -95,7 +96,59 @@ static void test_put_get_dedup(void)
           len == strlen("file-backed object") &&
           memcmp(buf, "file-backed object", len) == 0,
           "put path content");
+    CHECK(source_store_path_matches(f.id, src) == ESP_OK,
+          "staged bytes match the observed object");
+    write_text(src, "different source");
+    CHECK(source_store_path_matches(f.id, src) == ESP_ERR_INVALID_CRC,
+          "different staged bytes do not match");
+    CHECK(source_store_verify(f.id, strlen("file-backed object")) == ESP_OK,
+          "matching staged bytes does not change the source store");
     cleanup();
+}
+
+static void test_root_ledger_duplicates(void)
+{
+    cJSON *root = cJSON_CreateObject();
+    CHECK(root != NULL, "create root ledger");
+    if (!root) return;
+    for (int i = 0; i < 760; i++) {
+        cJSON *entry = cJSON_AddObjectToObject(root, i % 2
+                                               ? "settings/currentsettings.json"
+                                               : "SETTINGS/CurrentSettings.json");
+        if (entry) {
+            cJSON_AddStringToObject(entry, "size", "3072");
+            cJSON_AddStringToObject(entry, "ts", i == 759 ? "new" : "old");
+        }
+    }
+    cJSON *unrelated = cJSON_AddObjectToObject(root, "Identification.json");
+    if (unrelated) cJSON_AddStringToObject(unrelated, "ts", "keep");
+    size_t count = 0;
+    cJSON *latest = sb_root_ledger_latest(root, "SETTINGS/CurrentSettings.json", &count);
+    CHECK(count == 760 && latest &&
+          !strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(latest, "ts")), "new"),
+          "find last entry and count duplicate case aliases");
+    CHECK(!sb_root_ledger_replace(root, "SETTINGS/CurrentSettings.json",
+                                  NULL, "new", false),
+          "invalid replacement is rejected");
+    CHECK(sb_root_ledger_latest(root, "SETTINGS/CurrentSettings.json", &count) &&
+          count == 760, "failed replacement preserves all ledger entries");
+    CHECK(sb_root_ledger_replace(root, "SETTINGS/CurrentSettings.json",
+                                 "3072", "new", false),
+          "replace duplicate entries");
+    latest = sb_root_ledger_latest(root, "SETTINGS/CurrentSettings.json", &count);
+    CHECK(count == 1 && latest &&
+          !strcmp(latest->string, "SETTINGS/CurrentSettings.json") &&
+          !strcmp(cJSON_GetStringValue(cJSON_GetObjectItem(latest, "ts")), "new"),
+          "one canonical entry remains");
+    CHECK(cJSON_GetObjectItemCaseSensitive(root, "Identification.json") == unrelated,
+          "other root entries survive reconciliation");
+    CHECK(sb_root_ledger_replace(root, "SETTINGS/CurrentSettings.json",
+                                 "3072", NULL, true),
+          "null timestamps remain supported");
+    latest = sb_root_ledger_latest(root, "SETTINGS/CurrentSettings.json", &count);
+    CHECK(count == 1 && cJSON_IsNull(cJSON_GetObjectItem(latest, "ts")),
+          "null timestamp replaces prior tuple");
+    cJSON_Delete(root);
 }
 
 static void test_observations(void)
@@ -296,6 +349,7 @@ int main(void)
     test_prune();
     test_find_and_copy();
     test_budget();
+    test_root_ledger_duplicates();
     printf("source_store_test: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

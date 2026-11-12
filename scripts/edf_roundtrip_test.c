@@ -738,6 +738,31 @@ static void as11_native_roundtrip(void)
           as10_sample(bytes, len, "MaskOn", 1) == 700 &&
           as10_sample(bytes, len, "MaskOff", 1) == 760,
           "native mask timing remains unchanged");
+    f = fopen(SD_SUMMARIES_DIR "/20260302.native.settings.json", "wb");
+    check(f != NULL, "create corrupt synthetic native day");
+    if (f) {
+        for (int i = 0; i < 512; i++) fputc(0, f);
+        fputs("damaged", f);
+        fclose(f);
+    }
+    check(edf_gen_rebuild_native_str() != ESP_OK, "corrupt day blocks publication");
+    size_t blocked_len = 0;
+    uint8_t *blocked = slurp(SD_SDCARD_DIR "/STR.edf", &blocked_len);
+    check(bytes && blocked && len == blocked_len && !memcmp(bytes, blocked, len),
+          "failed rebuild preserves the published STR");
+    free(blocked);
+    sh("cp '%s' '%s'", copy, source);
+    ctx = edf_import_ctx_create();
+    check(ctx && edf_import_process_next(ctx, &unit) == ESP_OK &&
+          !unit.root_retained && unit.settings_written == 1,
+          "reimport reconstructs only the corrupt day");
+    edf_import_ctx_destroy(ctx);
+    check(edf_gen_rebuild_native_str() == ESP_OK, "publish after native day recovery");
+    size_t recovered_len = 0;
+    uint8_t *recovered = slurp(SD_SDCARD_DIR "/STR.edf", &recovered_len);
+    check(bytes && recovered && len == recovered_len && !memcmp(bytes, recovered, len),
+          "recovered STR preserves all settings and mask times byte-for-byte");
+    free(recovered);
     check(access(SD_SDCARD_SETTINGS "/CurrentSettings.json", F_OK) != 0,
           "historical settings do not create CurrentSettings");
     check(rename(SD_SDCARD_DIR "/Identification.json",

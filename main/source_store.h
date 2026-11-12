@@ -57,6 +57,10 @@ esp_err_t source_store_put(const char *kind, const uint8_t *data, size_t len,
 esp_err_t source_store_put_path(const char *kind, const char *path,
                                 source_store_put_result_t *out);
 
+/* Check staged bytes against a previously observed content id, without
+ * creating or replacing any source objects. */
+esp_err_t source_store_path_matches(const char *id, const char *path);
+
 /* Read and verify an object.  Returns ESP_ERR_NOT_FOUND when absent and
  * ESP_ERR_INVALID_CRC when the bytes no longer match their name. */
 esp_err_t source_store_get(const char *id, uint8_t *buf, size_t cap,
