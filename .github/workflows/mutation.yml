@@ -23,7 +23,10 @@ permissions:
 jobs:
   mutation:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 30, not 20: on as10-somnobridge the check now takes 18-20 min on a hosted runner, so the
+    # old limit cancelled it by runner speed alone. Measured: 18m03s and 18m44s (success),
+    # 19m47s (success), then 20m10s, 20m16s and 20m56s (cancelled by the limit, no failing mutant).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
