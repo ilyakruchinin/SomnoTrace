@@ -50,6 +50,7 @@
 #include <time.h>
 #include <errno.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -1023,17 +1024,19 @@ out:
 
 /* End of the last annotation (onset + duration) relative to the file's own
  * start, in ms; 0 when the file has none or can't be read. */
-static int64_t imp_ann_span_ms(const char *path, bool csl)
+static esp_err_t imp_ann_span_ms(const char *path, bool csl, int64_t *out_end)
 {
     imp_ev_list_t L = {0};
     int64_t end = 0;
-    if (collect_tal(path, &L, csl) == ESP_OK)
+    esp_err_t err = collect_tal(path, &L, csl);
+    if (err == ESP_OK)
         for (int i = 0; i < L.n; i++) {
             int64_t t = L.ev[i].onset_ms + L.ev[i].dur_ms;
             if (t > end) end = t;
         }
     free(L.ev);
-    return end;
+    if (err == ESP_OK) *out_end = end;
+    return err;
 }
 
 /* Emit one EventNotification JSON line per event (each well under the
@@ -1666,6 +1669,10 @@ struct edf_import_ctx {
     int     n_skipped;
     bool    skip_full;
     int     quiesce_s;      /* defer units modified within this window; 0 = off */
+    char    future_unit[320];
+    uint64_t future_signature;
+    int64_t future_seen_us;
+    bool    future_observed;
     imp_edf_t *scratch;     /* reusable header buffer */
 };
 
@@ -2648,105 +2655,79 @@ static int file_ts_cmp(const void *a, const void *b)
 static bool is_wave(imp_kind_t k) { return k == K_BRP || k == K_PLD || k == K_SA2; }
 static bool is_ann(imp_kind_t k) { return k == K_EVE || k == K_CSL; }
 
-/* Cluster a day's files into sessions.  `files` is sorted in place — the
- * returned cluster members point INTO it, so it must outlive `out`.
- * Wave files (BRP/PLD/SA2) sharing a timestamp ±2 s form a wave cluster;
- * annotation files (EVE/CSL) likewise form ann clusters.  Each ann cluster
- * pairs with the earliest wave cluster starting 0..60 s after it (MaskOn
- * follows TherapyStart); leftovers stand alone. */
+/* Collect same-stem candidates without assigning annotation ownership.
+ * `files` is sorted in place and must outlive the returned clusters. */
 static int cluster_files(imp_file_t *files, int n_files,
                          imp_cluster_t *out, int max_out)
 {
-    int n = n_files > IMP_MAX_FILES ? IMP_MAX_FILES : n_files;
-    qsort(files, n, sizeof(imp_file_t), file_ts_cmp);
-
+    if (n_files > IMP_MAX_FILES) return -1;
+    qsort(files, n_files, sizeof(imp_file_t), file_ts_cmp);
     int n_out = 0;
-    /* 1:1 pairing by walking the sorted list: an ann file maps to the next
-     * wave file within the match window; all wave files at one timestamp
-     * share the wave anchor, all ann files at one timestamp share the ann
-     * anchor. */
-    typedef struct { int64_t ts; int idx; } grp_t;
-    /* Zero-fill so cppcheck's uninitvar can see the initialized-prefix
-     * invariant: reads are bounded by nw/na but the arrays are written
-     * conditionally under `nw < IMP_MAX_SESSIONS` guards. */
-    grp_t waves[IMP_MAX_SESSIONS] = {0}, anns[IMP_MAX_SESSIONS] = {0};
-    int nw = 0, na = 0;
-
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n_files; i++) {
         const imp_file_t *f = &files[i];
-        if (is_wave(f->kind)) {
-            if (nw == 0 || f->ts_dev_ms - waves[nw - 1].ts > IMP_CLUSTER_MS)
-                { if (nw < IMP_MAX_SESSIONS) waves[nw] = (grp_t){ f->ts_dev_ms, i }, nw++; }
-        } else if (is_ann(f->kind)) {
-            if (na == 0 || f->ts_dev_ms - anns[na - 1].ts > IMP_CLUSTER_MS)
-                { if (na < IMP_MAX_SESSIONS) anns[na] = (grp_t){ f->ts_dev_ms, i }, na++; }
+        if (!is_wave(f->kind) && !is_ann(f->kind)) continue;
+        int c = 0;
+        for (; c < n_out; c++) {
+            int64_t anchor = is_wave(f->kind) ? out[c].wav_ts : out[c].eve_ts;
+            if (anchor == f->ts_dev_ms) break;
         }
-    }
-
-    /* Match ann clusters to wave clusters.  An unmatched ann cluster still
-     * yields a session (mask-off run); unmatched wave clusters too. */
-    int wi = 0;
-    for (int ai = 0; ai < na && n_out < max_out; ai++) {
-        int64_t eve_ts = anns[ai].ts;
-        /* Wave clusters starting before this ann anchor (beyond tolerance)
-         * belong to an earlier therapy — skip them. */
-        while (wi < nw && waves[wi].ts < eve_ts - IMP_CLUSTER_MS)
-            wi++;
-        int match = -1;
-        if (wi < nw) {
-            int64_t delta = waves[wi].ts - eve_ts;
-            if (delta >= -IMP_CLUSTER_MS && delta <= IMP_MATCH_MS)
-                match = wi++;
+        if (c == n_out) {
+            if (n_out >= max_out) return -1;
+            memset(&out[n_out], 0, sizeof(out[n_out]));
+            out[n_out].wav_ts = is_wave(f->kind) ? f->ts_dev_ms : -1;
+            out[n_out].eve_ts = is_ann(f->kind) ? f->ts_dev_ms : -1;
+            n_out++;
         }
-        imp_cluster_t *c = &out[n_out];
-        memset(c, 0, sizeof(*c));
-        c->eve_ts = eve_ts;
-        c->wav_ts = (match >= 0) ? waves[match].ts : -1;
-        n_out++;
-    }
-    for (; wi < nw && n_out < max_out; wi++) {
-        imp_cluster_t *c = &out[n_out];
-        memset(c, 0, sizeof(*c));
-        c->eve_ts = -1;
-        c->wav_ts = waves[wi].ts;
-        n_out++;
-    }
-
-    /* Fill file slots per cluster. */
-    for (int i = 0; i < n; i++) {
-        const imp_file_t *f = &files[i];
-        for (int c = 0; c < n_out; c++) {
-            imp_cluster_t *cl = &out[c];
-            int64_t anchor = is_wave(f->kind) ? cl->wav_ts : cl->eve_ts;
-            if (anchor < 0 ||
-                llabs(f->ts_dev_ms - anchor) > IMP_CLUSTER_MS) continue;
-            switch (f->kind) {
-                case K_BRP: if (!cl->brp) cl->brp = f; break;
-                case K_PLD: if (!cl->pld) cl->pld = f; break;
-                case K_SA2: if (!cl->sa2) cl->sa2 = f; break;
-                case K_EVE: if (!cl->eve) cl->eve = f; break;
-                case K_CSL: if (!cl->csl) cl->csl = f; break;
-                default: break;
-            }
-            break;
+        const imp_file_t **slot = NULL;
+        switch (f->kind) {
+        case K_BRP: slot = &out[c].brp; break;
+        case K_PLD: slot = &out[c].pld; break;
+        case K_SA2: slot = &out[c].sa2; break;
+        case K_EVE: slot = &out[c].eve; break;
+        case K_CSL: slot = &out[c].csl; break;
+        default: break;
         }
+        /* SA2/SAD aliases or duplicate kinds must not silently disappear. */
+        if (!slot || *slot) return -1;
+        *slot = f;
     }
     return n_out;
 }
 
 /* ── Commit protocol ────────────────────────────────────────────────── */
 
-/* Marker written before any .part is staged: presence of
- * <id>_session.json.importing means "import in flight".  Orphan cleanup at
- * scan start removes it plus every <id>* file when no finished manifest
- * exists. */
+/* The versioned marker claims a new cohort, not an older session's files. */
+#define IMP_V2_MARKER "SomnoTrace import grouping v2\n"
 static esp_err_t write_import_marker(const char *dir, const char *id)
 {
     char p[448];
     snprintf(p, sizeof(p), "%s/%s_session.json.importing", dir, id);
-    FILE *f = fopen(p, "w");
-    if (!f) return ESP_FAIL;
+    int fd = open(p, O_WRONLY | O_CREAT | O_EXCL, 0664);
+    if (fd < 0) return ESP_FAIL;
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        unlink(p);
+        return ESP_FAIL;
+    }
+    if (fputs(IMP_V2_MARKER, f) < 0) {
+        fclose(f);
+        unlink(p);
+        return ESP_FAIL;
+    }
     return imp_flush_close(f, p);
+}
+
+static bool is_v2_import_marker(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char text[sizeof(IMP_V2_MARKER)];
+    size_t n = fread(text, 1, sizeof(text), f);
+    bool valid = n == sizeof(IMP_V2_MARKER) - 1 &&
+                 !memcmp(text, IMP_V2_MARKER, n) && !ferror(f);
+    fclose(f);
+    return valid;
 }
 
 static void delete_import_marker(const char *dir, const char *id)
@@ -2783,9 +2764,8 @@ static esp_err_t publish_parts(const char *dir, const char *id)
     return ret;
 }
 
-/* Boot/scan cleanup: drop incomplete imports (marker present, manifest
- * absent) and every stale *.part under streams/.  Public: main.c runs it
- * before session_writer_recover() so recovery never sees import residue. */
+/* Boot/scan cleanup owns only explicit v2 import markers and their artifacts.
+ * Legacy, malformed and unrelated .part files are not ours to remove. */
 void edf_import_cleanup_residue(void)
 {
     DIR *days = opendir(SD_STREAMS_DIR);
@@ -2806,28 +2786,27 @@ void edf_import_cleanup_residue(void)
         while ((fe = readdir(dd)) != NULL) {
             const char *nm = fe->d_name;
             size_t nl = strlen(nm);
-            /* stale .part → importer residue, delete */
-            if (nl > 5 && strcmp(nm + nl - 5, ".part") == 0) {
-                char p[600];
-                snprintf(p, sizeof(p), "%s/%s", dpath, nm);
-                unlink(p);
-                continue;
-            }
             const char *mfx = "_session.json.importing";
             size_t ml = strlen(mfx);
             if (nl <= ml || strcmp(nm + nl - ml, mfx) != 0) continue;
-            /* marker present: keep it only if the finished manifest is missing */
-            char id[40], mp[600];
+            char id[40], mp[600], marker[600];
             size_t idl = nl - ml;
             if (idl >= sizeof(id)) continue;
             memcpy(id, nm, idl); id[idl] = '\0';
+            snprintf(marker, sizeof(marker), "%s/%s", dpath, nm);
+            if (!is_v2_import_marker(marker)) continue;
             snprintf(mp, sizeof(mp), "%s/%s_session.json", dpath, id);
             struct stat st;
             if (stat(mp, &st) == 0) {
-                /* committed manifest exists → just drop the marker */
-                snprintf(mp, sizeof(mp), "%s/%s", dpath, nm);
-                unlink(mp);
-            } else if (n_dead < 24) {
+                cJSON *m = read_json_file(mp);
+                const cJSON *version = cJSON_GetObjectItemCaseSensitive(m, "import_grouping_version");
+                const cJSON *state = cJSON_GetObjectItemCaseSensitive(m, "state");
+                if (cJSON_IsNumber(version) && version->valuedouble == 2.0 &&
+                    cJSON_IsString(state) && state->valuestring &&
+                    !strcmp(state->valuestring, "completed"))
+                    unlink(marker);
+                cJSON_Delete(m);
+            } else if (errno == ENOENT && n_dead < 24) {
                 memcpy(dead[n_dead++], id, idl + 1);
             }
         }
@@ -2866,6 +2845,8 @@ typedef struct {
     const char          *src_family;   /* "AS10" | "AS11" | "" */
     const char          *src_serial;
     bool                 src_identity_verified;
+    bool                 retain_raw;  /* cross-stem association retains source evidence */
+    bool                 frozen;      /* matched a pre-cohort/future manifest */
     char                 src_hash[5][65]; /* source-byte fingerprints */
     uint64_t             src_size[5];
     uint8_t              src_record_count[5][8];
@@ -3160,9 +3141,63 @@ static int native_mask_relation(const imp_work_t *w, int64_t ann, int64_t wave)
     return ann_index == wave_index ? 1 : 0;
 }
 
+typedef enum {
+    IMP_ASSOC_INDEPENDENT = 0,
+    IMP_ASSOC_SAME_SOURCE,
+    IMP_ASSOC_NATIVE_INTERVAL,
+    IMP_ASSOC_DEFER_UNKNOWN,
+    IMP_ASSOC_DEFER_CONFLICT
+} imp_assoc_t;
+
+/* A nearby timestamp is a reason to consider a claim, never positive proof. */
+static imp_assoc_t association_policy(bool same_machine, bool same_stem,
+                                      int mask_relation, bool competing)
+{
+    if (competing || (same_stem && mask_relation == 0))
+        return IMP_ASSOC_DEFER_CONFLICT;
+    if (mask_relation == 0) return IMP_ASSOC_INDEPENDENT;
+    if (!same_machine) return IMP_ASSOC_DEFER_UNKNOWN;
+    if (same_stem) return IMP_ASSOC_SAME_SOURCE;
+    if (mask_relation == 1) return IMP_ASSOC_NATIVE_INTERVAL;
+    return IMP_ASSOC_DEFER_UNKNOWN;
+}
+
+/* Old/live manifests have no import anchors. Compare their recorded device
+ * time window when possible; unknown or malformed timing cannot disprove a
+ * match, so it must not authorize a second publication. */
+static bool frozen_manifest_may_match(const cJSON *m, const imp_cluster_t *cl,
+                                      int64_t incoming_end_dev)
+{
+    const cJSON *start = cJSON_GetObjectItemCaseSensitive(m, "start_epoch_ms");
+    const cJSON *end = cJSON_GetObjectItemCaseSensitive(m, "end_epoch_ms");
+    const cJSON *drift = cJSON_GetObjectItemCaseSensitive(m, "clock_drift_ms");
+    if (!cJSON_IsNumber(start) || !cJSON_IsNumber(end) || !cJSON_IsNumber(drift) ||
+        !isfinite(start->valuedouble) || !isfinite(end->valuedouble) ||
+        !isfinite(drift->valuedouble) ||
+        floor(start->valuedouble) != start->valuedouble ||
+        floor(end->valuedouble) != end->valuedouble ||
+        floor(drift->valuedouble) != drift->valuedouble ||
+        start->valuedouble <= 0 || end->valuedouble < start->valuedouble ||
+        end->valuedouble > 253402300799999.0 ||
+        fabs(drift->valuedouble) > IMP_DRIFT_MAX_MS)
+        return true;
+    /* clock_drift_ms is the complete applied shift, including any zone delta. */
+    int64_t shift = (int64_t)drift->valuedouble;
+    int64_t old_start = (int64_t)start->valuedouble - shift;
+    int64_t old_end = (int64_t)end->valuedouble - shift;
+    int64_t incoming_start = cl->eve_ts >= 0 ? cl->eve_ts : cl->wav_ts;
+    if (cl->wav_ts >= 0 && cl->wav_ts < incoming_start) incoming_start = cl->wav_ts;
+    if (incoming_start < 0 || incoming_end_dev < incoming_start) return true;
+    bool usable = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "clock_drift_valid")) ||
+                  cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "clock_drift_usable"));
+    int64_t uncertainty = usable ? IMP_CLUSTER_MS : IMP_DRIFT_MAX_MS;
+    return incoming_start <= old_end + uncertainty &&
+           incoming_end_dev >= old_start - uncertainty;
+}
+
 /* Match only a verified machine and unambiguous source anchors. The raw
  * source clock, not the current drift estimate, identifies a session. */
-static esp_err_t find_import_match(const char *dir, const imp_work_t *w,
+static esp_err_t find_import_match(const char *dir, imp_work_t *w,
                                    const imp_cluster_t *cl,
                                    int64_t incoming_end_dev,
                                    char *out_id, size_t out_len)
@@ -3175,15 +3210,22 @@ static esp_err_t find_import_match(const char *dir, const imp_work_t *w,
     struct dirent *ent;
     const char *suffix = "_session.json";
     const size_t suffix_len = strlen(suffix);
-    while ((ent = readdir(d)) != NULL) {
+    for (;;) {
+        errno = 0;
+        ent = readdir(d);
+        if (!ent) {
+            if (errno != 0) { closedir(d); return ESP_FAIL; }
+            break;
+        }
         size_t n = strlen(ent->d_name);
         if (n <= suffix_len || strcmp(ent->d_name + n - suffix_len, suffix))
             continue;
         size_t id_len = n - suffix_len;
-        if (id_len >= out_len) continue;
+        if (id_len >= out_len) { closedir(d); return ESP_ERR_INVALID_SIZE; }
         char path[600];
         snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
         cJSON *m = read_json_file(path);
+        if (!cJSON_IsObject(m)) { cJSON_Delete(m); closedir(d); return ESP_FAIL; }
         const cJSON *sources = cJSON_GetObjectItemCaseSensitive(m, "import_sources");
         const cJSON *serial = cJSON_GetObjectItemCaseSensitive(m, "source_serial");
         const cJSON *family = cJSON_GetObjectItemCaseSensitive(m, "source_device_family");
@@ -3191,7 +3233,11 @@ static esp_err_t find_import_match(const char *dir, const imp_work_t *w,
         bool previous_verified = cJSON_IsTrue(verified) &&
                                  cJSON_IsString(serial) && serial->valuestring &&
                                  cJSON_IsString(family) && family->valuestring;
-        if (!cJSON_IsObject(sources)) {
+        if (!cJSON_IsObject(sources) || cJSON_GetArraySize(sources) == 0) {
+            if (frozen_manifest_may_match(m, cl, incoming_end_dev)) {
+                conflict = true;
+                w->frozen = true;
+            }
             cJSON_Delete(m);
             continue;
         }
@@ -3205,69 +3251,63 @@ static esp_err_t find_import_match(const char *dir, const imp_work_t *w,
             cJSON_Delete(m);
             continue;
         }
-        bool exact = false, different = false;
+        bool exact = false, different = false, same_stem = false;
         for (int i = 0; i < 5; i++) {
             const imp_file_t *f = cluster_source(cl, i);
             const cJSON *v = cJSON_GetObjectItemCaseSensitive(sources, imp_source_keys[i]);
-            if (!f || !v) continue;
-            if (cJSON_IsString(v) && v->valuestring && !strcmp(v->valuestring, f->prefix))
-                exact = true;
-            else
-                different = true;
+            if (!f) continue;
+            if (v) {
+                if (cJSON_IsString(v) && v->valuestring &&
+                    !strcmp(v->valuestring, f->prefix))
+                    exact = true;
+                else
+                    different = true;
+            }
+            for (int k = 0; k < 5; k++) {
+                const cJSON *old = cJSON_GetObjectItemCaseSensitive(sources, imp_source_keys[k]);
+                if (cJSON_IsString(old) && old->valuestring &&
+                    !strcmp(old->valuestring, f->prefix))
+                    same_stem = true;
+            }
         }
         int64_t old_wave = source_anchor(sources, 0, 3);
         int64_t old_ann = source_anchor(sources, 3, 5);
-        bool near = false;
-        if (!different && old_wave >= 0 && cl->wav_ts >= 0 &&
-            llabs(old_wave - cl->wav_ts) <= IMP_CLUSTER_MS)
-            near = true;
-        if (!different && old_ann >= 0 && cl->eve_ts >= 0 &&
-            llabs(old_ann - cl->eve_ts) <= IMP_CLUSTER_MS)
-            near = true;
-        if (!different && old_ann >= 0 && old_wave < 0 && cl->wav_ts >= 0 &&
-            cl->wav_ts - old_ann >= -IMP_CLUSTER_MS &&
-            cl->wav_ts - old_ann <= IMP_MATCH_MS)
-            near = true;
-        if (!different && old_ann < 0 && old_wave >= 0 && cl->eve_ts >= 0 &&
-            old_wave - cl->eve_ts >= -IMP_CLUSTER_MS &&
-            old_wave - cl->eve_ts <= IMP_MATCH_MS)
-            near = true;
-        bool long_pair = old_ann >= 0 && cl->wav_ts >= 0 &&
-                         cl->wav_ts - old_ann > IMP_MATCH_MS;
-        bool long_reverse = old_ann < 0 && old_wave >= 0 && cl->eve_ts >= 0 &&
-                            old_wave - cl->eve_ts > IMP_MATCH_MS;
         int mask_pair = old_ann >= 0 && cl->wav_ts >= 0
                         ? native_mask_relation(w, old_ann, cl->wav_ts) : -1;
-        int mask_reverse = old_ann < 0 && old_wave >= 0 && cl->eve_ts >= 0
+        int mask_reverse = old_wave >= 0 && cl->eve_ts >= 0
                            ? native_mask_relation(w, cl->eve_ts, old_wave) : -1;
-        if (mask_pair == 0 || mask_reverse == 0) {
-            near = false;
-            if (exact) conflict = true;
-        }
-        if (long_pair && mask_pair == 1) {
-            if (different || (old_wave >= 0 && !near && !exact)) conflict = true;
-            else if (old_wave < 0) near = true;
-        }
-        if (long_reverse && mask_reverse == 1) {
-            if (different) conflict = true;
-            else near = true;
-        }
-        /* An overlapping long-gap annotation/wave pair without matching
-         * native mask evidence may be one session or two. Keep it staged. */
+        int mask = (mask_pair == 0 || mask_reverse == 0) ? 0 :
+                   (mask_pair == 1 || mask_reverse == 1) ? 1 : -1;
+        bool near = (old_wave >= 0 && cl->wav_ts >= 0 &&
+                     llabs(old_wave - cl->wav_ts) <= IMP_CLUSTER_MS) ||
+                    (old_ann >= 0 && cl->eve_ts >= 0 &&
+                     llabs(old_ann - cl->eve_ts) <= IMP_CLUSTER_MS) ||
+                    (old_ann >= 0 && cl->wav_ts >= 0 &&
+                     llabs(old_ann - cl->wav_ts) <= IMP_MATCH_MS) ||
+                    (old_wave >= 0 && cl->eve_ts >= 0 &&
+                     llabs(old_wave - cl->eve_ts) <= IMP_MATCH_MS);
         int64_t prior_end = 0, prior_shift = 0;
-        if (!near && !different && old_ann >= 0 && old_wave < 0 && long_pair &&
-            mask_pair < 0 &&
+        if (old_ann >= 0 && old_wave < 0 && cl->wav_ts >= old_ann &&
             (cl->wav_ts - old_ann <= IMP_UNCERTAIN_MS ||
              (json_i64(m, "end_epoch_ms", &prior_end) &&
               json_i64(m, "clock_drift_ms", &prior_shift) &&
               cl->wav_ts <= prior_end - prior_shift)))
-            conflict = true;
-        if (!near && !different && long_reverse && mask_reverse < 0 &&
-            (old_wave - cl->eve_ts <= IMP_UNCERTAIN_MS ||
+            near = true;
+        if (old_wave >= 0 && old_ann < 0 && cl->eve_ts >= 0 &&
+            (llabs(old_wave - cl->eve_ts) <= IMP_UNCERTAIN_MS ||
              incoming_end_dev >= old_wave))
+            near = true;
+        if (different && !exact && !same_stem) {
+            cJSON_Delete(m);
+            continue;
+        }
+        imp_assoc_t decision = association_policy(true, same_stem, mask,
+                                                   exact && different);
+        if (decision == IMP_ASSOC_DEFER_CONFLICT ||
+            (decision == IMP_ASSOC_DEFER_UNKNOWN && near)) {
             conflict = true;
-        if (exact && different) conflict = true;
-        else if (exact || near) {
+        } else if (decision == IMP_ASSOC_SAME_SOURCE ||
+                   decision == IMP_ASSOC_NATIVE_INTERVAL) {
             matches++;
             if (matches == 1) {
                 memcpy(out_id, ent->d_name, id_len);
@@ -3284,7 +3324,7 @@ static esp_err_t find_import_match(const char *dir, const imp_work_t *w,
 /* A session already stored across a noon boundary cannot safely be moved
  * between day folders here. Retain a possible late complement for review
  * rather than silently creating a second session in the adjacent folder. */
-static esp_err_t guard_adjacent_noon(const imp_work_t *w, const imp_cluster_t *cl,
+static esp_err_t guard_adjacent_noon(imp_work_t *w, const imp_cluster_t *cl,
                                      int64_t end_dev)
 {
     int day_number = as11_time_day_number(w->day);
@@ -3313,6 +3353,27 @@ static esp_err_t guard_adjacent_noon(const imp_work_t *w, const imp_cluster_t *c
     return ESP_OK;
 }
 
+/* An absent manifest does not prove an id is unused: a live or historical
+ * session can still have raw files or an unfamiliar recovery marker. */
+static int session_id_has_artifacts(const char *dir, const char *id)
+{
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    int found = 0;
+    size_t len = strlen(id);
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *name = ent->d_name;
+        if (strncmp(name, id, len) == 0 && name[len] == '_' &&
+            !(name[len + 1] >= '0' && name[len + 1] <= '9')) {
+            found = 1;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
 /* Find a free id without changing an existing live or legacy session. */
 static esp_err_t pick_session_id(const char *dir, int64_t start_ntp,
                                  char *out_id, size_t out_len)
@@ -3327,6 +3388,10 @@ static esp_err_t pick_session_id(const char *dir, int64_t start_ntp,
         snprintf(mp, sizeof(mp), "%s/%s_session.json", dir, id);
         struct stat st;
         if (stat(mp, &st) != 0) {
+            if (errno != ENOENT) return ESP_FAIL;
+            int artifacts = session_id_has_artifacts(dir, id);
+            if (artifacts < 0) return ESP_FAIL;
+            if (artifacts) return ESP_ERR_NOT_SUPPORTED;
             snprintf(out_id, out_len, "%s", id);
             return ESP_OK;
         }
@@ -3652,6 +3717,53 @@ done:
     return ret;
 }
 
+/* Legacy/future cohorts are immutable. Only consume a byte-identical replay
+ * when its identity, complete fingerprint and published artifacts all exist. */
+static bool frozen_exact_duplicate(const char *dir, const char *id,
+                                   const cJSON *manifest, const imp_work_t *w,
+                                   const imp_cluster_t *cl, uint8_t *consumed)
+{
+    *consumed = 0;
+    if (!w->src_identity_verified) return false;
+    const cJSON *state = cJSON_GetObjectItemCaseSensitive(manifest, "state");
+    const cJSON *sources = cJSON_GetObjectItemCaseSensitive(manifest, "import_sources");
+    const cJSON *hashes = cJSON_GetObjectItemCaseSensitive(manifest, "import_sha256");
+    if (!cJSON_IsString(state) || !state->valuestring ||
+        strcmp(state->valuestring, "completed") || !cJSON_IsObject(sources) ||
+        !cJSON_IsObject(hashes)) return false;
+    char path[448];
+    struct stat st;
+    snprintf(path, sizeof(path), "%s/%s_session.json.importing", dir, id);
+    if (stat(path, &st) == 0 || errno != ENOENT) return false;
+    snprintf(path, sizeof(path), "%s/%s_augment.pending", dir, id);
+    if (stat(path, &st) == 0 || errno != ENOENT) return false;
+    static const char *const artifacts[] = {
+        "_flow.snt", "_pld.snt", "_sa2.snt", "_events.snt", "_events.snt"
+    };
+    uint8_t offered = 0;
+    for (int i = 0; i < 5; i++) {
+        const imp_file_t *file = cluster_source(cl, i);
+        if (!file) continue;
+        const cJSON *name = cJSON_GetObjectItemCaseSensitive(sources, imp_source_keys[i]);
+        const cJSON *entry = cJSON_GetObjectItemCaseSensitive(hashes, imp_source_keys[i]);
+        const char *hash;
+        uint64_t size;
+        uint8_t records[8];
+        if (!cJSON_IsString(name) || !name->valuestring ||
+            strcmp(name->valuestring, file->prefix) ||
+            !source_hash_metadata(entry, &hash, &size, records) ||
+            strcmp(hash, w->src_hash[i]) || size != w->src_size[i] ||
+            memcmp(records, w->src_record_count[i], sizeof(records)))
+            return false;
+        snprintf(path, sizeof(path), "%s/%s%s", dir, id, artifacts[i]);
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
+            return false;
+        offered |= (uint8_t)(1u << i);
+    }
+    *consumed = offered;
+    return offered != 0;
+}
+
 /* New imports carry source anchors, allowing updates to be checked against
  * their own converted streams without touching older or live sessions. */
 static esp_err_t augment_sourced_session(const char *dir, const char *id,
@@ -3663,6 +3775,24 @@ static esp_err_t augment_sourced_session(const char *dir, const char *id,
     cJSON *mj = read_json_file(mp);
     cJSON *sources = cJSON_GetObjectItemCaseSensitive(mj, "import_sources");
     if (!cJSON_IsObject(sources)) { cJSON_Delete(mj); return ESP_ERR_NOT_SUPPORTED; }
+    const cJSON *version = cJSON_GetObjectItemCaseSensitive(mj, "import_grouping_version");
+    if (!cJSON_IsNumber(version) || version->valuedouble != 2.0) {
+        bool duplicate = frozen_exact_duplicate(dir, id, mj, w, cl, &w->src_consumed);
+        if (!duplicate) w->frozen = true;
+        cJSON_Delete(mj);
+        return duplicate ? ESP_ERR_INVALID_STATE : ESP_ERR_NOT_SUPPORTED;
+    }
+    for (int i = 0; i < 5; i++) {
+        const imp_file_t *file = cluster_source(cl, i);
+        if (!file) continue;
+        bool same_stem = false;
+        for (int k = 0; k < 5; k++) {
+            const cJSON *old = cJSON_GetObjectItemCaseSensitive(sources, imp_source_keys[k]);
+            if (cJSON_IsString(old) && old->valuestring &&
+                !strcmp(old->valuestring, file->prefix)) same_stem = true;
+        }
+        if (!same_stem) w->retain_raw = true;
+    }
 
     char pending_path[448];
     snprintf(pending_path, sizeof(pending_path), "%s/%s_augment.pending", dir, id);
@@ -3873,13 +4003,20 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
     for (int i = 0; i < 5; i++) {
         if (!memb[i]) continue;
         imp_edf_t *e = imp_malloc(sizeof(imp_edf_t));
-        if (e && imp_edf_open(e, memb[i]->path) == ESP_OK) {
+        if (!e) return ESP_ERR_NO_MEM;
+        esp_err_t opened = imp_edf_open(e, memb[i]->path);
+        if (opened == ESP_OK) {
             int64_t span = (int64_t)(e->rdur_s * 1000.0) * e->n_records;
             /* Annotation files declare 0 s records, so a mask-less session's
              * span is its last annotation's end instead.  With waveforms the
              * waveform files alone define the end. */
             if (ann_only && e->is_ann) {
-                int64_t a = imp_ann_span_ms(memb[i]->path, i == 4);
+                int64_t a = 0;
+                esp_err_t span_err = imp_ann_span_ms(memb[i]->path, i == 4, &a);
+                if (span_err != ESP_OK) {
+                    free(e);
+                    return span_err;
+                }
                 if (a > span) span = a;
             }
             int64_t fend = e->ts_dev_ms >= 0 ? e->ts_dev_ms + span
@@ -3887,6 +4024,7 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
             if (fend > end_dev) end_dev = fend;
         }
         free(e);
+        if (opened != ESP_OK) return opened;
     }
     /* A mask-less session still needs end > start: the day spool and
      * SessionModeEntries ignore zero-length windows, and the AS11 itself
@@ -3990,23 +4128,23 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
             char p[400];
             snt_w_t t;
             snprintf(p, sizeof(p), "%s/%s%s", dir, w->id, T[i].sfx);
-            if (snt_w_open(&t, p, T[i].ch, T[i].hz, T[i].tier, wav_ntp) == ESP_OK)
-                snt_w_flush(&t);
+            if (snt_w_open(&t, p, T[i].ch, T[i].hz, T[i].tier, wav_ntp) != ESP_OK ||
+                snt_w_flush(&t) != ESP_OK) goto out;
         }
     }
     if (n_sa2 == 0) {
         char p[400];
         snt_w_t t;
         snprintf(p, sizeof(p), "%s/%s_sa2.snt", dir, w->id);
-        if (snt_w_open(&t, p, 2, 10, SNT_TIER_RAW, wav_ntp) == ESP_OK)
-            snt_w_flush(&t);
+        if (snt_w_open(&t, p, 2, 10, SNT_TIER_RAW, wav_ntp) != ESP_OK ||
+            snt_w_flush(&t) != ESP_OK) goto out;
     }
     if (!have_pld) {
         char p[400];
         snt_w_t t;
         snprintf(p, sizeof(p), "%s/%s_pld.snt", dir, w->id);
-        if (snt_w_open(&t, p, 12, 5, SNT_TIER_RAW, wav_ntp) == ESP_OK)
-            snt_w_flush(&t);
+        if (snt_w_open(&t, p, 12, 5, SNT_TIER_RAW, wav_ntp) != ESP_OK ||
+            snt_w_flush(&t) != ESP_OK) goto out;
     }
 
     /* ── Events → staged .part ── */
@@ -4044,6 +4182,10 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
     /* The manifest remains the commit point for all published files. */
     {
         cJSON *r = cJSON_CreateObject();
+        if (!r || !cJSON_AddNumberToObject(r, "import_grouping_version", 2)) {
+            cJSON_Delete(r);
+            goto out;
+        }
         char iso[32];
         imp_epoch_to_local_iso(start_ntp, iso, sizeof(iso));
         cJSON_AddStringToObject(r, "id", w->id);
@@ -4156,6 +4298,9 @@ typedef struct {
     char        key[9];             /* sort key — always an 8-char day label */
     bool        is_flat;            /* files lived directly under IMPORT/ */
     bool        has_part;           /* .part/.tmp present → still transferring */
+    bool        future_part;        /* future timestamp needs monotonic observation */
+    uint64_t    future_part_signature;
+    bool        capacity_exceeded;  /* all candidates must be visible together */
     char        drift_path[320];    /* _bridge_drift.json, "" when absent */
     int         n_files;
     imp_file_t  files[IMP_MAX_FILES];
@@ -4195,8 +4340,11 @@ static bool name_is_dir8(const char *n)
     return true;
 }
 
+static bool imp_recent(const char *path, int quiesce_s);
+static bool imp_future_file(const char *path, uint64_t *signature);
+
 /* Scan one directory for session EDFs + a drift sidecar. */
-static void scan_group_dir(const char *dir, imp_group_t *g)
+static void scan_group_dir(const char *dir, imp_group_t *g, int quiesce_s)
 {
     DIR *d = opendir(dir);
     if (!d) return;
@@ -4207,7 +4355,14 @@ static void scan_group_dir(const char *dir, imp_group_t *g)
         if (nl > 5 &&
             (!strcasecmp(nm + nl - 5, ".part") ||
              !strcasecmp(nm + nl - 5, ".tmp"))) {
-            g->has_part = true;
+            char part_path[640];
+            int n = snprintf(part_path, sizeof(part_path), "%s/%s", dir, nm);
+            if (n > 0 && (size_t)n < sizeof(part_path) &&
+                imp_recent(part_path, quiesce_s))
+                g->has_part = true;
+            if (quiesce_s > 0 && n > 0 && (size_t)n < sizeof(part_path) &&
+                imp_future_file(part_path, &g->future_part_signature))
+                g->future_part = true;
             continue;
         }
         if (!strcmp(nm, IMP_DRIFT_FILE)) {
@@ -4216,8 +4371,10 @@ static void scan_group_dir(const char *dir, imp_group_t *g)
             continue;
         }
         imp_file_t f;
-        if (g->n_files < IMP_MAX_FILES && imp_classify(dir, nm, &f))
-            g->files[g->n_files++] = f;
+        if (imp_classify(dir, nm, &f)) {
+            if (g->n_files < IMP_MAX_FILES) g->files[g->n_files++] = f;
+            else g->capacity_exceeded = true;
+        }
     }
     closedir(d);
 }
@@ -4253,7 +4410,7 @@ static bool next_group(const edf_import_ctx_t *ctx, imp_group_t *g)
             struct stat st;
             if (stat(t->src_dir, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
             memcpy(t->key, ent->d_name, 9);   /* name_is_dir8 ⇒ exactly 8 + NUL */
-            scan_group_dir(t->src_dir, t);
+            scan_group_dir(t->src_dir, t, ctx->quiesce_s);
             if (t->has_part) continue;          /* transfer in flight */
             if (t->n_files == 0) {
                 /* Nothing importable in here: an already-drained husk, or a
@@ -4282,6 +4439,8 @@ static bool next_group(const edf_import_ctx_t *ctx, imp_group_t *g)
         DIR *d = opendir(IMP_IMPORT_DIR);
         if (d) {
             bool blocked = false;
+            bool future_part = false;
+            uint64_t future_part_signature = 0;
             char flat_key[9] = "";
             struct dirent *ent;
             while ((ent = readdir(d)) != NULL) {
@@ -4289,8 +4448,17 @@ static bool next_group(const edf_import_ctx_t *ctx, imp_group_t *g)
                 size_t nl = strlen(nm);
                 if (nl > 5 &&
                     (!strcasecmp(nm + nl - 5, ".part") ||
-                     !strcasecmp(nm + nl - 5, ".tmp")))
-                    blocked = true;
+                     !strcasecmp(nm + nl - 5, ".tmp"))) {
+                    char part_path[640];
+                    int n = snprintf(part_path, sizeof(part_path), "%s/%s",
+                                     IMP_IMPORT_DIR, nm);
+                    if (n > 0 && (size_t)n < sizeof(part_path) &&
+                        imp_recent(part_path, ctx->quiesce_s))
+                        blocked = true;
+                    if (ctx->quiesce_s > 0 && n > 0 && (size_t)n < sizeof(part_path) &&
+                        imp_future_file(part_path, &future_part_signature))
+                        future_part = true;
+                }
                 imp_file_t f;
                 if (!imp_classify(IMP_IMPORT_DIR, nm, &f)) continue;
                 char nd[9];
@@ -4307,6 +4475,8 @@ static bool next_group(const edf_import_ctx_t *ctx, imp_group_t *g)
                 memset(g, 0, sizeof(*g));
                 have = true;
                 g->is_flat = true;
+                g->future_part = future_part;
+                g->future_part_signature = future_part_signature;
                 memcpy(g->key, flat_key, sizeof(g->key));
                 snprintf(g->src_dir, sizeof(g->src_dir), "%s",
                          IMP_IMPORT_DIR);
@@ -4317,9 +4487,10 @@ static bool next_group(const edf_import_ctx_t *ctx, imp_group_t *g)
                         continue;
                     char nd[9];
                     as11_time_noon_day(f.ts_dev_ms, nd, sizeof(nd));
-                    if (!strcmp(nd, flat_key) &&
-                        g->n_files < IMP_MAX_FILES)
-                        g->files[g->n_files++] = f;
+                    if (!strcmp(nd, flat_key)) {
+                        if (g->n_files < IMP_MAX_FILES) g->files[g->n_files++] = f;
+                        else g->capacity_exceeded = true;
+                    }
                 }
                 /* root-level drift sidecar, if present */
                 char dp[320];
@@ -4849,8 +5020,8 @@ static esp_err_t inspect_session_source(const imp_file_t *file)
     imp_edf_t *e = imp_malloc(sizeof(*e));
     if (!e) return ESP_ERR_NO_MEM;
     esp_err_t result = imp_edf_open(e, file->path);
-    if (result == ESP_OK && e->incomplete && e->n_records == 0)
-        result = ESP_ERR_INVALID_SIZE;
+    if (result == ESP_OK && e->incomplete)
+        result = ESP_FAIL; /* a still-growing or torn source remains staged */
     if (result == ESP_OK) {
         bool usable = true;
         if (file->kind == K_BRP) {
@@ -4886,7 +5057,8 @@ static cJSON *cluster_verified_ident(const imp_cluster_t *cl)
         if (!files[i]) continue;
         imp_edf_t *e = imp_malloc(sizeof(*e));
         cJSON *ident = NULL;
-        if (e && imp_edf_open(e, files[i]->path) == ESP_OK)
+        if (e && imp_edf_open(e, files[i]->path) == ESP_OK &&
+            e->ts_dev_ms == files[i]->ts_dev_ms)
             ident = ident_from_rec_id(e->rec_id);
         free(e);
         const cJSON *sn = cJSON_GetObjectItemCaseSensitive(ident, "SerialNumber");
@@ -4906,36 +5078,77 @@ static cJSON *cluster_verified_ident(const imp_cluster_t *cl)
     return first;
 }
 
-/* A short filename gap alone must not join two mask sessions when the
- * identity-checked native STR explicitly places them in different windows. */
-static int split_distinct_mask_clusters(imp_cluster_t *clusters, int n, int cap)
+typedef struct {
+    uint8_t decision[IMP_MAX_SESSIONS][IMP_MAX_SESSIONS];
+    uint8_t claims[IMP_MAX_SESSIONS];
+    bool pending[IMP_MAX_SESSIONS];
+    bool merged[IMP_MAX_SESSIONS];
+    bool retain_raw[IMP_MAX_SESSIONS];
+} imp_associations_t;
+
+/* Compare the complete offered set before assigning anything. Conflicting
+ * candidate ownership keeps every involved source staged. */
+static void associate_clusters(imp_cluster_t *clusters, int n,
+                               imp_associations_t *a)
 {
-    const int initial = n;
-    for (int i = 0; i < initial; i++) {
-        imp_cluster_t *cl = &clusters[i];
-        if (cl->eve_ts < 0 || cl->wav_ts < 0) continue;
-        cJSON *ident = cluster_verified_ident(cl);
-        if (!ident) continue;
-        const cJSON *serial = cJSON_GetObjectItemCaseSensitive(ident, "SerialNumber");
-        imp_work_t w = {0};
-        w.src_serial = serial->valuestring;
-        w.src_family = settings_provenance_family_name(settings_provenance_family(ident));
-        as11_time_noon_day(cl->eve_ts, w.day, sizeof(w.day));
-        int relation = native_mask_relation(&w, cl->eve_ts, cl->wav_ts);
-        cJSON_Delete(ident);
-        if (relation != 0) continue;
-        if (n >= cap) return -1;
-        clusters[n] = *cl;
-        clusters[n].eve = NULL;
-        clusters[n].csl = NULL;
-        clusters[n].eve_ts = -1;
-        n++;
-        cl->brp = NULL;
-        cl->pld = NULL;
-        cl->sa2 = NULL;
-        cl->wav_ts = -1;
+    for (int i = 0; i < n; i++) {
+        if (clusters[i].eve_ts < 0) continue;
+        for (int j = 0; j < n; j++) {
+            if (clusters[j].wav_ts < 0) continue;
+            imp_cluster_t combined = clusters[i];
+            combined.brp = clusters[j].brp;
+            combined.pld = clusters[j].pld;
+            combined.sa2 = clusters[j].sa2;
+            combined.wav_ts = clusters[j].wav_ts;
+            cJSON *ident = cluster_verified_ident(&combined);
+            int relation = -1;
+            if (ident) {
+                const cJSON *serial = cJSON_GetObjectItemCaseSensitive(ident, "SerialNumber");
+                imp_work_t w = {0};
+                w.src_serial = serial->valuestring;
+                w.src_family = settings_provenance_family_name(settings_provenance_family(ident));
+                as11_time_noon_day(combined.eve_ts, w.day, sizeof(w.day));
+                relation = native_mask_relation(&w, combined.eve_ts, combined.wav_ts);
+            }
+            bool same_stem = combined.eve_ts == combined.wav_ts;
+            bool candidate = llabs(combined.wav_ts - combined.eve_ts) <= IMP_MATCH_MS ||
+                             relation >= 0;
+            imp_assoc_t decision = association_policy(ident != NULL, same_stem, relation, false);
+            cJSON_Delete(ident);
+            if (!candidate || decision == IMP_ASSOC_INDEPENDENT) continue;
+            a->decision[i][j] = (uint8_t)decision;
+            a->claims[i]++;
+            a->claims[j]++;
+        }
     }
-    return n;
+    for (int i = 0; i < n; i++) {
+        if (clusters[i].eve_ts < 0) continue;
+        for (int j = 0; j < n; j++) {
+            imp_assoc_t decision = (imp_assoc_t)a->decision[i][j];
+            if (decision == IMP_ASSOC_INDEPENDENT) continue;
+            if (a->claims[i] != 1 || a->claims[j] != 1 ||
+                decision == IMP_ASSOC_DEFER_UNKNOWN ||
+                decision == IMP_ASSOC_DEFER_CONFLICT) {
+                a->pending[i] = a->pending[j] = true;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (clusters[i].eve_ts < 0 || a->pending[i]) continue;
+        for (int j = 0; j < n; j++) {
+            imp_assoc_t decision = (imp_assoc_t)a->decision[i][j];
+            if (a->pending[j] || (decision != IMP_ASSOC_SAME_SOURCE &&
+                                  decision != IMP_ASSOC_NATIVE_INTERVAL)) continue;
+            clusters[i].brp = clusters[j].brp;
+            clusters[i].pld = clusters[j].pld;
+            clusters[i].sa2 = clusters[j].sa2;
+            clusters[i].wav_ts = clusters[j].wav_ts;
+            a->merged[j] = true;
+            a->retain_raw[i] = decision == IMP_ASSOC_NATIVE_INTERVAL &&
+                               clusters[i].eve_ts != clusters[i].wav_ts;
+            break;
+        }
+    }
 }
 
 /* Process one day-group: cluster → convert → commit → delete sources.
@@ -4951,21 +5164,41 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
         return;
     }
     memcpy(u->day_label, g->key, sizeof(u->day_label));
+    if (g->capacity_exceeded) {
+        ESP_LOGW(TAG, "import: group exceeds source capacity; all sources kept");
+        skip_group(ctx, g);
+        u->sessions_failed++;
+        u->deferred_capacity++;
+        return;
+    }
 
     imp_drift_t drift;
     parse_drift_sidecar(g->drift_path[0] ? g->drift_path : NULL, &drift);
     const char *import_src = g->drift_path[0] ? "somnobridge" : "file_import";
 
-    imp_cluster_t cl[IMP_MAX_SESSIONS];
+    imp_cluster_t *cl = imp_psram_calloc(IMP_MAX_SESSIONS, sizeof(*cl));
+    imp_associations_t *associations = imp_psram_calloc(1, sizeof(*associations));
+    if (!cl || !associations) {
+        free(cl);
+        free(associations);
+        if (drift.raw) cJSON_Delete(drift.raw);
+        skip_group(ctx, g);
+        u->sessions_failed++;
+        ESP_LOGW(TAG, "import: association scratch unavailable; sources kept");
+        return;
+    }
     int n_sess = cluster_files(g->files, g->n_files, cl, IMP_MAX_SESSIONS);
-    n_sess = split_distinct_mask_clusters(cl, n_sess, IMP_MAX_SESSIONS);
     if (n_sess < 0) {
         ESP_LOGW(TAG, "import: too many distinct mask sessions; sources kept");
         skip_group(ctx, g);
         if (drift.raw) cJSON_Delete(drift.raw);
+        free(associations);
+        free(cl);
         u->sessions_failed++;
+        u->deferred_capacity++;
         return;
     }
+    associate_clusters(cl, n_sess, associations);
     ESP_LOGI(TAG, "import: %s → %d session cluster(s) from %d file(s)",
              g->src_dir, n_sess, g->n_files);
 
@@ -4978,6 +5211,14 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
     bool source_retained = false;
 
     for (int i = 0; i < n_sess; i++) {
+        if (associations->merged[i]) continue;
+        if (associations->pending[i]) {
+            u->sessions_skipped++;
+            u->deferred_association++;
+            source_retained = true;
+            ESP_LOGW(TAG, "import: association unknown or conflicting; sources kept");
+            continue;
+        }
         imp_work_t w;
         memset(&w, 0, sizeof(w));
         w.cl = &cl[i];
@@ -4999,6 +5240,15 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
             continue;
         }
         cJSON *rec_ident = cluster_verified_ident(&cl[i]);
+        int source_count = 0;
+        for (int s = 0; s < 5; s++) if (srcs[s]) source_count++;
+        if (!rec_ident && source_count > 1) {
+            source_retained = true;
+            u->sessions_skipped++;
+            u->deferred_identity++;
+            ESP_LOGW(TAG, "import: source identity unknown or conflicting; sources kept");
+            continue;
+        }
         if (rec_ident) {
             const cJSON *sn = cJSON_GetObjectItemCaseSensitive(rec_ident, "SerialNumber");
             int family = settings_provenance_family(rec_ident);
@@ -5015,6 +5265,7 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
         } else {
             /* Keep a display fallback, but never attest its machine identity. */
             w.ident = ctx->ident;
+            w.retain_raw = true;
         }
 
         if (w.src_identity_verified && hash_cluster_sources(&w, false) != ESP_OK) {
@@ -5029,8 +5280,13 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
 
         if (r == ESP_OK) {
             u->sessions_imported++;
-            for (int s = 0; s < 5; s++)
-                if (srcs[s]) { delete_source(srcs[s]); u->files_consumed++; }
+            if (associations->retain_raw[i] || w.retain_raw) {
+                source_retained = true;
+                ESP_LOGI(TAG, "import: cross-stem source evidence retained");
+            } else {
+                for (int s = 0; s < 5; s++)
+                    if (srcs[s]) { delete_source(srcs[s]); u->files_consumed++; }
+            }
             if (w.day[0] &&
                 (n_days == 0 ||
                  (strcmp(w.day, days[0]) &&
@@ -5053,20 +5309,33 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
              * guess, retried on a later pass. */
             u->sessions_skipped++;
             for (int s = 0; s < 5; s++)
-                if (srcs[s] && (w.src_consumed & (1u << s))) {
+                if (srcs[s] && !associations->retain_raw[i] && !w.retain_raw &&
+                    (w.src_consumed & (1u << s))) {
                     delete_source(srcs[s]);
                     u->files_consumed++;
                 }
+            if (associations->retain_raw[i] || w.retain_raw) source_retained = true;
             if (r == ESP_ERR_NOT_SUPPORTED)
                 ESP_LOGW(TAG, "import: %s session %s — unverifiable "
                          "source(s) kept for a later pass",
                          g->src_dir, w.id);
-            if (r == ESP_ERR_NOT_SUPPORTED) source_retained = true;
+            if (r == ESP_ERR_NOT_SUPPORTED) {
+                if (w.frozen) u->deferred_frozen++;
+                else u->deferred_conflict++;
+                source_retained = true;
+            }
         } else {
             u->sessions_failed++;
             source_retained = true;
             ESP_LOGW(TAG, "import: session failed; source files retained for retry");
         }
+    }
+
+    if (u->deferred_association || u->deferred_identity || u->deferred_frozen ||
+        u->deferred_conflict || u->deferred_capacity) {
+        ESP_LOGW(TAG, "import: staged association=%d identity=%d frozen=%d conflict=%d capacity=%d",
+                 u->deferred_association, u->deferred_identity, u->deferred_frozen,
+                 u->deferred_conflict, u->deferred_capacity);
     }
 
     /* Orphan files in the group that never joined a cluster (unknown
@@ -5124,6 +5393,8 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
     rmdir(IMP_DATALOG_DIR);
 
     if (drift.raw) cJSON_Delete(drift.raw);
+    free(associations);
+    free(cl);
 }
 
 /* ── Public API ─────────────────────────────────────────────────────── */
@@ -5294,9 +5565,8 @@ static void final_needs_spool_sweep(void)
  * file's directory entry (size/mtime) on close/sync, so stat() alone cannot
  * prove an FTP upload is finished — the worker additionally holds off while
  * the FTP server is receiving (see edf_import_task); this check covers the
- * tail after the last close and any other writer.  A file dated in the
- * future (clock not yet set, or a PC with a fast clock) says nothing about
- * recency and never defers. */
+ * tail after the last close and any other writer.  Future-dated files are
+ * observed separately with a monotonic quiet window. */
 static bool imp_recent(const char *path, int quiesce_s)
 {
     if (quiesce_s <= 0) return false;
@@ -5307,7 +5577,58 @@ static bool imp_recent(const char *path, int quiesce_s)
     return (now - st.st_mtime) < quiesce_s;
 }
 
-static bool root_files_recent(int quiesce_s)
+/* Order-independent signature: readdir ordering is not stable on FAT. */
+static bool imp_future_file(const char *path, uint64_t *signature)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_mtime <= time(NULL) + 2) return false;
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++)
+        h = (h ^ *p) * UINT64_C(1099511628211);
+    h = (h ^ (uint64_t)st.st_size) * UINT64_C(1099511628211);
+    h = (h ^ (uint64_t)st.st_mtime) * UINT64_C(1099511628211);
+    *signature ^= h;
+    return true;
+}
+
+#ifdef EDF_IMPORT_HOST
+static int64_t s_test_monotonic_us = -1;
+void edf_import_test_set_monotonic_us(int64_t value) { s_test_monotonic_us = value; }
+#endif
+
+static int64_t imp_monotonic_us(void)
+{
+#ifdef EDF_IMPORT_HOST
+    if (s_test_monotonic_us >= 0) return s_test_monotonic_us;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    return (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+#else
+    return esp_timer_get_time();
+#endif
+}
+
+static bool imp_future_deferred(edf_import_ctx_t *ctx, const char *unit,
+                                bool future, uint64_t signature)
+{
+    if (ctx->quiesce_s <= 0 || !future) {
+        ctx->future_observed = false;
+        return false;
+    }
+    int64_t now = imp_monotonic_us();
+    if (now < 0) return true;
+    if (!ctx->future_observed || strcmp(ctx->future_unit, unit) ||
+        ctx->future_signature != signature || now < ctx->future_seen_us) {
+        snprintf(ctx->future_unit, sizeof(ctx->future_unit), "%s", unit);
+        ctx->future_signature = signature;
+        ctx->future_seen_us = now;
+        ctx->future_observed = true;
+        return true;
+    }
+    return now - ctx->future_seen_us < (int64_t)ctx->quiesce_s * 1000000;
+}
+
+static bool root_files_recent(edf_import_ctx_t *ctx)
 {
     static const char *const paths[] = {
         IMP_IMPORT_DIR "/STR.edf",
@@ -5315,17 +5636,30 @@ static bool root_files_recent(int quiesce_s)
         IMP_IMPORT_DIR "/Identification.tgt",
         IMP_IMPORT_DIR "/SETTINGS/CurrentSettings.json",
     };
-    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++)
-        if (imp_recent(paths[i], quiesce_s)) return true;
-    return false;
+    bool future = false;
+    uint64_t signature = 0;
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        if (imp_recent(paths[i], ctx->quiesce_s)) return true;
+        if (ctx->quiesce_s > 0 && imp_future_file(paths[i], &signature)) future = true;
+    }
+    return imp_future_deferred(ctx, "root", future, signature);
 }
 
-static bool group_recent(const imp_group_t *g, int quiesce_s)
+static bool group_recent(edf_import_ctx_t *ctx, const imp_group_t *g)
 {
-    if (g->drift_path[0] && imp_recent(g->drift_path, quiesce_s)) return true;
-    for (int i = 0; i < g->n_files; i++)
-        if (imp_recent(g->files[i].path, quiesce_s)) return true;
-    return false;
+    bool future = g->future_part;
+    uint64_t signature = g->future_part_signature;
+    if (g->drift_path[0]) {
+        if (imp_recent(g->drift_path, ctx->quiesce_s)) return true;
+        if (ctx->quiesce_s > 0 && imp_future_file(g->drift_path, &signature)) future = true;
+    }
+    for (int i = 0; i < g->n_files; i++) {
+        if (imp_recent(g->files[i].path, ctx->quiesce_s)) return true;
+        if (ctx->quiesce_s > 0 && imp_future_file(g->files[i].path, &signature)) future = true;
+    }
+    char unit[320];
+    snprintf(unit, sizeof(unit), "%s/%s", g->src_dir, g->key);
+    return imp_future_deferred(ctx, unit, future, signature);
 }
 
 esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
@@ -5342,7 +5676,7 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
         if (root_files_pending()) {
             /* Root files come first — sessions use the resolved ident and
              * settings — so a root copy still in flight holds everything. */
-            if (root_files_recent(ctx->quiesce_s)) {
+            if (root_files_recent(ctx)) {
                 ESP_LOGI(TAG, "import: root files modified within %d s — deferred",
                          ctx->quiesce_s);
                 out->root_pass = true;
@@ -5359,7 +5693,7 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
     imp_group_t *g = imp_calloc(1, sizeof(imp_group_t));
     if (!g) return ESP_ERR_NO_MEM;
     bool have = next_group(ctx, g);
-    if (have && group_recent(g, ctx->quiesce_s)) {
+    if (have && group_recent(ctx, g)) {
         ESP_LOGI(TAG, "import: %s modified within %d s — deferred",
                  g->src_dir, ctx->quiesce_s);
         out->deferred = true;
@@ -5393,7 +5727,7 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
 
 #ifndef EDF_IMPORT_HOST
 
-#define IMP_WORKER_STACK   (20 * 1024)   /* PSRAM — cJSON_Parse recursion + inlined converters */
+#define IMP_WORKER_STACK   (24 * 1024)   /* PSRAM — cJSON_Parse recursion + inlined converters */
 #define IMP_WORKER_PRIO    4
 #define IMP_SETTLE_MS      15000   /* let SD + FTP quieten before scanning */
 #define IMP_DEFER_POLL_MS  3000    /* re-check cadence while a copy is in flight */
@@ -5412,6 +5746,7 @@ static void edf_import_task(void *arg)
     int defer_ms = 0;
     bool root_deferred = false;
     if (ctx) {
+        psram_work_begin("import-start", IMP_WORKER_STACK);
         for (;;) {
             if (!sd_storage_is_ready() || sd_storage_recording_active()) break;
 
@@ -5455,6 +5790,7 @@ static void edf_import_task(void *arg)
                 root_deferred = true;
             }
             edf_import_unit_t u;
+            psram_work_phase("import-unit", IMP_WORKER_STACK);
             esp_err_t r = edf_import_process_next(ctx, &u);
             if (r == ESP_OK && u.root_pass && !u.deferred) {
                 if (u.root_retained) root_retry_mark(esp_timer_get_time());
@@ -5512,6 +5848,7 @@ static void edf_import_task(void *arg)
              * nudged when the rebuild actually published. */
             if (u.day_label[0] && u.sessions_imported > 0) {
                 any_imported = true;
+                psram_work_phase("import-rebuild", IMP_WORKER_STACK);
                 struct stat native_dirty;
                 bool native_pending = stat(IMP_NATIVE_DIRTY, &native_dirty) == 0;
                 esp_err_t rebuilt = native_pending ? edf_gen_rebuild_day_for_native(u.day_label)
@@ -5526,6 +5863,7 @@ static void edf_import_task(void *arg)
             }
             vTaskDelay(pdMS_TO_TICKS(200));   /* yield between units */
         }
+        psram_work_end("import-done", IMP_WORKER_STACK);
         edf_import_ctx_destroy(ctx);
     }
 
@@ -5534,7 +5872,8 @@ static void edf_import_task(void *arg)
     if (any_imported) somno_ml_reconcile();
 
     ESP_LOGI(TAG, "import: worker finished (stack: %u of %u bytes never used)",
-             (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)IMP_WORKER_STACK);
+             (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)),
+             (unsigned)IMP_WORKER_STACK);
     s_worker_running = false;
     vTaskDelete(NULL);
 }

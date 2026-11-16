@@ -55,8 +55,13 @@ typedef struct {
     char day2_label[9];     /* second streams day touched, if any, else "" */
     bool root_pass;         /* this unit was the root-files pass */
     int  sessions_imported;
-    int  sessions_skipped;  /* already present / duplicates */
+    int  sessions_skipped;  /* already present or conservatively deferred */
     int  sessions_failed;
+    int  deferred_association;
+    int  deferred_identity;
+    int  deferred_frozen;
+    int  deferred_conflict;
+    int  deferred_capacity;
     int  files_consumed;    /* source files deleted after durable commit */
     int  files_rejected;    /* corrupt files moved aside to *.bad */
     int  spools_written;
@@ -87,8 +92,8 @@ void              edf_import_ctx_destroy(edf_import_ctx_t *ctx);
  * modified less than `seconds` ago is deferred (edf_import_unit_t.deferred)
  * instead of imported — the user may still be copying the card.  Default is
  * 15 s on target and 0 (off) under EDF_IMPORT_HOST.  An explicit "import
- * now" trigger can pass 0.  Files dated in the future (unset clocks) never
- * count as recent. */
+ * now" trigger can pass 0. Future-dated files require an unchanged monotonic
+ * observation window because their timestamps cannot prove quiescence. */
 void edf_import_ctx_set_quiesce(edf_import_ctx_t *ctx, int seconds);
 
 /* Process exactly one pending unit.
@@ -103,6 +108,7 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
 /* Test the retained-root retry gate with a synthetic monotonic clock. */
 void edf_import_test_mark_root_retry(int64_t now_us);
 bool edf_import_test_defer_root_retry(int64_t now_us, bool groups_pending);
+void edf_import_test_set_monotonic_us(int64_t value);
 #endif
 
 #ifndef EDF_IMPORT_HOST

@@ -125,4 +125,44 @@ context.setDashPanelState(element, snore, {t: [1]});
 assert(!classes.has('dash-panel-empty'));
 assert(!('data-empty-label' in attrs));
 
-console.log('dashboard missing-data panels: passed');
+vm.runInContext(getFunction('refreshStageAvailability'), context);
+
+async function testStageRefresh() {
+  let fetched = 0, rendered = 0;
+  context.dashNoonDay = '20240115';
+  context.dashLoadId = 1;
+  context.dashSessions = [{id: 'a', has_stages: false}, {id: 'b', has_stages: false}];
+  context.dashSessionData = [{}, {}];
+  context.fetch = () => Promise.resolve({
+    ok: true, json: () => Promise.resolve([
+      {id: 'a', has_stages: true, stage_status: 'ready'},
+      {id: 'b', has_stages: false, stage_status: 'absent'},
+    ]),
+  });
+  context.fetchSntFile = () => { fetched++; return Promise.resolve('sst'); };
+  context.parseSst = () => ({n: 1});
+  context.renderDashboardCharts = () => { rendered++; };
+  await context.refreshStageAvailability('20240115', 1);
+  assert.strictEqual(fetched, 1, 'only newly available stages are fetched');
+  assert.strictEqual(rendered, 1);
+  assert(context.dashSessionData[0].stg);
+  assert(!context.dashSessionData[1].stg);
+
+  let finish;
+  context.dashSessionData[0] = {};
+  context.fetchSntFile = () => new Promise(resolve => { finish = resolve; });
+  const pending = context.refreshStageAvailability('20240115', 1);
+  await new Promise(resolve => setImmediate(resolve));
+  assert(finish, 'stage download started');
+  context.dashLoadId = 2;
+  finish('sst');
+  await pending;
+  assert(!context.dashSessionData[0].stg, 'stale stage download is discarded');
+}
+
+testStageRefresh().then(() => {
+  console.log('dashboard missing-data panels and stage refresh: passed');
+}).catch(err => {
+  console.error(err);
+  process.exitCode = 1;
+});

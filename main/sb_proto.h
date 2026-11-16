@@ -121,3 +121,18 @@ bool sb_parse_u64_str(const char *s, uint64_t *out);
 
 /* True when s is exactly n hex digits (either case). */
 bool sb_hex_str_ok(const char *s, size_t n);
+
+/* The bridge lists existing folders, not every calendar day.  A complete
+ * global catalog is still required because this protocol has no independent
+ * parent-enumeration-complete or pagination marker. */
+typedef struct {
+    int offered, accepted, checked, warming, failed;
+    bool catalog_complete, hot_ready;
+    char previous[9];
+} sb_catalog_window_t;
+void sb_catalog_window_init(sb_catalog_window_t *window, int requested, int offered,
+                            bool catalog_complete, bool hot_ready);
+bool sb_catalog_window_accept(sb_catalog_window_t *window, const char *day);
+void sb_catalog_window_failed(sb_catalog_window_t *window, const char *code);
+bool sb_catalog_window_ready(const sb_catalog_window_t *window);
+bool sb_catalog_unpaged(const struct cJSON *result);

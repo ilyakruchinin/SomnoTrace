@@ -142,6 +142,7 @@ static const ble_uuid128_t UUID_DATA =
 #define SB_NVS_ADDR       "addr"
 #define SB_LEDGER_PATH    SD_SESSIONS_DIR "/bridge_ledger.json"
 #define SB_TX_LOG_PATH    SD_SESSIONS_DIR "/bridge_tx.log"
+#define SB_TX_ARCHIVE_DIR SD_SESSIONS_DIR "/bridge_tx_archive"
 
 /* ── State ──────────────────────────────────────────────────────────── */
 
@@ -496,7 +497,10 @@ static esp_err_t json_request(const char *op, cJSON *args, uint32_t *out_rid,
         if (out_result) *out_result = NULL;
         ret = ESP_FAIL;
         const char *code = cJSON_GetStringValue(cJSON_GetObjectItem(err, "code"));
-        ESP_LOGW(TAG, "%s: error %s", op, code ? code : "?");
+        if (code && !strcmp(op, "LIST_DAY") && !strcmp(code, "NOT_SCANNED"))
+            ESP_LOGD(TAG, "%s: catalog warming", op);
+        else
+            ESP_LOGW(TAG, "%s: error %s", op, code ? code : "?");
     }
     if (out_rid) *out_rid = rid;
     cJSON_Delete(root);
@@ -1640,28 +1644,46 @@ done:
 /* Root pull transactions (WP3).  Each attempt gets a unique id because the
  * log refuses a second PREPARE for the same id.  A failed log write never
  * blocks a pull: the existing staging/ledger path still runs. */
-static tx_log_t *s_tx;
-static uint32_t  s_tx_seq;
+static tx_journal_t *s_tx;
+static bool s_tx_degraded;
 
 static bool root_tx_begin(const char *key, const char *size, const char *ts,
                           bool ts_null, char *id, size_t cap)
 {
-    if (!s_tx) return false;
-    if (snprintf(id, cap, "%s#%lu", key, (unsigned long)s_tx_seq++) >= (int)cap)
+    if (!s_tx) { s_tx_degraded = true; return false; }
+    esp_err_t err = tx_journal_next_id(s_tx, key, id, cap);
+    if (err != ESP_OK) {
+        s_tx_degraded = true;
+        ESP_LOGW(TAG, "tx: cannot allocate ID for %s: %s", key, esp_err_to_name(err));
         return false;
+    }
     char pl[256];
     snprintf(pl, sizeof(pl), "%s|%s", size ? size : "", ts_null ? "null" : (ts ? ts : ""));
-    if (tx_log_append(s_tx, TX_PREPARE, id, pl, strlen(pl)) == ESP_OK) return true;
-    ESP_LOGW(TAG, "tx: cannot record PREPARE for %s", key);
+    err = tx_journal_append(s_tx, TX_PREPARE, id, pl, strlen(pl));
+    if (err == ESP_OK) return true;
+    s_tx_degraded = true;
+    ESP_LOGW(TAG, "tx: cannot record PREPARE for %s: %s", key, esp_err_to_name(err));
     id[0] = '\0';
+    if (!tx_journal_healthy(s_tx)) {
+        tx_journal_close(s_tx);
+        s_tx = NULL;
+    }
     return false;
 }
 
 static void root_tx_end(const char *id, bool ok)
 {
     if (!s_tx || !id[0]) return;
-    if (tx_log_append(s_tx, ok ? TX_COMMIT : TX_ABORT, id, NULL, 0) != ESP_OK)
-        ESP_LOGW(TAG, "tx: cannot record %s for %s", ok ? "COMMIT" : "ABORT", id);
+    esp_err_t err = tx_journal_append(s_tx, ok ? TX_COMMIT : TX_ABORT, id, NULL, 0);
+    if (err != ESP_OK) {
+        s_tx_degraded = true;
+        ESP_LOGW(TAG, "tx: cannot record %s for %s: %s",
+                 ok ? "COMMIT" : "ABORT", id, esp_err_to_name(err));
+        /* Reopen on the next pass so even a definitely failed terminal write
+         * is retained as unfinished evidence, not mistaken for a live pull. */
+        tx_journal_close(s_tx);
+        s_tx = NULL;
+    }
 }
 
 static root_sync_result_t sync_root_dir(const char *directory,
@@ -1913,6 +1935,7 @@ static void drift_probe_log(void)
 static void sync_run(bool full)
 {
     s_last_sync_attempt_ms = esp_timer_get_time() / 1000;
+    s_tx_degraded = false;
     /* normal sync follows the configured "days to keep in sync" window
      * so bridge pull and upload depth can't diverge; full stays 365  */
     const int days = full ? SB_SYNC_DAYS_FULL : uploader_max_days();
@@ -1932,14 +1955,33 @@ static void sync_run(bool full)
         else
             ESP_LOGW(TAG, "tx: log absent (errno=%d)", errno);
     }
-    if (!s_tx) {
-        bool torn = false;
+    bool journal_space = false;
+    esp_err_t space_err = sd_storage_diagnostics_allowed(&journal_space);
+    if (space_err != ESP_OK || !journal_space) {
+        s_tx_degraded = true;
+        ESP_LOGW(TAG, "tx: diagnostic space unavailable (%s)", esp_err_to_name(space_err));
+    }
+    if (s_tx) tx_journal_allow_writes(s_tx, journal_space);
+    if (!s_tx && journal_space) {
+        bool archived_unfinished = false;
         mkdir(SD_SESSIONS_DIR, 0775);
-        if (tx_log_open(SB_TX_LOG_PATH, &s_tx, &torn) != ESP_OK) {
-            ESP_LOGW(TAG, "tx: log unavailable; root pulls run without transaction records");
+        esp_err_t err = tx_journal_open(SB_TX_LOG_PATH, SB_TX_ARCHIVE_DIR,
+                                        true, &s_tx, &archived_unfinished);
+        if (err == ESP_OK) {
+            for (int i = 0; i < 8; i++) {
+                uint64_t nonce = ((uint64_t)esp_random() << 32) | esp_random();
+                err = tx_journal_set_nonce(s_tx, nonce);
+                if (err != ESP_ERR_INVALID_STATE) break;
+            }
+        }
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "tx: journal unavailable: %s; root pulls are unjournaled",
+                     esp_err_to_name(err));
+            tx_journal_close(s_tx);
             s_tx = NULL;
-        } else if (torn) {
-            ESP_LOGW(TAG, "tx: torn tail truncated in %s", SB_TX_LOG_PATH);
+            s_tx_degraded = true;
+        } else if (archived_unfinished) {
+            ESP_LOGW(TAG, "tx: unfinished or torn journal retained in archive");
         }
     }
     if (!s_source_store_ready) {
@@ -1958,6 +2000,7 @@ static void sync_run(bool full)
         pass_fail++;
     }
     pass_fail += root_a.failed + root_s.failed;
+    if (s_tx_degraded) pass_fail++;
     cJSON *list = cJSON_GetObjectItem(res, "days");
     if (!cJSON_IsArray(list)) {
         ESP_LOGW(TAG, "sync: LIST_RECENT_DAYS has no days array");
@@ -1968,28 +2011,39 @@ static void sync_run(bool full)
         cJSON_GetObjectItem(res, "catalog_complete"));
     bool hot_ready = cJSON_IsTrue(cJSON_GetObjectItem(res, "hot_ready"));
     if (!catalog_complete || !hot_ready) {
-        ESP_LOGW(TAG, "sync: catalog incomplete (complete=%d hot_ready=%d)",
+        ESP_LOGI(TAG, "sync: catalog warming (complete=%d hot_ready=%d)",
                  catalog_complete, hot_ready);
-        pass_fail++;
     }
     int n = cJSON_GetArraySize(list);
+    sb_catalog_window_t window;
+    sb_catalog_window_init(&window, days, n, catalog_complete, hot_ready);
+    if (!sb_catalog_unpaged(res)) {
+        ESP_LOGW(TAG, "sync: incomplete paginated day listing");
+        sb_catalog_window_failed(&window, NULL);
+    }
     ESP_LOGI(TAG, "sync: %d day(s) in the %d-day window", n, days);
 
     for (int i = 0; i < n; i++) {
         cJSON *d = cJSON_GetArrayItem(list, i);
         const char *day = cJSON_IsString(d) ? d->valuestring : NULL;
-        if (!day || strlen(day) != 8) continue;
+        if (!sb_catalog_window_accept(&window, day)) {
+            ESP_LOGW(TAG, "sync: invalid or unordered catalog day");
+            continue;
+        }
 
         cJSON *da = cJSON_CreateObject();
         cJSON_AddStringToObject(da, "day", day);
         cJSON *dres = NULL;
         if (json_op("LIST_DAY", da, &dres) != ESP_OK || !dres) {
+            sb_catalog_window_failed(&window, s_last_code);
             pass_fail++;
             cJSON_Delete(dres);
             continue;
         }
-        if (cJSON_IsTrue(cJSON_GetObjectItem(dres, "folder_stale"))) {
+        const cJSON *stale = cJSON_GetObjectItem(dres, "folder_stale");
+        if (!cJSON_IsBool(stale) || cJSON_IsTrue(stale) || !sb_catalog_unpaged(dres)) {
             ESP_LOGW(TAG, "sync: %s listing is stale; deferred", day);
+            sb_catalog_window_failed(&window, NULL);
             pass_fail++;
             cJSON_Delete(dres);
             continue;
@@ -1999,6 +2053,7 @@ static void sync_run(bool full)
         cJSON *files = cJSON_GetObjectItem(dres, "files");
         if (!cJSON_IsArray(files)) {
             ESP_LOGW(TAG, "sync: %s LIST_DAY has no files array", day);
+            sb_catalog_window_failed(&window, NULL);
             pass_fail++;
             cJSON_Delete(dres);
             continue;
@@ -2023,7 +2078,11 @@ static void sync_run(bool full)
             }
             if (!ledger_seen(day, fn, size, ts, ts_null)) pending++;
         }
-        if (day_bad) { pass_fail++; cJSON_Delete(dres); continue; }
+        if (day_bad) {
+            sb_catalog_window_failed(&window, NULL);
+            pass_fail++; cJSON_Delete(dres); continue;
+        }
+        window.checked++;
         if (pending == 0) { cJSON_Delete(dres); continue; }
 
         /* Pre-warm the bridge's freshness guard. */
@@ -2119,6 +2178,10 @@ static void sync_run(bool full)
             ESP_LOGI(TAG, "sync: %s staged (%d day(s) done)", day, s_sync_days_done);
     }
 
+    if (window.warming)
+        ESP_LOGI(TAG, "sync: %d of %d catalog day(s) await scanning",
+                 window.warming, window.offered);
+    if (!sb_catalog_window_ready(&window)) pass_fail++;
     drift_probe_log();
     cJSON_Delete(res);
     if (pass_fail == 0)
@@ -2843,6 +2906,7 @@ cJSON *sb_ble_status_json(void)
     cJSON_AddBoolToObject(o, "card_wifi", s_card_wifi);
     if (s_card_mode[0]) cJSON_AddStringToObject(o, "card_mode", s_card_mode);
     cJSON_AddBoolToObject(o, "sync_running", s_sync_running);
+    cJSON_AddBoolToObject(o, "journal_degraded", s_tx_degraded);
     cJSON_AddNumberToObject(o, "mtu", s_mtu);
     if (s_error[0]) cJSON_AddStringToObject(o, "error", s_error);
     if (s_last_error[0]) cJSON_AddStringToObject(o, "last_error", s_last_error);

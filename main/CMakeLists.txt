@@ -5,11 +5,15 @@ idf_component_register(SRCS "main.c" "bsp_power.c" "bsp_display.c" "net_provisio
                            "as11_time.c" "as11_events.c" "leak_roll.c" "bridge_indicator.c"
                            "crash_diag.c"
                            "sb_ble.c" "sb_proto.c" "sb_root.c" "sb_root_ledger.c" "oximeter.c" "oximeter_oxyii.c" "oximeter_legacy.c" "legacy_file_list.c" "oximeter_store.c" "oximetry_vld3.c" "oxyii_trailer.c" "oxyii_codec.c" "oximetry_time.c" "oximetry_canonical.c" "oximetry_http.c" "web_auth.c" "web_auth_core.c"
-                           "mqtt_manager.c" "http_query.c" "update_check.c" "update_check_core.c"
+                           "mqtt_manager.c" "http_query.c" "update_check.c" "update_check_core.c" "ws_clients.c"
                        INCLUDE_DIRS "."
                        REQUIRES esp_lcd driver esp_wifi esp_netif esp_event nvs_flash esp_http_server json esp_app_format
                                 bt mbedtls esp_rom fatfs sdmmc esp-idf-ftpServer uploader esp_http_client mqtt
                                 esp_driver_i2c esp_driver_i2s esp_adc app_update espcoredump esp_https_ota therapy_alert esp_coex somno_ml)
+
+if(SOMNOTRACE_STACK_AUDIT)
+    target_compile_options(${COMPONENT_LIB} PRIVATE -fstack-usage -Wframe-larger-than=3072)
+endif()
 
 # Download zones.json (IANA-to-POSIX timezone database) if not present.
 # Source: https://github.com/nayarsystems/posix_tz_db (MIT License)

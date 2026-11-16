@@ -68,3 +68,9 @@ TaskHandle_t psram_task_create(TaskFunction_t task_func,
  * and on every psram_task_create() call; exposed here for explicit sweeps.
  */
 void psram_task_reap(void);
+
+/* Bounded phase snapshots for the memory-intensive workers.  The stack
+ * watermark is a lifetime minimum, not proof that this phase caused it. */
+void psram_work_begin(const char *phase, uint32_t stack_bytes);
+void psram_work_phase(const char *phase, uint32_t stack_bytes);
+void psram_work_end(const char *phase, uint32_t stack_bytes);

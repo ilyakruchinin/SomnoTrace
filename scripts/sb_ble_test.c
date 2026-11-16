@@ -552,6 +552,44 @@ static void test_stream_begin_match(void)
     cJSON_Delete(rl);
 }
 
+static void test_catalog_window(void)
+{
+    sb_catalog_window_t w;
+    sb_catalog_window_init(&w, 5, 2, true, true);
+    CHECK(sb_catalog_window_accept(&w, "20240105"), "accept newest day");
+    w.checked++;
+    CHECK(sb_catalog_window_accept(&w, "20240101"), "accept next existing day");
+    w.checked++;
+    CHECK(sb_catalog_window_ready(&w), "complete existing-folder window succeeds");
+
+    sb_catalog_window_init(&w, 5, 1, false, true);
+    CHECK(sb_catalog_window_accept(&w, "20240105"), "accept warming catalog day");
+    w.checked++;
+    CHECK(!sb_catalog_window_ready(&w), "unknown parent coverage remains incomplete");
+
+    sb_catalog_window_init(&w, 5, 1, true, true);
+    CHECK(sb_catalog_window_accept(&w, "20240105"), "accept not-scanned day");
+    sb_catalog_window_failed(&w, "NOT_SCANNED");
+    CHECK(w.warming == 1 && w.failed == 0 && !sb_catalog_window_ready(&w),
+          "not-scanned is aggregated as warming, not success");
+    sb_catalog_window_failed(&w, "TIMEOUT");
+    CHECK(w.failed == 1, "real failures remain errors");
+
+    sb_catalog_window_init(&w, 5, 2, true, true);
+    CHECK(sb_catalog_window_accept(&w, "20240105"), "accept first row");
+    CHECK(!sb_catalog_window_accept(&w, "20240105") && !sb_catalog_window_ready(&w),
+          "duplicate day cannot produce a complete window");
+    sb_catalog_window_init(&w, 1, 2, true, true);
+    CHECK(w.failed && !sb_catalog_window_ready(&w), "oversized listing is incomplete");
+    CHECK(!sb_catalog_window_accept(&w, "2024x105"), "invalid day is rejected");
+
+    cJSON *listing = cJSON_CreateObject();
+    CHECK(sb_catalog_unpaged(listing), "current unpaged protocol accepted");
+    cJSON_AddBoolToObject(listing, "has_more", true);
+    CHECK(!sb_catalog_unpaged(listing), "partial paginated listing rejected");
+    cJSON_Delete(listing);
+}
+
 int main(void)
 {
     test_header();
@@ -566,6 +604,7 @@ int main(void)
     test_hex_str_ok();
     test_root_names();
     test_root_cache_action();
+    test_catalog_window();
     printf("sb_ble_test: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

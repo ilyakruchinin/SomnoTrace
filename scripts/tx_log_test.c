@@ -288,6 +288,264 @@ static void test_full_replay_table(void)
     cleanup();
 }
 
+static void test_segmented_rotation_and_nonce(void)
+{
+    fresh();
+    char archive[320], first[350], id[TX_LOG_ID_MAX + 1];
+    snprintf(archive, sizeof(archive), "%s/archive", dir);
+    snprintf(first, sizeof(first), "%s/seg-00000000.log", archive);
+    tx_journal_t *j = NULL;
+    bool retained = true;
+    CHECK(tx_journal_open(path, archive, true, &j, &retained) == ESP_OK && j,
+          "open segmented journal");
+    CHECK(!retained, "new journal has no unfinished evidence");
+    if (!j) { cleanup(); return; }
+    CHECK(tx_journal_set_nonce(j, 0x123456789abcdef0ULL) == ESP_OK, "set nonce");
+    bool ok = true;
+    for (unsigned i = 0; i < 1000; i++) {
+        if (tx_journal_next_id(j, "STR.edf", id, sizeof(id)) != ESP_OK ||
+            tx_journal_append(j, TX_PREPARE, id, NULL, 0) != ESP_OK ||
+            tx_journal_append(j, TX_COMMIT, id, NULL, 0) != ESP_OK) {
+            ok = false;
+            break;
+        }
+    }
+    CHECK(ok, "1000 completed transactions cross segments");
+    CHECK(file_size(first) > 0, "first segment retained as archive");
+    long first_size = file_size(first);
+    tx_journal_close(j);
+    j = NULL;
+    CHECK(tx_journal_open(path, archive, true, &j, &retained) == ESP_OK && j,
+          "reopen after rotation");
+    if (j) {
+        CHECK(tx_journal_set_nonce(j, 0x123456789abcdef0ULL) == ESP_ERR_INVALID_STATE,
+              "nonce collision with archived IDs is rejected");
+        CHECK(tx_journal_set_nonce(j, 0x123456789abcdef1ULL) == ESP_OK,
+              "new nonce accepted");
+        CHECK(tx_journal_next_id(j, "STR.edf", id, sizeof(id)) == ESP_OK &&
+              tx_journal_append(j, TX_PREPARE, id, NULL, 0) == ESP_OK &&
+              tx_journal_append(j, TX_ABORT, id, NULL, 0) == ESP_OK,
+              "append after reopen");
+        tx_journal_close(j);
+    }
+    CHECK(file_size(first) == first_size, "archive never modified");
+    cleanup();
+}
+
+static void test_segmented_unfinished_and_torn_preserved(void)
+{
+    fresh();
+    char archive[320], first[350], id[TX_LOG_ID_MAX + 1];
+    snprintf(archive, sizeof(archive), "%s/archive", dir);
+    snprintf(first, sizeof(first), "%s/seg-00000000.log", archive);
+    tx_journal_t *j = NULL;
+    bool retained = false;
+    CHECK(tx_journal_open(path, archive, true, &j, &retained) == ESP_OK && j,
+          "open segmented journal");
+    if (!j) { cleanup(); return; }
+    CHECK(tx_journal_set_nonce(j, 1) == ESP_OK &&
+          tx_journal_next_id(j, "STR.edf", id, sizeof(id)) == ESP_OK &&
+          tx_journal_append(j, TX_PREPARE, id, "x", 1) == ESP_OK,
+          "write unfinished transaction");
+    tx_journal_close(j);
+    FILE *f = fopen(path, "ab");
+    CHECK(f != NULL, "open synthetic torn append");
+    if (f) {
+        const unsigned char partial[] = { 0x47, 0x4c, 0x58, 0x54, 0x01 };
+        CHECK(fwrite(partial, 1, sizeof(partial), f) == sizeof(partial),
+              "write synthetic torn bytes");
+        fclose(f);
+    }
+    long old_size = file_size(path);
+    j = NULL;
+    CHECK(tx_journal_open(path, archive, true, &j, &retained) == ESP_OK && j,
+          "reopen and retain interrupted segment");
+    CHECK(retained && file_size(first) == old_size && file_size(path) == 0,
+          "unfinished record and torn bytes archived without truncation");
+    if (j) {
+        CHECK(tx_journal_set_nonce(j, 1) == ESP_ERR_INVALID_STATE,
+              "archived unfinished nonce cannot be reused");
+        tx_journal_close(j);
+    }
+    cleanup();
+}
+
+static void test_segmented_pending_limit(void)
+{
+    fresh();
+    char archive[320], id[TX_LOG_ID_MAX + 1];
+    snprintf(archive, sizeof(archive), "%s/archive", dir);
+    tx_journal_t *j = NULL;
+    bool retained;
+    CHECK(tx_journal_open(path, archive, true, &j, &retained) == ESP_OK && j,
+          "open segmented journal");
+    if (!j) { cleanup(); return; }
+    CHECK(tx_journal_set_nonce(j, 2) == ESP_OK, "set nonce");
+    bool ok = true;
+    for (int i = 0; i < 16; i++) {
+        if (tx_journal_next_id(j, "STR.edf", id, sizeof(id)) != ESP_OK ||
+            tx_journal_append(j, TX_PREPARE, id, NULL, 0) != ESP_OK) ok = false;
+    }
+    CHECK(ok, "bounded unfinished entries accepted");
+    long before = file_size(path);
+    CHECK(tx_journal_next_id(j, "STR.edf", id, sizeof(id)) == ESP_OK &&
+          tx_journal_append(j, TX_PREPARE, id, NULL, 0) == ESP_ERR_INVALID_SIZE,
+          "seventeenth unfinished entry refused");
+    CHECK(file_size(path) == before, "refused prepare changes no bytes");
+    tx_journal_close(j);
+    cleanup();
+}
+
+static void test_segmented_legacy_over_limit(void)
+{
+    fresh();
+    char archive[320], first[350], id[32];
+    snprintf(archive, sizeof(archive), "%s/archive", dir);
+    snprintf(first, sizeof(first), "%s/seg-00000000.log", archive);
+    tx_log_t *old = NULL;
+    bool torn;
+    CHECK(tx_log_open(path, &old, &torn) == ESP_OK && old, "open legacy log");
+    if (!old) { cleanup(); return; }
+    bool ok = true;
+    for (int i = 0; i < 256; i++) {
+        snprintf(id, sizeof(id), "legacy-%03d", i);
+        if (tx_log_append(old, TX_PREPARE, id, NULL, 0) != ESP_OK ||
+            tx_log_append(old, TX_COMMIT, id, NULL, 0) != ESP_OK) ok = false;
+    }
+    CHECK(ok && tx_log_append(old, TX_PREPARE, "legacy-256", NULL, 0) == ESP_OK,
+          "make legacy 257th prepared entry");
+    tx_log_close(old);
+    long original = file_size(path);
+    tx_journal_t *j = NULL;
+    bool retained = false;
+    CHECK(tx_journal_open(path, archive, true, &j, &retained) == ESP_OK && j,
+          "validate legacy history beyond old table limit");
+    CHECK(retained && file_size(first) == original && file_size(path) == 0,
+          "legacy bytes and unfinished evidence retained");
+    if (j) tx_journal_close(j);
+    cleanup();
+}
+
+static void test_segmented_interrupted_rotation(void)
+{
+    fresh();
+    char archive[320], first[350], id[TX_LOG_ID_MAX + 1];
+    snprintf(archive, sizeof(archive), "%s/archive", dir);
+    snprintf(first, sizeof(first), "%s/seg-00000000.log", archive);
+    tx_journal_t *j = NULL;
+    bool retained;
+    CHECK(tx_journal_open(path, archive, true, &j, &retained) == ESP_OK && j,
+          "open segmented journal");
+    if (!j) { cleanup(); return; }
+    CHECK(tx_journal_set_nonce(j, 3) == ESP_OK, "set nonce");
+    bool ok = true;
+    for (int i = 0; i < 192; i++) {
+        if (tx_journal_next_id(j, "STR.edf", id, sizeof(id)) != ESP_OK ||
+            tx_journal_append(j, TX_PREPARE, id, NULL, 0) != ESP_OK ||
+            tx_journal_append(j, TX_COMMIT, id, NULL, 0) != ESP_OK) ok = false;
+    }
+    CHECK(ok, "fill active segment");
+    long before = file_size(path);
+    CHECK(tx_journal_next_id(j, "STR.edf", id, sizeof(id)) == ESP_OK, "next ID");
+    tx_log_fault_after(2);
+    CHECK(tx_journal_append(j, TX_PREPARE, id, NULL, 0) == ESP_FAIL &&
+          !tx_journal_healthy(j), "interrupted rotation poisons handle");
+    CHECK(file_size(path) == -1 && file_size(first) == before,
+          "old active segment remains in archive");
+    tx_journal_close(j);
+    j = NULL;
+    CHECK(tx_journal_open(path, archive, true, &j, &retained) == ESP_OK && j,
+          "reopen after archive rename");
+    if (j) {
+        CHECK(tx_journal_set_nonce(j, 4) == ESP_OK &&
+              tx_journal_next_id(j, "STR.edf", id, sizeof(id)) == ESP_OK &&
+              tx_journal_append(j, TX_PREPARE, id, NULL, 0) == ESP_OK &&
+              tx_journal_append(j, TX_COMMIT, id, NULL, 0) == ESP_OK,
+              "fresh segment continues after interrupted rotation");
+        tx_journal_close(j);
+    }
+    CHECK(file_size(first) == before, "recovery leaves old bytes unchanged");
+    cleanup();
+}
+
+static void test_segmented_uncertain_write_and_low_space(void)
+{
+    fresh();
+    char archive[320], first[350], id[TX_LOG_ID_MAX + 1];
+    snprintf(archive, sizeof(archive), "%s/archive", dir);
+    snprintf(first, sizeof(first), "%s/seg-00000000.log", archive);
+    tx_journal_t *j = NULL;
+    bool retained;
+    CHECK(tx_journal_open(path, archive, true, &j, &retained) == ESP_OK && j,
+          "open segmented journal");
+    if (!j) { cleanup(); return; }
+    CHECK(tx_journal_set_nonce(j, 5) == ESP_OK &&
+          tx_journal_next_id(j, "STR.edf", id, sizeof(id)) == ESP_OK,
+          "allocate segmented transaction ID");
+    tx_log_fault_after(2);
+    CHECK(tx_journal_append(j, TX_PREPARE, id, NULL, 0) == ESP_FAIL &&
+          !tx_journal_healthy(j), "uncertain completed write poisons handle");
+    long before = file_size(path);
+    CHECK(before > 0 &&
+          tx_journal_append(j, TX_PREPARE, id, NULL, 0) == ESP_ERR_INVALID_STATE &&
+          file_size(path) == before, "poisoned handle refuses further writes");
+    tx_journal_close(j);
+    j = NULL;
+    CHECK(tx_journal_open(path, archive, true, &j, &retained) == ESP_OK && j &&
+          retained && file_size(first) == before,
+          "uncertain prepared record retained on reopen");
+    if (j) {
+        CHECK(tx_journal_set_nonce(j, 6) == ESP_OK, "new nonce after recovery");
+        tx_journal_allow_writes(j, false);
+        CHECK(tx_journal_next_id(j, "STR.edf", id, sizeof(id)) == ESP_ERR_INVALID_STATE,
+              "low-space gate refuses optional diagnostic writes");
+        tx_journal_allow_writes(j, true);
+        CHECK(tx_journal_next_id(j, "STR.edf", id, sizeof(id)) == ESP_OK &&
+              tx_journal_append(j, TX_PREPARE, id, NULL, 0) == ESP_OK &&
+              tx_journal_append(j, TX_PREPARE, id, NULL, 0) == ESP_ERR_INVALID_STATE &&
+              tx_journal_append(j, TX_COMMIT, id, NULL, 0) == ESP_OK &&
+              tx_journal_append(j, TX_ABORT, id, NULL, 0) == ESP_ERR_INVALID_STATE,
+              "duplicate IDs and illegal transitions rejected");
+        tx_journal_close(j);
+    }
+    tx_log_t *old = NULL;
+    CHECK(tx_log_open(path, &old, &retained) == ESP_OK && old,
+          "legacy reader accepts new active segment");
+    if (old) tx_log_close(old);
+    cleanup();
+}
+
+static void test_segmented_corruption_preserved(void)
+{
+    fresh();
+    char archive[320], id[TX_LOG_ID_MAX + 1];
+    snprintf(archive, sizeof(archive), "%s/archive", dir);
+    tx_journal_t *j = NULL;
+    bool retained;
+    CHECK(tx_journal_open(path, archive, true, &j, &retained) == ESP_OK && j,
+          "open segmented journal");
+    if (!j) { cleanup(); return; }
+    CHECK(tx_journal_set_nonce(j, 7) == ESP_OK &&
+          tx_journal_next_id(j, "STR.edf", id, sizeof(id)) == ESP_OK &&
+          tx_journal_append(j, TX_PREPARE, id, NULL, 0) == ESP_OK &&
+          tx_journal_append(j, TX_COMMIT, id, NULL, 0) == ESP_OK,
+          "write two valid records");
+    tx_journal_close(j);
+    FILE *f = fopen(path, "r+b");
+    CHECK(f != NULL, "open synthetic corruption");
+    if (f) {
+        CHECK(fseek(f, 14, SEEK_SET) == 0 && fputc(0xff, f) != EOF &&
+              fputc(0x01, f) != EOF, "corrupt first record length");
+        fclose(f);
+    }
+    long before = file_size(path);
+    j = NULL;
+    CHECK(tx_journal_open(path, archive, true, &j, &retained) == ESP_ERR_INVALID_CRC &&
+          !j && file_size(path) == before,
+          "later valid record prevents treating middle corruption as torn tail");
+    cleanup();
+}
+
 int main(void)
 {
     test_commit_and_state();
@@ -298,6 +556,13 @@ int main(void)
     test_recovers_from_interrupted_truncation();
     test_replay_allocation_failure();
     test_full_replay_table();
+    test_segmented_rotation_and_nonce();
+    test_segmented_unfinished_and_torn_preserved();
+    test_segmented_pending_limit();
+    test_segmented_legacy_over_limit();
+    test_segmented_interrupted_rotation();
+    test_segmented_uncertain_write_and_low_space();
+    test_segmented_corruption_preserved();
     printf("tx_log_test: %d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

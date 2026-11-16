@@ -2798,12 +2798,14 @@ static void recreate_edfs_task(void *arg)
         return;
     }
     int n_sessions = 0;
+    bool collection_changed = false;
 
     /* 4. Second pass: collect all sessions. */
     d = opendir(SD_STREAMS_DIR);
     if (d) {
         struct dirent *ent;
         while ((ent = readdir(d)) != NULL) {
+            if (collection_changed) break;
             if (ent->d_type != DT_DIR) continue;
             if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
                 continue;
@@ -2852,6 +2854,11 @@ static void recreate_edfs_task(void *arg)
                         cJSON_Delete(j);
                         continue;
                     }
+                    if (n_sessions >= total_sessions) {
+                        collection_changed = true;
+                        cJSON_Delete(j);
+                        break;
+                    }
                     recreate_session_t *s = &sessions[n_sessions++];
                     strlcpy(s->session_dir, day_dir, sizeof(s->session_dir));
                     strlcpy(s->session_id, session_id, sizeof(s->session_id));
@@ -2864,6 +2871,12 @@ static void recreate_edfs_task(void *arg)
             closedir(dd);
         }
         closedir(d);
+    }
+    if (collection_changed) {
+        ESP_LOGW(TAG, "recreate_edfs_task: sessions changed during scan; retry required");
+        free(sessions);
+        vTaskDelete(NULL);
+        return;
     }
 
     ESP_LOGI(TAG, "recreate_edfs_task: found %d sessions", n_sessions);
@@ -2892,7 +2905,8 @@ static void recreate_edfs_task(void *arg)
         return;
     }
     int n_queued_days = 0;
-    int n_processed = 0;
+    int n_completed = 0;
+    psram_work_begin("recreate-days", 24 * 1024);
 
     for (int i = 0; i < n_sessions; i++) {
         char day_folder[32];
@@ -2909,30 +2923,24 @@ static void recreate_edfs_task(void *arg)
                  * older; stop processing. */
                 break;
             }
-            /* Delete just this day's existing EDF folder before recreating
-             * it, so stale files from a previous export don't survive. */
-            char old_day_dir[300];
-            snprintf(old_day_dir, sizeof(old_day_dir), "%s/%s",
-                     SD_SDCARD_DATALOG, day_folder);
-            recursive_delete(old_day_dir);
             strlcpy(queued_days[n_queued_days++], day_folder, sizeof(queued_days[0]));
+            /* Build the whole day in staging and retain the sentinel until
+             * its shared STR/settings pass also succeeds. */
+            esp_err_t err = edf_gen_rebuild_day(day_folder);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "recreate_edfs_task: rebuild %s failed (%s); "
+                         "stopping without queuing the incomplete day",
+                         day_folder, esp_err_to_name(err));
+                break;
+            }
+            uploader_on_day_invalidated(day_folder);
+            n_completed++;
         }
-
-        n_processed++;
-        ESP_LOGI(TAG, "recreate_edfs_task: generating EDFs for session %d: %s",
-                 n_processed, sessions[i].session_id);
-        edf_gen_generate(sessions[i].session_dir, sessions[i].session_id,
-                         sessions[i].start_epoch_ms, sessions[i].end_epoch_ms,
-                         sessions[i].clock_drift_ms);
     }
 
-    /* 7. Queue unique day folders for upload. */
-    for (int j = 0; j < n_queued_days; j++) {
-        uploader_on_day_invalidated(queued_days[j]);
-    }
-
-    ESP_LOGI(TAG, "recreate_edfs_task: done (%d/%d sessions processed, %d unique days queued)",
-             n_processed, n_sessions, n_queued_days);
+    ESP_LOGI(TAG, "recreate_edfs_task: done (%d days rebuilt, %d examined)",
+             n_completed, n_queued_days);
+    psram_work_end("recreate-done", 24 * 1024);
     free(queued_days);
     free(sessions);
     vTaskDelete(NULL);
@@ -2946,7 +2954,9 @@ static void rebuild_day_task(void *arg)
     char *day = (char *)arg;
     if (!day) { vTaskDelete(NULL); return; }
 
+    psram_work_begin("manual-rebuild", 24 * 1024);
     esp_err_t ret = edf_gen_rebuild_day(day);
+    psram_work_end("manual-rebuild-done", 24 * 1024);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "rebuild_day_task: %s rebuilt, queueing for upload", day);
         /* The day's files were replaced: discard what the backends were told
@@ -3517,7 +3527,7 @@ static esp_err_t actions_handler(httpd_req_t *req)
             return send_busy(req, "therapy recording in progress");
         }
         ESP_LOGW(TAG, "action: recreate ALL EDFs (destructive)");
-        TaskHandle_t h = psram_task_create(recreate_edfs_task, "recreate_edfs", 16384, NULL, 5, 1, NULL, NULL);
+        TaskHandle_t h = psram_task_create(recreate_edfs_task, "recreate_edfs", 24 * 1024, NULL, 5, 1, NULL, NULL);
         if (!h) {
             err = ESP_ERR_NO_MEM;
         }
@@ -3537,7 +3547,7 @@ static esp_err_t actions_handler(httpd_req_t *req)
         } else {
             ESP_LOGI(TAG, "action: rebuild day %s", day_arg);
             TaskHandle_t h = psram_task_create(rebuild_day_task, "rebuild_day",
-                                               16384, day_arg, 5, 1, NULL, NULL);
+                                               24 * 1024, day_arg, 5, 1, NULL, NULL);
             if (!h) {
                 free(day_arg);
                 err = ESP_ERR_NO_MEM;
@@ -3618,7 +3628,12 @@ static esp_err_t start_webserver(void)
 {
     if (s_httpd) {
         ESP_LOGI(TAG, "stopping existing webserver");
-        httpd_stop(s_httpd);
+        log_stream_ws_server_stopping(s_httpd);
+        esp_err_t stop_result = httpd_stop(s_httpd);
+        if (stop_result != ESP_OK) {
+            log_stream_ws_server_started(s_httpd);
+            return stop_result;
+        }
         s_httpd = NULL;
     }
 
@@ -3677,7 +3692,6 @@ static esp_err_t start_webserver(void)
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         return ESP_FAIL;
     }
-
     web_auth_begin_routes();
     web_auth_register_handlers(s_httpd);
     session_graph_init();

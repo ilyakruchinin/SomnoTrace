@@ -51,6 +51,8 @@
 static int edf_test_rename(const char *from, const char *to);
 static bool test_fat_rename, test_fail_install, test_fail_restore;
 int host_heap_caps_realloc_fail;
+int host_heap_caps_malloc_fail;
+int host_heap_caps_calloc_fail;
 #define rename edf_test_rename
 #define TAG TAG_hdr
 #include "edf_header.c"       /* found via -I<main dir>, see run_host_tests.sh */
@@ -62,12 +64,28 @@ int host_heap_caps_realloc_fail;
 #define TAG TAG_ann
 #include "edf_annotations.c"
 #undef TAG
+static bool test_summary_print_fail;
+static char *test_summary_print(const cJSON *item);
+#define cJSON_PrintUnformatted test_summary_print
 #define TAG TAG_sum
 #include "edf_summary.c"
 #undef TAG
+#undef cJSON_PrintUnformatted
 #define TAG TAG_gen
 #include "edf_gen.c"
 #undef TAG
+
+static char *test_summary_print(const cJSON *item)
+{
+    return test_summary_print_fail ? NULL : cJSON_PrintUnformatted(item);
+}
+
+static void *test_cjson_alloc_failure(size_t size)
+{
+    (void)size;
+    errno = ENOMEM;
+    return NULL;
+}
 
 #include <assert.h>
 #include <math.h>
@@ -1444,6 +1462,12 @@ static void reset_day_state(const char *day)
     unlink(path);
 }
 
+static cJSON *read_daily_settings(const char *day, int family, const char *serial)
+{
+    esp_err_t err;
+    return read_daily_settings_checked(day, family, serial, &err);
+}
+
 static void test_daily_settings_provenance(void)
 {
     const char *day = "20260301";
@@ -1770,6 +1794,38 @@ static void test_drift_index_allocation_failure(void)
           "drift index succeeds after allocation recovers");
     free(entries);
     unlink(path);
+    rmdir(dir);
+}
+
+static void test_rebuild_manifest_allocation_failure(void)
+{
+    const char *day = "20330518";
+    char dir[400], manifest[600], export_dir[500], artifact[600];
+    mk("%s", SD_STREAMS_DIR);
+    snprintf(dir, sizeof(dir), "%s/%s", SD_STREAMS_DIR, day);
+    mk("%s", dir);
+    snprintf(manifest, sizeof(manifest), "%s/20330518_220000_session.json", dir);
+    write_text(manifest, "{\"start_epoch_ms\":2000000000000,\"end_epoch_ms\":2000000060000}");
+    mk("%s", SD_SDCARD_DIR);
+    mk("%s", SD_SDCARD_DATALOG);
+    snprintf(export_dir, sizeof(export_dir), "%s/%s", SD_SDCARD_DATALOG, day);
+    mk("%s", export_dir);
+    snprintf(artifact, sizeof(artifact), "%s/previous.edf", export_dir);
+    write_text(artifact, "valid previous export");
+
+    host_heap_caps_malloc_fail = 1;
+    CHECK(edf_gen_rebuild_day(day) == ESP_ERR_NO_MEM,
+          "manifest allocation failure propagates");
+    host_heap_caps_malloc_fail = 0;
+    size_t len = 0;
+    uint8_t *bytes = read_file(artifact, &len);
+    CHECK(bytes && len == strlen("valid previous export") &&
+          !memcmp(bytes, "valid previous export", len),
+          "manifest allocation failure preserves previous day");
+    free(bytes);
+    unlink(artifact);
+    rmdir(export_dir);
+    unlink(manifest);
     rmdir(dir);
 }
 
@@ -2720,6 +2776,7 @@ static void test_resolver_gates_daily_settings(void)
     set_tz("UTC");
     const char *day = "20260310";
     char path[600];
+    resolver_session_t resolver_scratch[RESOLVER_MAX_SESSIONS];
     reset_day_state(day);
     cJSON *native = cJSON_Parse(
         "{\"SettingProfiles\":{\"ActiveProfiles\":{\"TherapyProfile\":\"CpapProfile\"}}}");
@@ -2728,23 +2785,86 @@ static void test_resolver_gates_daily_settings(void)
           settings_provenance_set_family(native, SETTINGS_FAMILY_AS11) &&
           settings_provenance_record_sessions(native, day), "gate: native record");
     if (!native) return;
+    bool authorised = false;
     snprintf(path, sizeof(path), "%s/%s/unverified_session.json", SD_STREAMS_DIR, day);
     write_text(path, "{}");
-    CHECK(!resolver_authorises_day(day, SETTINGS_FAMILY_AS11, "fixture-machine", native),
+    CHECK(resolver_authorises_day_checked(day, SETTINGS_FAMILY_AS11, "fixture-machine",
+                                         native, resolver_scratch, &authorised) == ESP_OK &&
+          !authorised,
           "gate: unverified local session withholds the native record");
     unlink(path);
-    CHECK(resolver_authorises_day(day, SETTINGS_FAMILY_AS11, "fixture-machine", native),
+    CHECK(resolver_authorises_day_checked(day, SETTINGS_FAMILY_AS11, "fixture-machine",
+                                         native, resolver_scratch, &authorised) == ESP_OK &&
+          authorised,
           "gate: verified native record with no local sessions applies");
     snprintf(path, sizeof(path), "%s/%s/bridge_session.json", SD_STREAMS_DIR, day);
     write_text(path, "{\"import_source\":\"somnobridge\"}");
-    CHECK(resolver_authorises_day(day, SETTINGS_FAMILY_AS11, "fixture-machine", native),
+    CHECK(resolver_authorises_day_checked(day, SETTINGS_FAMILY_AS11, "fixture-machine",
+                                         native, resolver_scratch, &authorised) == ESP_OK &&
+          authorised,
           "gate: bridge import without identity is covered by the verified native record");
     unlink(path);
-    CHECK(!resolver_authorises_day(day, SETTINGS_FAMILY_AS11, "other-machine", native),
+    CHECK(resolver_authorises_day_checked(day, SETTINGS_FAMILY_AS11, "other-machine",
+                                         native, resolver_scratch, &authorised) == ESP_OK &&
+          !authorised,
           "gate: native record from another machine is withheld");
     cJSON_Delete(native);
-    CHECK(resolver_gate_daily(day, SETTINGS_FAMILY_AS11, "fixture-machine", NULL) == NULL,
+    cJSON *none = NULL;
+    CHECK(resolver_gate_daily_checked(day, SETTINGS_FAMILY_AS11, "fixture-machine",
+                                      &none, resolver_scratch) == ESP_OK && !none,
           "gate: no record stays unknown");
+
+    snprintf(path, sizeof(path), "%s/%s/oom_session.json", SD_STREAMS_DIR, day);
+    write_text(path, "{}");
+    snprintf(path, sizeof(path), "%s/%s/oom.live.settings.json", SD_STREAMS_DIR, day);
+    write_text(path, "{\"SettingProfiles\":{\"TherapyProfiles\":{}}}");
+    test_summary_print_fail = true;
+    CHECK(resolver_authorises_day_checked(day, SETTINGS_FAMILY_AS11, "fixture-machine",
+                                         NULL, resolver_scratch, &authorised) == ESP_ERR_NO_MEM,
+          "gate: settings digest allocation failure is an error, not unknown");
+    test_summary_print_fail = false;
+    cJSON_Hooks hooks = { .malloc_fn = test_cjson_alloc_failure, .free_fn = free };
+    cJSON_InitHooks(&hooks);
+    esp_err_t provenance_err = resolver_authorises_day_checked(
+        day, SETTINGS_FAMILY_AS11, "fixture-machine", NULL, resolver_scratch, &authorised);
+    cJSON_InitHooks(NULL);
+    CHECK(provenance_err == ESP_ERR_NO_MEM && !authorised,
+          "gate: unavailable manifest evidence is an error, not a conflict");
+
+    snprintf(path, sizeof(path), "%s/%s/oom_session.json", SD_STREAMS_DIR, day);
+    FILE *manifest_file = fopen(path, "wb");
+    CHECK(manifest_file != NULL, "gate: create large synthetic manifest");
+    if (manifest_file) {
+        fputs("{\"padding\":\"", manifest_file);
+        for (int i = 0; i < 5000; i++) fputc('m', manifest_file);
+        fputs("\"}", manifest_file);
+        fclose(manifest_file);
+        host_heap_caps_malloc_fail = 1;
+        provenance_err = resolver_authorises_day_checked(
+            day, SETTINGS_FAMILY_AS11, "fixture-machine", NULL, resolver_scratch, &authorised);
+        host_heap_caps_malloc_fail = 0;
+        CHECK(provenance_err == ESP_ERR_NO_MEM && !authorised,
+              "gate: large manifest cannot fall back to internal RAM");
+    }
+
+    snprintf(path, sizeof(path), "%s/%s.imported.settings.json", SD_SUMMARIES_DIR, day);
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL, "gate: create large synthetic daily settings");
+    if (f) {
+        fputs("{\"padding\":\"", f);
+        for (int i = 0; i < 5000; i++) fputc('x', f);
+        fputs("\"}", f);
+        fclose(f);
+        esp_err_t err = ESP_OK;
+        host_heap_caps_malloc_fail = 1;
+        cJSON *daily = read_daily_settings_checked(day, SETTINGS_FAMILY_AS11,
+                                                  "fixture-machine", &err);
+        host_heap_caps_malloc_fail = 0;
+        CHECK(!daily && err == ESP_ERR_NO_MEM,
+              "gate: settings-read allocation failure is not treated as absence");
+        cJSON_Delete(daily);
+        unlink(path);
+    }
 }
 
 int main(void)
@@ -2810,6 +2930,8 @@ int main(void)
         test_imported_spool_selection, NULL);
     run("a partial drift index is rejected when PSRAM is exhausted",
         test_drift_index_allocation_failure, NULL);
+    run("a rebuild preserves the day when manifest allocation fails",
+        test_rebuild_manifest_allocation_failure, NULL);
     run("unexpected summary metric numbers stay in bounds",
         test_spool_metric_bounds, NULL);
     run("day rebuild markers protect interrupted publication",

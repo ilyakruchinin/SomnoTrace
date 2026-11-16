@@ -72,6 +72,23 @@ esp_err_t tx_log_state(tx_log_t *log, const char *id, tx_state_t *state);
 /* Number of records currently in the log and the last sequence written. */
 esp_err_t tx_log_count(tx_log_t *log, uint64_t *records, uint64_t *last_seq);
 
+/* Bounded bridge journal. Archives are immutable and are never automatically
+ * deleted. State/count refer to the active segment only. The caller is the
+ * sole owner and must set a collision-checked boot nonce before making IDs. */
+typedef struct tx_journal tx_journal_t;
+
+esp_err_t tx_journal_open(const char *path, const char *archive_dir,
+                          bool allow_writes, tx_journal_t **out,
+                          bool *archived_unfinished);
+void tx_journal_close(tx_journal_t *journal);
+void tx_journal_allow_writes(tx_journal_t *journal, bool allow);
+esp_err_t tx_journal_set_nonce(tx_journal_t *journal, uint64_t nonce);
+esp_err_t tx_journal_next_id(tx_journal_t *journal, const char *key,
+                             char *id, size_t cap);
+esp_err_t tx_journal_append(tx_journal_t *journal, tx_type_t type,
+                            const char *id, const void *payload, size_t payload_len);
+bool tx_journal_healthy(const tx_journal_t *journal);
+
 /* Test hooks: fail the Nth subsequent write or allocation (0 = never).
  * Only built when TX_LOG_FAULT_INJECT is defined. */
 #ifdef TX_LOG_FAULT_INJECT

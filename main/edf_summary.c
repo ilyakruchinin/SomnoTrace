@@ -1208,7 +1208,7 @@ static int collect_session_mask_pairs(const char *session_dir,
  * one, so MaskEvents and the mask windows under-reported the night.
  *
  * Fills rec->values, mask_on_extra, mask_off_extra, period_start. */
-static void build_current_day_record(str_day_record_t *rec,
+static esp_err_t build_current_day_record(str_day_record_t *rec,
                                      const char *session_dir,
                                      const char *session_id,
                                      int64_t start_epoch_ms,
@@ -1226,10 +1226,11 @@ static void build_current_day_record(str_day_record_t *rec,
      * (here empty) Summary context, so it must not run after the values
      * below or it silently overwrites Duration with 0 — which is what made
      * the synthesised day report zero usage. */
-    summary_ctx_t *empty_ctx = calloc(1, sizeof(summary_ctx_t));
+    summary_ctx_t *empty_ctx = heap_caps_calloc(1, sizeof(summary_ctx_t),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!empty_ctx) {
         ESP_LOGE(TAG, "STR.edf: calloc failed for current-day ctx");
-        return;
+        return ESP_ERR_NO_MEM;
     }
     build_str_data_values(empty_ctx, rec->values, settings_json);
     free(empty_ctx);
@@ -1248,7 +1249,7 @@ static void build_current_day_record(str_day_record_t *rec,
     if (noon_secs == 0 || day_number < 0) {
         ESP_LOGW(TAG, "STR.edf: unusable day label '%s' for session %s",
                  day_label, session_id);
-        return;
+        return ESP_ERR_INVALID_ARG;
     }
     int64_t noon_epoch_ms = noon_secs * 1000;
 
@@ -1360,6 +1361,7 @@ static void build_current_day_record(str_day_record_t *rec,
              "(%d session(s), MaskOn=%d MaskOff=%d Duration=%d min)",
              day_label, n_pairs, (int)rec->values[1], (int)rec->values[2],
              (int)rec->values[4]);
+    return ESP_OK;
 }
 
 /* Resolve the drift for one AS11 Summary noon-day.  Session metadata stores
@@ -1503,7 +1505,8 @@ esp_err_t edf_gen_summary_json(const char *noon_day, char **out_json)
         return ESP_ERR_NOT_FOUND;
     }
 
-    summary_ctx_t *ctx = calloc(1, sizeof(summary_ctx_t));
+    summary_ctx_t *ctx = heap_caps_calloc(1, sizeof(summary_ctx_t),
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!ctx) { free(spool_data); return ESP_ERR_NO_MEM; }
     pb_iter(spool_data, spool_len, summary_field_cb, ctx);
     free(spool_data);
@@ -1569,7 +1572,7 @@ esp_err_t edf_gen_summary_json(const char *noon_day, char **out_json)
  * settings are missing, borrowed, or different. An imported STR record is
  * the source's daily choice, provided the imported file is authoritative. */
 static bool live_day_unambiguous(const char *day, const cJSON *candidate,
-                                 const char *serial)
+                                 const char *serial, esp_err_t *error)
 {
     if (!serial || !serial[0]) return false;
     const cJSON *profiles = cJSON_GetObjectItem(candidate, "SettingProfiles");
@@ -1583,7 +1586,10 @@ static bool live_day_unambiguous(const char *day, const cJSON *candidate,
     char dir_path[300];
     snprintf(dir_path, sizeof(dir_path), "%s/%s", SD_STREAMS_DIR, day);
     DIR *dir = opendir(dir_path);
-    if (!dir) return false;
+    if (!dir) {
+        if (errno != ENOENT) *error = ESP_FAIL;
+        return false;
+    }
     bool found = false, found_source = false, valid = true;
     struct dirent *ent;
     const char suffix[] = "_session.json";
@@ -1600,13 +1606,23 @@ static bool live_day_unambiguous(const char *day, const cJSON *candidate,
         memcpy(sid, ent->d_name, sid_len);
         sid[sid_len] = '\0';
         snprintf(path, sizeof(path), "%s/%s.live.settings.json", dir_path, sid);
-        cJSON *other = edf_read_json_file(path);
+        cJSON *other = NULL;
+        esp_err_t err = edf_read_json_file_checked(path, &other);
+        if (err != ESP_OK) {
+            if (err != ESP_ERR_NOT_FOUND) *error = err;
+            valid = false;
+            break;
+        }
         const cJSON *other_profiles = cJSON_GetObjectItem(other, "SettingProfiles");
         int16_t actual[STR_DATA_COUNT];
         memset(actual, 0xFF, sizeof(actual));
         build_str_settings_values(actual, other);
+        bool matches = false, bridge = false;
+        esp_err_t session_err = settings_provenance_session_checked(
+            day, sid, serial, SETTINGS_FAMILY_AS11, &matches, &bridge);
+        if (session_err != ESP_OK) *error = session_err;
         if (!settings_provenance_is(other, SETTINGS_SOURCE_LIVE, day, sid) ||
-            !settings_provenance_session_matches(day, sid, serial, SETTINGS_FAMILY_AS11) ||
+            session_err != ESP_OK || !matches ||
             !cJSON_IsObject(other_profiles) ||
             memcmp(expected + 5, actual + 5, (76 - 5) * sizeof(int16_t)) != 0) {
             valid = false;
@@ -1617,6 +1633,7 @@ static bool live_day_unambiguous(const char *day, const cJSON *candidate,
         if (strcmp(source_session->valuestring, sid) == 0) found_source = true;
     }
     closedir(dir);
+    if (read_failed) *error = ESP_FAIL;
     return !read_failed && valid && found && found_source;
 }
 
@@ -1641,54 +1658,79 @@ static bool native_fields_valid(const cJSON *fields, int family)
     return true;
 }
 
-static cJSON *read_daily_settings(const char *day, int family, const char *serial)
+static cJSON *read_daily_settings_checked(const char *day, int family,
+                                         const char *serial, esp_err_t *error)
 {
+    *error = ESP_OK;
     if (!serial || !serial[0] || family == SETTINGS_FAMILY_UNKNOWN) return NULL;
     char path[330];
     struct stat st;
     snprintf(path, sizeof(path), "%s/%s.native.settings.json", SD_SUMMARIES_DIR, day);
     int status = stat(path, &st);
     if (status == 0 || errno != ENOENT) {
-        cJSON *native = edf_read_json_file(path);
+        if (status != 0) { *error = ESP_FAIL; return NULL; }
+        cJSON *native = NULL;
+        *error = edf_read_json_file_checked(path, &native);
+        if (*error != ESP_OK) return NULL;
         const char *source_serial = settings_provenance_serial(native);
         const cJSON *fields = cJSON_GetObjectItemCaseSensitive(
             native, family == SETTINGS_FAMILY_AS10 ? "_as10_edf_settings" : "_as11_edf_settings");
         if (settings_provenance_is(native, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) &&
             native_fields_valid(fields, family) &&
             settings_provenance_is_family(native, family) &&
-            source_serial && !strcmp(source_serial, serial) &&
-            !settings_provenance_day_conflicts(day, serial, family))
-            return native;
+            source_serial && !strcmp(source_serial, serial)) {
+            bool conflict = false;
+            *error = settings_provenance_day_conflicts_checked(day, serial, family, &conflict);
+            if (*error == ESP_OK && !conflict) return native;
+        }
         cJSON_Delete(native);
         return NULL;
     }
     snprintf(path, sizeof(path), "%s/%s.imported.settings.json", SD_SUMMARIES_DIR, day);
-    cJSON *settings = edf_read_json_file(path);
+    cJSON *settings = NULL;
+    esp_err_t err = edf_read_json_file_checked(path, &settings);
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) { *error = err; return NULL; }
     const char *source_serial = settings_provenance_serial(settings);
     if (settings_provenance_is(settings, SETTINGS_SOURCE_IMPORTED_STR, day, NULL) &&
         settings_provenance_is_family(settings, family) &&
-        source_serial && strcmp(source_serial, serial) == 0 &&
-        settings_provenance_covers_sessions(settings, day) &&
-        !settings_provenance_day_conflicts(day, serial, family))
-        return settings;
+        source_serial && strcmp(source_serial, serial) == 0) {
+        bool covered = false, conflict = false;
+        *error = settings_provenance_covers_sessions_checked(settings, day, &covered);
+        if (*error == ESP_OK && covered)
+            *error = settings_provenance_day_conflicts_checked(day, serial, family, &conflict);
+        if (*error == ESP_OK && covered && !conflict) return settings;
+    }
     cJSON_Delete(settings);
+    if (*error != ESP_OK) return NULL;
 
     if (family != SETTINGS_FAMILY_AS11) return NULL;
     snprintf(path, sizeof(path), "%s/%s.live.settings.json", SD_SUMMARIES_DIR, day);
-    settings = edf_read_json_file(path);
+    settings = NULL;
+    err = edf_read_json_file_checked(path, &settings);
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) { *error = err; return NULL; }
     if (settings_provenance_is(settings, SETTINGS_SOURCE_LIVE, day, NULL) &&
-        live_day_unambiguous(day, settings, serial))
+        live_day_unambiguous(day, settings, serial, error))
         return settings;
     cJSON_Delete(settings);
+    if (*error != ESP_OK) return NULL;
 
     /* A daily cache write may fail while the session snapshot survives. */
     char dir_path[300];
     snprintf(dir_path, sizeof(dir_path), "%s/%s", SD_STREAMS_DIR, day);
     DIR *dir = opendir(dir_path);
-    if (!dir) return NULL;
+    if (!dir) {
+        if (errno != ENOENT) *error = ESP_FAIL;
+        return NULL;
+    }
     struct dirent *entry;
     const char suffix[] = ".live.settings.json";
-    while ((entry = readdir(dir)) != NULL) {
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            if (errno != 0) *error = ESP_FAIL;
+            break;
+        }
         size_t len = strlen(entry->d_name), tail = sizeof(suffix) - 1;
         if (len <= tail || len - tail >= 100 ||
             strcmp(entry->d_name + len - tail, suffix) != 0) continue;
@@ -1698,10 +1740,17 @@ static cJSON *read_daily_settings(const char *day, int family, const char *seria
         char session_path[420];
         snprintf(session_path, sizeof(session_path), "%s/%s.live.settings.json",
                  dir_path, sid);
-        settings = edf_read_json_file(session_path);
-        if (settings_provenance_is(settings, SETTINGS_SOURCE_LIVE, day, sid) &&
-            settings_provenance_session_matches(day, sid, serial, SETTINGS_FAMILY_AS11)) {
-            bool unambiguous = live_day_unambiguous(day, settings, serial);
+        settings = NULL;
+        err = edf_read_json_file_checked(session_path, &settings);
+        if (err != ESP_OK) { *error = err; break; }
+        bool matches = false, bridge = false;
+        if (settings_provenance_is(settings, SETTINGS_SOURCE_LIVE, day, sid)) {
+            *error = settings_provenance_session_checked(
+                day, sid, serial, SETTINGS_FAMILY_AS11, &matches, &bridge);
+            if (*error != ESP_OK) { cJSON_Delete(settings); break; }
+        }
+        if (matches) {
+            bool unambiguous = live_day_unambiguous(day, settings, serial, error);
             closedir(dir);
             if (unambiguous) return settings;
             cJSON_Delete(settings);
@@ -1728,11 +1777,15 @@ static uint64_t resolver_hash_str(uint64_t h, const char *s)
     return h;
 }
 
-static bool resolver_authorises_day(const char *day, int family, const char *serial,
-                                    const cJSON *day_settings)
+static esp_err_t resolver_authorises_day_checked(const char *day, int family,
+                                                  const char *serial,
+                                                  const cJSON *day_settings,
+                                                  resolver_session_t *sessions,
+                                                  bool *authorised)
 {
-    if (!day || strlen(day) != 8) return false;
-    resolver_session_t sessions[RESOLVER_MAX_SESSIONS];
+    if (!day || strlen(day) != 8 || !sessions || !authorised)
+        return ESP_ERR_INVALID_ARG;
+    *authorised = false;
     size_t n = 0;
     char dir_path[300];
     snprintf(dir_path, sizeof(dir_path), "%s/%s", SD_STREAMS_DIR, day);
@@ -1740,7 +1793,13 @@ static bool resolver_authorises_day(const char *day, int family, const char *ser
     if (dir) {
         struct dirent *ent;
         const char suffix[] = "_session.json";
-        while ((ent = readdir(dir)) != NULL) {
+        for (;;) {
+            errno = 0;
+            ent = readdir(dir);
+            if (!ent) {
+                if (errno != 0) { closedir(dir); return ESP_FAIL; }
+                break;
+            }
             size_t len = strlen(ent->d_name), tail = sizeof(suffix) - 1;
             if (len <= tail || strcmp(ent->d_name + len - tail, suffix) != 0) continue;
             if (n >= RESOLVER_MAX_SESSIONS || len - tail >= 100) { n = SIZE_MAX; break; }
@@ -1750,19 +1809,32 @@ static bool resolver_authorises_day(const char *day, int family, const char *ser
             resolver_session_t *s = &sessions[n];
             memset(s, 0, sizeof(*s));
             s->id_hash = resolver_hash_str(0xcbf29ce484222325ULL, sid);
-            s->verified = settings_provenance_session_matches(day, sid, serial, family);
+            bool bridge = false;
+            esp_err_t evidence_err = settings_provenance_session_checked(
+                day, sid, serial, family, &s->verified, &bridge);
+            if (evidence_err != ESP_OK) { closedir(dir); return evidence_err; }
             s->serial_match = s->family_match = s->verified;
-            if (!s->verified && settings_provenance_session_is_bridge_unverified(day, sid, serial, family)) {
+            if (!s->verified && bridge) {
                 s->bridge_unverified = true;
                 s->serial_match = s->family_match = true;
             }
             char sp[420];
             snprintf(sp, sizeof(sp), "%s/%s.live.settings.json", dir_path, sid);
-            cJSON *live = edf_read_json_file(sp);
+            cJSON *live = NULL;
+            esp_err_t err = edf_read_json_file_checked(sp, &live);
+            if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+                closedir(dir);
+                return err;
+            }
             s->live_capture = settings_provenance_is(live, SETTINGS_SOURCE_LIVE, day, sid);
             if (live) {
                 cJSON *profiles = cJSON_GetObjectItem(live, "SettingProfiles");
                 char *txt = profiles ? cJSON_PrintUnformatted(profiles) : NULL;
+                if (profiles && !txt) {
+                    cJSON_Delete(live);
+                    closedir(dir);
+                    return ESP_ERR_NO_MEM;
+                }
                 s->settings_digest = txt ? resolver_hash_str(0xcbf29ce484222325ULL, txt) : 0;
                 free(txt);
                 cJSON_Delete(live);
@@ -1770,11 +1842,13 @@ static bool resolver_authorises_day(const char *day, int family, const char *ser
             n++;
         }
         closedir(dir);
+    } else if (errno != ENOENT) {
+        return ESP_FAIL;
     }
     if (n == SIZE_MAX) {
         ESP_LOGW(TAG, "resolver: day=%s has more than %d sessions; daily settings withheld",
                  day, RESOLVER_MAX_SESSIONS);
-        return false;
+        return ESP_ERR_INVALID_SIZE;
     }
 
     resolver_input_t in;
@@ -1787,14 +1861,17 @@ static bool resolver_authorises_day(const char *day, int family, const char *ser
                          settings_provenance_is_family(day_settings, family);
     in.native_serial_match = in.native_verified;
     in.native_family_match = in.native_verified;
-    in.native_window_covers_all = in.native_present &&
-        settings_provenance_covers_sessions(day_settings, day);
+    if (in.native_present) {
+        esp_err_t err = settings_provenance_covers_sessions_checked(
+            day_settings, day, &in.native_window_covers_all);
+        if (err != ESP_OK) return err;
+    }
     in.sessions = sessions;
     in.n_sessions = n;
 
     resolver_state_t st = settings_resolve_day(&in);
-    bool authorised = st == RES_APPLY_NATIVE || st == RES_APPLY_LIVE;
-    if (authorised) {
+    *authorised = st == RES_APPLY_NATIVE || st == RES_APPLY_LIVE;
+    if (*authorised) {
         ESP_LOGI(TAG, "resolver day=%s state=%s sessions=%u", day,
                  settings_resolver_state_name(st), (unsigned)n);
     } else if (!day_settings) {
@@ -1804,23 +1881,29 @@ static bool resolver_authorises_day(const char *day, int family, const char *ser
         ESP_LOGW(TAG, "resolver day=%s state=%s sessions=%u: daily settings withheld",
                  day, settings_resolver_state_name(st), (unsigned)n);
     }
-    return authorised;
+    return ESP_OK;
 }
 
 /* Gate a daily record found by read_daily_settings().  Takes ownership.  Every
  * STR day is evaluated and logged, including days with no record; a missing
  * record stays NULL, so output for those days is unchanged. */
-static cJSON *resolver_gate_daily(const char *day, int family, const char *serial,
-                                  cJSON *day_settings)
+static esp_err_t resolver_gate_daily_checked(const char *day, int family,
+                                              const char *serial,
+                                              cJSON **day_settings,
+                                              resolver_session_t *sessions)
 {
-    if (settings_provenance_is(day_settings, SETTINGS_SOURCE_NATIVE_DAY, day, NULL))
-        return day_settings;
-    bool authorised = resolver_authorises_day(day, family, serial, day_settings);
-    if (day_settings && !authorised) {
-        cJSON_Delete(day_settings);
-        return NULL;
+    if (settings_provenance_is(*day_settings, SETTINGS_SOURCE_NATIVE_DAY, day, NULL))
+        return ESP_OK;
+    bool authorised = false;
+    esp_err_t err = resolver_authorises_day_checked(day, family, serial,
+                                                     *day_settings, sessions,
+                                                     &authorised);
+    if (err != ESP_OK) return err;
+    if (*day_settings && !authorised) {
+        cJSON_Delete(*day_settings);
+        *day_settings = NULL;
     }
-    return day_settings;
+    return ESP_OK;
 }
 
 static bool native_identity_matches(const cJSON *ident, const char *serial, int family)
@@ -2018,7 +2101,9 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
     #define STR_MAX_DAYS  365
 
     str_day_record_t *records = heap_caps_calloc(STR_MAX_DAYS + 1, sizeof(str_day_record_t), MALLOC_CAP_SPIRAM);
-    summary_ctx_t *ctx = heap_caps_calloc(1, sizeof(summary_ctx_t), MALLOC_CAP_SPIRAM);
+    summary_ctx_t *ctx = heap_caps_calloc(
+        1, sizeof(summary_ctx_t) + RESOLVER_MAX_SESSIONS * sizeof(resolver_session_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     edf_signal_def_t *str_sigs = heap_caps_calloc(STR_DATA_COUNT, sizeof(edf_signal_def_t), MALLOC_CAP_SPIRAM);
     if (!records || !ctx || !str_sigs) {
         ESP_LOGE(TAG, "STR.edf: malloc failed");
@@ -2026,6 +2111,7 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         free(spool_names);
         return ESP_ERR_NO_MEM;
     }
+    resolver_session_t *resolver_sessions = (resolver_session_t *)(ctx + 1);
 
     /* Build session drift index once (avoids O(days × sessions) dir scans). */
     int n_drift_entries = 0;
@@ -2125,8 +2211,18 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         build_str_mask_events(ctx, rec->values, rec->mask_on_extra,
                               rec->mask_off_extra, period_start, record_drift_ms);
 
-        cJSON *day_settings = resolver_gate_daily(as11_day_label, family, serial,
-                                                  read_daily_settings(as11_day_label, family, serial));
+        esp_err_t resolver_err = ESP_OK;
+        cJSON *day_settings = read_daily_settings_checked(
+            as11_day_label, family, serial, &resolver_err);
+        if (resolver_err == ESP_OK)
+            resolver_err = resolver_gate_daily_checked(
+                as11_day_label, family, serial, &day_settings, resolver_sessions);
+        if (resolver_err != ESP_OK) {
+            cJSON_Delete(day_settings);
+            free(spool_names); free(drift_index);
+            free(records); free(ctx); free(str_sigs);
+            return resolver_err;
+        }
         if (native_day_blocked(as11_day_label, family, serial, day_settings)) {
             ESP_LOGE(TAG, "STR.edf: invalid or conflicting native settings for day %s", as11_day_label);
             cJSON_Delete(day_settings);
@@ -2139,8 +2235,14 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
             strcmp(as11_day_label, current_day_label) == 0 &&
             settings_provenance_is(settings_json, SETTINGS_SOURCE_LIVE,
                                    as11_day_label, session_id) &&
-            live_day_unambiguous(as11_day_label, settings_json, serial)) {
+            live_day_unambiguous(as11_day_label, settings_json, serial, &resolver_err)) {
             settings_to_use = settings_json;
+        }
+        if (resolver_err != ESP_OK) {
+            cJSON_Delete(day_settings);
+            free(spool_names); free(drift_index);
+            free(records); free(ctx); free(str_sigs);
+            return resolver_err;
         }
         build_str_data_values(ctx, rec->values,
                               family == SETTINGS_FAMILY_AS10 ? NULL : settings_to_use);
@@ -2194,8 +2296,17 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
     if (!current_day_found && n_records < STR_MAX_DAYS + 1) {
         ESP_LOGI(TAG, "STR.edf: synthesizing current day record (day=%s)",
                  current_day_label);
-        cJSON *day_settings = resolver_gate_daily(current_day_label, family, serial,
-                                                  read_daily_settings(current_day_label, family, serial));
+        esp_err_t resolver_err = ESP_OK;
+        cJSON *day_settings = read_daily_settings_checked(
+            current_day_label, family, serial, &resolver_err);
+        if (resolver_err == ESP_OK)
+            resolver_err = resolver_gate_daily_checked(
+                current_day_label, family, serial, &day_settings, resolver_sessions);
+        if (resolver_err != ESP_OK) {
+            cJSON_Delete(day_settings);
+            free(records); free(ctx); free(str_sigs);
+            return resolver_err;
+        }
         if (native_day_blocked(current_day_label, family, serial, day_settings)) {
             ESP_LOGE(TAG, "STR.edf: invalid or conflicting native settings for day %s", current_day_label);
             cJSON_Delete(day_settings);
@@ -2206,12 +2317,23 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         if (!current_settings && family == SETTINGS_FAMILY_AS11 &&
             settings_provenance_is(settings_json, SETTINGS_SOURCE_LIVE,
                                    current_day_label, session_id) &&
-            live_day_unambiguous(current_day_label, settings_json, serial))
+            live_day_unambiguous(current_day_label, settings_json, serial, &resolver_err))
             current_settings = settings_json;
-        build_current_day_record(&records[n_records], session_dir,
-                                 session_id,
-                                 start_epoch_ms, end_epoch_ms, clock_drift_ms,
-                                 family == SETTINGS_FAMILY_AS10 ? NULL : current_settings);
+        if (resolver_err != ESP_OK) {
+            cJSON_Delete(day_settings);
+            free(records); free(ctx); free(str_sigs);
+            return resolver_err;
+        }
+        esp_err_t current_err = build_current_day_record(&records[n_records], session_dir,
+                                                         session_id, start_epoch_ms,
+                                                         end_epoch_ms, clock_drift_ms,
+                                                         family == SETTINGS_FAMILY_AS10
+                                                         ? NULL : current_settings);
+        if (current_err != ESP_OK) {
+            cJSON_Delete(day_settings);
+            free(records); free(ctx); free(str_sigs);
+            return current_err;
+        }
         if (family == SETTINGS_FAMILY_AS10)
             omitted_settings += apply_as10_settings(records[n_records].values, current_settings);
         else if (settings_provenance_is(current_settings, SETTINGS_SOURCE_NATIVE_DAY,

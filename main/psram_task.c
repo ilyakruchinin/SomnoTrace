@@ -29,6 +29,43 @@
 
 static const char *TAG = "psram_task";
 
+static unsigned s_work_active;
+
+static void log_work_phase(const char *phase, uint32_t stack_bytes, unsigned active)
+{
+    multi_heap_info_t internal, psram;
+    heap_caps_get_info(&internal, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    heap_caps_get_info(&psram, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    unsigned hwm = (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t));
+    ESP_LOGI(TAG, "work phase=%s task=%s stack=%u hwm=%u active=%u "
+             "internal=%u/%u/%u psram=%u/%u/%u (free/min/largest)",
+             phase, pcTaskGetName(NULL), (unsigned)stack_bytes, hwm, active,
+             (unsigned)internal.total_free_bytes, (unsigned)internal.minimum_free_bytes,
+             (unsigned)internal.largest_free_block,
+             (unsigned)psram.total_free_bytes, (unsigned)psram.minimum_free_bytes,
+             (unsigned)psram.largest_free_block);
+    if (hwm < 2048)
+        ESP_LOGW(TAG, "work phase=%s task=%s low stack watermark=%u B",
+                 phase, pcTaskGetName(NULL), hwm);
+}
+
+void psram_work_begin(const char *phase, uint32_t stack_bytes)
+{
+    unsigned active = __atomic_add_fetch(&s_work_active, 1, __ATOMIC_RELAXED);
+    log_work_phase(phase, stack_bytes, active);
+}
+
+void psram_work_phase(const char *phase, uint32_t stack_bytes)
+{
+    log_work_phase(phase, stack_bytes, __atomic_load_n(&s_work_active, __ATOMIC_RELAXED));
+}
+
+void psram_work_end(const char *phase, uint32_t stack_bytes)
+{
+    log_work_phase(phase, stack_bytes, __atomic_load_n(&s_work_active, __ATOMIC_RELAXED));
+    __atomic_sub_fetch(&s_work_active, 1, __ATOMIC_RELAXED);
+}
+
 #define REAPER_INTERVAL_US (2000 * 1000) /* 2 seconds */
 
 typedef struct psram_task_entry {

@@ -102,12 +102,14 @@ static esp_err_t generate_annotation_edf(const char *edf_path,
 
     size_t capacity = 128;
     size_t count = 0;
-    snt_event_t *ev_list = malloc(capacity * sizeof(snt_event_t));
+    snt_event_t *ev_list = heap_caps_malloc(capacity * sizeof(snt_event_t),
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!ev_list) {
         ESP_LOGE(TAG, "generate_annotation_edf: out of memory");
         return ESP_ERR_NO_MEM;
     }
 
+    bool alloc_failed = false;
     FILE *ef = fopen(snt_path, "r");
     if (ef) {
         char line[512];
@@ -159,12 +161,16 @@ static esp_err_t generate_annotation_edf(const char *edf_path,
                                 if (onset_sec < 0) onset_sec = 0;
 
                                 if (count >= capacity) {
-                                    size_t new_cap = capacity * 2;
-                                    snt_event_t *tmp = realloc(ev_list, new_cap * sizeof(snt_event_t));
+                                    size_t new_cap = capacity <= SIZE_MAX / 2 ? capacity * 2 : 0;
+                                    snt_event_t *tmp = new_cap && new_cap <= SIZE_MAX / sizeof(snt_event_t)
+                                        ? heap_caps_realloc(ev_list, new_cap * sizeof(snt_event_t),
+                                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+                                        : NULL;
                                     if (tmp) {
                                         ev_list = tmp;
                                         capacity = new_cap;
                                     } else {
+                                        alloc_failed = true;
                                         break;
                                     }
                                 }
@@ -178,10 +184,15 @@ static esp_err_t generate_annotation_edf(const char *edf_path,
                 }
             }
             cJSON_Delete(msg);
+            if (alloc_failed) break;
         }
         fclose(ef);
     } else {
         ESP_LOGW(TAG, "generate_annotation_edf: cannot open %s: %s", snt_path, strerror(errno));
+    }
+    if (alloc_failed) {
+        free(ev_list);
+        return ESP_ERR_NO_MEM;
     }
 
     /* Sort by onset (label breaks ties) and drop exact repeats. */

@@ -286,7 +286,8 @@ static ox_probe_mode_t s_probe_mode = OX_PROBE_PERSISTENT;
 /* Measured: END powers off ~120s after take-off IF no one connects.
  * Any GATT connection resets that timer. Pull happens inside the
  * window, so after a pull: never reconnect while the advert lasts.
- * Still advertising at pull+130s can only mean re-worn. */
+ * Continued advertising after pull+130s triggers a wear-state check; it is
+ * not by itself evidence that the ring is being worn. */
 #define OX_END_WINDOW_MS  130000
 #define OX_WORN_PROBE_MS  60000  /* LIVE_B interval while worn; END lasts ~120s */
 #define OX_F1_MAX_RETRIES 3      /* give up on F1 after N consecutive timeouts */
@@ -1698,14 +1699,13 @@ static void pull_task(void *arg)
         if (s_presence_served) {
             /* Never reconnect during END — a connection resets the
              * ring's power-off timer (measured). Passive scans only.
-             * Still advertising past the longest possible END window
-             * (take-off + ~120s; pull ran inside it) ⇒ back on a
-             * finger ⇒ clear served so the next take-off pulls. */
+             * After the expected END window, resume checking wear state and
+             * clear served so the next observed take-off pulls. */
             if ((xTaskGetTickCount() - s_served_at) < pdMS_TO_TICKS(OX_END_WINDOW_MS)) {
                 xSemaphoreGive(s_ops_mtx);
                 continue;
             }
-            ESP_LOGI(TAG, "watch: still advertising past END window — re-worn, resuming probes");
+            ESP_LOGI(TAG, "watch: still advertising past END window; checking wear state");
             s_presence_served = false;
             s_f1_fail_count = 0;
             s_pull_fail_count = 0;

@@ -27,6 +27,9 @@
 #include "esp_log.h"
 
 #include <errno.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +38,8 @@
 
 #ifndef TX_LOG_HOST
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #endif
 
 static const char *TAG = "tx_log";
@@ -361,5 +366,530 @@ esp_err_t tx_log_count(tx_log_t *log, uint64_t *records, uint64_t *last_seq)
     if (!log || !records || !last_seq) return ESP_ERR_INVALID_ARG;
     *records = log->records;
     *last_seq = log->last_seq;
+    return ESP_OK;
+}
+
+/* The bridge's segmented journal deliberately has a separate API from the
+ * legacy single-file log. It never truncates or deletes archived evidence. */
+#define JOURNAL_IDS             192u
+#define JOURNAL_PENDING          16u
+#define JOURNAL_SEGMENT_BYTES   (32u * 1024u)
+#define JOURNAL_ARCHIVE_BYTES   (1024u * 1024u)
+#define JOURNAL_SCAN_BUDGET     (256u * 1024u * 1024u)
+
+typedef struct {
+    uint8_t bytes[TX_MAX_RECORD];
+    tx_rec_t record;
+} journal_scratch_t;
+
+struct tx_journal {
+    char path[300];
+    char archive_dir[300];
+    id_state_t *seen;
+    journal_scratch_t *scratch;
+    journal_scratch_t *prior_scratch;
+    size_t seen_count;
+    size_t distinct;
+    size_t pending;
+    uint64_t bytes;
+    uint64_t records;
+    uint64_t last_seq;
+    uint64_t archive_bytes;
+    uint64_t nonce;
+    uint32_t counter;
+    bool nonce_set;
+    bool counter_exhausted;
+    bool allow_writes;
+    bool poisoned;
+};
+
+typedef enum { JR_RECORD, JR_END, JR_TORN, JR_BAD, JR_IO } journal_read_t;
+
+static journal_read_t journal_read(FILE *f, journal_scratch_t *s,
+                                   uint64_t *work)
+{
+    size_t n = fread(s->bytes, 1, TX_HDR_LEN, f);
+    *work += n;
+    if (n != TX_HDR_LEN) {
+        if (ferror(f)) return JR_IO;
+        return n ? JR_TORN : JR_END;
+    }
+    if (get_u32(s->bytes) != TX_MAGIC) return JR_BAD;
+    unsigned id_len = s->bytes[13];
+    unsigned plen = (unsigned)s->bytes[14] | ((unsigned)s->bytes[15] << 8);
+    if (!id_len || id_len > TX_LOG_ID_MAX || plen > TX_LOG_PAYLOAD_MAX)
+        return JR_BAD;
+    size_t remain = id_len + plen + 4;
+    n = fread(s->bytes + TX_HDR_LEN, 1, remain, f);
+    *work += n;
+    if (n != remain) return ferror(f) ? JR_IO : JR_TORN;
+    if (parse_record(s->bytes, TX_HDR_LEN + remain, &s->record) != REC_OK ||
+        memchr(s->bytes + TX_HDR_LEN, '\0', id_len) != NULL)
+        return JR_BAD;
+    return JR_RECORD;
+}
+
+/* Validate an ID's preceding transitions without retaining an unbounded
+ * lifetime-ID table. This slow path runs only on oversized legacy segments. */
+static esp_err_t journal_prior_state(tx_journal_t *j, long before,
+                                     const char *id, tx_state_t *out,
+                                     uint64_t *work)
+{
+    FILE *f = fopen(j->path, "rb");
+    if (!f) return ESP_FAIL;
+    tx_state_t state = TX_STATE_NONE;
+    esp_err_t ret = ESP_OK;
+    while (ftell(f) < before) {
+        if (*work > JOURNAL_SCAN_BUDGET) { ret = ESP_ERR_INVALID_SIZE; break; }
+        journal_read_t r = journal_read(f, j->prior_scratch, work);
+        if (r != JR_RECORD) { ret = ESP_ERR_INVALID_CRC; break; }
+        if (!strcmp(j->prior_scratch->record.id, id)) {
+            bool legal;
+            state = next_state(state, j->prior_scratch->record.type, &legal);
+            if (!legal) { ret = ESP_ERR_INVALID_STATE; break; }
+        }
+#ifndef TX_LOG_HOST
+        if (((*work >> 16) & 7u) == 0) taskYIELD();
+#endif
+    }
+    if (fclose(f) != 0 && ret == ESP_OK) ret = ESP_FAIL;
+    *out = state;
+    return ret;
+}
+
+/* An incomplete-looking record can also be a corrupt length in the middle
+ * of a file. A subsequent complete CRC-valid record makes it corruption,
+ * not a tail that can be moved aside as an interrupted append. */
+static esp_err_t journal_later_record(tx_journal_t *j, long offset,
+                                      uint64_t *work, bool *found)
+{
+    *found = false;
+    FILE *f = fopen(j->path, "rb");
+    if (!f) return ESP_FAIL;
+    esp_err_t ret = ESP_OK;
+    if (fseek(f, offset + 1, SEEK_SET) != 0) ret = ESP_FAIL;
+    uint32_t window = 0;
+    unsigned have = 0;
+    int ch;
+    while (ret == ESP_OK && (ch = fgetc(f)) != EOF) {
+        (*work)++;
+        if (*work > JOURNAL_SCAN_BUDGET) { ret = ESP_ERR_INVALID_SIZE; break; }
+#ifndef TX_LOG_HOST
+        if ((*work & 4095u) == 0) taskYIELD();
+#endif
+        window = (window >> 8) | ((uint32_t)(uint8_t)ch << 24);
+        if (have < 4) have++;
+        if (have < 4 || window != TX_MAGIC) continue;
+        long candidate = ftell(f) - 4;
+        if (candidate < 0 || fseek(f, candidate, SEEK_SET) != 0) {
+            ret = ESP_FAIL;
+            break;
+        }
+        journal_read_t r = journal_read(f, j->prior_scratch, work);
+        if (r == JR_IO) { ret = ESP_FAIL; break; }
+        if (r == JR_RECORD) { *found = true; break; }
+        if (fseek(f, candidate + 4, SEEK_SET) != 0) { ret = ESP_FAIL; break; }
+#ifndef TX_LOG_HOST
+        taskYIELD();
+#endif
+    }
+    if (ferror(f) && ret == ESP_OK) ret = ESP_FAIL;
+    if (fclose(f) != 0 && ret == ESP_OK) ret = ESP_FAIL;
+    return ret;
+}
+
+static esp_err_t journal_scan_active(tx_journal_t *j, bool *torn)
+{
+    FILE *f = fopen(j->path, "rb");
+    if (!f) return ESP_FAIL;
+    j->seen_count = j->distinct = j->pending = 0;
+    j->bytes = j->records = j->last_seq = 0;
+    *torn = false;
+    uint64_t work = 0;
+    esp_err_t ret = ESP_OK;
+    for (;;) {
+        long offset = ftell(f);
+        if (offset < 0 || work > JOURNAL_SCAN_BUDGET) {
+            ret = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        journal_read_t r = journal_read(f, j->scratch, &work);
+        if (r == JR_END) break;
+        if (r == JR_TORN) {
+            bool later = false;
+            ret = journal_later_record(j, offset, &work, &later);
+            if (ret == ESP_OK && later) ret = ESP_ERR_INVALID_CRC;
+            if (ret == ESP_OK) *torn = true;
+            break;
+        }
+        if (r != JR_RECORD) {
+            ret = r == JR_IO ? ESP_FAIL : ESP_ERR_INVALID_CRC;
+            break;
+        }
+        tx_rec_t *rec = &j->scratch->record;
+        if (rec->seq != j->last_seq + 1) {
+            ret = ESP_ERR_INVALID_CRC;
+            break;
+        }
+        size_t i = 0;
+        while (i < j->seen_count && strcmp(j->seen[i].id, rec->id)) i++;
+        tx_state_t state = TX_STATE_NONE;
+        if (i < j->seen_count) {
+            state = j->seen[i].state;
+        } else if (j->seen_count == JOURNAL_IDS) {
+            ret = journal_prior_state(j, offset, rec->id, &state, &work);
+            if (ret != ESP_OK) break;
+        }
+        bool legal;
+        tx_state_t next = next_state(state, rec->type, &legal);
+        if (!legal) { ret = ESP_ERR_INVALID_STATE; break; }
+        if (state == TX_STATE_NONE) {
+            j->distinct++;
+            if (j->seen_count < JOURNAL_IDS) {
+                i = j->seen_count++;
+                snprintf(j->seen[i].id, sizeof(j->seen[i].id), "%s", rec->id);
+            }
+        }
+        if (i < j->seen_count) j->seen[i].state = next;
+        if (rec->type == TX_PREPARE) j->pending++;
+        else j->pending--;
+        j->last_seq = rec->seq;
+        j->records++;
+        j->bytes += rec->length;
+    }
+    if (fclose(f) != 0 && ret == ESP_OK) ret = ESP_FAIL;
+    return ret;
+}
+
+static esp_err_t journal_inventory(tx_journal_t *j)
+{
+    DIR *dir = opendir(j->archive_dir);
+    if (!dir) return ESP_FAIL;
+    uint64_t total = 0;
+    esp_err_t ret = ESP_OK;
+    struct dirent *ent;
+    errno = 0;
+    while ((ent = readdir(dir)) != NULL) {
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+        unsigned long number;
+        char tail;
+        if (sscanf(ent->d_name, "seg-%8lx.log%c", &number, &tail) != 1 ||
+            strlen(ent->d_name) != 16) {
+            ret = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        char path[340];
+        struct stat st;
+        if (snprintf(path, sizeof(path), "%s/%s", j->archive_dir,
+                     ent->d_name) >= (int)sizeof(path) ||
+            stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
+            ret = ESP_FAIL;
+            break;
+        }
+        total += (uint64_t)st.st_size;
+        errno = 0;
+    }
+    if (errno && ret == ESP_OK) ret = ESP_FAIL;
+    if (closedir(dir) != 0 && ret == ESP_OK) ret = ESP_FAIL;
+    if (ret == ESP_OK) j->archive_bytes = total;
+    return ret;
+}
+
+static esp_err_t journal_create_active(tx_journal_t *j)
+{
+    if (!j->allow_writes) return ESP_ERR_INVALID_STATE;
+    int fd = open(j->path, O_WRONLY | O_CREAT | O_EXCL, 0664);
+    if (fd < 0) return ESP_FAIL;
+    bool ok = fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    return ok ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t journal_rotate(tx_journal_t *j)
+{
+    if (!j->allow_writes || j->poisoned) return ESP_ERR_INVALID_STATE;
+    esp_err_t ret = journal_inventory(j);
+    if (ret != ESP_OK) return ret;
+    struct stat st;
+    if (stat(j->path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0)
+        return ESP_FAIL;
+    uint64_t size = (uint64_t)st.st_size;
+    if (j->archive_bytes > JOURNAL_ARCHIVE_BYTES ||
+        size > JOURNAL_ARCHIVE_BYTES - j->archive_bytes)
+        return ESP_ERR_INVALID_SIZE;
+    char archive[340];
+    bool found = false;
+    for (uint64_t i = 0; i <= UINT32_MAX; i++) {
+        if (snprintf(archive, sizeof(archive), "%s/seg-%08lx.log",
+                     j->archive_dir, (unsigned long)i) >= (int)sizeof(archive))
+            return ESP_ERR_INVALID_SIZE;
+        if (stat(archive, &st) != 0) {
+            if (errno != ENOENT) return ESP_FAIL;
+            found = true;
+            break;
+        }
+    }
+    if (!found) return ESP_ERR_INVALID_SIZE;
+    /* The single journal owner checks the unused destination immediately
+     * before rename; never intentionally replace an existing archive. */
+    if (fault_hit()) return ESP_FAIL;
+    j->poisoned = true;
+    if (rename(j->path, archive) != 0) return ESP_FAIL;
+    if (fault_hit()) return ESP_FAIL;
+    ret = journal_create_active(j);
+    if (ret != ESP_OK) return ret;
+    bool torn;
+    ret = journal_scan_active(j, &torn);
+    if (ret != ESP_OK || torn || j->records != 0)
+        return ret == ESP_OK ? ESP_ERR_INVALID_STATE : ret;
+    j->archive_bytes += size;
+    j->poisoned = false;
+    return ESP_OK;
+}
+
+void tx_journal_close(tx_journal_t *j)
+{
+    if (!j) return;
+    free(j->seen);
+    free(j->scratch);
+    free(j->prior_scratch);
+    free(j);
+}
+
+esp_err_t tx_journal_open(const char *path, const char *archive_dir,
+                          bool allow_writes, tx_journal_t **out,
+                          bool *archived_unfinished)
+{
+    if (!path || !archive_dir || !out) return ESP_ERR_INVALID_ARG;
+    *out = NULL;
+    if (archived_unfinished) *archived_unfinished = false;
+    tx_journal_t *j = tx_alloc(sizeof(*j));
+    if (!j) return ESP_ERR_NO_MEM;
+    memset(j, 0, sizeof(*j));
+    j->seen = tx_alloc(JOURNAL_IDS * sizeof(*j->seen));
+    j->scratch = tx_alloc(sizeof(*j->scratch));
+    j->prior_scratch = tx_alloc(sizeof(*j->prior_scratch));
+    if (!j->seen || !j->scratch || !j->prior_scratch) {
+        tx_journal_close(j);
+        return ESP_ERR_NO_MEM;
+    }
+    if (snprintf(j->path, sizeof(j->path), "%s", path) >= (int)sizeof(j->path) ||
+        snprintf(j->archive_dir, sizeof(j->archive_dir), "%s", archive_dir) >=
+            (int)sizeof(j->archive_dir)) {
+        tx_journal_close(j);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    j->allow_writes = allow_writes;
+    struct stat st;
+    if (stat(j->archive_dir, &st) != 0) {
+        if (errno != ENOENT || !allow_writes || mkdir(j->archive_dir, 0775) != 0) {
+            tx_journal_close(j);
+            return ESP_FAIL;
+        }
+    } else if (!S_ISDIR(st.st_mode)) {
+        tx_journal_close(j);
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t ret = journal_inventory(j);
+    if (ret != ESP_OK) { tx_journal_close(j); return ret; }
+    if (j->archive_bytes >= JOURNAL_ARCHIVE_BYTES) {
+        tx_journal_close(j);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char bak[320], tmp[320];
+    snprintf(bak, sizeof(bak), "%s.bak", j->path);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", j->path);
+    bool active = stat(j->path, &st) == 0;
+    if (!active && errno != ENOENT) { tx_journal_close(j); return ESP_FAIL; }
+    bool backup = stat(bak, &st) == 0;
+    if (!backup && errno != ENOENT) { tx_journal_close(j); return ESP_FAIL; }
+    bool temporary = stat(tmp, &st) == 0;
+    if (!temporary && errno != ENOENT) { tx_journal_close(j); return ESP_FAIL; }
+    if (active && (backup || temporary)) {
+        /* Do not guess which evidence survived a previous replacement. */
+        tx_journal_close(j);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!active && backup && temporary) {
+        tx_journal_close(j);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!active && backup) {
+        if (!allow_writes || rename(bak, j->path) != 0) {
+            tx_journal_close(j);
+            return ESP_FAIL;
+        }
+        active = true;
+    } else if (!active && temporary) {
+        tx_journal_close(j);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!active && (ret = journal_create_active(j)) != ESP_OK) {
+        tx_journal_close(j);
+        return ret;
+    }
+
+    bool torn;
+    ret = journal_scan_active(j, &torn);
+    if (ret != ESP_OK) { tx_journal_close(j); return ret; }
+    bool unfinished = j->pending != 0;
+    if (torn || unfinished || j->distinct > JOURNAL_IDS ||
+        j->bytes > JOURNAL_SEGMENT_BYTES) {
+        ret = journal_rotate(j);
+        if (ret != ESP_OK) { tx_journal_close(j); return ret; }
+        if (archived_unfinished) *archived_unfinished = torn || unfinished;
+    }
+    *out = j;
+    return ESP_OK;
+}
+
+void tx_journal_allow_writes(tx_journal_t *j, bool allow)
+{
+    if (j) j->allow_writes = allow;
+}
+
+bool tx_journal_healthy(const tx_journal_t *j)
+{
+    return j && !j->poisoned && j->allow_writes && j->nonce_set;
+}
+
+static esp_err_t journal_file_has_nonce(tx_journal_t *j, const char *path,
+                                        const char *needle, bool *found)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return ESP_FAIL;
+    uint64_t seq = 0, work = 0;
+    esp_err_t ret = ESP_OK;
+    for (;;) {
+        journal_read_t r = journal_read(f, j->scratch, &work);
+        if (r == JR_END || r == JR_TORN) break;
+        if (r != JR_RECORD || j->scratch->record.seq != seq + 1) {
+            ret = r == JR_IO ? ESP_FAIL : ESP_ERR_INVALID_CRC;
+            break;
+        }
+        seq++;
+        if (strstr(j->scratch->record.id, needle)) *found = true;
+        if (work > JOURNAL_SCAN_BUDGET) { ret = ESP_ERR_INVALID_SIZE; break; }
+    }
+    if (fclose(f) != 0 && ret == ESP_OK) ret = ESP_FAIL;
+    return ret;
+}
+
+esp_err_t tx_journal_set_nonce(tx_journal_t *j, uint64_t nonce)
+{
+    if (!j || j->poisoned || j->nonce_set) return ESP_ERR_INVALID_STATE;
+    char needle[20];
+    snprintf(needle, sizeof(needle), "@%016" PRIx64 "-", nonce);
+    bool found = false;
+    esp_err_t ret = journal_file_has_nonce(j, j->path, needle, &found);
+    if (ret != ESP_OK) return ret;
+    DIR *dir = opendir(j->archive_dir);
+    if (!dir) return ESP_FAIL;
+    struct dirent *ent;
+    errno = 0;
+    while ((ent = readdir(dir)) != NULL && ret == ESP_OK) {
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+        char path[340];
+        if (snprintf(path, sizeof(path), "%s/%s", j->archive_dir, ent->d_name) >=
+            (int)sizeof(path)) {
+            ret = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        ret = journal_file_has_nonce(j, path, needle, &found);
+        errno = 0;
+    }
+    if (errno && ret == ESP_OK) ret = ESP_FAIL;
+    if (closedir(dir) != 0 && ret == ESP_OK) ret = ESP_FAIL;
+    if (ret != ESP_OK) return ret;
+    if (found) return ESP_ERR_INVALID_STATE;
+    j->nonce = nonce;
+    j->counter = 0;
+    j->counter_exhausted = false;
+    j->nonce_set = true;
+    return ESP_OK;
+}
+
+esp_err_t tx_journal_next_id(tx_journal_t *j, const char *key,
+                             char *id, size_t cap)
+{
+    if (!j || !key || !key[0] || !id || !cap) return ESP_ERR_INVALID_ARG;
+    if (!tx_journal_healthy(j) || j->counter_exhausted)
+        return ESP_ERR_INVALID_STATE;
+    uint32_t counter = j->counter;
+    if (counter == UINT32_MAX) j->counter_exhausted = true;
+    else j->counter++;
+    int n = snprintf(id, cap, "%s@%016" PRIx64 "-%08" PRIx32,
+                     key, j->nonce, counter);
+    if (n < 0 || (size_t)n >= cap || n > TX_LOG_ID_MAX) {
+        id[0] = '\0';
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
+}
+
+esp_err_t tx_journal_append(tx_journal_t *j, tx_type_t type,
+                            const char *id, const void *payload, size_t payload_len)
+{
+    if (!j || !id || !id[0] || strlen(id) > TX_LOG_ID_MAX ||
+        payload_len > TX_LOG_PAYLOAD_MAX || (payload_len && !payload))
+        return ESP_ERR_INVALID_ARG;
+    if (!tx_journal_healthy(j)) return ESP_ERR_INVALID_STATE;
+    size_t i = 0;
+    while (i < j->seen_count && strcmp(j->seen[i].id, id)) i++;
+    tx_state_t state = i < j->seen_count ? j->seen[i].state : TX_STATE_NONE;
+    bool legal;
+    tx_state_t next = next_state(state, type, &legal);
+    if (!legal) return ESP_ERR_INVALID_STATE;
+    size_t id_len = strlen(id);
+    size_t total = TX_HDR_LEN + id_len + payload_len + 4;
+    if (type == TX_PREPARE) {
+        if (j->pending >= JOURNAL_PENDING) return ESP_ERR_INVALID_SIZE;
+        uint64_t reserved = (j->pending + 1) * TX_MAX_RECORD;
+        if (j->distinct >= JOURNAL_IDS ||
+            j->bytes + total + reserved > JOURNAL_SEGMENT_BYTES) {
+            if (j->pending) return ESP_ERR_INVALID_SIZE;
+            esp_err_t r = journal_rotate(j);
+            if (r != ESP_OK) return r;
+            i = 0;
+        }
+    } else if (j->bytes + total > JOURNAL_SEGMENT_BYTES) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    uint8_t *rec = j->scratch->bytes;
+    put_u32(rec, TX_MAGIC);
+    put_u64(rec + 4, j->last_seq + 1);
+    rec[12] = (uint8_t)type;
+    rec[13] = (uint8_t)id_len;
+    rec[14] = (uint8_t)payload_len;
+    rec[15] = (uint8_t)(payload_len >> 8);
+    memcpy(rec + TX_HDR_LEN, id, id_len);
+    if (payload_len) memcpy(rec + TX_HDR_LEN + id_len, payload, payload_len);
+    put_u32(rec + total - 4, crc32_bytes(rec, total - 4));
+    if (fault_hit()) return ESP_FAIL;
+    int fd = open(j->path, O_WRONLY | O_APPEND);
+    if (fd < 0) return ESP_FAIL;
+    ssize_t written = write(fd, rec, total);
+    bool ok = written == (ssize_t)total;
+    if (ok && fault_hit()) ok = false;
+    if (ok) ok = fsync(fd) == 0;
+    if (ok && fault_hit()) ok = false;
+    if (close(fd) != 0) ok = false;
+    if (!ok) {
+        j->poisoned = true;
+        return ESP_FAIL;
+    }
+    if (type == TX_PREPARE) {
+        snprintf(j->seen[i].id, sizeof(j->seen[i].id), "%s", id);
+        j->seen_count++;
+        j->distinct++;
+        j->pending++;
+    } else {
+        j->pending--;
+    }
+    j->seen[i].state = next;
+    j->bytes += total;
+    j->records++;
+    j->last_seq++;
     return ESP_OK;
 }

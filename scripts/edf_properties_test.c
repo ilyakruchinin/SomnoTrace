@@ -44,6 +44,9 @@
 
 /* Minimal stubs for edf file I/O not under test */
 cJSON *edf_read_json_file(const char *p) { (void)p; return NULL; }
+esp_err_t edf_read_json_file_checked(const char *p, cJSON **out) {
+    (void)p; *out = NULL; return ESP_ERR_NOT_FOUND;
+}
 esp_err_t edf_write_json_file(const char *p, const cJSON *j) { (void)p; (void)j; return -1; }
 uint8_t *edf_read_bin_file(const char *p, size_t *l) { (void)p; (void)l; return NULL; }
 FILE *edf_open_atomic_file(const char *p, char *t, size_t tl) { (void)p; (void)t; (void)tl; return NULL; }

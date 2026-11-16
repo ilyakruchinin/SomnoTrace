@@ -172,6 +172,7 @@ run_test as11_adv_test       -I"$SHIM" -I"$MAIN_DIR" scripts/as11_adv_test.c "$M
 run_test update_check_test   -I"$SHIM" -I"$MAIN_DIR" scripts/update_check_test.c "$MAIN_DIR/update_check_core.c"
 run_test http_query_test     -I"$SHIM" -I"$MAIN_DIR" scripts/http_query_test.c "$MAIN_DIR/http_query.c" \
     scripts/test_include/httpd_query_shim.c
+run_test ws_clients_test     -I"$MAIN_DIR" scripts/ws_clients_test.c "$MAIN_DIR/ws_clients.c"
 
 # SomnoStage Zeo CSV exporter: pure libc, no cJSON or ESP-IDF shims needed.
 # Pins the 30 s grid remap that keeps Gen1 (32 s epoch) nights from drifting
@@ -259,7 +260,7 @@ if [ -n "$CJ_INC" ]; then
     run_test edf_import_test $CJ_INC -I"$SHIM" -I"$MAIN_DIR" \
         -DEDF_IMPORT_HOST -DSOURCE_STORE_HOST '-DSD_MOUNT_POINT="/tmp/somnotrace_imp/sd"' \
         scripts/edf_import_test.c "$MAIN_DIR/edf_import.c" "$MAIN_DIR/source_store.c" \
-        "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" $CJ_SRC $CJ_LIB -lm
+        "$MAIN_DIR/as11_time.c" "$MAIN_DIR/settings_provenance.c" $CJ_SRC $CJ_LIB -Wl,--wrap=fopen -lm
     # Round trip: a live night exported by edf_gen, staged as an IMPORT/ card
     # image, imported, and exported again must be byte-identical.  edf_gen's
     # output is the real-card reference, so this catches layout assumptions

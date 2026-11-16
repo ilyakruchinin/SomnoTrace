@@ -47,9 +47,8 @@
  *   phase m  drift sidecar size budget: verbatim embed when small, compact
  *            projection + relocated copy when large, manifest always under
  *            the 4096 B cap of the pre-existing readers
- *   phase n  quiescence window: files modified moments ago (group, root,
- *            drift sidecar) defer instead of importing; future-dated files
- *            and window 0 never defer
+ *   phase n  quiescence window: fresh files defer; future-dated files need
+ *            a stable monotonic observation; window 0 never defers
  *   phase o  AS10 *.crc sidecars consumed with their EDF; a leftover-only
  *            or quarantined day folder is skipped, never aborting the scan
  *            for later days (issue #338)
@@ -62,6 +61,7 @@
 #include <dirent.h>
 #include <math.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -273,12 +273,21 @@ static void fx_write_real_ann(const char *path, int y, int mo, int d,
 
 static bool snt_read(const char *path, snt_header_t *h, int16_t **data)
 {
+    memset(h, 0, sizeof(*h));
+    *data = NULL;
     FILE *f = fopen(path, "rb");
     if (!f) return false;
     if (fread(h, 1, sizeof(*h), f) != sizeof(*h)) { fclose(f); return false; }
     size_t n = (size_t)h->sample_count * h->n_channels;
     *data = malloc(n * 2 + 2);
-    if (n && fread(*data, 2, n, f) != n) { fclose(f); free(*data); return false; }
+    if (!*data) { fclose(f); return false; }
+    if (n && fread(*data, 2, n, f) != n) {
+        fclose(f);
+        free(*data);
+        *data = NULL;
+        memset(h, 0, sizeof(*h));
+        return false;
+    }
     fclose(f);
     return true;
 }
@@ -404,6 +413,9 @@ static void set_fixture_recording_id(const char *dir, const char *rec_id)
     closedir(d);
 }
 
+static bool s_fixture_mask_2210;
+static void fixture_mask_2210(const char *serial, const char *family);
+
 static void fresh_tree(void)
 {
     rmtree(SD_MOUNT_POINT);
@@ -411,6 +423,22 @@ static void fresh_tree(void)
     mkpath(SD_STREAMS_DIR);
     mkpath(SD_SUMMARIES_DIR);
     mkpath(DATALOG_DAY);
+    if (s_fixture_mask_2210)
+        fixture_mask_2210("22199999999", "AS11");
+}
+
+static void fixture_mask_2210(const char *serial, const char *family)
+{
+    char path[600];
+    snprintf(path, sizeof(path), "%s/20240115.native.mask-intervals.json",
+             SD_SUMMARIES_DIR);
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL, "create synthetic native mask evidence");
+    if (!f) return;
+    fprintf(f, "{\"day\":\"20240115\",\"serial\":\"%s\","
+               "\"family\":\"%s\",\"complete\":true,\"pairs\":[[610,700]]}",
+            serial, family);
+    fclose(f);
 }
 
 /* Runs process_next until NOT_FOUND; returns last unit. */
@@ -422,6 +450,11 @@ static edf_import_unit_t drain(edf_import_ctx_t *c, int *units)
         tot.sessions_imported += u.sessions_imported;
         tot.sessions_skipped  += u.sessions_skipped;
         tot.sessions_failed   += u.sessions_failed;
+        tot.deferred_association += u.deferred_association;
+        tot.deferred_identity += u.deferred_identity;
+        tot.deferred_frozen += u.deferred_frozen;
+        tot.deferred_conflict += u.deferred_conflict;
+        tot.deferred_capacity += u.deferred_capacity;
         tot.files_consumed    += u.files_consumed;
         tot.files_rejected    += u.files_rejected;
         tot.spools_written    += u.spools_written;
@@ -434,10 +467,22 @@ static edf_import_unit_t drain(edf_import_ctx_t *c, int *units)
     return tot;
 }
 
+static bool fail_empty_flow_open;
+FILE *__real_fopen(const char *path, const char *mode);
+FILE *__wrap_fopen(const char *path, const char *mode)
+{
+    if (fail_empty_flow_open && strstr(path, "_flow.snt.part") && !strcmp(mode, "wb")) {
+        errno = EIO;
+        return NULL;
+    }
+    return __real_fopen(path, mode);
+}
+
 /* ── phase a: full session, AS11 layout ────────────────────────────── */
 static void phase_a(void)
 {
     fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
     char dir[256];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
     build_session_dir(dir, "20240115_221007", "20240115_221000", true,
@@ -452,8 +497,8 @@ static void phase_a(void)
     CHECK(units == 1, "one unit expected");
     CHECK(t.sessions_imported == 1, "1 session imported");
     CHECK(t.sessions_failed == 0, "no failures");
-    CHECK(t.files_consumed == 5, "5 sources consumed");
-    CHECK(!edf_import_pending(), "inbox drained");
+    CHECK(t.files_consumed == 0, "cross-stem source evidence is retained");
+    CHECK(edf_import_pending(), "retained evidence remains available");
 
     /* Session id = eve start (2024-01-15 22:10:00 UTC) → 1705356600000 */
     const char *id = "20240115_221000";
@@ -531,7 +576,7 @@ static void phase_a(void)
     /* press.snt — phys 0-40, dig 0-2000: dig=100 → 2.0 → 200 */
     snprintf(p, sizeof(p), "%s/%s/%s_press.snt", SD_STREAMS_DIR, DAY, id);
     CHECK(snt_read(p, &h, &d), "press.snt readable");
-    CHECK(h.sample_count == 75 && d[0] == 200 && d[1] == 202, "press values");
+    CHECK(d && h.sample_count == 75 && d[0] == 200 && d[1] == 202, "press values");
     free(d);
 
     /* flow_mm.snt — 2ch 1Hz minmax over each 25-sample second.
@@ -540,15 +585,15 @@ static void phase_a(void)
     CHECK(snt_read(p, &h, &d), "flow_mm.snt readable");
     CHECK(h.n_channels == 2 && h.sample_hz_x10 == 10 && h.sample_count == 3,
           "flow_mm header");
-    CHECK(d[0] == 0 && d[1] == 48, "flow_mm sec0");
+    CHECK(d && d[0] == 0 && d[1] == 48, "flow_mm sec0");
     free(d);
 
     /* sa2.snt — stored = phys×100; dig -1 → INT16_MIN */
     snprintf(p, sizeof(p), "%s/%s/%s_sa2.snt", SD_STREAMS_DIR, DAY, id);
     CHECK(snt_read(p, &h, &d), "sa2.snt readable");
     CHECK(h.n_channels == 2 && h.sample_count == 3, "sa2 header");
-    CHECK(d[0] == 6200 && d[1] == 9700, "sa2 frame0");
-    CHECK(d[2] == INT16_MIN && d[5] == INT16_MIN, "sa2 missing → sentinel");
+    CHECK(d && d[0] == 6200 && d[1] == 9700, "sa2 frame0");
+    CHECK(d && d[2] == INT16_MIN && d[5] == INT16_MIN, "sa2 missing → sentinel");
     free(d);
 
     /* pld.snt — 12ch, MaskPress dig 110 → phys 2.20 → 220;
@@ -558,8 +603,8 @@ static void phase_a(void)
     CHECK(snt_read(p, &h, &d), "pld.snt readable");
     CHECK(h.n_channels == 12 && h.sample_hz_x10 == 5 && h.sample_count == 3,
           "pld header");
-    CHECK(d[0] == 220 && d[3] == 40 && d[10] == 20, "pld mapped channels");
-    CHECK(d[7] == 0 && d[8] == 0 && d[11] == 0, "pld absent channels zero");
+    CHECK(d && d[0] == 220 && d[3] == 40 && d[10] == 20, "pld mapped channels");
+    CHECK(d && d[7] == 0 && d[8] == 0 && d[11] == 0, "pld absent channels zero");
     free(d);
 
     /* events.snt — synthetic therapy + mask window + 2 respiratory + 2 CSR */
@@ -578,9 +623,9 @@ static void phase_a(void)
         free(ev);
     }
 
-    /* all 5 sources deleted */
+    /* Different stems joined by native evidence stay available for review. */
     snprintf(p, sizeof(p), "%s/%s/20240115_221007_BRP.edf", DATALOG_DAY, DAY);
-    CHECK(!file_exists(p), "BRP source deleted");
+    CHECK(file_exists(p), "cross-stem waveform source retained");
     edf_import_ctx_destroy(c);
     printf("phase a OK (%d checks)\n", g_checks);
 }
@@ -606,15 +651,14 @@ static void phase_b(void)
     build_session_dir(dir, "20240115_221007", "20240115_221000", false,
                       2024, 1, 15);
     set_fixture_recording_id(dir, "SRN=22161122334 MID=24 VID=1");
+    fixture_mask_2210("22161122334", "AS10");
 
     edf_import_ctx_t *c = edf_import_ctx_create();
     int units;
     edf_import_unit_t t = drain(c, &units);
     CHECK(units == 2, "root pass + day unit");
     CHECK(t.sessions_imported == 1, "1 session");
-    /* BRP+PLD+EVE+CSL consumed in the day unit; the .tgt went in the
-     * root pass which does not count toward files_consumed. */
-    CHECK(t.files_consumed == 4, "4 sources consumed");
+    CHECK(t.files_consumed == 0, "cross-stem sources retained for review");
 
     const char *id = "20240115_221000";
     char p[700];
@@ -644,7 +688,7 @@ static void phase_b(void)
     snt_header_t h; int16_t *d;
     snprintf(p, sizeof(p), "%s/%s/%s_sa2.snt", SD_STREAMS_DIR, DAY, id);
     CHECK(snt_read(p, &h, &d), "sa2.snt exists despite missing SA2.edf");
-    CHECK(h.sample_count == 3 && d[0] == INT16_MIN && d[1] == INT16_MIN &&
+    CHECK(d && h.sample_count == 3 && d[0] == INT16_MIN && d[1] == INT16_MIN &&
           d[3] == INT16_MIN, "sa2 all-missing fill");
     free(d);
 
@@ -669,17 +713,25 @@ static void phase_c(void)
     };
     char p[700];
     snprintf(p, sizeof(p), "%s/20240115_221000_BRP.edf", dir);
-    /* header declares 99 records; 3 valid records + 733 junk bytes on disk.
-     * stride = 25*2+2 = 52 → disk holds 17 record slots; records 3..16
-     * fail CRC and must import as SNT_MISSING, not garbage. */
+    /* A growing file whose header promises more data must remain staged. */
     fx_write_edf(p, "SRN=22199999999 MID=46 VID=1",
                  2024, 1, 15, 22, 10, 0, "", "1", 99, 3, s, 1, 733);
 
     edf_import_ctx_t *c = edf_import_ctx_create();
     int units;
     edf_import_unit_t t = drain(c, &units);
-    CHECK(t.sessions_imported == 1, "torn session still imports");
-    CHECK(t.sessions_failed == 0, "torn tail is not a failure");
+    CHECK(t.sessions_imported == 0 && file_exists(p),
+          "incomplete source remains staged");
+    edf_import_ctx_destroy(c);
+
+    /* A complete 17-record file with bad trailing CRCs keeps their positions
+     * as missing samples rather than importing arbitrary bytes. */
+    fx_write_edf(p, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 22, 10, 0, "", "1", 17, 3, s, 1, 14 * 52);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    CHECK(t.sessions_imported == 1 && t.sessions_failed == 0,
+          "complete source imports");
 
     snprintf(p, sizeof(p), "%s/%s/20240115_221000_flow.snt",
              SD_STREAMS_DIR, DAY);
@@ -687,8 +739,8 @@ static void phase_c(void)
     CHECK(snt_read(p, &h, &d), "flow.snt readable");
     CHECK(h.sample_count == 17 * 25, "17 record slots kept positional");
     /* dig 74 → phys = -2 + (74+1000)·5/2500 = 0.148 → stored 15 */
-    CHECK(d[74] == 15, "last good sample");
-    CHECK(d[75] == INT16_MIN && d[424] == INT16_MIN, "CRC junk → missing");
+    CHECK(d && d[74] == 15, "last good sample");
+    CHECK(d && d[75] == INT16_MIN && d[424] == INT16_MIN, "CRC junk → missing");
     free(d);
     edf_import_ctx_destroy(c);
     printf("phase c OK (%d checks)\n", g_checks);
@@ -752,6 +804,7 @@ static void phase_d(void)
 /* ── phase e: SomnoBridge drift sidecar ────────────────────────────── */
 static void phase_e(void)
 {
+    s_fixture_mask_2210 = true;
     fresh_tree();
     char dir[256];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
@@ -799,7 +852,7 @@ static void phase_e(void)
               "drifted start");
         cJSON_Delete(m);
     }
-    CHECK(!file_exists(dp), "sidecar consumed");
+    CHECK(file_exists(dp), "sidecar retained with cross-stem source evidence");
     edf_import_ctx_destroy(c);
 
     /* estimate-only sidecar → valid=false, usable iff half_ms ≤ 5000 */
@@ -1104,6 +1157,7 @@ static void phase_e(void)
         cJSON_Delete(m11);
     }
     edf_import_ctx_destroy(c);
+    s_fixture_mask_2210 = false;
     printf("phase e OK (%d checks)\n", g_checks);
 }
 
@@ -1113,7 +1167,7 @@ static void phase_f(void)
     fresh_tree();
     char dir[256];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
-    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true,
                       2024, 1, 15);
 
     edf_import_ctx_t *c = edf_import_ctx_create();
@@ -1122,7 +1176,7 @@ static void phase_f(void)
     edf_import_ctx_destroy(c);
 
     /* Re-drop identical files → duplicate detection consumes them */
-    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true,
                       2024, 1, 15);
     c = edf_import_ctx_create();
     edf_import_unit_t t = drain(c, &units);
@@ -1132,7 +1186,7 @@ static void phase_f(void)
     edf_import_ctx_destroy(c);
 
     /* Same anchor, slightly different content → still the same session */
-    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+    build_session_dir(dir, "20240115_221000", "20240115_221000", false,
                       2024, 1, 15);
     c = edf_import_ctx_create();
     t = drain(c, &units);
@@ -1151,10 +1205,11 @@ static void phase_f(void)
     FILE *f = fopen(mpath, "w");
     /* existing session at 22:06:40 — 200 s away → not a dup */
     fputs("{\"id\":\"20240115_221000\",\"start_epoch_ms\":1705356400000,"
-          "\"end_epoch_ms\":1705356410000}", f);
+          "\"end_epoch_ms\":1705356410000,\"clock_drift_ms\":0,"
+          "\"clock_drift_valid\":true}", f);
     fclose(f);
 
-    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true,
                       2024, 1, 15);
     c = edf_import_ctx_create();
     t = drain(c, &units);
@@ -1295,7 +1350,7 @@ static void phase_g(void)
     /* session on 2024-01-15 so the resolved AS11 ident gets attached */
     char dir[256];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
-    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true,
                       2024, 1, 15);
     set_fixture_recording_id(dir, "SRN=22199876543 MID=46 VID=1");
 
@@ -1379,7 +1434,7 @@ static void phase_g(void)
 
     /* A fresh ctx with no root ident falls back to EDF recording_id */
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, "20240116");
-    build_session_dir(dir, "20240116_221007", "20240116_221000", true,
+    build_session_dir(dir, "20240116_221000", "20240116_221000", true,
                       2024, 1, 16);
     c = edf_import_ctx_create();
     drain(c, &units);
@@ -1412,19 +1467,24 @@ static void phase_h(void)
      * renamed stream, NO manifest. */
     char p[700];
     snprintf(p, sizeof(p), "%s/20240115_221000_session.json.importing", dir);
-    FILE *f = fopen(p, "w"); fclose(f);
+    FILE *f = fopen(p, "w"); fputs("SomnoTrace import grouping v2\n", f); fclose(f);
     snprintf(p, sizeof(p), "%s/20240115_221000_flow.snt.part", dir);
     f = fopen(p, "wb"); fwrite("0123456789", 1, 10, f); fclose(f);
     snprintf(p, sizeof(p), "%s/20240115_221000_events.snt", dir);
     f = fopen(p, "wb"); fwrite("0123456789", 1, 10, f); fclose(f);
     /* A committed marker (manifest exists) must survive: */
     snprintf(p, sizeof(p), "%s/20240115_230000_session.json.importing", dir);
-    f = fopen(p, "w"); fclose(f);
+    f = fopen(p, "w"); fputs("SomnoTrace import grouping v2\n", f); fclose(f);
     snprintf(p, sizeof(p), "%s/20240115_230000_session.json", dir);
     f = fopen(p, "w");
-    fputs("{\"start_epoch_ms\":1705360200000}", f); fclose(f);
+    fputs("{\"start_epoch_ms\":1705360200000,\"state\":\"completed\","
+          "\"import_grouping_version\":2}", f); fclose(f);
     snprintf(p, sizeof(p), "%s/20240115_230000_flow.snt", dir);
     f = fopen(p, "wb"); fwrite("0123456789", 1, 10, f); fclose(f);
+    snprintf(p, sizeof(p), "%s/20240115_200000_session.json.importing", dir);
+    f = fopen(p, "w"); fclose(f); /* pre-cohort marker */
+    snprintf(p, sizeof(p), "%s/20240115_200000_flow.snt.part", dir);
+    f = fopen(p, "wb"); fwrite("legacy", 1, 6, f); fclose(f);
 
     edf_import_ctx_t *c = edf_import_ctx_create();
     int units;
@@ -1443,6 +1503,10 @@ static void phase_h(void)
     CHECK(file_exists(p), "committed flow kept");
     snprintf(p, sizeof(p), "%s/20240115_230000_session.json.importing", dir);
     CHECK(!file_exists(p), "committed marker removed");
+    snprintf(p, sizeof(p), "%s/20240115_200000_session.json.importing", dir);
+    CHECK(file_exists(p), "pre-cohort marker preserved");
+    snprintf(p, sizeof(p), "%s/20240115_200000_flow.snt.part", dir);
+    CHECK(file_exists(p), "pre-cohort staged artifact preserved");
     printf("phase h OK (%d checks)\n", g_checks);
 }
 
@@ -1491,9 +1555,9 @@ static void phase_j(void)
     char dir[256];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);   /* .../20240115 */
     /* 01:00 belongs to the previous noon-day; 22:00 stays on 0115. */
-    build_session_dir(dir, "20240115_010007", "20240115_010000", false,
+    build_session_dir(dir, "20240115_010000", "20240115_010000", false,
                       2024, 1, 15);
-    build_session_dir(dir, "20240115_220007", "20240115_220000", false,
+    build_session_dir(dir, "20240115_220000", "20240115_220000", false,
                       2024, 1, 15);
 
     edf_import_ctx_t *c = edf_import_ctx_create();
@@ -1524,8 +1588,9 @@ static void phase_k(void)
     fresh_tree();
     char dir[256], p[700];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
-    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+    build_session_dir(dir, "20240115_221000", "20240115_221000", false,
                       2024, 1, 15);
+    set_fixture_recording_id(dir, "SRN=22199876543 MID=46 VID=1");
 
     /* Overwrite PLD.edf with the AS10 short-label variant — every channel
      * carries a distinct dig so a misrouted probe cannot pass silently.
@@ -1550,9 +1615,9 @@ static void phase_k(void)
         {"FL.2s","",0,100,0,1000,1,s_fl,NULL,0},     /* AS10 FlowLim  */
         {"Ti.2s","",0,100,0,1000,1,s_ti,NULL,0},
     };
-    snprintf(p, sizeof(p), "%s/20240115_221007_PLD.edf", dir);
-    fx_write_edf(p, "SRN=22199876543 MID=38 VID=1",
-                 2024, 1, 15, 22, 10, 7, "", "1", 3, 3, pld_s, 12, 0);
+    snprintf(p, sizeof(p), "%s/20240115_221000_PLD.edf", dir);
+    fx_write_edf(p, "SRN=22199876543 MID=46 VID=1",
+                 2024, 1, 15, 22, 10, 0, "", "1", 3, 3, pld_s, 12, 0);
 
     /* CurrentSettings.json — carries a marker field the STR does not
      * cover; the S.* overlay must preserve it (not stub the tree). */
@@ -1852,7 +1917,7 @@ static drift_case_t run_sidecar_case(const char *label, int n_files, int flags_l
     char msg[120];
     snprintf(msg, sizeof(msg), "%s: session imported", label);
     CHECK(t.sessions_imported == 1 && t.sessions_failed == 0, msg);
-    CHECK(!file_exists(dp), "sidecar consumed");
+    CHECK(file_exists(dp), "sidecar retained with cross-stem source evidence");
 
     /* id is in the drifted domain: 22:10:00 + 214 s */
     snprintf(p, sizeof(p), "%s/%s/20240115_221334_session.json", SD_STREAMS_DIR, DAY);
@@ -1897,6 +1962,7 @@ static drift_case_t run_sidecar_case(const char *label, int n_files, int flags_l
 
 static void phase_m(void)
 {
+    s_fixture_mask_2210 = true;
     /* m1: small sidecar — embedded verbatim, nothing relocated (unchanged) */
     drift_case_t a = run_sidecar_case("small", 1, 0);
     CHECK(a.compact_present && !a.truncated && !a.file_ref, "small: verbatim embed");
@@ -1919,6 +1985,7 @@ static void phase_m(void)
     a = run_sidecar_case("giant-scalar", 1, 6000);
     CHECK(!a.compact_present && a.truncated, "giant-scalar: embed dropped, flagged");
     CHECK(a.file_ref, "giant-scalar: verbatim copy still relocated");
+    s_fixture_mask_2210 = false;
     printf("phase m OK (%d checks)\n", g_checks);
 }
 
@@ -1935,6 +2002,7 @@ static void touch_tree(const char *root, long delta_s)
 
 static void phase_n(void)
 {
+    s_fixture_mask_2210 = true;
     char dir[256], p[700];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
     int units;
@@ -1955,7 +2023,7 @@ static void phase_n(void)
     touch_tree(IMPORT_DIR, -120);
     CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.deferred &&
           u.sessions_imported == 1, "n1: quiet files import");
-    CHECK(!file_exists(p), "n1: sources consumed after import");
+    CHECK(file_exists(p), "n1: cross-stem evidence retained after import");
     edf_import_ctx_destroy(c);
 
     /* n2: a root copy in flight (Identification.json just written) holds
@@ -1997,16 +2065,49 @@ static void phase_n(void)
     CHECK(t.sessions_imported == 1, "n3: imports once the sidecar is quiet");
     edf_import_ctx_destroy(c);
 
-    /* n4: files dated in the future (unset device clock / fast PC clock)
-     * carry no recency information and must not defer forever */
+    /* n4: future-dated sources and .part files must first remain unchanged
+     * for a monotonic window, even when the wall clock is wrong. */
     fresh_tree();
     build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
+    snprintf(p, sizeof(p), "%s/upload.part", dir);
+    f = fopen(p, "w"); CHECK(f != NULL, "n4: create future transfer marker");
+    if (f) { fputs("first", f); fclose(f); }
     touch_tree(IMPORT_DIR, 3600);
     c = edf_import_ctx_create();
     edf_import_ctx_set_quiesce(c, 60);
-    t = drain(c, &units);
-    CHECK(t.sessions_imported == 1, "n4: future-dated files import");
+    edf_import_test_set_monotonic_us(0);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.deferred,
+          "n4: future-dated group is not assumed quiet");
+    edf_import_test_set_monotonic_us(30000000);
+    f = fopen(p, "a");
+    if (f) { fputs("still transferring", f); fclose(f); }
+    touch_tree(IMPORT_DIR, 3600);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.deferred,
+          "n4: changing future transfer restarts quiet window");
+    edf_import_test_set_monotonic_us(91000000);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.deferred &&
+          u.sessions_imported == 1, "n4: stable future group eventually imports");
     edf_import_ctx_destroy(c);
+
+    fresh_tree();
+    snprintf(p, sizeof(p), "%s/Identification.json", IMPORT_DIR);
+    f = fopen(p, "w");
+    if (f) {
+        fputs("{\"FlowGenerator\":{\"IdentificationProfiles\":{\"Product\":"
+              "{\"SerialNumber\":\"22199999999\",\"PlatformIdentifier\":46}}}}", f);
+        fclose(f);
+    }
+    touch_tree(IMPORT_DIR, 3600);
+    c = edf_import_ctx_create();
+    edf_import_ctx_set_quiesce(c, 60);
+    edf_import_test_set_monotonic_us(0);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.deferred && u.root_pass,
+          "n4: future-dated root is initially deferred");
+    edf_import_test_set_monotonic_us(61000000);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.deferred && u.root_pass,
+          "n4: stable future root eventually imports");
+    edf_import_ctx_destroy(c);
+    edf_import_test_set_monotonic_us(-1);
 
     /* n5: window 0 (explicit "import now") ignores recency */
     fresh_tree();
@@ -2017,6 +2118,7 @@ static void phase_n(void)
     CHECK(t.sessions_imported == 1, "n5: quiesce 0 imports fresh files");
     edf_import_ctx_destroy(c);
 
+    s_fixture_mask_2210 = false;
     printf("phase n OK (%d checks)\n", g_checks);
 }
 
@@ -2054,10 +2156,10 @@ static void phase_o(void)
      * later day, so each reboot imported exactly one folder. */
     fresh_tree();
     snprintf(dir, sizeof(dir), "%s/20240115", IMPORT_DIR);
-    build_session_dir(dir, "20240115_221007", "20240115_221000", true, 2024, 1, 15);
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true, 2024, 1, 15);
     CHECK(crc_siblings(dir) == 5, "o1: 5 .crc siblings written");
     snprintf(dir, sizeof(dir), "%s/20240116", IMPORT_DIR);
-    build_session_dir(dir, "20240116_221007", "20240116_221000", true, 2024, 1, 16);
+    build_session_dir(dir, "20240116_221000", "20240116_221000", true, 2024, 1, 16);
     CHECK(crc_siblings(dir) == 5, "o1: second day's .crc siblings written");
     edf_import_ctx_t *c = edf_import_ctx_create();
     edf_import_unit_t t = drain(c, &units);
@@ -2080,7 +2182,7 @@ static void phase_o(void)
     FILE *f = fopen(p, "w");
     if (f) { fputs("keep me\n", f); fclose(f); }
     snprintf(dir, sizeof(dir), "%s/20240115", IMPORT_DIR);
-    build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
+    build_session_dir(dir, "20240115_221000", "20240115_221000", false, 2024, 1, 15);
     c = edf_import_ctx_create();
     t = drain(c, &units);
     CHECK(t.sessions_imported == 1, "o2: day after a leftover-only folder imports");
@@ -2089,11 +2191,11 @@ static void phase_o(void)
     CHECK(file_exists(notes), "o2: the user's own file is left alone");
     edf_import_ctx_destroy(c);
 
-    /* o3: a corrupt EDF is quarantined *.bad and must not pin the inbox */
+    /* o3: an unreadable candidate must not pin other days. */
     fresh_tree();
     snprintf(dir, sizeof(dir), "%s/20240115", IMPORT_DIR);
-    build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
-    snprintf(p, sizeof(p), "%s/20240115_221007_BRP.edf", dir);
+    build_session_dir(dir, "20240115_221000", "20240115_221000", false, 2024, 1, 15);
+    snprintf(p, sizeof(p), "%s/20240115_221000_BRP.edf", dir);
     f = fopen(p, "wb");
     if (f) { fputs("garbage", f); fclose(f); }
     char old_bad[760], new_bad[760], drift_path[760], crc_path[760];
@@ -2101,22 +2203,22 @@ static void phase_o(void)
     snprintf(new_bad, sizeof(new_bad), "%s.bad.1", p);
     f = fopen(old_bad, "w");
     if (f) { fputs("prior quarantine", f); fclose(f); }
-    snprintf(crc_path, sizeof(crc_path), "%s/20240115_221007_BRP.crc", dir);
+    snprintf(crc_path, sizeof(crc_path), "%s/20240115_221000_BRP.crc", dir);
     f = fopen(crc_path, "w");
     if (f) { fputs("checksum", f); fclose(f); }
     snprintf(drift_path, sizeof(drift_path), "%s/_bridge_drift.json", dir);
     f = fopen(drift_path, "w");
     if (f) { fputs("{\"source_of_truth\":{\"clock_drift_ms\":\"1000\"}}", f); fclose(f); }
     snprintf(dir, sizeof(dir), "%s/20240116", IMPORT_DIR);
-    build_session_dir(dir, "20240116_221007", "20240116_221000", false, 2024, 1, 16);
+    build_session_dir(dir, "20240116_221000", "20240116_221000", false, 2024, 1, 16);
     c = edf_import_ctx_create();
     t = drain(c, &units);
-    CHECK(t.files_rejected >= 1, "o3: corrupt EDF quarantined");
+    CHECK(file_exists(p), "o3: short source remains staged for retry");
     CHECK(t.sessions_imported == 1, "o3: the healthy day still imports");
     f = fopen(old_bad, "r");
     CHECK(f && fgetc(f) == 'p', "o3: previous quarantine is not overwritten");
     if (f) fclose(f);
-    CHECK(file_exists(new_bad), "o3: new quarantine uses a distinct filename");
+    CHECK(!file_exists(new_bad), "o3: ambiguous short source is not renamed");
     CHECK(file_exists(crc_path) && file_exists(drift_path),
           "o3: quarantined sources keep checksum and drift sidecars");
     snprintf(h2, sizeof(h2), "%s/20240116", IMPORT_DIR);
@@ -2290,7 +2392,7 @@ static void phase_r(void)
     CHECK(f != NULL, "create unverified local session");
     if (f) { fputs("{}", f); fclose(f); }
     snprintf(dir, sizeof(dir), "%s/20240117", DATALOG_DAY);
-    build_session_dir(dir, "20240117_221007", "20240117_221000", false, 2024, 1, 17);
+    build_session_dir(dir, "20240117_221000", "20240117_221000", false, 2024, 1, 17);
 
     edf_import_ctx_t *c = edf_import_ctx_create();
     edf_import_unit_t u;
@@ -2331,7 +2433,7 @@ static void phase_r(void)
                          2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, signals, 1, 0);
         }
         snprintf(dir, sizeof(dir), "%s/20240117", DATALOG_DAY);
-        build_session_dir(dir, "20240117_221007", "20240117_221000", false, 2024, 1, 17);
+        build_session_dir(dir, "20240117_221000", "20240117_221000", false, 2024, 1, 17);
         c = edf_import_ctx_create();
         CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
               "malformed, truncated or non-STR root retained");
@@ -2437,7 +2539,7 @@ static void phase_s(void)
     CHECK(mkdir(temp, 0775) == 0, "s1: block metadata write");
     char queued[800];
     snprintf(queued, sizeof(queued), "%s/20240117", DATALOG_DAY);
-    build_session_dir(queued, "20240117_221007", "20240117_221000", false, 2024, 1, 17);
+    build_session_dir(queued, "20240117_221000", "20240117_221000", false, 2024, 1, 17);
     edf_import_ctx_t *c = edf_import_ctx_create();
     edf_import_unit_t u;
     CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
@@ -2474,7 +2576,7 @@ static void phase_s(void)
     f = fopen(settings, "w");
     if (f) { fputs("{\"FlowGenerator\":{\"new\":true}}", f); fclose(f); }
     snprintf(dir, sizeof(dir), "%s/20240117", DATALOG_DAY);
-    build_session_dir(dir, "20240117_221007", "20240117_221000", false, 2024, 1, 17);
+    build_session_dir(dir, "20240117_221000", "20240117_221000", false, 2024, 1, 17);
     c = edf_import_ctx_create();
     CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
           "s2: foreign current settings retained rather than lost");
@@ -2489,19 +2591,19 @@ static void phase_s(void)
 
     fresh_tree();
     snprintf(dir, sizeof(dir), "%s/20240115", DATALOG_DAY);
-    build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
+    build_session_dir(dir, "20240115_221000", "20240115_221000", false, 2024, 1, 15);
     snprintf(queued, sizeof(queued), "%s/20240116", DATALOG_DAY);
-    build_session_dir(queued, "20240116_221007", "20240116_221000", false, 2024, 1, 16);
+    build_session_dir(queued, "20240116_221000", "20240116_221000", false, 2024, 1, 16);
     snprintf(temp, sizeof(temp), "%s/20240115", SD_STREAMS_DIR);
     mkpath(temp);
     snprintf(temp, sizeof(temp), "%s/20240115/20240115_221000_ident.json.tmp", SD_STREAMS_DIR);
     CHECK(mkdir(temp, 0775) == 0, "s3: block session identity write");
     c = edf_import_ctx_create();
-    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_failed == 1,
-          "s3: session identity failure reported");
-    snprintf(ident, sizeof(ident), "%s/20240115_221007_BRP.edf", dir);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_skipped == 1,
+          "s3: unowned identity artifact defers publication");
+    snprintf(ident, sizeof(ident), "%s/20240115_221000_BRP.edf", dir);
     CHECK(file_exists(ident), "s3: valid input retained under its original name");
-    snprintf(queued, sizeof(queued), "%s/20240115_221007_BRP.edf.bad", dir);
+    snprintf(queued, sizeof(queued), "%s/20240115_221000_BRP.edf.bad", dir);
     CHECK(!file_exists(queued), "s3: I/O failure is not mislabeled corrupt");
     CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_imported == 1,
           "s3: failed group does not starve later day");
@@ -2697,6 +2799,7 @@ static void phase_incremental_sources(void)
     snprintf(mp, sizeof(mp), "%s/%s/20240115_221000_session.json",
              SD_STREAMS_DIR, DAY);
     fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
     build_session_dir(dir, "20240115_221007", "20240115_221000", true,
                       2024, 1, 15);
     remove_fixture_kind(dir, "20240115_221007", "BRP");
@@ -2792,7 +2895,8 @@ static void phase_incremental_sources(void)
     c = edf_import_ctx_create();
     t = drain(c, &units);
     edf_import_ctx_destroy(c);
-    CHECK(t.sessions_imported == 1, "unidentified annotation session imports");
+    CHECK(t.sessions_imported == 0,
+          "unidentified annotation group remains staged");
     build_session_dir(dir, "20240115_221007", "20240115_221000", true,
                       2024, 1, 15);
     set_fixture_recording_id(dir, "Unknown machine");
@@ -2809,6 +2913,7 @@ static void phase_incremental_sources(void)
           "unverified late waveforms stay staged instead of creating a duplicate");
 
     fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
     build_session_dir(dir, "20240115_221007", "20240115_221000", true,
                       2024, 1, 15);
     remove_fixture_kind(dir, "20240115_221000", "EVE");
@@ -2908,6 +3013,7 @@ static void phase_incremental_sources(void)
           "same-length unconverted source change stays staged");
 
     fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
     build_session_dir(dir, "20240115_221007", "20240115_221000", true,
                       2024, 1, 15);
     remove_fixture_kind(dir, "20240115_221007", "BRP");
@@ -2970,6 +3076,7 @@ static void phase_incremental_sources(void)
     cJSON_Delete(m);
 
     fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
     build_session_dir(dir, "20240115_221007", "20240115_221000", true,
                       2024, 1, 15);
     write_growing_brp(dir, 3, false);
@@ -3018,6 +3125,7 @@ static void phase_incremental_sources(void)
     cJSON_Delete(m);
 
     fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
     build_session_dir(dir, "20240115_221007", "20240115_221000", true,
                       2024, 1, 15);
     c = edf_import_ctx_create();
@@ -3061,6 +3169,7 @@ static void phase_incremental_sources(void)
     free(events);
 
     fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
     build_session_dir(dir, "20240115_221007", "20240115_221000", true,
                       2024, 1, 15);
     snprintf(path, sizeof(path), "%s/20240115_221000_EVE.edf", dir);
@@ -3166,7 +3275,7 @@ static void phase_incremental_sources(void)
     snprintf(path, sizeof(path), "%s/%s/20240115_223715_session.json",
              SD_STREAMS_DIR, DAY);
     m = parse_json_file(mp);
-    CHECK(t.sessions_imported == 2 && m && !file_exists(path),
+    CHECK(t.sessions_imported == 1 && m && !file_exists(path),
           "native mask evidence reconciles 27-minute staggered anchors");
     if (m) {
         cJSON *v = cJSON_GetObjectItem(m, "waveform_offset_ms");
@@ -3290,13 +3399,354 @@ static void phase_incremental_sources(void)
     printf("incremental source reconciliation OK (%d checks)\n", g_checks);
 }
 
+/* Arrival order must not turn a timing guess into durable source ownership. */
+static void phase_grouping_arrival_safety(void)
+{
+    const char *a0 = "20240115_221000";
+    const char *a1 = "20240115_221014";
+    const char *wave = "20240115_221019";
+    char dir[300], source[700], manifest[700];
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+    snprintf(manifest, sizeof(manifest), "%s/%s/%s_session.json",
+             SD_STREAMS_DIR, DAY, a0);
+    int units;
+    edf_import_ctx_t *c;
+    edf_import_unit_t t;
+
+    fresh_tree();
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    build_session_dir(dir, wave, a1, true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, wave);
+    CHECK(t.sessions_imported == 0 && file_exists(source) && !file_exists(manifest),
+          "competing annotation stems and wave remain staged");
+
+    fresh_tree();
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, wave, "BRP");
+    remove_fixture_kind(dir, wave, "PLD");
+    remove_fixture_kind(dir, wave, "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1 && file_exists(manifest),
+          "annotation-only cohort may be published independently");
+    char *before = read_text(manifest);
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "EVE");
+    remove_fixture_kind(dir, a0, "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    char *after = read_text(manifest);
+    CHECK(t.sessions_imported == 0 && file_exists(source) && before && after &&
+          !strcmp(before, after),
+          "later waveform is not timing-joined to earlier annotation");
+    free(after);
+    build_session_dir(dir, wave, a1, true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    after = read_text(manifest);
+    CHECK(t.sessions_imported == 0 && file_exists(source) && before && after &&
+          !strcmp(before, after),
+          "later competing annotation leaves existing ownership unchanged");
+    free(before);
+    free(after);
+
+    fresh_tree();
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "EVE");
+    remove_fixture_kind(dir, a0, "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    char wave_manifest[700];
+    snprintf(wave_manifest, sizeof(wave_manifest), "%s/%s/%s_session.json",
+             SD_STREAMS_DIR, DAY, wave);
+    CHECK(t.sessions_imported == 1 && file_exists(wave_manifest),
+          "waveform-only cohort may be published independently");
+    before = read_text(wave_manifest);
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, wave, "BRP");
+    remove_fixture_kind(dir, wave, "PLD");
+    remove_fixture_kind(dir, wave, "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_EVE.edf", dir, a0);
+    after = read_text(wave_manifest);
+    CHECK(t.sessions_imported == 0 && file_exists(source) && before && after &&
+          !strcmp(before, after),
+          "waveform-first arrival does not accept a timing-only annotation");
+    free(before);
+    free(after);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    cJSON *m = parse_json_file(manifest);
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(m, "import_grouping_version");
+    CHECK(t.sessions_imported == 1 && cJSON_IsNumber(v) && v->valueint == 2,
+          "verified same-stem sources publish a versioned cohort");
+    cJSON_Delete(m);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "BRP");
+    remove_fixture_kind(dir, a0, "PLD");
+    remove_fixture_kind(dir, a0, "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "same-stem annotation-only cohort imports");
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "EVE");
+    remove_fixture_kind(dir, a0, "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(manifest);
+    v = cJSON_GetObjectItemCaseSensitive(m, "brp_samples");
+    CHECK(t.sessions_imported == 1 && cJSON_IsNumber(v) && v->valueint == 75,
+          "verified same-stem late waveform augments the new cohort");
+    cJSON_Delete(m);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "BRP");
+    remove_fixture_kind(dir, a0, "PLD");
+    remove_fixture_kind(dir, a0, "SA2");
+    remove_fixture_kind(dir, a0, "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "EVE can arrive before CSL");
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "BRP");
+    remove_fixture_kind(dir, a0, "PLD");
+    remove_fixture_kind(dir, a0, "SA2");
+    remove_fixture_kind(dir, a0, "EVE");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    char events_path[700];
+    snprintf(events_path, sizeof(events_path), "%s/%s/%s_events.snt",
+             SD_STREAMS_DIR, DAY, a0);
+    char *events = read_text(events_path);
+    m = parse_json_file(manifest);
+    const cJSON *hashes = cJSON_GetObjectItemCaseSensitive(m, "import_sha256");
+    CHECK(t.sessions_imported == 1 && events && strstr(events, "ObstructiveApneaEnd") &&
+          strstr(events, "CsrStart") &&
+          cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(hashes, "eve")) &&
+          cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(hashes, "csl")),
+          "late CSL preserves EVE events and both fingerprints");
+    free(events);
+    cJSON_Delete(m);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "BRP");
+    remove_fixture_kind(dir, a0, "PLD");
+    remove_fixture_kind(dir, a0, "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(manifest);
+    CHECK(m != NULL, "create synthetic pre-cohort manifest");
+    if (m) {
+        cJSON_DeleteItemFromObjectCaseSensitive(m, "import_grouping_version");
+        char *text = cJSON_PrintUnformatted(m);
+        FILE *f = fopen(manifest, "w");
+        CHECK(text && f && fputs(text, f) >= 0, "write synthetic legacy manifest");
+        if (f) fclose(f);
+        free(text);
+        cJSON_Delete(m);
+    }
+    before = read_text(manifest);
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "EVE");
+    remove_fixture_kind(dir, a0, "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, a0);
+    after = read_text(manifest);
+    CHECK(t.sessions_imported == 0 && file_exists(source) && before && after &&
+          !strcmp(before, after),
+          "late complementary source cannot mutate a pre-cohort session");
+    free(before);
+    free(after);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    char other_dir[300], old_manifest[700], other_manifest[700];
+    snprintf(other_dir, sizeof(other_dir), "%s/20240117", DATALOG_DAY);
+    build_session_dir(other_dir, "20240117_221000", "20240117_221000",
+                      true, 2024, 1, 17);
+    snprintf(old_manifest, sizeof(old_manifest), "%s/%s/legacy_session.json",
+             SD_STREAMS_DIR, DAY);
+    char day_dir[700];
+    snprintf(day_dir, sizeof(day_dir), "%s/%s", SD_STREAMS_DIR, DAY);
+    mkpath(day_dir);
+    FILE *broken = fopen(old_manifest, "w");
+    CHECK(broken && fputs("{truncated", broken) >= 0, "create unreadable manifest");
+    if (broken) fclose(broken);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, a0);
+    snprintf(other_manifest, sizeof(other_manifest),
+             "%s/20240117/20240117_221000_session.json", SD_STREAMS_DIR);
+    after = read_text(old_manifest);
+    CHECK(t.sessions_failed > 0 && t.sessions_imported == 1 && file_exists(source) &&
+          !file_exists(manifest) && file_exists(other_manifest) &&
+          after && !strcmp(after, "{truncated"),
+          "unreadable local manifest blocks only its cohort and preserves all evidence");
+    free(after);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    build_session_dir(dir, "20240115_200000", "20240115_200000",
+                      true, 2024, 1, 15);
+    mkpath(day_dir);
+    snprintf(old_manifest, sizeof(old_manifest), "%s/%s/20240115_220955_session.json",
+             SD_STREAMS_DIR, DAY);
+    broken = fopen(old_manifest, "w");
+    CHECK(broken && fputs("{\"state\":\"completed\",\"start_epoch_ms\":1705356595000,"
+                          "\"end_epoch_ms\":1705357200000,\"clock_drift_ms\":0,"
+                          "\"clock_drift_valid\":true}", broken) >= 0,
+          "create source-unattested historical session");
+    if (broken) fclose(broken);
+    before = read_text(old_manifest);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, a0);
+    snprintf(other_manifest, sizeof(other_manifest),
+             "%s/%s/20240115_200000_session.json", SD_STREAMS_DIR, DAY);
+    after = read_text(old_manifest);
+    CHECK(t.deferred_frozen > 0 && t.sessions_imported == 1 &&
+          file_exists(source) && !file_exists(manifest) && file_exists(other_manifest) &&
+          before && after && !strcmp(before, after),
+          "possible source for frozen session is staged; independent session imports");
+    free(before);
+    free(after);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    mkpath(day_dir);
+    broken = fopen(old_manifest, "w");
+    CHECK(broken && fputs("{\"state\":\"completed\",\"start_epoch_ms\":1705348800000,"
+                          "\"end_epoch_ms\":1705349400000,\"clock_drift_ms\":0,"
+                          "\"clock_drift_valid\":false}", broken) >= 0,
+          "create historical session without usable drift evidence");
+    if (broken) fclose(broken);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.deferred_frozen > 0 && t.sessions_imported == 0 &&
+          file_exists(source) && !file_exists(manifest),
+          "unknown historical drift cannot prove nearby-day independence");
+}
+
+static void phase_grouping_capacity(void)
+{
+    fresh_tree();
+    char dir[300], first[700], last[700], path[700];
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+    mkpath(dir);
+    first[0] = last[0] = '\0';
+    for (int i = 0; i < 193; i++) {
+        snprintf(path, sizeof(path), "%s/20240115_22%02d%02d_EVE.edf",
+                 dir, i / 60, i % 60);
+        FILE *f = fopen(path, "wb");
+        CHECK(f != NULL, "create synthetic capacity input");
+        if (f) fclose(f);
+        if (!i) snprintf(first, sizeof(first), "%s", path);
+        if (i == 192) snprintf(last, sizeof(last), "%s", path);
+    }
+    int units;
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 0 && t.sessions_failed > 0 &&
+          t.files_consumed == 0 && file_exists(first) && file_exists(last),
+          "over-capacity group retains all offered sources");
+}
+
+static void phase_stale_part_does_not_block(void)
+{
+    fresh_tree();
+    char dir[300], stale[700];
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true,
+                      2024, 1, 15);
+    snprintf(stale, sizeof(stale), "%s/old-transfer.part", dir);
+    FILE *f = fopen(stale, "wb");
+    CHECK(f != NULL, "create synthetic stale part");
+    if (f) fclose(f);
+    int units;
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_ctx_set_quiesce(c, 0);
+    edf_import_unit_t t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1 && file_exists(stale),
+          "explicit import ignores but preserves an unrelated stale part");
+}
+
+static void phase_stub_write_failure(void)
+{
+    fresh_tree();
+    char dir[300], source[700], manifest[700];
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true, 2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "BRP");
+    remove_fixture_kind(dir, "20240115_221000", "PLD");
+    remove_fixture_kind(dir, "20240115_221000", "SA2");
+    snprintf(source, sizeof(source), "%s/20240115_221000_EVE.edf", dir);
+    snprintf(manifest, sizeof(manifest), "%s/%s/20240115_221000_session.json",
+             SD_STREAMS_DIR, DAY);
+    int units;
+    fail_empty_flow_open = true;
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    fail_empty_flow_open = false;
+    CHECK(t.sessions_failed > 0 && file_exists(source) && !file_exists(manifest),
+          "failed empty-stream write keeps sources and publishes no manifest");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1 && file_exists(manifest),
+          "empty-stream write failure retries successfully");
+}
+
 int main(void)
 {
     setenv("TZ", "UTC", 1);
     tzset();
     snprintf(DATALOG_DAY, sizeof(DATALOG_DAY), "%s/DATALOG", IMPORT_DIR);
     mkpath(DATALOG_DAY);
-
+    if (getenv("EDF_IMPORT_PHASE_A")) {
+        phase_a();
+        rmtree(SD_MOUNT_POINT);
+        printf("edf_import_test: %d checks, %d failures\n", g_checks, g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (getenv("EDF_IMPORT_GROUPING_ONLY")) {
+        phase_h();
+        phase_grouping_arrival_safety();
+        phase_grouping_capacity();
+        phase_stale_part_does_not_block();
+        rmtree(SD_MOUNT_POINT);
+        printf("edf_import_test: %d checks, %d failures\n", g_checks, g_fail);
+        return g_fail ? 1 : 0;
+    }
     phase_a();
     phase_b();
     phase_c();
@@ -3319,6 +3769,10 @@ int main(void)
     phase_native_corruption();
     phase_store_budget();
     phase_incremental_sources();
+    phase_grouping_arrival_safety();
+    phase_grouping_capacity();
+    phase_stale_part_does_not_block();
+    phase_stub_write_failure();
 
     rmtree(SD_MOUNT_POINT);
     printf("edf_import_test: %d checks, %d failures\n", g_checks, g_fail);

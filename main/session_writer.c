@@ -1357,7 +1357,9 @@ static void pending_export_service(void)
              day, attempts + 1);
     crash_diag_note_activity("rebuild_day");
 
+    psram_work_begin("pending-rebuild", 24 * 1024);
     esp_err_t ret = edf_gen_rebuild_day(day);
+    psram_work_end("pending-rebuild-done", 24 * 1024);
     if (ret == ESP_OK) {
         /* Re-offer the day, then retire the marker.
          *
@@ -1457,6 +1459,7 @@ static void sw_post_task(void *arg)
             __atomic_sub_fetch(&s_post_in_flight, 1, __ATOMIC_SEQ_CST);
             continue;
         }
+        psram_work_begin("post-start", 24 * 1024);
 
         /* 1. Establish drift with honest provenance.
          *
@@ -1550,6 +1553,7 @@ static void sw_post_task(void *arg)
 
         if (storage_failed) {
             __atomic_sub_fetch(&s_post_in_flight, 1, __ATOMIC_SEQ_CST);
+            psram_work_end("post-storage-failed", 24 * 1024);
             ESP_LOGE(TAG, "post: storage failed for %s — skipping export",
                      session_id);
             if (!bsp_display_is_therapy_active()) uploader_request_scan();
@@ -1561,6 +1565,7 @@ static void sw_post_task(void *arg)
          * telemetry and the deferred incident diagnostics can see when
          * this flow is in flight. */
         bool spool_current = false;
+        psram_work_phase("post-collection", 24 * 1024);
         if (job.allow_ble) {
             s_post_active = true;
             ESP_LOGI(TAG, "post: starting post-therapy collection");
@@ -1585,6 +1590,7 @@ static void sw_post_task(void *arg)
          * at the exact moment a session needs exporting.  Release the
          * post-stop hold just before notifying the uploader so EV_EXPORT sees
          * the hold cleared and the complete day's EDFs already on disk. */
+        psram_work_phase("post-export", 24 * 1024);
         esp_err_t ret = edf_gen_generate(session_dir, session_id,
                                         start_epoch_ms, end_epoch_ms, drift_ms);
         __atomic_sub_fetch(&s_post_in_flight, 1, __ATOMIC_SEQ_CST);
@@ -1592,18 +1598,16 @@ static void sw_post_task(void *arg)
         as11_time_noon_day(start_epoch_ms - drift_ms, day_folder, sizeof(day_folder));
         if (ret == ESP_OK) {
             uploader_on_export_complete(day_folder);
-        } else if (ret == ESP_ERR_TIMEOUT) {
+        } else if (ret == ESP_ERR_TIMEOUT || ret == ESP_ERR_NO_MEM) {
             /* The export lease was held by a long upload run (edf_gen_generate
              * gives up after 120 s).  Nothing is wrong with the session itself,
              * so leave a pending-export marker and let the idle worker rebuild
              * the day rather than losing the night.
              *
-             * Only this error defers.  A malformed session or an invalid
-             * timestamp fails identically on every retry, so marking those
-             * would burn the attempt budget and end in a stalled marker that
-             * needs attention, having achieved nothing. */
-            ESP_LOGW(TAG, "post: export lease busy, marking day %s "
-                     "for deferred export", day_folder);
+             * PSRAM exhaustion is also transient. Malformed sessions and
+             * invalid timestamps still fail rather than burning retries. */
+            ESP_LOGW(TAG, "post: export unavailable (%s), marking day %s "
+                     "for deferred export", esp_err_to_name(ret), day_folder);
             pending_export_mark(day_folder);
         } else {
             ESP_LOGW(TAG, "post: EDF generation failed (%s), not triggering upload",
@@ -1623,6 +1627,7 @@ static void sw_post_task(void *arg)
             ESP_LOGI(TAG, "post worker: peak stack headroom %u bytes",
                      (unsigned)free_bytes);
         }
+        psram_work_end("post-done", 24 * 1024);
     }
 }
 
@@ -1651,7 +1656,7 @@ esp_err_t session_writer_init(void)
         ESP_LOGE(TAG, "storage worker creation failed");
         return ESP_ERR_NO_MEM;
     }
-    s_post_task = psram_task_create(sw_post_task, "sw_post", 16384,
+    s_post_task = psram_task_create(sw_post_task, "sw_post", 24 * 1024,
                                     NULL, 5, 1, NULL, NULL);
     if (!s_post_task) {
         ESP_LOGE(TAG, "post worker creation failed");

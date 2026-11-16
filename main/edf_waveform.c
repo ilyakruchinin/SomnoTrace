@@ -363,11 +363,8 @@ esp_err_t edf_convert_snt_to_edf(const char *snt_path, const char *edf_path,
     size_t record_bytes = record_data_samples * sizeof(int16_t);
     size_t raw_record_bytes = samples_per_record * snt_channels * sizeof(int16_t);
 
-    int16_t *raw = malloc(raw_record_bytes);
-    int16_t *record_buf = heap_caps_malloc(record_bytes, MALLOC_CAP_SPIRAM);
-    if (!record_buf) {
-        record_buf = malloc(record_bytes);
-    }
+    int16_t *raw = heap_caps_malloc(raw_record_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int16_t *record_buf = heap_caps_malloc(record_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!raw || !record_buf) {
         ESP_LOGE(TAG, "malloc record buffers failed");
         free(raw); free(record_buf); free(spr); free(sig);
@@ -390,15 +387,15 @@ esp_err_t edf_convert_snt_to_edf(const char *snt_path, const char *edf_path,
             if (snt2) {
                 int n_samp = (int)(avail / (snt_channels * sizeof(int16_t)));
                 size_t ch_bytes = (size_t)n_samp * sizeof(int16_t);
-                int16_t *flow_buf = malloc(ch_bytes);
-                int16_t *press_buf = malloc(ch_bytes);
+                int16_t *flow_buf = heap_caps_malloc(ch_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                int16_t *press_buf = heap_caps_malloc(ch_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
                 if (!flow_buf || !press_buf) {
                     ESP_LOGW(TAG, "v2 interleave malloc failed at record %d", rec);
                     free(flow_buf); free(press_buf);
                     free(raw); free(record_buf); free(spr); free(sig);
                     edf_discard_atomic_file(edf, tmp_path);
                     fclose(snt); fclose(snt2);
-                    return ESP_FAIL;
+                    return ESP_ERR_NO_MEM;
                 }
                 if (fread(flow_buf, 1, ch_bytes, snt) != ch_bytes ||
                     fread(press_buf, 1, ch_bytes, snt2) != ch_bytes) {

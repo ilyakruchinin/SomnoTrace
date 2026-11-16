@@ -4494,6 +4494,8 @@ function connectWs() {
 }
 
 document.addEventListener('visibilitychange', function() {
+  if (!document.hidden && dashNoonDay && !dashIsLoading)
+    refreshStageAvailability(dashNoonDay, dashLoadId);
   if (!appWs || appWs.readyState !== WebSocket.OPEN) return;
   if (document.hidden) {
     try { appWs.send('pause'); } catch(e) {}
@@ -5939,6 +5941,32 @@ function fetchSntFile(sessionId, noonDay, type) {
   }).catch(function() { return null; });
 }
 
+/* Cached historical sessions can acquire stages after their first display. */
+function refreshStageAvailability(noonDay, loadId) {
+  if (!noonDay || !dashSessions.length) return Promise.resolve();
+  return fetch('/api/sessions?date=' + noonDay, {cache: 'no-store'})
+    .then(function(r) { return r.ok ? r.json() : null; })
+    .then(function(sessions) {
+      if (loadId !== dashLoadId || noonDay !== dashNoonDay || !Array.isArray(sessions)) return;
+      var pending = [];
+      dashSessions.forEach(function(session, idx) {
+        var updated = sessions.find(function(s) { return s.id === session.id; });
+        var data = dashSessionData[idx];
+        if (!updated || !data) return;
+        session.has_stages = updated.has_stages;
+        session.stage_status = updated.stage_status;
+        if (updated.has_stages !== true || data.stg || data.noTherapy) return;
+        pending.push(fetchSntFile(session.id, noonDay, 'stages').then(function(buf) {
+          if (loadId !== dashLoadId || noonDay !== dashNoonDay ||
+              dashSessionData[idx] !== data || !buf) return;
+          var stages = parseSst(buf);
+          if (stages) { data.stg = stages; renderDashboardCharts(); }
+        }));
+      });
+      return Promise.all(pending);
+    }).catch(function() {});
+}
+
 /* ── Summary (AHI / usage / leak / pressure) ─────────────────────── */
 function fmtUsage(min) {
   if (min == null || isNaN(min)) return '--';
@@ -6663,6 +6691,7 @@ function loadDashboardData() {
     loadEvents(noonDay, myLoadId);
     dashIsLoading = false;
     dashProgDone();
+    refreshStageAvailability(noonDay, myLoadId);
     return;
   }
 
@@ -6766,7 +6795,9 @@ function loadDashboardData() {
           var fetchSa2 = (s.sa2_samples && s.sa2_samples > 0)
             ? fetchSntFile(s.id, noonDay, 'sa2')
             : Promise.resolve(null);
-          var fetchStg = fetchSntFile(s.id, noonDay, 'stages');
+          var fetchStg = s.has_stages === false
+            ? Promise.resolve(null)
+            : fetchSntFile(s.id, noonDay, 'stages');
           return Promise.all([fetchPld, fetchSa2, fetchStg]);
         }).then(function(res) {
           if (myLoadId !== dashLoadId || !res) return;  /* cancelled */

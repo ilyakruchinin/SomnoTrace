@@ -65,6 +65,7 @@ esp_err_t edf_finalize_atomic_file(FILE *f, const char *tmp_path, const char *pa
 void edf_discard_atomic_file(FILE *f, const char *tmp_path);
 
 cJSON *edf_read_json_file(const char *path);
+esp_err_t edf_read_json_file_checked(const char *path, cJSON **out);
 esp_err_t edf_write_json_file(const char *path, const cJSON *json);
 uint8_t *edf_read_bin_file(const char *path, size_t *out_len);
 

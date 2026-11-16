@@ -53,6 +53,10 @@ void log_stream_init(void);
  */
 void log_stream_register_handlers(httpd_handle_t server);
 
+/* Quiesce cross-task queue submissions before stopping/replacing a server. */
+void log_stream_ws_server_stopping(httpd_handle_t server);
+void log_stream_ws_server_started(httpd_handle_t server);
+
 /**
  * Push a typed JSON envelope frame down the active WebSocket connection.
  * Format: {"type": "<type>", "data": <data_obj>}

@@ -34,8 +34,19 @@
 #include <unistd.h>
 #include "somno_ml_features.h"
 #include "somno_stage_csv.h"
+#include "esp_heap_caps.h"
 int64_t host_now_us = 1000000;
 int host_heap_caps_malloc_fail;
+static int worker_alloc_calls, worker_fail_alloc_at;
+static void *host_worker_caps_malloc(size_t size, unsigned caps)
+{
+    (void)caps;
+    worker_alloc_calls++;
+    if (host_heap_caps_malloc_fail ||
+        (worker_fail_alloc_at && worker_alloc_calls == worker_fail_alloc_at))
+        return NULL;
+    return malloc(size);
+}
 static int created, destroyed;
 somno_feat_t *__real_somno_feat_create(double dt, int motion);
 somno_feat_t *__wrap_somno_feat_create(double dt, int motion)
@@ -121,6 +132,9 @@ static void rm_tree(const char *path)
 #define unlink(p)     host_unlink(p)
 #define somno_stage_write_zeo_csv_file(c, h, s) host_zeo(c, h, s)
 #define somno_stage_export_csv_from_sst(s, c)   host_backfill(s, c)
+#undef heap_caps_malloc
+#define heap_caps_malloc(size, caps) host_worker_caps_malloc((size), (caps))
+#define SOMNO_ML_WORKER_TEST 1
 #include "somno_ml_worker.c"
 
 bool somno_ml_available(void) { return true; }
@@ -141,10 +155,15 @@ int somno_ml_decode_night(const somno_model_t *m, const double *probs, int n,
     }
     return 0;
 }
+static bool fail_queue, fail_mutex, fail_task;
+static int queue_deleted, mutex_deleted;
 QueueHandle_t xQueueCreate(UBaseType_t n, UBaseType_t size)
 {
-    (void)n; (void)size; return (void *)1;
+    (void)n; (void)size; return fail_queue ? NULL : (void *)1;
 }
+void vQueueDelete(QueueHandle_t q) { assert(q); queue_deleted++; }
+SemaphoreHandle_t xSemaphoreCreateMutex(void) { return fail_mutex ? NULL : (void *)1; }
+void vSemaphoreDelete(SemaphoreHandle_t mutex) { assert(mutex); mutex_deleted++; }
 static int queue_sends;
 BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t ticks)
 {
@@ -161,8 +180,38 @@ TaskHandle_t xTaskCreateStaticPinnedToCore(TaskFunction_t fn, const char *name,
 {
     (void)fn; (void)name; (void)arg; (void)priority; (void)core;
     assert(size >= 24 * 1024);
+    if (fail_task) return NULL;
     free(stack); free(tcb);
     return (void *)1;
+}
+
+static void test_worker_start_failures(void)
+{
+    fail_queue = true;
+    somno_ml_worker_start();
+    assert(!s_queue);
+    fail_queue = false;
+
+    fail_mutex = true;
+    somno_ml_worker_start();
+    assert(!s_queue && !s_pending_mux && queue_deleted == 1);
+    fail_mutex = false;
+
+    worker_alloc_calls = 0;
+    worker_fail_alloc_at = 1;
+    somno_ml_worker_start();
+    assert(!s_queue && !s_pending_mux && queue_deleted == 2 && mutex_deleted == 1);
+
+    worker_alloc_calls = 0;
+    worker_fail_alloc_at = 2;
+    somno_ml_worker_start();
+    assert(!s_queue && !s_pending_mux && queue_deleted == 3 && mutex_deleted == 2);
+    worker_fail_alloc_at = 0;
+
+    fail_task = true;
+    somno_ml_worker_start();
+    assert(!s_queue && !s_pending_mux && queue_deleted == 4 && mutex_deleted == 3);
+    fail_task = false;
 }
 static void fixture(const char *dir, int index, ring_rec_t *rec)
 {
@@ -343,13 +392,16 @@ static void test_sa2_grown(const char *dir)
     assert(somno_ml_score_file(&job) == 0);
     FILE *rf = fopen(sst, "rb"); assert(rf);
     size_t ref_n = fread(ref, 1, sizeof(ref), rf); fclose(rf);
-    assert(unlink(sst) == 0);
-    host_heap_caps_malloc_fail = 1;      /* PSRAM exhausted: plain-malloc fallbacks */
-    assert(somno_ml_score_file(&job) == 0);
+    struct utimbuf stale = { time(NULL) - 3600, time(NULL) - 3600 };
+    assert(utime(sst, &stale) == 0);
+    host_heap_caps_malloc_fail = 1;      /* PSRAM exhaustion must preserve the old SST */
+    assert(somno_ml_score_file(&job) != 0);
     host_heap_caps_malloc_fail = 0;
     rf = fopen(sst, "rb"); assert(rf);
     assert(fread(got, 1, sizeof(got), rf) == ref_n); fclose(rf);
     assert(memcmp(ref, got, ref_n) == 0);
+    assert(unlink(sst) == 0);
+    assert(somno_ml_score_file(&job) == 0);
     int flags = somno_ml_sst_validate(sst, sv, sizeof(sv));
     assert(flags >= 0 && !(flags & (SOMNO_SST_FLAG_PARTIAL | SOMNO_SST_FLAG_INSUFFICIENT)));
     assert(strcmp(sv, somno_ml_model_semver()) == 0);
@@ -581,7 +633,9 @@ int main(void)
     assert(!as11_is_recording(active.dir,active.id));
     assert(somno_ml_score_file(&active) == -1);
     assert(score_ring_group(NULL,0,"synthetic") == -1);
+    test_worker_start_failures();
     somno_ml_worker_start();
+    assert(s_queue && s_pending_mux);
     test_deadlines();
     puts("somno_worker_test: allocations, active-source deferral and stack budget passed");
     return 0;

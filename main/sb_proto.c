@@ -348,3 +348,52 @@ bool sb_hex_str_ok(const char *s, size_t n)
     }
     return true;
 }
+
+void sb_catalog_window_init(sb_catalog_window_t *window, int requested, int offered,
+                            bool catalog_complete, bool hot_ready)
+{
+    memset(window, 0, sizeof(*window));
+    window->offered = offered;
+    window->catalog_complete = catalog_complete;
+    window->hot_ready = hot_ready;
+    if (requested <= 0 || offered < 0 || offered > requested) window->failed++;
+}
+
+bool sb_catalog_window_accept(sb_catalog_window_t *window, const char *day)
+{
+    bool valid = day && strlen(day) == 8;
+    for (int i = 0; valid && i < 8; i++)
+        if (day[i] < '0' || day[i] > '9') valid = false;
+    if (valid && window->previous[0] && strcmp(window->previous, day) <= 0)
+        valid = false;
+    if (!valid) { window->failed++; return false; }
+    memcpy(window->previous, day, 9);
+    window->accepted++;
+    return true;
+}
+
+void sb_catalog_window_failed(sb_catalog_window_t *window, const char *code)
+{
+    if (code && !strcmp(code, "NOT_SCANNED")) window->warming++;
+    else window->failed++;
+}
+
+bool sb_catalog_window_ready(const sb_catalog_window_t *window)
+{
+    return window->catalog_complete && window->hot_ready &&
+           window->accepted == window->offered && window->checked == window->offered &&
+           window->warming == 0 && window->failed == 0;
+}
+
+bool sb_catalog_unpaged(const cJSON *result)
+{
+    static const char *const keys[] = {"more", "has_more", "next", "next_offset"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const cJSON *v = cJSON_GetObjectItem(result, keys[i]);
+        if (!v || cJSON_IsNull(v) || cJSON_IsFalse(v)) continue;
+        if (cJSON_IsNumber(v) && v->valuedouble == 0) continue;
+        if (cJSON_IsString(v) && v->valuestring && !v->valuestring[0]) continue;
+        return false;
+    }
+    return true;
+}

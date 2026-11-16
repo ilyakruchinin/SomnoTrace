@@ -163,25 +163,39 @@ void edf_discard_atomic_file(FILE *f, const char *tmp_path)
     if (tmp_path) unlink(tmp_path);
 }
 
-cJSON *edf_read_json_file(const char *path)
+esp_err_t edf_read_json_file_checked(const char *path, cJSON **out)
 {
+    if (!path || !out) return ESP_ERR_INVALID_ARG;
+    *out = NULL;
     FILE *f = fopen(path, "r");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
+    if (!f) return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return ESP_FAIL; }
     long fsize = ftell(f);
     if (fsize < 0 || fsize > 1024 * 1024 || fseek(f, 0, SEEK_SET) != 0) {
         fclose(f);
-        return NULL;
+        return ESP_FAIL;
     }
     char *buf = heap_caps_malloc((size_t)fsize + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf && fsize <= 4096) buf = malloc((size_t)fsize + 1);
-    if (!buf) { fclose(f); return NULL; }
+    if (!buf) { fclose(f); return ESP_ERR_NO_MEM; }
     size_t rd = fread(buf, 1, fsize, f);
     buf[rd] = '\0';
-    fclose(f);
-    if (rd != (size_t)fsize) { free(buf); return NULL; }
+    bool ok = rd == (size_t)fsize && !ferror(f);
+    if (fclose(f) != 0) ok = false;
+    if (!ok) { free(buf); return ESP_FAIL; }
+    errno = 0;
     cJSON *json = cJSON_Parse(buf);
+    int parse_errno = errno;
     free(buf);
+    if (!json) return parse_errno == ENOMEM ? ESP_ERR_NO_MEM : ESP_FAIL;
+    *out = json;
+    return ESP_OK;
+}
+
+cJSON *edf_read_json_file(const char *path)
+{
+    cJSON *json = NULL;
+    (void)edf_read_json_file_checked(path, &json);
     return json;
 }
 
@@ -502,8 +516,7 @@ esp_err_t edf_generate_identification_files(const char *edf_dir,
             unlink(crc_path);
         }
     } else {
-        unlink(crc_path);
-        ESP_LOGW(TAG, "Identification.json write failed — removed stale %s", crc_path);
+        ESP_LOGW(TAG, "identification write failed — retaining previous files");
     }
 
     free(json_str);

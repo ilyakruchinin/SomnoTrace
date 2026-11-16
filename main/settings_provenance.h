@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "cJSON.h"
+#include "esp_err.h"
 
 #define SETTINGS_PROVENANCE_KEY "_somnotrace_provenance"
 #define SETTINGS_SOURCE_LIVE "live"
@@ -152,3 +153,12 @@ bool settings_provenance_session_is_bridge_unverified(const char *day, const cha
                                                       const char *serial, int family);
 bool settings_provenance_session_matches(const char *day, const char *session,
                                         const char *serial, int family);
+
+/* Export must distinguish unavailable evidence from an actual conflict. */
+esp_err_t settings_provenance_session_checked(const char *day, const char *session,
+                                              const char *serial, int family,
+                                              bool *match, bool *bridge_unverified);
+esp_err_t settings_provenance_day_conflicts_checked(const char *day, const char *serial,
+                                                    int family, bool *conflict);
+esp_err_t settings_provenance_covers_sessions_checked(const cJSON *root, const char *day,
+                                                      bool *covered);
