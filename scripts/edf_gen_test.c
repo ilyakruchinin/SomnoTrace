@@ -1640,6 +1640,25 @@ static void test_daily_settings_provenance(void)
         CHECK(!read && native_day_blocked(day, SETTINGS_FAMILY_AS11, "fixture-machine", read),
               "corrupt native day does not fall back to old evidence");
         cJSON_Delete(read);
+        /* A native record declaring another machine carries no authority
+         * here: it must be skipped, not gate this machine's resolution or
+         * block the day (mixed-machine noon-days are legitimate). */
+        CHECK(settings_provenance_set_serial(native, "other-machine"),
+              "relabel native record as foreign");
+        json = cJSON_PrintUnformatted(native);
+        write_text(path, json);
+        free(json);
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+        CHECK(read && settings_provenance_is(read, SETTINGS_SOURCE_IMPORTED_STR, day, NULL),
+              "foreign native record defers to own imported settings");
+        CHECK(!native_day_blocked(day, SETTINGS_FAMILY_AS11, "fixture-machine", read),
+              "foreign native record does not block the day");
+        cJSON_Delete(read);
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "other-machine");
+        CHECK(read == NULL &&
+              native_day_blocked(day, SETTINGS_FAMILY_AS11, "other-machine", read),
+              "the record still gates its own machine when the day conflicts");
+        cJSON_Delete(read);
         unlink(path);
         cJSON_Delete(native);
     }

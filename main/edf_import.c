@@ -3145,6 +3145,7 @@ typedef enum {
     IMP_ASSOC_INDEPENDENT = 0,
     IMP_ASSOC_SAME_SOURCE,
     IMP_ASSOC_NATIVE_INTERVAL,
+    IMP_ASSOC_HEURISTIC,
     IMP_ASSOC_DEFER_UNKNOWN,
     IMP_ASSOC_DEFER_CONFLICT
 } imp_assoc_t;
@@ -3298,6 +3299,20 @@ static esp_err_t find_import_match(const char *dir, imp_work_t *w,
              incoming_end_dev >= old_wave))
             near = true;
         if (different && !exact && !same_stem) {
+            /* Not the same cohort — but a stored annotation-only session
+             * may still contest a wave grafted onto another annotation.
+             * Mirror the wave-alone rule so a bundled source cannot bypass
+             * a pending claim: a proven shared mask interval contests
+             * outright, STR silence contests inside the unproven window,
+             * and a proven different interval exonerates. */
+            if (old_ann >= 0 && old_wave < 0 && cl->wav_ts >= old_ann &&
+                (mask_pair == 1 ||
+                 (mask_pair != 0 &&
+                  (cl->wav_ts - old_ann <= IMP_UNCERTAIN_MS ||
+                   (json_i64(m, "end_epoch_ms", &prior_end) &&
+                    json_i64(m, "clock_drift_ms", &prior_shift) &&
+                    cl->wav_ts <= prior_end - prior_shift)))))
+                conflict = true;
             cJSON_Delete(m);
             continue;
         }
@@ -5113,8 +5128,20 @@ static void associate_clusters(imp_cluster_t *clusters, int n,
             bool same_stem = combined.eve_ts == combined.wav_ts;
             bool candidate = llabs(combined.wav_ts - combined.eve_ts) <= IMP_MATCH_MS ||
                              relation >= 0;
-            imp_assoc_t decision = association_policy(ident != NULL, same_stem, relation, false);
+            bool verified = ident != NULL;
+            imp_assoc_t decision = association_policy(verified, same_stem, relation, false);
             cJSON_Delete(ident);
+            /* Verified machine and MaskOn inside the one-minute window after
+             * TherapyStart is the pairing the importer has always used.
+             * STR silence must not stall it: the day's STR snapshot is
+             * written only after the sessions it could prove, so relation -1
+             * is the normal state for a same-day bridge import.  Backward
+             * stems (MaskOn before TherapyStart) still defer — a wave cannot
+             * precede its own session. */
+            if (decision == IMP_ASSOC_DEFER_UNKNOWN && verified &&
+                combined.wav_ts >= combined.eve_ts &&
+                combined.wav_ts - combined.eve_ts <= IMP_MATCH_MS)
+                decision = IMP_ASSOC_HEURISTIC;
             if (!candidate || decision == IMP_ASSOC_INDEPENDENT) continue;
             a->decision[i][j] = (uint8_t)decision;
             a->claims[i]++;
@@ -5138,14 +5165,14 @@ static void associate_clusters(imp_cluster_t *clusters, int n,
         for (int j = 0; j < n; j++) {
             imp_assoc_t decision = (imp_assoc_t)a->decision[i][j];
             if (a->pending[j] || (decision != IMP_ASSOC_SAME_SOURCE &&
-                                  decision != IMP_ASSOC_NATIVE_INTERVAL)) continue;
+                                  decision != IMP_ASSOC_NATIVE_INTERVAL &&
+                                  decision != IMP_ASSOC_HEURISTIC)) continue;
             clusters[i].brp = clusters[j].brp;
             clusters[i].pld = clusters[j].pld;
             clusters[i].sa2 = clusters[j].sa2;
             clusters[i].wav_ts = clusters[j].wav_ts;
             a->merged[j] = true;
-            a->retain_raw[i] = decision == IMP_ASSOC_NATIVE_INTERVAL &&
-                               clusters[i].eve_ts != clusters[i].wav_ts;
+            a->retain_raw[i] = clusters[i].eve_ts != clusters[i].wav_ts;
             break;
         }
     }

@@ -1673,18 +1673,25 @@ static cJSON *read_daily_settings_checked(const char *day, int family,
         *error = edf_read_json_file_checked(path, &native);
         if (*error != ESP_OK) return NULL;
         const char *source_serial = settings_provenance_serial(native);
-        const cJSON *fields = cJSON_GetObjectItemCaseSensitive(
-            native, family == SETTINGS_FAMILY_AS10 ? "_as10_edf_settings" : "_as11_edf_settings");
-        if (settings_provenance_is(native, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) &&
-            native_fields_valid(fields, family) &&
-            settings_provenance_is_family(native, family) &&
-            source_serial && !strcmp(source_serial, serial)) {
-            bool conflict = false;
-            *error = settings_provenance_day_conflicts_checked(day, serial, family, &conflict);
-            if (*error == ESP_OK && !conflict) return native;
+        if (source_serial && source_serial[0] && strcmp(source_serial, serial)) {
+            /* The daily record declares a different machine — it carries no
+             * authority over this one's STR.  Treat it as absent and let
+             * this machine's own sources resolve below. */
+            cJSON_Delete(native);
+        } else {
+            const cJSON *fields = cJSON_GetObjectItemCaseSensitive(
+                native, family == SETTINGS_FAMILY_AS10 ? "_as10_edf_settings" : "_as11_edf_settings");
+            if (settings_provenance_is(native, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) &&
+                native_fields_valid(fields, family) &&
+                settings_provenance_is_family(native, family) &&
+                source_serial && !strcmp(source_serial, serial)) {
+                bool conflict = false;
+                *error = settings_provenance_day_conflicts_checked(day, serial, family, &conflict);
+                if (*error == ESP_OK && !conflict) return native;
+            }
+            cJSON_Delete(native);
+            return NULL;
         }
-        cJSON_Delete(native);
-        return NULL;
     }
     snprintf(path, sizeof(path), "%s/%s.imported.settings.json", SD_SUMMARIES_DIR, day);
     cJSON *settings = NULL;
@@ -1932,6 +1939,17 @@ static bool native_day_blocked(const char *day, int family, const char *serial,
     struct stat st;
     snprintf(path, sizeof(path), "%s/%s.native.settings.json", SD_SUMMARIES_DIR, day);
     if (stat(path, &st) != 0 && errno == ENOENT) return false;
+    /* A record declaring a different machine is not this machine's evidence
+     * and cannot gate its STR.  Unreadable or unattributable files keep the
+     * gate — fail closed. */
+    cJSON *native = NULL;
+    if (edf_read_json_file_checked(path, &native) == ESP_OK) {
+        const char *source_serial = settings_provenance_serial(native);
+        bool foreign = source_serial && source_serial[0] &&
+                       strcmp(source_serial, serial) != 0;
+        cJSON_Delete(native);
+        if (foreign) return false;
+    }
     return !settings_provenance_is(settings, SETTINGS_SOURCE_NATIVE_DAY, day, NULL);
 }
 

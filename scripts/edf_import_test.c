@@ -3652,6 +3652,46 @@ static void phase_grouping_arrival_safety(void)
     CHECK(t.deferred_frozen > 0 && t.sessions_imported == 0 &&
           file_exists(source) && !file_exists(manifest),
           "unknown historical drift cannot prove nearby-day independence");
+
+    /* Verified machine, MaskOn 19 s after TherapyStart, and no usable STR
+     * coverage — the normal state of a same-day bridge import, whose STR
+     * snapshot is written only after the sessions it could prove.  The
+     * legacy one-minute pairing still applies; cross-stem evidence stays. */
+    fresh_tree();
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, wave);
+    CHECK(t.sessions_imported == 1 && file_exists(manifest) && file_exists(source) &&
+          t.files_consumed == 0,
+          "verified one-minute gap pairs without STR evidence; sources retained");
+
+    /* The reverse order cannot be the same session — a wave cannot precede
+     * its own TherapyStart — so the heuristic never runs backward. */
+    fresh_tree();
+    build_session_dir(dir, a0, wave, true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, a0);
+    snprintf(wave_manifest, sizeof(wave_manifest),
+             "%s/%s/%s_session.json", SD_STREAMS_DIR, DAY, wave);
+    CHECK(t.sessions_imported == 0 && file_exists(source) &&
+          !file_exists(wave_manifest),
+          "MaskOn before TherapyStart cannot be its own session — staged");
+
+    /* A one-minute gap earns the pairing only for a verified machine —
+     * unverifiable identity stays staged. */
+    fresh_tree();
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    set_fixture_recording_id(dir, "X X X X");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, wave);
+    CHECK(t.sessions_imported == 0 && file_exists(source) && !file_exists(manifest),
+          "unverifiable machine keeps a one-minute gap staged");
 }
 
 static void phase_grouping_capacity(void)
