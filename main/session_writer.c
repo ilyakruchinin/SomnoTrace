@@ -1332,6 +1332,10 @@ static void pending_export_service(void)
         ESP_LOGW(TAG, "pending export: day %s no longer on the card — "
                  "dropping marker", day);
         unlink(path);
+        /* A publish sentinel naming this day can never be serviced — nothing
+         * remains to rebuild it from — and would block every other day's
+         * publish forever. */
+        edf_gen_release_interrupted_rebuild(day);
         return;
     }
 
@@ -1378,6 +1382,7 @@ static void pending_export_service(void)
         ESP_LOGE(TAG, "pending export: day %s failed permanently (%s) — "
                  "needs attention, not retrying", day, esp_err_to_name(ret));
         pending_update(day, attempts + 1, true, ret);
+        edf_gen_release_interrupted_rebuild(day);
     } else {
         int next = attempts + 1;
         bool give_up = (next >= PENDING_MAX_ATTEMPTS);
@@ -1385,6 +1390,7 @@ static void pending_export_service(void)
                  day, esp_err_to_name(ret), next, PENDING_MAX_ATTEMPTS,
                  give_up ? " — giving up, needs attention" : "");
         pending_update(day, next, give_up, ret);
+        if (give_up) edf_gen_release_interrupted_rebuild(day);
     }
     crash_diag_note_activity("idle");
 }

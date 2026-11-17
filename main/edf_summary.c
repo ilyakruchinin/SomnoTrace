@@ -1686,7 +1686,8 @@ static cJSON *read_daily_settings_checked(const char *day, int family,
                 settings_provenance_is_family(native, family) &&
                 source_serial && !strcmp(source_serial, serial)) {
                 bool conflict = false;
-                *error = settings_provenance_day_conflicts_checked(day, serial, family, &conflict);
+                *error = settings_provenance_day_conflicts_checked(day, serial, family, &conflict,
+                                                                   NULL);
                 if (*error == ESP_OK && !conflict) return native;
             }
             cJSON_Delete(native);
@@ -1704,7 +1705,8 @@ static cJSON *read_daily_settings_checked(const char *day, int family,
         bool covered = false, conflict = false;
         *error = settings_provenance_covers_sessions_checked(settings, day, &covered);
         if (*error == ESP_OK && covered)
-            *error = settings_provenance_day_conflicts_checked(day, serial, family, &conflict);
+            *error = settings_provenance_day_conflicts_checked(day, serial, family, &conflict,
+                                                               NULL);
         if (*error == ESP_OK && covered && !conflict) return settings;
     }
     cJSON_Delete(settings);
@@ -1943,14 +1945,31 @@ static bool native_day_blocked(const char *day, int family, const char *serial,
      * and cannot gate its STR.  Unreadable or unattributable files keep the
      * gate — fail closed. */
     cJSON *native = NULL;
-    if (edf_read_json_file_checked(path, &native) == ESP_OK) {
-        const char *source_serial = settings_provenance_serial(native);
-        bool foreign = source_serial && source_serial[0] &&
-                       strcmp(source_serial, serial) != 0;
-        cJSON_Delete(native);
-        if (foreign) return false;
-    }
-    return !settings_provenance_is(settings, SETTINGS_SOURCE_NATIVE_DAY, day, NULL);
+    bool valid = edf_read_json_file_checked(path, &native) == ESP_OK;
+    const char *source_serial = settings_provenance_serial(native);
+    bool foreign = source_serial && source_serial[0] &&
+                   strcmp(source_serial, serial) != 0;
+    bool claim = valid &&
+                 settings_provenance_is(native, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) &&
+                 settings_provenance_is_family(native, family) &&
+                 source_serial && source_serial[0] &&
+                 strcmp(source_serial, serial) == 0;
+    cJSON_Delete(native);
+    if (foreign) return false;
+    if (settings_provenance_is(settings, SETTINGS_SOURCE_NATIVE_DAY, day, NULL))
+        return false;
+    /* A valid same-machine claim withheld when the day contains evidence
+     * that cannot be attributed (unreadable, rather than proven foreign)
+     * degrades to a settings-less record like any other conflict — it
+     * does not block the export.  Verified-foreign conflicts and any
+     * other unresolved reason still block. */
+    bool conflicts = false, soft = false;
+    if (claim && !settings &&
+        settings_provenance_day_conflicts_checked(day, serial, family, &conflicts,
+                                                  &soft) == ESP_OK &&
+        conflicts && soft)
+        return false;
+    return true;
 }
 
 static int apply_as10_settings(int16_t *values, const cJSON *settings)
@@ -2236,6 +2255,8 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
             resolver_err = resolver_gate_daily_checked(
                 as11_day_label, family, serial, &day_settings, resolver_sessions);
         if (resolver_err != ESP_OK) {
+            ESP_LOGE(TAG, "STR.edf: day %s settings/resolver check failed (err=%d); preserving export",
+                     as11_day_label, resolver_err);
             cJSON_Delete(day_settings);
             free(spool_names); free(drift_index);
             free(records); free(ctx); free(str_sigs);
@@ -2257,6 +2278,8 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
             settings_to_use = settings_json;
         }
         if (resolver_err != ESP_OK) {
+            ESP_LOGE(TAG, "STR.edf: day %s live-settings gate failed (err=%d); preserving export",
+                     as11_day_label, resolver_err);
             cJSON_Delete(day_settings);
             free(spool_names); free(drift_index);
             free(records); free(ctx); free(str_sigs);
@@ -2321,6 +2344,8 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
             resolver_err = resolver_gate_daily_checked(
                 current_day_label, family, serial, &day_settings, resolver_sessions);
         if (resolver_err != ESP_OK) {
+            ESP_LOGE(TAG, "STR.edf: current day %s settings/resolver check failed (err=%d); preserving export",
+                     current_day_label, resolver_err);
             cJSON_Delete(day_settings);
             free(records); free(ctx); free(str_sigs);
             return resolver_err;
@@ -2338,6 +2363,8 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
             live_day_unambiguous(current_day_label, settings_json, serial, &resolver_err))
             current_settings = settings_json;
         if (resolver_err != ESP_OK) {
+            ESP_LOGE(TAG, "STR.edf: current day %s live-settings gate failed (err=%d); preserving export",
+                     current_day_label, resolver_err);
             cJSON_Delete(day_settings);
             free(records); free(ctx); free(str_sigs);
             return resolver_err;
@@ -2348,6 +2375,8 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
                                                          family == SETTINGS_FAMILY_AS10
                                                          ? NULL : current_settings);
         if (current_err != ESP_OK) {
+            ESP_LOGE(TAG, "STR.edf: current day %s record build failed (err=%d); preserving export",
+                     current_day_label, current_err);
             cJSON_Delete(day_settings);
             free(records); free(ctx); free(str_sigs);
             return current_err;

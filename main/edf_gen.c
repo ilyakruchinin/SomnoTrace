@@ -1933,3 +1933,24 @@ bool edf_gen_take_interrupted_rebuild(char *out_day, size_t out_len)
     strlcpy(out_day, buf, out_len);
     return true;
 }
+
+void edf_gen_release_interrupted_rebuild(const char *day_folder)
+{
+    if (!day_folder || strlen(day_folder) != 8) return;
+
+    FILE *f = fopen(REBUILD_SENTINEL, "r");
+    if (!f) return;
+    char buf[16] = "";
+    bool match = fgets(buf, sizeof(buf), f) &&
+                 !strncmp(buf, day_folder, 8) &&
+                 (buf[8] == '\n' || buf[8] == '\0');
+    fclose(f);
+    if (!match) return;
+
+    if (unlink(REBUILD_SENTINEL) == 0)
+        ESP_LOGW(TAG, "rebuild: released publish sentinel for abandoned day "
+                 "%.8s", day_folder);
+    else
+        ESP_LOGE(TAG, "rebuild: cannot release publish sentinel for day "
+                 "%.8s", day_folder);
+}

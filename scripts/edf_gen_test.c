@@ -1665,6 +1665,69 @@ static void test_daily_settings_provenance(void)
     cJSON_Delete(settings);
 }
 
+/* A session whose identity evidence cannot be read (e.g. an interrupted
+ * write leaves a torn _session.json/_ident.json behind) is unattributable.
+ * It must withhold that day's settings — the record still exports, minus
+ * the settings overlay — and must not abort the whole STR generation. */
+static void test_corrupt_session_evidence_withholds_day(void)
+{
+    const char *day = "20260303";
+    const char *sid = "20260303_221500";
+    char dir[400], path[600];
+    mk("%s", SD_MOUNT_POINT);
+    mk("%s", SD_APP_DIR);
+    mk("%s", SD_SESSIONS_DIR);
+    mk("%s", SD_STREAMS_DIR);
+    mk("%s", SD_SUMMARIES_DIR);
+    reset_day_state(day);
+    snprintf(dir, sizeof(dir), "%s/%s", SD_STREAMS_DIR, day);
+
+    snprintf(path, sizeof(path), "%s/%s_session.json", dir, sid);
+    write_text(path, "{}");
+    snprintf(path, sizeof(path), "%s/%s_ident.json", dir, sid);
+    write_live_ident(path, day, sid);
+    cJSON *native = cJSON_Parse("{\"_as11_edf_settings\":{\"S.C.Press\":8}}");
+    CHECK(native && settings_provenance_set(native, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) &&
+          settings_provenance_set_serial(native, "fixture-machine") &&
+          settings_provenance_set_family(native, SETTINGS_FAMILY_AS11),
+          "create same-machine native daily record");
+    if (!native) return;
+    char *json = cJSON_PrintUnformatted(native);
+    snprintf(path, sizeof(path), "%s/%s.native.settings.json", SD_SUMMARIES_DIR, day);
+    write_text(path, json);
+    free(json);
+
+    snprintf(path, sizeof(path), "%s/%s_2_session.json", dir, sid);
+    write_text(path, "{}");
+    snprintf(path, sizeof(path), "%s/%s_2_ident.json", dir, sid);
+    write_text(path, "broken JSON");
+    esp_err_t err = ESP_OK;
+    cJSON *read = read_daily_settings_checked(day, SETTINGS_FAMILY_AS11,
+                                              "fixture-machine", &err);
+    CHECK(read == NULL && err == ESP_OK,
+          "unreadable identity evidence withholds the day without erroring");
+    bool conflicts = false;
+    CHECK(settings_provenance_day_conflicts_checked(day, "fixture-machine",
+          SETTINGS_FAMILY_AS11, &conflicts, NULL) == ESP_OK && conflicts,
+          "unattributable session counts as a conflict");
+    CHECK(!native_day_blocked(day, SETTINGS_FAMILY_AS11, "fixture-machine", read),
+          "valid native claim withheld by conflict must not block the export");
+    cJSON_Delete(read);
+
+    snprintf(path, sizeof(path), "%s/%s_2_session.json", dir, sid);
+    write_text(path, "broken JSON");
+    CHECK(settings_provenance_day_conflicts_checked(day, "fixture-machine",
+          SETTINGS_FAMILY_AS11, &conflicts, NULL) == ESP_OK && conflicts,
+          "unreadable session manifest counts as a conflict");
+    bool match = true, bridge = true;
+    CHECK(settings_provenance_session_checked(day, "20260303_221500_2",
+          "fixture-machine", SETTINGS_FAMILY_AS11, &match, &bridge) == ESP_OK &&
+          !match && !bridge,
+          "unreadable session manifest resolves as unverified");
+    cJSON_Delete(native);
+    reset_day_state(day);
+}
+
 static void test_pb_varint(FILE *f, uint64_t value)
 {
     while (value >= 0x80) {
@@ -1885,6 +1948,14 @@ static void test_rebuild_sentinel_safety(void)
           "boot recovery leaves the marker until rebuild succeeds");
     CHECK(rebuild_write_sentinel("20260301") == ESP_OK,
           "the same interrupted day can be retried");
+    edf_gen_release_interrupted_rebuild("20260302");
+    CHECK(access(REBUILD_SENTINEL, F_OK) == 0,
+          "release ignores a sentinel naming a different day");
+    edf_gen_release_interrupted_rebuild("20260301");
+    CHECK(access(REBUILD_SENTINEL, F_OK) != 0,
+          "release drops the abandoned day's sentinel");
+    CHECK(rebuild_write_sentinel("20260303") == ESP_OK,
+          "another day's publish unblocks once the sentinel is released");
     CHECK(unlink(REBUILD_SENTINEL) == 0, "remove test-owned marker");
     char tmp[400];
     snprintf(tmp, sizeof(tmp), "%s.tmp", REBUILD_SENTINEL);
@@ -2957,6 +3028,8 @@ int main(void)
         test_rebuild_sentinel_safety, NULL);
     run("the resolver gates daily settings fail-closed",
         test_resolver_gates_daily_settings, NULL);
+    run("unreadable session evidence withholds but does not abort the day",
+        test_corrupt_session_evidence_withholds_day, NULL);
 
     run("crc32 matches the published CRC-32/ISO-HDLC check vector",
         test_crc32_matches_the_published_check_vector, NULL);

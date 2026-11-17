@@ -116,7 +116,10 @@ static bool manifest_matches(const cJSON *manifest, const char *day,
         esp_err_t read_error;
         ident = read_manifest_checked(path, &read_error);
         if (read_error != ESP_OK && read_error != ESP_ERR_NOT_FOUND) {
-            *error = read_error;
+            /* Unreadable ⇒ unattributable ⇒ unverified, which callers
+             * already handle by withholding; erroring here aborts the
+             * whole export on one corrupted file.  Resource errors fail. */
+            if (read_error != ESP_FAIL) *error = read_error;
             return false;
         }
         if (settings_provenance_is(ident, SETTINGS_SOURCE_LIVE_IDENT, day, session) &&
@@ -196,7 +199,11 @@ esp_err_t settings_provenance_session_checked(const char *day, const char *sessi
     if (n < 0 || (size_t)n >= sizeof(path)) return ESP_ERR_INVALID_SIZE;
     esp_err_t error = ESP_OK;
     cJSON *manifest = read_manifest_checked(path, &error);
-    if (!manifest) return error;
+    if (!manifest) {
+        /* Unreadable ⇒ unattributable ⇒ unverified (never bridge-flagged).
+         * Resource errors still fail the scan. */
+        return error == ESP_OK || error == ESP_FAIL ? ESP_OK : error;
+    }
     bool imported = false;
     if (serial && serial[0])
         *match = manifest_matches(manifest, day, session, serial, family, &imported, &error);
@@ -254,8 +261,13 @@ static cJSON *local_session_ids_mode(const char *day, const char *serial, int fa
         cJSON *manifest = read_manifest_checked(path, error);
         if (!cJSON_IsObject(manifest)) {
             cJSON_Delete(manifest);
-            if (*error == ESP_OK) *error = ESP_FAIL;
-            ok = false; break;
+            /* Unreadable ⇒ unattributable ⇒ cannot join the local set.
+             * A NULL set makes coverage checks withhold, fail-closed.
+             * Resource/structural errors still fail the scan. */
+            if (*error != ESP_OK && *error != ESP_FAIL) { ok = false; break; }
+            *error = ESP_OK;
+            ok = false;
+            break;
         }
         memcpy(sid, entry->d_name, sid_len);
         sid[sid_len] = '\0';
@@ -279,12 +291,16 @@ static cJSON *local_session_ids_mode(const char *day, const char *serial, int fa
     return ids;
 }
 
-/* Missing provenance is not a conflict, but an explicit foreign identity is. */
+/* Missing provenance is not a conflict, but an explicit foreign identity is.
+ * Unreadable evidence counts as a conflict too — an unattributable session —
+ * and is reported via out_soft: it withholds the day but does not prove the
+ * day belongs to another machine. */
 esp_err_t settings_provenance_day_conflicts_checked(const char *day, const char *serial,
-                                                    int family, bool *out)
+                                                    int family, bool *out, bool *out_soft)
 {
     if (!out) return ESP_ERR_INVALID_ARG;
     *out = true;
+    if (out_soft) *out_soft = false;
     if (!day || strlen(day) != 8 || !serial || !serial[0] ||
         !settings_provenance_family_name(family)) return ESP_OK;
     char dir_path[300];
@@ -295,7 +311,7 @@ esp_err_t settings_provenance_day_conflicts_checked(const char *day, const char 
         *out = false;
         return ESP_OK;
     }
-    bool conflict = false;
+    bool conflict = false, explicit_foreign = false;
     esp_err_t error = ESP_OK;
     struct dirent *ent;
     const char suffix[] = "_session.json";
@@ -315,8 +331,14 @@ esp_err_t settings_provenance_day_conflicts_checked(const char *day, const char 
         else manifest = read_manifest_checked(path, &error);
         if (!cJSON_IsObject(manifest)) {
             cJSON_Delete(manifest);
-            if (error == ESP_OK) error = ESP_FAIL;
-            break;
+            /* A session whose manifest cannot be read is unattributable —
+             * a conflict that withholds this day's authority, but not a
+             * reason to fail the whole export: a corrupted file never
+             * heals by retrying.  Resource/structural errors still fail. */
+            if (error != ESP_OK && error != ESP_FAIL) break;
+            conflict = true;
+            error = ESP_OK;
+            continue;
         }
         const cJSON *sn = cJSON_GetObjectItemCaseSensitive(manifest, "source_serial");
         const cJSON *fam = cJSON_GetObjectItemCaseSensitive(manifest, "source_device_family");
@@ -326,9 +348,10 @@ esp_err_t settings_provenance_day_conflicts_checked(const char *day, const char 
                      (fam->valuestring[0] &&
                       strcmp(fam->valuestring, settings_provenance_family_name(family)))))) {
             conflict = true;
+            explicit_foreign = true;
         }
         cJSON_Delete(manifest);
-        if (conflict) break;
+        if (explicit_foreign) break;
         size_t sid_len = len - tail;
         if (sid_len >= 100) { error = ESP_ERR_INVALID_SIZE; break; }
         char sid[100];
@@ -339,25 +362,37 @@ esp_err_t settings_provenance_day_conflicts_checked(const char *day, const char 
         if (n < 0 || (size_t)n >= sizeof(path)) error = ESP_ERR_INVALID_SIZE;
         else ident = read_manifest_checked(path, &error);
         if (error == ESP_ERR_NOT_FOUND) error = ESP_OK;
-        if (error != ESP_OK) { cJSON_Delete(ident); break; }
+        if (error != ESP_OK) {
+            cJSON_Delete(ident);
+            /* Unreadable identity evidence ⇒ unattributable session. */
+            if (error != ESP_FAIL) break;
+            conflict = true;
+            error = ESP_OK;
+            continue;
+        }
         if (settings_provenance_is(ident, SETTINGS_SOURCE_LIVE_IDENT, day, sid)) {
             const cJSON *is = cJSON_GetObjectItemCaseSensitive(ident, "SerialNumber");
             if (!cJSON_IsString(is) || !is->valuestring || strcmp(is->valuestring, serial) ||
-                settings_provenance_family(ident) != family) conflict = true;
+                settings_provenance_family(ident) != family) {
+                conflict = true;
+                explicit_foreign = true;
+            }
         }
         cJSON_Delete(ident);
-        if (conflict) break;
+        if (explicit_foreign) break;
     }
     closedir(dir);
     if (error != ESP_OK) return error;
     *out = conflict;
+    if (out_soft) *out_soft = conflict && !explicit_foreign;
     return ESP_OK;
 }
 
 bool settings_provenance_day_conflicts(const char *day, const char *serial, int family)
 {
     bool conflict = true;
-    return settings_provenance_day_conflicts_checked(day, serial, family, &conflict) != ESP_OK ||
+    return settings_provenance_day_conflicts_checked(day, serial, family, &conflict,
+                                                     NULL) != ESP_OK ||
            conflict;
 }
 

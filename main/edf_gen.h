@@ -151,3 +151,11 @@ esp_err_t edf_gen_rebuild_native_str(void);
  * the rebuild succeeds. Call once at boot, before anything reads the
  * export tree. */
 bool edf_gen_take_interrupted_rebuild(char *out_day, size_t out_len);
+
+/* Release the publish sentinel when the day it names has been given up —
+ * either its source sessions are gone (nothing left to rebuild from) or the
+ * pending-export machinery has stopped retrying it.  A sentinel for a day
+ * that can never complete otherwise blocks every later day's publish, since
+ * only one recovery can be tracked at a time.  No-op unless the sentinel
+ * actually names this day. */
+void edf_gen_release_interrupted_rebuild(const char *day_folder);

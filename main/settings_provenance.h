@@ -159,6 +159,7 @@ esp_err_t settings_provenance_session_checked(const char *day, const char *sessi
                                               const char *serial, int family,
                                               bool *match, bool *bridge_unverified);
 esp_err_t settings_provenance_day_conflicts_checked(const char *day, const char *serial,
-                                                    int family, bool *conflict);
+                                                    int family, bool *conflict,
+                                                    bool *out_soft);
 esp_err_t settings_provenance_covers_sessions_checked(const cJSON *root, const char *day,
                                                       bool *covered);
