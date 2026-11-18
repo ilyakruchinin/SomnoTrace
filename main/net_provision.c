@@ -3710,10 +3710,10 @@ static esp_err_t start_webserver(void)
                                          recv timeout instead of RSTs */
     config.max_uri_handlers = 128;
     config.stack_size = 12288;
-    config.max_open_sockets = 20;   /* ~8 for browser/WS + up to 12 pending defers */
-    config.backlog_conn = 10;       /* SYNs in backlog each hold a TCP pcb —
+    config.max_open_sockets = 24;   /* ~8 for browser/WS + up to 13 pending defers */
+    config.backlog_conn = 12;       /* SYNs in backlog each hold a TCP pcb —
                                        keep sessions+backlog under
-                                       CONFIG_LWIP_MAX_ACTIVE_TCP (44) */
+                                       CONFIG_LWIP_MAX_ACTIVE_TCP (56) */
     config.recv_wait_timeout = 1;       /* close idle keep-alive sockets fast */
     config.send_wait_timeout = 5;
     config.keep_alive_enable = true;    /* detect dead connections via TCP probes */

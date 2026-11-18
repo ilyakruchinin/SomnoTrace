@@ -240,7 +240,7 @@ static bool run_backend(backend_rt_t *r, int max_days,
      * which is the order the index already keeps. */
     /* static: only the scheduler task ever runs this, and 366 entries have no
      * business on the stack alongside the backends' own buffers. */
-    static uint32_t days[UPLOAD_MAX_DAYS_CAP];
+    static EXT_RAM_BSS_ATTR uint32_t days[UPLOAD_MAX_DAYS_CAP];
     int n_days = 0;
     int n_units = 0;
     int n_index = upload_index_day_count();

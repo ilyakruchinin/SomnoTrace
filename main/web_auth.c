@@ -29,6 +29,7 @@
 #include <time.h>
 
 #include "cJSON.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -98,7 +99,7 @@ typedef struct {
     void *user_ctx;
     bool  is_websocket;
 } route_t;
-static route_t s_routes[MAX_ROUTES];
+static EXT_RAM_BSS_ATTR route_t s_routes[MAX_ROUTES];
 static int     s_nroutes;
 
 typedef enum { AUTH_OK, AUTH_MISSING, AUTH_BAD, AUTH_THROTTLED, AUTH_ORIGIN } auth_result_t;

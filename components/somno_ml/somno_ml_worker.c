@@ -109,7 +109,7 @@ typedef struct {
     int      tries;
 } pending_sst_t;
 
-static pending_sst_t   s_pending[PENDING_CAP];
+static EXT_RAM_BSS_ATTR pending_sst_t s_pending[PENDING_CAP];
 static SemaphoreHandle_t s_pending_mux;
 static int64_t s_next_recon_ms = -1;
 static int64_t s_next_full_ms  = -1;
