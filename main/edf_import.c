@@ -1946,6 +1946,28 @@ static void mark_root_processed(const char *path, const char *id)
     if (err != ESP_OK) ESP_LOGW(TAG, "import: cannot record processed root source (error %d)", (int)err);
 }
 
+/* Record that a staged root file passed through the importer — distinct
+ * from mark_root_processed's "consumed" marker.  The file stays in place
+ * for re-resolution, but the sync layer may supersede it with fresher
+ * content instead of deferring on unproven staged input forever. */
+static void mark_root_evaluated(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    if (!source_store_lock()) return;
+    source_store_put_result_t put;
+    esp_err_t err = source_store_init(NULL);
+    if (err == ESP_OK) err = source_store_put_path("native_str_import", path, &put);
+    cJSON *observation = err == ESP_OK ? cJSON_CreateObject() : NULL;
+    if (err == ESP_OK)
+        err = observation ? source_store_observe(put.id, "root-evaluated",
+                                                 "native_str_import", observation)
+                          : ESP_ERR_NO_MEM;
+    cJSON_Delete(observation);
+    source_store_unlock();
+    if (err != ESP_OK) ESP_LOGW(TAG, "import: cannot record evaluated root source (error %d)", (int)err);
+}
+
 static bool quarantine_source(const char *path);
 
 static esp_err_t save_native_identity(const edf_import_ctx_t *ctx)
@@ -4347,6 +4369,141 @@ static void skip_group(edf_import_ctx_t *ctx, const imp_group_t *g)
     ctx->skipped[ctx->n_skipped++].kind = kind;
 }
 
+/* ── Persistent no-change markers ─────────────────────────────────────
+ * A group whose evaluation leaves only staged/rejected sources gets a
+ * .import_state file recording a signature of the surviving file set and
+ * the evidence epoch it was evaluated under.  While neither changes the
+ * group is skipped entirely — staged sources keep waiting for evidence
+ * instead of being re-clustered and re-evaluated on every pass.
+ *
+ * The evidence epoch is a counter in IMPORT/.import_epoch bumped whenever
+ * an import unit commits durable progress (sessions imported, sources
+ * consumed, settings or spools written): association outcomes consult
+ * committed manifests and STR mask intervals across days, so any durable
+ * change invalidates every marker once — then groups go quiet again. */
+
+static uint32_t s_import_epoch;
+static bool     s_epoch_loaded;
+
+static uint32_t import_epoch(void)
+{
+    if (!s_epoch_loaded) {
+        s_epoch_loaded = true;
+        cJSON *j = read_json_file(IMP_IMPORT_DIR "/.import_epoch");
+        const cJSON *e = j ? cJSON_GetObjectItemCaseSensitive(j, "epoch") : NULL;
+        if (cJSON_IsNumber(e) && e->valuedouble > 0 &&
+            e->valuedouble < 4294967295.0)
+            s_import_epoch = (uint32_t)e->valuedouble;
+        cJSON_Delete(j);
+        if (!s_import_epoch) s_import_epoch = 1;
+    }
+    return s_import_epoch;
+}
+
+static void import_epoch_bump(void)
+{
+    s_import_epoch = import_epoch() + 1;
+    if (!s_import_epoch) s_import_epoch = 1;
+    FILE *f = fopen(IMP_IMPORT_DIR "/.import_epoch", "w");
+    if (f) {
+        fprintf(f, "{\"epoch\":%lu}", (unsigned long)s_import_epoch);
+        fclose(f);
+    }
+}
+
+/* Order-independent signature over a group's surviving sources: each
+ * present file contributes a hash of name|size|mtime, so renames,
+ * rewrites, arrivals and deletions all change the sum.  Sources deleted
+ * after a commit drop out on their own via the stat failure. */
+static uint64_t group_signature(const imp_group_t *g)
+{
+    uint64_t sig = 0;
+    for (int i = 0; i < g->n_files; i++) {
+        struct stat st;
+        if (stat(g->files[i].path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        const char *base = strrchr(g->files[i].path, '/');
+        base = base ? base + 1 : g->files[i].path;
+        char rec[360];
+        int n = snprintf(rec, sizeof(rec), "%s|%lld|%lld|%lld", base,
+                         (long long)st.st_size, (long long)st.st_mtime,
+                         (long long)st.st_ctime);
+        if (n <= 0) continue;
+        if (n >= (int)sizeof(rec)) n = (int)sizeof(rec) - 1;
+        uint64_t h = 1469598103934665603ULL;   /* FNV-1a 64 */
+        for (int j = 0; j < n; j++) {
+            h ^= (uint8_t)rec[j];
+            h *= 1099511628211ULL;
+        }
+        sig += h;
+    }
+    if (g->drift_path[0]) {
+        struct stat st;
+        if (stat(g->drift_path, &st) == 0 && S_ISREG(st.st_mode))
+            sig += 0x9e3779b97f4a7c15ULL ^ (uint64_t)st.st_size ^
+                   ((uint64_t)st.st_mtime << 20);
+    }
+    return sig;
+}
+
+static void group_state_path(const imp_group_t *g, char *out, size_t cap)
+{
+    /* Flat groups share IMPORT/ — give each noon-day key its own file. */
+    if (g->is_flat)
+        snprintf(out, cap, "%s/.import_state_%s", g->src_dir, g->key);
+    else
+        snprintf(out, cap, "%s/.import_state", g->src_dir);
+}
+
+typedef enum {
+    GROUP_STATE_NEW,        /* no marker, or files/evidence changed */
+    GROUP_STATE_CONFIRM,    /* same set seen once — evaluate once more */
+    GROUP_STATE_SKIP,       /* unchanged across a confirmed evaluation */
+} group_state_t;
+
+/* A marker only earns the skip after the same file set was already
+ * evaluated twice with the same outcome: augmentation is iterative —
+ * a second pass over an unchanged set can legally merge what the first
+ * staged (e.g. a corrected-prefix append).  One confirmation pass bounds
+ * the extra work while never freezing a mid-resolution state. */
+static group_state_t group_state_check(const imp_group_t *g, uint64_t sig,
+                                       int *seen_out, int *skipped_out)
+{
+    char path[340];
+    group_state_path(g, path, sizeof(path));
+    *seen_out = 0;
+    *skipped_out = 0;
+    cJSON *j = read_json_file(path);
+    if (!j) return GROUP_STATE_NEW;
+    const cJSON *s = cJSON_GetObjectItemCaseSensitive(j, "sig");
+    const cJSON *e = cJSON_GetObjectItemCaseSensitive(j, "epoch");
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(j, "seen");
+    const cJSON *k = cJSON_GetObjectItemCaseSensitive(j, "skipped");
+    group_state_t st = GROUP_STATE_NEW;
+    if (cJSON_IsString(s) && s->valuestring && cJSON_IsNumber(e) &&
+        cJSON_IsNumber(v) && v->valueint >= 0 &&
+        (uint64_t)e->valuedouble == (uint64_t)import_epoch() &&
+        strtoull(s->valuestring, NULL, 16) == sig) {
+        *seen_out = v->valueint;
+        if (cJSON_IsNumber(k) && k->valueint > 0)
+            *skipped_out = k->valueint;
+        st = v->valueint >= 2 ? GROUP_STATE_SKIP : GROUP_STATE_CONFIRM;
+    }
+    cJSON_Delete(j);
+    return st;
+}
+
+static void group_state_write(const imp_group_t *g, int seen, int skipped)
+{
+    char path[340];
+    group_state_path(g, path, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "{\"sig\":\"%llx\",\"epoch\":%lu,\"seen\":%d,\"skipped\":%d}",
+            (unsigned long long)group_signature(g),
+            (unsigned long)import_epoch(), seen, skipped);
+    fclose(f);
+}
+
 static bool name_is_dir8(const char *n)
 {
     if (strlen(n) != 8) return false;
@@ -4633,6 +4790,19 @@ static esp_err_t process_root_pass(edf_import_ctx_t *ctx, edf_import_unit_t *u)
              * import independent day groups; never clear identity here. */
             ESP_LOGW(TAG, "import: STR source retained (%d new settings, %d new spools)",
                      u->settings_written, u->spools_written);
+            if (result == STR_IMPORT_PARTIAL) {
+                /* Ambiguous days stay resolvable: the staged STR keeps its
+                 * canonical name so a later pass can extract their intervals
+                 * once the conflict clears.  But the file was already
+                 * evaluated — marking it lets the sync layer supersede it
+                 * with a fresher bridge copy instead of deferring on staged
+                 * input forever (which would deadlock the channel that
+                 * carries the resolving evidence). */
+                mark_root_evaluated(IMP_IMPORT_DIR "/STR.edf");
+                mark_root_evaluated(IMP_IMPORT_DIR "/Identification.json");
+                mark_root_evaluated(IMP_IMPORT_DIR "/Identification.tgt");
+                mark_root_evaluated(IMP_IMPORT_DIR "/SETTINGS/CurrentSettings.json");
+            }
             ctx->root_retained = true;
             u->root_retained = true;
             return ESP_OK;
@@ -5201,6 +5371,23 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
         return;
     }
 
+    /* A group already evaluated under the current evidence epoch whose
+     * surviving file set is unchanged has nothing new to decide — its
+     * staged sources stay put until files or evidence change.  One
+     * confirmation pass is always granted: identical input can still
+     * advance a staged resolution. */
+    int state_seen = 0, state_skipped = 0;
+    if (group_state_check(g, group_signature(g),
+                          &state_seen, &state_skipped) == GROUP_STATE_SKIP) {
+        skip_group(ctx, g);
+        u->sessions_skipped += state_skipped;
+        ESP_LOGI(TAG, "import: %s unchanged since last evaluation — skipped",
+                 g->src_dir);
+        return;
+    }
+    int failed_before = u->sessions_failed;
+    int skipped_before = u->sessions_skipped;
+
     imp_drift_t drift;
     parse_drift_sidecar(g->drift_path[0] ? g->drift_path : NULL, &drift);
     const char *import_src = g->drift_path[0] ? "somnobridge" : "file_import";
@@ -5337,9 +5524,12 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
              * rest stay in place — unverifiable, never deleted on a
              * guess, retried on a later pass. */
             u->sessions_skipped++;
+            /* Sources flagged in src_consumed were provably merged or
+             * covered — delete them even under retain_raw: the flag guards
+             * the *unverifiable* remainder, not bytes already committed.
+             * Keeping them re-offered them on every pass forever. */
             for (int s = 0; s < 5; s++)
-                if (srcs[s] && !associations->retain_raw[i] && !w.retain_raw &&
-                    (w.src_consumed & (1u << s))) {
+                if (srcs[s] && (w.src_consumed & (1u << s))) {
                     delete_source(srcs[s]);
                     u->files_consumed++;
                 }
@@ -5390,6 +5580,19 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
      * in each session's manifest). */
     bool remaining = directory_has_session_edfs(g->src_dir);
     if (source_retained && remaining) skip_group(ctx, g);
+    if (remaining && u->sessions_failed == failed_before && !g->future_part) {
+        /* Only staged/rejected/failed-clean sources remain: record the
+         * surviving set so the next pass can skip this group until files
+         * or evidence change.  Transient failures never get a marker —
+         * they must be retried. */
+        group_state_write(g, state_seen + 1,
+                          u->sessions_skipped - skipped_before);
+    } else if (!remaining) {
+        /* Fully drained — a stale marker must not pin this group. */
+        char sp[340];
+        group_state_path(g, sp, sizeof(sp));
+        unlink(sp);
+    }
     if (g->drift_path[0] && !source_retained && !remaining)
         unlink(g->drift_path);
 
@@ -5713,7 +5916,10 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
                 return ESP_OK;
             }
             ctx->root_done = true;
-            return process_root_pass(ctx, out);
+            esp_err_t rr = process_root_pass(ctx, out);
+            if (out->settings_written || out->spools_written)
+                import_epoch_bump();
+            return rr;
         }
         ctx->root_done = true;
         /* fall through — no root files, look for day groups */
@@ -5732,6 +5938,10 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
     if (have) {
         process_group(ctx, g, out);
         free(g);
+        /* Deleting sources is durable evidence change — unlike re-merging
+         * retained files, it can never feed back into marker writes. */
+        if (out->files_consumed)
+            import_epoch_bump();
         /* A group deferred for in-flight transfers is not an error —
          * report the unit so the worker knows work remains pending. */
         return ESP_OK;

@@ -1806,12 +1806,46 @@ static root_sync_result_t sync_root_dir(const char *directory,
                 }
                 continue;
             }
-            /* The staged file may still be unprocessed or deliberately
-             * retained. Do not replace it with a newer bridge version. */
-            ESP_LOGI(TAG, "root: deferring %s while unverified staged input remains",
-                     canonical_key);
-            r.deferred = true;
-            continue;
+            /* A staged file the importer already evaluated (processed_root,
+             * or root-evaluated after a partial STR pass) is pipeline-known:
+             * its bytes live in the source store, its extraction state is
+             * durable, and a fresher copy can only supersede it — keeping it
+             * would veto every newer bridge version forever, including the
+             * evidence the staged state is waiting for.  Archive it and fall
+             * through to the restore/pull path.  Staged input that was never
+             * evaluated still defers as before. */
+            bool staged_done = false;
+            if (s_source_store_ready && source_store_lock()) {
+                source_store_put_result_t put;
+                if (source_store_put_path("root", canonical_local, &put) == ESP_OK)
+                    staged_done = source_store_has_observation(
+                                      put.id, s_root_processed_ids[idx],
+                                      "processed_root") ||
+                                  source_store_has_observation(
+                                      put.id, "root-evaluated",
+                                      "native_str_import");
+                source_store_unlock();
+            }
+            if (staged_done) {
+                char arch[300];
+                snprintf(arch, sizeof(arch), "%s.retained-%ld",
+                         canonical_local, (long)lst.st_mtime);
+                if (rename(canonical_local, arch) == 0 ||
+                    unlink(canonical_local) == 0) {
+                    ESP_LOGI(TAG, "root: staged %s already processed — cleared",
+                             canonical_key);
+                    local_present = false;
+                } else {
+                    ESP_LOGW(TAG, "root: cannot archive staged %s",
+                             canonical_key);
+                }
+            }
+            if (local_present) {
+                ESP_LOGI(TAG, "root: deferring %s while unverified staged input remains",
+                         canonical_key);
+                r.deferred = true;
+                continue;
+            }
         }
 
         char tx_id[96] = "";

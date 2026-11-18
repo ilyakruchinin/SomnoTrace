@@ -28,6 +28,14 @@
 /* PSRAM vs internal placement is irrelevant on the host: plain malloc. */
 #define MALLOC_CAP_SPIRAM    0
 #define MALLOC_CAP_INTERNAL  0
+
+/* Section-placement attributes are likewise no-ops on the host. */
+#ifndef EXT_RAM_BSS_ATTR
+#define EXT_RAM_BSS_ATTR
+#endif
+#ifndef EXT_RAM_ATTR
+#define EXT_RAM_ATTR
+#endif
 #define MALLOC_CAP_8BIT      0
 #define MALLOC_CAP_DEFAULT   0
 

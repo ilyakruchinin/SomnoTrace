@@ -556,6 +556,16 @@ static void phase_a(void)
         } else {
             CHECK(false, "end_iso present");
         }
+        /* Evidence contract: the deleted cross-stem wave source survives
+         * as a recorded stem under import_sources. */
+        cJSON *srcs = cJSON_GetObjectItem(m, "import_sources");
+        CHECK(srcs && cJSON_IsObject(srcs), "import_sources recorded");
+        if (srcs) {
+            cJSON *brp = cJSON_GetObjectItem(srcs, "brp");
+            CHECK(brp && cJSON_IsString(brp) && brp->valuestring &&
+                  strstr(brp->valuestring, "20240115_221007"),
+                  "cross-stem wave recorded as evidence");
+        }
         cJSON_Delete(m);
     }
 
