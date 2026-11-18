@@ -5126,7 +5126,12 @@ static void associate_clusters(imp_cluster_t *clusters, int n,
                 relation = native_mask_relation(&w, combined.eve_ts, combined.wav_ts);
             }
             bool same_stem = combined.eve_ts == combined.wav_ts;
-            bool candidate = llabs(combined.wav_ts - combined.eve_ts) <= IMP_MATCH_MS ||
+            /* MaskOn cannot precede TherapyStart, and whole-second stems
+             * cannot invert the order of two events on one clock: a wave
+             * stem before an annotation stem is provably a different
+             * session's wave — never a candidate. */
+            int64_t gap_ms = combined.wav_ts - combined.eve_ts;
+            bool candidate = (gap_ms >= 0 && gap_ms <= IMP_MATCH_MS) ||
                              relation >= 0;
             bool verified = ident != NULL;
             imp_assoc_t decision = association_policy(verified, same_stem, relation, false);
@@ -5135,12 +5140,9 @@ static void associate_clusters(imp_cluster_t *clusters, int n,
              * TherapyStart is the pairing the importer has always used.
              * STR silence must not stall it: the day's STR snapshot is
              * written only after the sessions it could prove, so relation -1
-             * is the normal state for a same-day bridge import.  Backward
-             * stems (MaskOn before TherapyStart) still defer — a wave cannot
-             * precede its own session. */
+             * is the normal state for a same-day bridge import. */
             if (decision == IMP_ASSOC_DEFER_UNKNOWN && verified &&
-                combined.wav_ts >= combined.eve_ts &&
-                combined.wav_ts - combined.eve_ts <= IMP_MATCH_MS)
+                gap_ms >= 0 && gap_ms <= IMP_MATCH_MS)
                 decision = IMP_ASSOC_HEURISTIC;
             if (!candidate || decision == IMP_ASSOC_INDEPENDENT) continue;
             a->decision[i][j] = (uint8_t)decision;

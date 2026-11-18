@@ -3668,7 +3668,9 @@ static void phase_grouping_arrival_safety(void)
           "verified one-minute gap pairs without STR evidence; sources retained");
 
     /* The reverse order cannot be the same session — a wave cannot precede
-     * its own TherapyStart — so the heuristic never runs backward. */
+     * its own TherapyStart, so the pair is no longer a pairing candidate.
+     * The wave publishes independently; the orphan annotation then contests
+     * the committed nearby wave session and stays staged for evidence. */
     fresh_tree();
     build_session_dir(dir, a0, wave, true, 2024, 1, 15);
     c = edf_import_ctx_create();
@@ -3677,9 +3679,49 @@ static void phase_grouping_arrival_safety(void)
     snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, a0);
     snprintf(wave_manifest, sizeof(wave_manifest),
              "%s/%s/%s_session.json", SD_STREAMS_DIR, DAY, wave);
-    CHECK(t.sessions_imported == 0 && file_exists(source) &&
-          !file_exists(wave_manifest),
-          "MaskOn before TherapyStart cannot be its own session — staged");
+    char ann_source[700];
+    snprintf(ann_source, sizeof(ann_source), "%s/%s_EVE.edf", dir, wave);
+    CHECK(t.sessions_imported == 1 && t.deferred_association == 0 &&
+          t.deferred_conflict > 0 && file_exists(manifest) &&
+          !file_exists(wave_manifest) && file_exists(ann_source),
+          "wave before TherapyStart is no pairing candidate — wave publishes, "
+          "contesting annotation stays staged");
+
+    /* Even a one-second backward stem is excluded: device clocks do not
+     * run backward, so it is provably another session's wave.  The wave
+     * publishes alone; the later annotation contests it and stays staged. */
+    fresh_tree();
+    build_session_dir(dir, "20240115_220959", a0, true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    char jitter_manifest[700], jitter_source[700];
+    snprintf(jitter_manifest, sizeof(jitter_manifest),
+             "%s/%s/20240115_220959_session.json", SD_STREAMS_DIR, DAY);
+    snprintf(jitter_source, sizeof(jitter_source), "%s/%s_EVE.edf", dir, a0);
+    CHECK(t.sessions_imported == 1 && t.deferred_association == 0 &&
+          t.deferred_conflict > 0 && file_exists(jitter_manifest) &&
+          !file_exists(manifest) && file_exists(jitter_source),
+          "wave one second before TherapyStart is not a candidate either");
+
+    /* AS10 mask-bounce interlock: an earlier session's wave stem sits inside
+     * the next session's one-minute window on the wrong side.  The provably
+     * impossible backward claim must not register — otherwise both clusters
+     * end multi-claimed and every involved source stages forever. */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221006", "20240115_221000", true, 2024, 1, 15);
+    build_session_dir(dir, "20240115_221101", "20240115_221056", true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    char stub_manifest[700], big_manifest[700];
+    snprintf(stub_manifest, sizeof(stub_manifest),
+             "%s/%s/20240115_221000_session.json", SD_STREAMS_DIR, DAY);
+    snprintf(big_manifest, sizeof(big_manifest),
+             "%s/%s/20240115_221056_session.json", SD_STREAMS_DIR, DAY);
+    CHECK(t.sessions_imported == 2 && t.deferred_association == 0 &&
+          file_exists(stub_manifest) && file_exists(big_manifest),
+          "backward-adjacent stub cannot wedge the next session's pairing");
 
     /* A one-minute gap earns the pairing only for a verified machine —
      * unverifiable identity stays staged. */
