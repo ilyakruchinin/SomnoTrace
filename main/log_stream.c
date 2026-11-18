@@ -43,6 +43,7 @@
 #include "cJSON.h"
 #include "sd_storage.h"
 #include "psram_task.h"
+#include "httpd_defer.h"
 #include "net_provision.h"
 #include "uploader.h"
 #include "as11_ble.h"
@@ -932,7 +933,7 @@ buf_full:
 
 /* ── History Endpoint: GET /api/logs/history ─────────────────────── */
 
-static esp_err_t logs_history_handler(httpd_req_t *req)
+static esp_err_t logs_history_impl(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
@@ -993,9 +994,15 @@ hist_done:
     return ESP_OK;
 }
 
+/* Streams SD log files — seconds of FatFS I/O under churn; deferred. */
+static esp_err_t logs_history_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, logs_history_impl);
+}
+
 /* ── Download Endpoint: GET /api/logs/download ────────────────────── */
 
-static esp_err_t logs_download_handler(httpd_req_t *req)
+static esp_err_t logs_download_impl(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_set_hdr(req, "Content-Disposition",
@@ -1055,6 +1062,11 @@ static esp_err_t logs_download_handler(httpd_req_t *req)
 dl_done:
     httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
+}
+
+static esp_err_t logs_download_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, logs_download_impl);
 }
 
 /* ── Log Level Endpoint: POST /api/logs/level ─────────────────────── */

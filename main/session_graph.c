@@ -42,6 +42,8 @@
 #include "freertos/queue.h"
 #include "psram_task.h"
 #include "http_query.h"
+#include "httpd_defer.h"
+#include "session_graph.h"
 
 static const char *TAG = "session_graph";
 
@@ -224,7 +226,7 @@ static long file_size_stat(const char *path)
     return 0;
 }
 
-esp_err_t sessions_list_handler(httpd_req_t *req)
+static esp_err_t sessions_list_impl(httpd_req_t *req)
 {
     char date[16];
     if (!get_qparam(req, "date", date, sizeof(date))) {
@@ -453,6 +455,13 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Reads every *_session.json in the day dir + stats .snt files — seconds of
+ * SD I/O under import/upload churn, so it runs on the deferred worker. */
+esp_err_t sessions_list_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, sessions_list_impl);
+}
+
 static void resolve_day_dir(httpd_req_t *req, const char *session_id,
                             char *day_dir, size_t day_dir_len);
 
@@ -463,7 +472,7 @@ static int cmp_str(const void *a, const void *b)
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-esp_err_t days_list_handler(httpd_req_t *req)
+static esp_err_t days_list_impl(httpd_req_t *req)
 {
     DIR *dd = opendir(SD_STREAMS_DIR);
     if (!dd) {
@@ -534,8 +543,15 @@ esp_err_t days_list_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Opens ~140 day folders to count sessions — O(history) SD I/O that stalls
+ * the httpd task for seconds while the importer churns; deferred. */
+esp_err_t days_list_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, days_list_impl);
+}
+
 /* GET /api/summary?date=YYYYMMDD — per-day summary metrics from the spool. */
-esp_err_t summary_handler(httpd_req_t *req)
+static esp_err_t summary_impl(httpd_req_t *req)
 {
     char date[16];
     if (!get_qparam(req, "date", date, sizeof(date)) || strlen(date) != 8) {
@@ -556,10 +572,15 @@ esp_err_t summary_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+esp_err_t summary_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, summary_impl);
+}
+
 /* GET /api/session/settings?session=ID&date=YYYYMMDD — therapy mode + pressure
  * settings for the pressure panel (CPAP flat lines). Parses the session's
  * settings.json (SettingProfiles). */
-esp_err_t session_settings_handler(httpd_req_t *req)
+static esp_err_t session_settings_impl(httpd_req_t *req)
 {
     char session_id[32];
     if (!get_qparam(req, "session", session_id, sizeof(session_id))) {
@@ -648,6 +669,11 @@ esp_err_t session_settings_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+esp_err_t session_settings_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, session_settings_impl);
+}
+
 /* Resolve the noon-day streams directory for a session.
  *
  * The session writer stores .snt files in a noon-day folder: sessions
@@ -690,7 +716,7 @@ static void resolve_day_dir(httpd_req_t *req, const char *session_id,
  *   → {"t":[...],"leak":[...]}
  * Flow zoom: brp.snt (L0, 25Hz, 2×int16/record)
  *   → {"t":[...],"flow":[...],"press":[...]}  */
-esp_err_t session_graph_handler(httpd_req_t *req)
+static esp_err_t session_graph_impl(httpd_req_t *req)
 {
     char session_id[32], channel[16], points_str[16];
     char start_ms_str[32], end_ms_str[32];
@@ -985,9 +1011,15 @@ esp_err_t session_graph_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Reads and decimates .snt channel data — SD-heavy; deferred. */
+esp_err_t session_graph_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, session_graph_impl);
+}
+
 typedef struct {
     httpd_req_t *req;
-    char file_path[400];
+    char file_path[512];    /* OXIMETRY_CANONICAL_MAX_PATH-sized */
     long range_start;
     long send_size;
 } session_file_async_t;
@@ -1243,8 +1275,19 @@ esp_err_t session_file_handler(httpd_req_t *req)
      * next request. */
     httpd_resp_set_hdr(req, "Connection", "close");
 
+    fclose(f);
+    return session_graph_enqueue_file(req, file_path, range_start, send_size);
+}
+
+/* Shared with /download (net_provision.c): hands a whole-file (or range)
+ * chunked transfer to the snt_download worker so the httpd task is not
+ * blocked for the duration of a large SD read + TCP stream.
+ * Caller sets response headers first; this always answers the request —
+ * with the file body on success or a 503/500 on contention/failure. */
+esp_err_t session_graph_enqueue_file(httpd_req_t *req, const char *file_path,
+                                     long range_start, long send_size)
+{
     if (!s_download_queue) {
-        fclose(f);
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_hdr(req, "Cache-Control", "no-store");
         httpd_resp_sendstr(req, "Download worker unavailable; retry later");
@@ -1256,26 +1299,26 @@ esp_err_t session_file_handler(httpd_req_t *req)
     httpd_req_t *async_req = NULL;
     if (!transfer || httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
         free(transfer);
-        fclose(f);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
     transfer->req = async_req;
-    memcpy(transfer->file_path, file_path, sizeof(transfer->file_path));
+    strlcpy(transfer->file_path, file_path, sizeof(transfer->file_path));
     transfer->range_start = range_start;
     transfer->send_size = send_size;
-    fclose(f);
 
     /* Hand off to the persistent download worker. Ownership of `transfer` and
      * completion of the async handler pass to the worker. If the queue is full
-     * (too many pending downloads), reject and clean up here. */
-    if (!s_download_queue ||
-        xQueueSend(s_download_queue, &transfer, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "snt_download: queue unavailable/full, rejecting request");
+     * (too many pending downloads), answer 503 rather than dropping the
+     * socket into an unhandled void. */
+    if (xQueueSend(s_download_queue, &transfer, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "snt_download: queue full, rejecting request");
+        httpd_resp_set_status(async_req, "503 Service Unavailable");
+        httpd_resp_set_hdr(async_req, "Cache-Control", "no-store");
+        httpd_resp_sendstr(async_req, "Too many downloads; retry later");
         httpd_req_async_handler_complete(async_req);
         free(transfer);
-        return ESP_FAIL;
     }
     return ESP_OK;
 }

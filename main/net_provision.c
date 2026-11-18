@@ -39,6 +39,7 @@
 #include "log_stream.h"
 #include "device_settings.h"
 #include "session_graph.h"
+#include "httpd_defer.h"
 #include "session_writer.h"
 #include "oximetry_http.h"
 
@@ -1475,7 +1476,7 @@ static esp_err_t recv_body(httpd_req_t *req, char *buf, size_t cap)
     return ESP_OK;
 }
 
-static esp_err_t ble_scan_handler(httpd_req_t *req)
+static esp_err_t ble_scan_impl(httpd_req_t *req)
 {
     if (as11_ble_scan(6) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ble not ready");
@@ -1488,6 +1489,12 @@ static esp_err_t ble_scan_handler(httpd_req_t *req)
     cJSON_free(json);
     cJSON_Delete(arr);
     return ESP_OK;
+}
+
+/* BLE scan blocks ~6 s — would freeze every other request on the httpd task. */
+static esp_err_t ble_scan_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, ble_scan_impl);
 }
 
 /* Phase 3: import status (Phase-1 inbox + bridge telemetry) and an explicit
@@ -1615,7 +1622,7 @@ static esp_err_t ble_forget_handler(httpd_req_t *req)
 }
 
 /* ── Oximeter (O2 Ring) endpoints ──────────────────────────────────── */
-static esp_err_t ox_scan_handler(httpd_req_t *req)
+static esp_err_t ox_scan_impl(httpd_req_t *req)
 {
     if (oximeter_scan(6) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oximeter not ready");
@@ -1628,6 +1635,12 @@ static esp_err_t ox_scan_handler(httpd_req_t *req)
     cJSON_free(json);
     cJSON_Delete(arr);
     return ESP_OK;
+}
+
+/* Oximeter BLE scan blocks ~6 s — deferred off the httpd task. */
+static esp_err_t ox_scan_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, ox_scan_impl);
 }
 
 static esp_err_t ox_pair_handler(httpd_req_t *req)
@@ -1708,7 +1721,7 @@ static esp_err_t ox_probe_mode_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t ble_passthrough_handler(httpd_req_t *req)
+static esp_err_t ble_passthrough_impl(httpd_req_t *req)
 {
     int total = req->content_len;
     if (total <= 0 || total > 2048) {
@@ -1754,10 +1767,16 @@ static esp_err_t ble_passthrough_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* BLE RPC round-trip can take up to 10 s — deferred off the httpd task. */
+static esp_err_t ble_passthrough_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, ble_passthrough_impl);
+}
+
 /* POST /api/sb/op — proxy a provisioning op to the bonded SomnoBridge so
  * the portal can configure the bridge's Wi-Fi/EZShare without its setup
  * AP. Whitelisted ops only; file/stream ops stay on the sync path. */
-static esp_err_t sb_op_handler(httpd_req_t *req)
+static esp_err_t sb_op_impl(httpd_req_t *req)
 {
     int total = req->content_len;
     if (total <= 0 || total > 1024) {
@@ -1822,6 +1841,12 @@ static esp_err_t sb_op_handler(httpd_req_t *req)
     httpd_resp_send(req, out_json, HTTPD_RESP_USE_STRLEN);
     free(out_json);
     return ESP_OK;
+}
+
+/* Bridge ops can block up to 45 s (EZSHARE_ADMIN) — deferred off httpd. */
+static esp_err_t sb_op_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, sb_op_impl);
 }
 
 static void reboot_task(void *arg)
@@ -2107,7 +2132,7 @@ static bool get_query_param(httpd_req_t *req, const char *key, char *out, int ou
     return fs_url_decode(out, raw, out_len) > 0;
 }
 
-static esp_err_t dir_get_handler(httpd_req_t *req)
+static esp_err_t dir_get_impl(httpd_req_t *req)
 {
     char dir_path[256];
     if (!get_query_param(req, "dir", dir_path, sizeof(dir_path)) || dir_path[0] == '\0') {
@@ -2171,6 +2196,12 @@ static esp_err_t dir_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* readdir + per-entry stat — SD I/O that stalls under import/upload churn. */
+static esp_err_t dir_get_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, dir_get_impl);
+}
+
 static esp_err_t download_get_handler(httpd_req_t *req)
 {
     char file_path[256];
@@ -2184,42 +2215,23 @@ static esp_err_t download_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    FILE *f = fopen(file_path, "rb");
-    if (!f) {
+    /* stat (not just fopen) so directories answer 404 instead of streaming
+     * garbage — a FAT dir fopen succeeds but fread returns nothing. */
+    struct stat st;
+    if (stat(file_path, &st) != 0 || !S_ISREG(st.st_mode)) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "file not found");
         return ESP_FAIL;
     }
 
-    struct stat st;
-    if (stat(file_path, &st) == 0) {
-        char len_str[16];
-        snprintf(len_str, sizeof(len_str), "%ld", (long)st.st_size);
-        httpd_resp_set_hdr(req, "Content-Length", len_str);
-    }
-
+    /* No Content-Length: the worker streams chunked, and a stale CL on the
+     * async request suppresses the body entirely. */
     httpd_resp_set_type(req, "application/octet-stream");
     httpd_resp_set_hdr(req, "Connection", "close");
 
-    /* Heap-allocate to avoid stack overflow */
-    char *buf = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
-    if (!buf) buf = malloc(2048);
-    if (!buf) {
-        fclose(f);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    size_t n;
-    while ((n = fread(buf, 1, 2048, f)) > 0) {
-        if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) {
-            free(buf);
-            fclose(f);
-            return ESP_FAIL;
-        }
-    }
-    free(buf);
-    fclose(f);
-    httpd_resp_send_chunk(req, NULL, 0);
-    return ESP_OK;
+    /* Streaming a large file would occupy the single httpd task for the
+     * whole transfer — every other request queues behind it. Hand off to
+     * the shared download worker (same path as /api/session/file). */
+    return session_graph_enqueue_file(req, file_path, 0, (long)st.st_size);
 }
 
 /* ── Upload config and status endpoints ────────────────────────────── */
@@ -2416,24 +2428,45 @@ static esp_err_t upload_test_send(httpd_req_t *req, const char *backend_id)
     return ESP_OK;
 }
 
-static esp_err_t upload_test_smb_handler(httpd_req_t *req)
+/* Test-connection probes can block ~30 s on unreachable backends — deferred. */
+static esp_err_t upload_test_smb_impl(httpd_req_t *req)
 {
     return upload_test_send(req, "smb");
 }
 
-static esp_err_t upload_test_sleephq_handler(httpd_req_t *req)
+static esp_err_t upload_test_smb_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, upload_test_smb_impl);
+}
+
+static esp_err_t upload_test_sleephq_impl(httpd_req_t *req)
 {
     return upload_test_send(req, "sleephq");
 }
 
-static esp_err_t upload_test_aerivue_handler(httpd_req_t *req)
+static esp_err_t upload_test_sleephq_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, upload_test_sleephq_impl);
+}
+
+static esp_err_t upload_test_aerivue_impl(httpd_req_t *req)
 {
     return upload_test_send(req, "aerivue");
 }
 
-static esp_err_t upload_test_breathingroom_handler(httpd_req_t *req)
+static esp_err_t upload_test_aerivue_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, upload_test_aerivue_impl);
+}
+
+static esp_err_t upload_test_breathingroom_impl(httpd_req_t *req)
 {
     return upload_test_send(req, "breathingroom");
+}
+
+static esp_err_t upload_test_breathingroom_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, upload_test_breathingroom_impl);
 }
 
 /* ── Device settings endpoints ─────────────────────────────────────── */
@@ -2487,7 +2520,7 @@ static esp_err_t alert_config_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t alert_test_push_handler(httpd_req_t *req)
+static esp_err_t alert_test_push_impl(httpd_req_t *req)
 {
     char *body = NULL;
     int total = req->content_len;
@@ -2517,6 +2550,12 @@ static esp_err_t alert_test_push_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
+}
+
+/* Test push does a network send (MQTT/ntfy) — can block seconds; deferred. */
+static esp_err_t alert_test_push_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, alert_test_push_impl);
 }
 
 /* ── MQTT config endpoints ─────────────────────────────────────────── */
@@ -3664,10 +3703,17 @@ static esp_err_t start_webserver(void)
     web_auth_init();
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.lru_purge_enable = true;
+    config.lru_purge_enable = false;  /* purge kills just-accepted (lowest-LRU)
+                                         sockets mid-request; with it off, excess
+                                         connects queue in the listen backlog and
+                                         idle keep-alives are reaped by the 1s
+                                         recv timeout instead of RSTs */
     config.max_uri_handlers = 128;
     config.stack_size = 12288;
-    config.max_open_sockets = 20;
+    config.max_open_sockets = 20;   /* ~8 for browser/WS + up to 12 pending defers */
+    config.backlog_conn = 10;       /* SYNs in backlog each hold a TCP pcb —
+                                       keep sessions+backlog under
+                                       CONFIG_LWIP_MAX_ACTIVE_TCP (44) */
     config.recv_wait_timeout = 1;       /* close idle keep-alive sockets fast */
     config.send_wait_timeout = 5;
     config.keep_alive_enable = true;    /* detect dead connections via TCP probes */
@@ -3695,6 +3741,7 @@ static esp_err_t start_webserver(void)
     web_auth_begin_routes();
     web_auth_register_handlers(s_httpd);
     session_graph_init();
+    httpd_defer_init();
     oximetry_http_register_handlers(s_httpd);
 
     httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
