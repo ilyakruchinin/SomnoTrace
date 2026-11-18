@@ -497,8 +497,8 @@ static void phase_a(void)
     CHECK(units == 1, "one unit expected");
     CHECK(t.sessions_imported == 1, "1 session imported");
     CHECK(t.sessions_failed == 0, "no failures");
-    CHECK(t.files_consumed == 0, "cross-stem source evidence is retained");
-    CHECK(edf_import_pending(), "retained evidence remains available");
+    CHECK(t.files_consumed == 5, "committed sources are consumed");
+    CHECK(!edf_import_pending(), "inbox fully drained");
 
     /* Session id = eve start (2024-01-15 22:10:00 UTC) → 1705356600000 */
     const char *id = "20240115_221000";
@@ -633,9 +633,10 @@ static void phase_a(void)
         free(ev);
     }
 
-    /* Different stems joined by native evidence stay available for review. */
+    /* Different stems joined by native evidence are recorded in the
+     * manifest — the staged originals are consumed on commit. */
     snprintf(p, sizeof(p), "%s/%s/20240115_221007_BRP.edf", DATALOG_DAY, DAY);
-    CHECK(file_exists(p), "cross-stem waveform source retained");
+    CHECK(!file_exists(p), "cross-stem waveform source consumed");
     edf_import_ctx_destroy(c);
     printf("phase a OK (%d checks)\n", g_checks);
 }
@@ -668,7 +669,7 @@ static void phase_b(void)
     edf_import_unit_t t = drain(c, &units);
     CHECK(units == 2, "root pass + day unit");
     CHECK(t.sessions_imported == 1, "1 session");
-    CHECK(t.files_consumed == 0, "cross-stem sources retained for review");
+    CHECK(t.files_consumed == 4, "committed sources consumed");
 
     const char *id = "20240115_221000";
     char p[700];
@@ -862,7 +863,7 @@ static void phase_e(void)
               "drifted start");
         cJSON_Delete(m);
     }
-    CHECK(file_exists(dp), "sidecar retained with cross-stem source evidence");
+    CHECK(!file_exists(dp), "sidecar consumed with fully-drained group");
     edf_import_ctx_destroy(c);
 
     /* estimate-only sidecar → valid=false, usable iff half_ms ≤ 5000 */
@@ -1927,7 +1928,7 @@ static drift_case_t run_sidecar_case(const char *label, int n_files, int flags_l
     char msg[120];
     snprintf(msg, sizeof(msg), "%s: session imported", label);
     CHECK(t.sessions_imported == 1 && t.sessions_failed == 0, msg);
-    CHECK(file_exists(dp), "sidecar retained with cross-stem source evidence");
+    CHECK(!file_exists(dp), "sidecar consumed with fully-drained group");
 
     /* id is in the drifted domain: 22:10:00 + 214 s */
     snprintf(p, sizeof(p), "%s/%s/20240115_221334_session.json", SD_STREAMS_DIR, DAY);
@@ -2033,7 +2034,7 @@ static void phase_n(void)
     touch_tree(IMPORT_DIR, -120);
     CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.deferred &&
           u.sessions_imported == 1, "n1: quiet files import");
-    CHECK(file_exists(p), "n1: cross-stem evidence retained after import");
+    CHECK(!file_exists(p), "n1: committed source consumed after import");
     edf_import_ctx_destroy(c);
 
     /* n2: a root copy in flight (Identification.json just written) holds
@@ -3666,16 +3667,16 @@ static void phase_grouping_arrival_safety(void)
     /* Verified machine, MaskOn 19 s after TherapyStart, and no usable STR
      * coverage — the normal state of a same-day bridge import, whose STR
      * snapshot is written only after the sessions it could prove.  The
-     * legacy one-minute pairing still applies; cross-stem evidence stays. */
+     * legacy one-minute pairing still applies; committed sources consume. */
     fresh_tree();
     build_session_dir(dir, wave, a0, true, 2024, 1, 15);
     c = edf_import_ctx_create();
     t = drain(c, &units);
     edf_import_ctx_destroy(c);
     snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, wave);
-    CHECK(t.sessions_imported == 1 && file_exists(manifest) && file_exists(source) &&
-          t.files_consumed == 0,
-          "verified one-minute gap pairs without STR evidence; sources retained");
+    CHECK(t.sessions_imported == 1 && file_exists(manifest) && !file_exists(source) &&
+          t.files_consumed == 5,
+          "verified one-minute gap pairs without STR evidence; sources consumed");
 
     /* The reverse order cannot be the same session — a wave cannot precede
      * its own TherapyStart, so the pair is no longer a pairing candidate.

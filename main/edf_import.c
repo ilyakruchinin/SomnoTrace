@@ -2290,9 +2290,15 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
     free(e);
     u->spools_written += written;
     u->settings_written += settings_written;
-    if (conflicting_days)
-        ESP_LOGW(TAG, "import: %d day(s) have conflicting or unreadable session identity",
-                 conflicting_days);
+    /* The STR is re-evaluated hourly while retained — only warn when the
+     * conflicting-day count actually changes. */
+    static int s_last_conflicting_days = -1;
+    if (conflicting_days != s_last_conflicting_days) {
+        s_last_conflicting_days = conflicting_days;
+        if (conflicting_days)
+            ESP_LOGW(TAG, "import: %d day(s) have conflicting or unreadable session identity",
+                     conflicting_days);
+    }
     if (unsupported)
         ESP_LOGW(TAG, "import: %d native settings samples have unsupported units or ranges; "
                  "the original STR is retained", unsupported);
@@ -4478,8 +4484,12 @@ static group_state_t group_state_check(const imp_group_t *g, uint64_t sig,
     const cJSON *e = cJSON_GetObjectItemCaseSensitive(j, "epoch");
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(j, "seen");
     const cJSON *k = cJSON_GetObjectItemCaseSensitive(j, "skipped");
+    const cJSON *mv = cJSON_GetObjectItemCaseSensitive(j, "v");
     group_state_t st = GROUP_STATE_NEW;
-    if (cJSON_IsString(s) && s->valuestring && cJSON_IsNumber(e) &&
+    /* v2: older markers predate consume-on-commit — surviving files must
+     * be re-evaluated once so already-committed sources are consumed. */
+    if (cJSON_IsNumber(mv) && mv->valuedouble == 2.0 &&
+        cJSON_IsString(s) && s->valuestring && cJSON_IsNumber(e) &&
         cJSON_IsNumber(v) && v->valueint >= 0 &&
         (uint64_t)e->valuedouble == (uint64_t)import_epoch() &&
         strtoull(s->valuestring, NULL, 16) == sig) {
@@ -4498,7 +4508,7 @@ static void group_state_write(const imp_group_t *g, int seen, int skipped)
     group_state_path(g, path, sizeof(path));
     FILE *f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "{\"sig\":\"%llx\",\"epoch\":%lu,\"seen\":%d,\"skipped\":%d}",
+    fprintf(f, "{\"v\":2,\"sig\":\"%llx\",\"epoch\":%lu,\"seen\":%d,\"skipped\":%d}",
             (unsigned long long)group_signature(g),
             (unsigned long)import_epoch(), seen, skipped);
     fclose(f);
@@ -4788,8 +4798,16 @@ static esp_err_t process_root_pass(edf_import_ctx_t *ctx, edf_import_unit_t *u)
             /* Valid days were written above.  Keep the source files and the
              * resolved identity/settings in memory so the same ctx can still
              * import independent day groups; never clear identity here. */
-            ESP_LOGW(TAG, "import: STR source retained (%d new settings, %d new spools)",
-                     u->settings_written, u->spools_written);
+            /* Retained STR is re-evaluated hourly — report once per
+             * outcome change, not once per pass. */
+            static int s_last_str_outcome[2] = { -1, -1 };
+            if (u->settings_written != s_last_str_outcome[0] ||
+                u->spools_written != s_last_str_outcome[1]) {
+                s_last_str_outcome[0] = u->settings_written;
+                s_last_str_outcome[1] = u->spools_written;
+                ESP_LOGW(TAG, "import: STR source retained (%d new settings, %d new spools)",
+                         u->settings_written, u->spools_written);
+            }
             if (result == STR_IMPORT_PARTIAL) {
                 /* Ambiguous days stay resolvable: the staged STR keeps its
                  * canonical name so a later pass can extract their intervals
@@ -5496,13 +5514,13 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
 
         if (r == ESP_OK) {
             u->sessions_imported++;
-            if (associations->retain_raw[i] || w.retain_raw) {
-                source_retained = true;
-                ESP_LOGI(TAG, "import: cross-stem source evidence retained");
-            } else {
-                for (int s = 0; s < 5; s++)
-                    if (srcs[s]) { delete_source(srcs[s]); u->files_consumed++; }
-            }
+            /* Committed content is durable: the manifest already records
+             * every offered kind (incl. cross-stem merges via
+             * manifest_record_sources), so the staged originals have done
+             * their job — consume them.  Only uncommitted sources
+             * (staged/failed) are ever left in IMPORT. */
+            for (int s = 0; s < 5; s++)
+                if (srcs[s]) { delete_source(srcs[s]); u->files_consumed++; }
             if (w.day[0] &&
                 (n_days == 0 ||
                  (strcmp(w.day, days[0]) &&
@@ -5689,6 +5707,93 @@ static bool dir_has_pending(const char *path, int depth, bool skip_root_str)
     }
     closedir(d);
     return any;
+}
+
+/* First .edf that can never join a group: imp_classify rejects it
+ * (unsupported name/kind).  Staged, retained and skipped sources all
+ * classify — they are tracked per-group, not here. */
+static bool first_stray_edf(const char *path, int depth, bool skip_root_str,
+                            char *out, size_t cap)
+{
+    DIR *d = opendir(path);
+    if (!d) return false;
+    bool found = false;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *nm = ent->d_name;
+        size_t nl = strlen(nm);
+        if (nl >= 1 && nm[0] == '.') continue;
+        char full[400];
+        snprintf(full, sizeof(full), "%s/%s", path, nm);
+        struct stat st;
+        if (depth > 0 && stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (first_stray_edf(full, depth - 1, false, out, cap)) {
+                found = true;
+                break;
+            }
+            continue;
+        }
+        if (nl > 4 && !strcasecmp(nm + nl - 4, ".edf")) {
+            if (skip_root_str && !strcasecmp(nm, "STR.edf")) continue;
+            imp_file_t f;
+            if (!imp_classify(path, nm, &f)) {
+                snprintf(out, cap, "%s", full);
+                found = true;
+                break;
+            }
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+/* True when at least one surviving group would actually be evaluated on
+ * this run — i.e. is not signature-skipped.  The root pass exists to give
+ * evaluating groups resolved ident/settings; when every pending group is
+ * already settled, re-running it only re-warns on unchanged state. */
+static bool groups_need_eval(void)
+{
+    /* ~65 KiB scratch group — heap (PSRAM on target), never the stack. */
+    imp_group_t *t = imp_calloc(1, sizeof(*t));
+    if (!t) return true;
+    const char *bases[] = { IMP_DATALOG_DIR, IMP_IMPORT_DIR };
+    for (int b = 0; b < 2; b++) {
+        DIR *d = opendir(bases[b]);
+        if (!d) continue;
+        struct dirent *ent;
+        bool need = false;
+        while ((ent = readdir(d)) != NULL) {
+            if (!name_is_dir8(ent->d_name)) continue;
+            memset(t, 0, sizeof(*t));
+            snprintf(t->src_dir, sizeof(t->src_dir), "%s/%.*s",
+                     bases[b], 8, ent->d_name);
+            memcpy(t->key, ent->d_name, 9);
+            scan_group_dir(t->src_dir, t, 0);
+            if (t->has_part) { need = true; break; }
+            if (t->n_files == 0) continue;
+            int seen, sk;
+            if (group_state_check(t, group_signature(t), &seen, &sk)
+                    != GROUP_STATE_SKIP) { need = true; break; }
+        }
+        closedir(d);
+        if (need) { free(t); return true; }
+    }
+    free(t);
+    /* Flat IMPORT .edf files form noon-day groups too — treat any present
+     * as needing eval: a manual drop plausibly wants root context. */
+    DIR *d = opendir(IMP_IMPORT_DIR);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            imp_file_t f;
+            if (imp_classify(IMP_IMPORT_DIR, ent->d_name, &f)) {
+                closedir(d);
+                return true;
+            }
+        }
+        closedir(d);
+    }
+    return false;
 }
 
 /* Retained root input is retried hourly, or sooner when observable inputs
@@ -5952,13 +6057,15 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
         ctx->sweep_done = true;
         final_needs_spool_sweep();
     }
-    /* EDFs are visible to the cheap pending check but no group could be
-     * built from them — say so rather than reporting a clean empty inbox
-     * (that silence is what made #338 hard to diagnose). */
-    if (dir_has_pending(IMP_IMPORT_DIR, 2, ctx->root_retained))
-        ESP_LOGW(TAG, "import: EDFs remain in %s but no importable day group "
-                 "was found (unsupported names or a folder with no session?)",
-                 IMP_IMPORT_DIR);
+    /* Staged and signature-skipped sources classify fine and are already
+     * reported per day — the leftover worth warning about is an EDF no
+     * group could ever be built from (the #338 case: unsupported names).
+     * Find the first one so the message stays actionable. */
+    char stray[400];
+    if (first_stray_edf(IMP_IMPORT_DIR, 2, ctx->root_retained,
+                        stray, sizeof(stray)))
+        ESP_LOGW(TAG, "import: %s matches no session group — left in place",
+                 stray);
     return ESP_ERR_NOT_FOUND;
 }
 
@@ -6023,7 +6130,7 @@ static void edf_import_task(void *arg)
                 continue;
             }
             if (!ctx->root_done && root_retry_defer(
-                    esp_timer_get_time(), dir_has_pending(IMP_IMPORT_DIR, 2, true))) {
+                    esp_timer_get_time(), groups_need_eval())) {
                 ctx->root_done = true;
                 ctx->root_retained = true;
                 root_deferred = true;

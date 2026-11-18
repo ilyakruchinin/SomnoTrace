@@ -406,8 +406,8 @@ static void roundtrip(const char *label, const char *tz, const char *tz_off,
         check(edf_gen_rebuild_day(days[i]) == ESP_OK, "%s: re-export of %s failed", label, days[i]);
     check(unlink(SD_SUMMARIES_DIR "/native-str.needs_rebuild") == 0,
           "%s: clear completed test rebuild marker", label);
-    check(edf_import_pending(),
-          "%s: cross-stem source evidence remains staged after rebuild", label);
+    check(!edf_import_pending(),
+          "%s: committed sources fully consumed after rebuild", label);
 
     /* A == B: same file set, same bytes */
     char b_files[16][80];
