@@ -1516,20 +1516,22 @@ static esp_err_t import_status_handler(httpd_req_t *req)
 
 static esp_err_t import_run_handler(httpd_req_t *req)
 {
-    bool full = false;
+    bool full = false, import_only = false;
     if (req->content_len > 0) {
         char body[96];
         if (recv_body(req, body, sizeof(body)) == ESP_OK) {
             cJSON *j = cJSON_Parse(body);
             if (j) {
                 full = cJSON_IsTrue(cJSON_GetObjectItem(j, "full"));
+                import_only = cJSON_IsTrue(cJSON_GetObjectItem(j, "import_only"));
                 cJSON_Delete(j);
             }
         }
     }
     /* Pull from the bridge first (it stages into IMPORT/), then let the
-     * Phase-1 importer drain whatever is there. */
-    if (sb_ble_is_paired()) sb_ble_sync_now(full);
+     * Phase-1 importer drain whatever is there.  import_only skips the
+     * pull — used when files were staged by hand (FTP/SD copy). */
+    if (!import_only && sb_ble_is_paired()) sb_ble_sync_now(full);
     edf_import_kick_now();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");

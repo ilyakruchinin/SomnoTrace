@@ -47,6 +47,7 @@
 #include "net_provision.h"
 #include "uploader.h"
 #include "as11_ble.h"
+#include "sb_ble.h"
 #include "oximeter.h"
 #include "web_auth.h"
 
@@ -638,6 +639,10 @@ static void ws_forwarder_task(void *arg)
                         cJSON_AddItemToObject(ble, "device", info);
                     }
                 }
+                /* Bridge telemetry rides the same push so the portal's
+                 * SomnoBridge cards update on transitions, not only on
+                 * the periodic status payload. */
+                cJSON_AddItemToObject(ble, "bridge", sb_ble_status_json());
                 log_stream_ws_send_json("ble", ble);
             }
         }

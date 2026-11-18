@@ -1481,10 +1481,9 @@ Upload Progress
 <svg viewBox="0 0 24 24"><path d="M17 7h-4v2h4c1.65 0 3 1.35 3 3s-1.35 3-3 3h-4v2h4c2.76 0 5-2.24 5-5s-2.24-5-5-5zm-6 8H7c-1.65 0-3-1.35-3-3s1.35-3 3-3h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-2zm-3-4h8v2H8v-2z"/></svg>
 SomnoBridge Sync
 </div>
-<p class="card-desc">Pull therapy data from the EZShare card through the paired SomnoBridge, then import it into SomnoTrace.</p>
+<p class="card-desc">The bridge syncs the card and imports staged files automatically every few minutes. <strong>Sync now</strong> pulls the recent-day window from the EZShare card through the paired SomnoBridge and imports it immediately; <strong>Import now</strong> only processes files already in IMPORT (e.g. manually copied days outside the sync window) without contacting the bridge.</p>
 <div style="display:flex;gap:8px;flex-wrap:wrap">
-<button type="button" class="btn btn-primary btn-sm" onclick="sbSyncNow(false)">Sync now</button>
-<button type="button" class="btn btn-sm" onclick="sbSyncNow(true)">Full sync (365 days)</button>
+<button type="button" class="btn btn-primary btn-sm" onclick="sbSyncNow()">Sync now</button>
 <button type="button" class="btn btn-outline btn-sm" onclick="importNow()">Import now</button>
 </div>
 <div id="sb-status-line" class="status-msg" style="margin-top:8px"></div>
@@ -2327,6 +2326,9 @@ function applyDeviceName(d) {
 
 function loadStatusTab(d) {
   applyDeviceName(d);
+  /* The periodic status payload already carries ble.bridge — render the
+   * SomnoBridge cards from it so they appear without visiting Settings. */
+  renderBridge(d.ble && d.ble.bridge);
   function setEl(id, val) { var el = document.getElementById(id); if (el) el.textContent = val; }
   setEl('status-fw', d.fw_ver || '--');
   /* Which repository this firmware was built from. Absent on builds from before the
@@ -2699,17 +2701,21 @@ function bleScan() {
 }
 
 var lastBridgeAddr = '';
-function sbSyncNow(full) {
+function sbStatusLine(t) { var el = document.getElementById('sb-status-line'); if (el) el.textContent = t; }
+function sbSyncNow() {
   fetch('/api/import/run', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-                             body: JSON.stringify({ full: !!full }) })
+                             body: JSON.stringify({ full: false }) })
     .then(function(r){ return r.json(); })
-    .then(function(){ bleStatusMsg(full ? 'Full sync requested' : 'Sync requested'); bleRefresh(); })
-    .catch(function(){ bleStatusMsg('Sync request failed'); });
+    .then(function(){ sbStatusLine('Sync requested'); bleRefresh(); })
+    .catch(function(){ sbStatusLine('Sync request failed'); });
 }
 function importNow() {
-  fetch('/api/import/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
-    .then(function(){ bleStatusMsg('Import requested'); bleRefresh(); })
-    .catch(function(){ bleStatusMsg('Import request failed'); });
+  /* import_only: drain whatever is already staged in IMPORT — no bridge
+   * sync — so manually copied files are picked up without a card pull. */
+  fetch('/api/import/run', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                             body: JSON.stringify({ import_only: true }) })
+    .then(function(){ sbStatusLine('Import requested'); bleRefresh(); })
+    .catch(function(){ sbStatusLine('Import request failed'); });
 }
 
 /* ── SomnoBridge: Status tab card + Actions card + config dialog ── */

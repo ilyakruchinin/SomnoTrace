@@ -135,7 +135,6 @@ static const ble_uuid128_t UUID_DATA =
 #define SB_IDLE_SYNC_MS   (5 * 60 * 1000)
 #define SB_PIN_BUDGET_MS  90000   /* > the bridge's 60 s attempt limit */
 #define SB_SEC_DELAY_MS   700     /* see deferred security note below  */
-#define SB_SYNC_DAYS      14
 #define SB_SYNC_DAYS_FULL 365
 
 #define SB_NVS_NS         "sbble"
