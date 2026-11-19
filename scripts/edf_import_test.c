@@ -455,6 +455,7 @@ static edf_import_unit_t drain(edf_import_ctx_t *c, int *units)
         tot.deferred_frozen += u.deferred_frozen;
         tot.deferred_conflict += u.deferred_conflict;
         tot.deferred_capacity += u.deferred_capacity;
+        tot.deferred_inflight += u.deferred_inflight;
         tot.files_consumed    += u.files_consumed;
         tot.files_rejected    += u.files_rejected;
         tot.spools_written    += u.spools_written;
@@ -2005,8 +2006,10 @@ static void phase_m(void)
 /* Stamp every file under `root` with mtime = now + delta_s. */
 static void touch_tree(const char *root, long delta_s)
 {
+    /* Dirs as well as files — a finished copy leaves an aged directory
+     * stamp, and the importer's dir-level quiescence keys on it. */
     char cmd[900];
-    snprintf(cmd, sizeof(cmd), "find '%s' -type f -exec touch -d @%ld {} +",
+    snprintf(cmd, sizeof(cmd), "find '%s' -exec touch -d @%ld {} +",
              root, (long)time(NULL) + delta_s);
     if (system(cmd) != 0) printf("  warn: touch_tree %s failed\n", root);
 }

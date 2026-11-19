@@ -62,6 +62,8 @@ typedef struct {
     int  deferred_frozen;
     int  deferred_conflict;
     int  deferred_capacity;
+    int  deferred_inflight;   /* incomplete source — upload still in flight
+                               * (or stalled); retained, not failed */
     int  files_consumed;    /* source files deleted after durable commit */
     int  files_rejected;    /* corrupt files moved aside to *.bad */
     int  spools_written;

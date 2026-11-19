@@ -128,6 +128,9 @@ static inline void *imp_psram_calloc(size_t n, size_t sz)
 #define IMP_UNCERTAIN_MS    (24LL * 60 * 60 * 1000) /* defer unproven same-day pair */
 #define IMP_LINE_MAX        470   /* keep event JSON lines < consumer buffers */
 #define IMP_NATIVE_DIRTY    SD_SUMMARIES_DIR "/native-str.needs_rebuild"
+/* An incomplete source untouched for this long is a stalled transfer, not
+ * a slow one — same staging, different report. */
+#define IMP_STALL_S         3600
 
 /* SomnoBridge drift sidecar */
 #define IMP_DRIFT_FILE      "_bridge_drift.json"
@@ -4345,6 +4348,7 @@ typedef struct {
     uint64_t    future_part_signature;
     bool        capacity_exceeded;  /* all candidates must be visible together */
     char        drift_path[320];    /* _bridge_drift.json, "" when absent */
+    time_t      dir_mtime;          /* src_dir mtime at scan — pre-commit re-check */
     int         n_files;
     imp_file_t  files[IMP_MAX_FILES];
 } imp_group_t;
@@ -4591,6 +4595,7 @@ static bool next_group(const edf_import_ctx_t *ctx, imp_group_t *g)
                      bases[b], 8, ent->d_name);
             struct stat st;
             if (stat(t->src_dir, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            t->dir_mtime = st.st_mtime;
             memcpy(t->key, ent->d_name, 9);   /* name_is_dir8 ⇒ exactly 8 + NUL */
             scan_group_dir(t->src_dir, t, ctx->quiesce_s);
             if (t->has_part) continue;          /* transfer in flight */
@@ -4662,6 +4667,11 @@ static bool next_group(const edf_import_ctx_t *ctx, imp_group_t *g)
                 memcpy(g->key, flat_key, sizeof(g->key));
                 snprintf(g->src_dir, sizeof(g->src_dir), "%s",
                          IMP_IMPORT_DIR);
+                {
+                    struct stat dst0;
+                    if (stat(g->src_dir, &dst0) == 0)
+                        g->dir_mtime = dst0.st_mtime;
+                }
                 rewinddir(d);
                 while ((ent = readdir(d)) != NULL) {
                     imp_file_t f;
@@ -5224,7 +5234,9 @@ static esp_err_t inspect_session_source(const imp_file_t *file)
     if (!e) return ESP_ERR_NO_MEM;
     esp_err_t result = imp_edf_open(e, file->path);
     if (result == ESP_OK && e->incomplete)
-        result = ESP_FAIL; /* a still-growing or torn source remains staged */
+        result = ESP_ERR_NOT_FINISHED; /* a still-growing or torn source
+                                        * remains staged — distinguishable
+                                        * from a true defect */
     if (result == ESP_OK) {
         bool usable = true;
         if (file->kind == K_BRP) {
@@ -5436,6 +5448,19 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
     ESP_LOGI(TAG, "import: %s → %d session cluster(s) from %d file(s)",
              g->src_dir, n_sess, g->n_files);
 
+    /* Entries may have landed between the directory scan and now — a stamp
+     * mismatch re-queues the unit rather than committing a subset. */
+    struct stat dst;
+    if (stat(g->src_dir, &dst) != 0 || dst.st_mtime != g->dir_mtime) {
+        ESP_LOGI(TAG, "import: %s changed during scan — re-queueing",
+                 g->src_dir);
+        if (drift.raw) cJSON_Delete(drift.raw);
+        free(associations);
+        free(cl);
+        u->deferred = true;
+        return;
+    }
+
     /* The streams noon-day of a committed session can differ from the
      * group's calendar-date key — sessions starting 00:00–11:59 belong to
      * the previous noon-day.  Track the days actually touched so spool
@@ -5461,13 +5486,33 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
         const imp_file_t *srcs[] = { cl[i].brp, cl[i].pld, cl[i].sa2,
                                      cl[i].eve, cl[i].csl };
         bool input_failed = false;
+        const imp_file_t *inflight = NULL;
         for (int s = 0; s < 5; s++) {
             if (!srcs[s]) continue;
             esp_err_t check = inspect_session_source(srcs[s]);
             if (check == ESP_OK) continue;
+            if (check == ESP_ERR_NOT_FINISHED) {
+                /* Still-growing or torn source — an upload in flight (or a
+                 * stalled one).  Staged and retried; not a defect. */
+                source_retained = true;
+                if (!inflight) inflight = srcs[s];
+                continue;
+            }
             input_failed = source_retained = true;
             if ((check == ESP_ERR_INVALID_SIZE || check == ESP_ERR_INVALID_VERSION) &&
                 quarantine_source(srcs[s]->path)) u->files_rejected++;
+        }
+        if (inflight && !input_failed) {
+            /* An old mtime means the transfer died rather than paused. */
+            struct stat st;
+            bool stalled = stat(inflight->path, &st) == 0 &&
+                           time(NULL) - st.st_mtime > IMP_STALL_S;
+            (void)stalled;               /* host ESP_LOGW is a no-op */
+            u->sessions_skipped++;
+            u->deferred_inflight++;
+            ESP_LOGW(TAG, "import: %s — incomplete upload %s; source(s) kept",
+                     g->src_dir, stalled ? "stalled" : "still in flight");
+            continue;
         }
         if (input_failed) {
             u->sessions_failed++;
@@ -5537,7 +5582,7 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
             }
         } else if (r == ESP_ERR_INVALID_STATE || r == ESP_ERR_NOT_SUPPORTED) {
             /* INVALID_STATE: true duplicate — every offered kind proved
-             * covered.  NOT_FINISHED: augment merged what it safely could
+             * covered.  NOT_SUPPORTED: augment merged what it safely could
              * and flagged the consumable sources in w.src_consumed; the
              * rest stay in place — unverifiable, never deleted on a
              * guess, retried on a later pass. */
@@ -5553,9 +5598,11 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
                 }
             if (associations->retain_raw[i] || w.retain_raw) source_retained = true;
             if (r == ESP_ERR_NOT_SUPPORTED)
-                ESP_LOGW(TAG, "import: %s session %s — unverifiable "
-                         "source(s) kept for a later pass",
-                         g->src_dir, w.id);
+                ESP_LOGW(TAG, "import: %s session %s — %ssource(s) kept "
+                         "for a later pass",
+                         g->src_dir, w.id,
+                         w.src_consumed ? "merged; remaining unverifiable "
+                                        : "unverifiable ");
             if (r == ESP_ERR_NOT_SUPPORTED) {
                 if (w.frozen) u->deferred_frozen++;
                 else u->deferred_conflict++;
@@ -5569,10 +5616,10 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
     }
 
     if (u->deferred_association || u->deferred_identity || u->deferred_frozen ||
-        u->deferred_conflict || u->deferred_capacity) {
-        ESP_LOGW(TAG, "import: staged association=%d identity=%d frozen=%d conflict=%d capacity=%d",
+        u->deferred_conflict || u->deferred_capacity || u->deferred_inflight) {
+        ESP_LOGW(TAG, "import: staged association=%d identity=%d frozen=%d conflict=%d capacity=%d inflight=%d",
                  u->deferred_association, u->deferred_identity, u->deferred_frozen,
-                 u->deferred_conflict, u->deferred_capacity);
+                 u->deferred_conflict, u->deferred_capacity, u->deferred_inflight);
     }
 
     /* Orphan files in the group that never joined a cluster (unknown
@@ -5654,7 +5701,7 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
 #ifdef EDF_IMPORT_HOST
 #define IMP_QUIESCE_DEFAULT_S  0
 #else
-#define IMP_QUIESCE_DEFAULT_S  15
+#define IMP_QUIESCE_DEFAULT_S  30
 #endif
 
 edf_import_ctx_t *edf_import_ctx_create(void)
@@ -5975,6 +6022,9 @@ static bool root_files_recent(edf_import_ctx_t *ctx)
     };
     bool future = false;
     uint64_t signature = 0;
+    /* Any root-level arrival — including names outside the list below and
+     * new subdirs — bumps IMPORT/'s own stamp: more evidence may follow. */
+    if (imp_recent(IMP_IMPORT_DIR, ctx->quiesce_s)) return true;
     for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
         if (imp_recent(paths[i], ctx->quiesce_s)) return true;
         if (ctx->quiesce_s > 0 && imp_future_file(paths[i], &signature)) future = true;
@@ -5986,6 +6036,10 @@ static bool group_recent(edf_import_ctx_t *ctx, const imp_group_t *g)
 {
     bool future = g->future_part;
     uint64_t signature = g->future_part_signature;
+    /* Creating a file bumps the parent dir's mtime before the entry is ever
+     * scanned — the dir check is the 'siblings may still be arriving'
+     * signal for every writer, not just in-progress file contents. */
+    if (imp_recent(g->src_dir, ctx->quiesce_s)) return true;
     if (g->drift_path[0]) {
         if (imp_recent(g->drift_path, ctx->quiesce_s)) return true;
         if (ctx->quiesce_s > 0 && imp_future_file(g->drift_path, &signature)) future = true;

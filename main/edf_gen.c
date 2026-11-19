@@ -110,9 +110,23 @@ static bool exported_identity_compatible(const cJSON *native)
     struct stat st;
     if (stat(path, &st) != 0) {
         if (errno != ENOENT) return false;
-        if (stat(SD_SDCARD_DIR "/STR.edf", &st) == 0 || errno != ENOENT)
+        int str_stat = stat(SD_SDCARD_DIR "/STR.edf", &st);
+        int str_errno = errno;
+        if (str_stat != 0 && str_errno == ENOENT && !exported_datalog_exists())
+            return true;
+        /* Identification.json missing while STR/DATALOG exist is an
+         * interrupted-export state, not a foreign tree: regenerate it from
+         * native.ident.json and let the compare below verify the result.
+         * The veto stays for a file that exists but cannot match, and for
+         * a native identity too weak to publish from. */
+        const cJSON *serial = cJSON_GetObjectItemCaseSensitive(native, "SerialNumber");
+        if (!cJSON_IsString(serial) || !serial->valuestring ||
+            !serial->valuestring[0] ||
+            settings_provenance_family(native) == SETTINGS_FAMILY_UNKNOWN ||
+            edf_generate_identification_files(SD_SDCARD_DIR,
+                SD_SUMMARIES_DIR "/native.ident.json") != ESP_OK)
             return false;
-        return !exported_datalog_exists();
+        ESP_LOGI(TAG, "native STR: regenerated missing Identification.json");
     }
     cJSON *published = edf_read_json_file(path);
     const cJSON *fg = cJSON_GetObjectItemCaseSensitive(published, "FlowGenerator");
