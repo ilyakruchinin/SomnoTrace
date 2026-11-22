@@ -5279,10 +5279,10 @@ var DASH_SIGNALS = [
  * Timestamps use the ms-precision reportTime plus the session's NTP drift
  * (the injected ntpTimeMs is only second-granular). */
 function parseSessionGate(text, driftMs) {
-  var g = { start: null, end: null, gated: false };
+  var g = { start: null, end: null, gated: false, windows: [] };
   if (!text) return g;
   var d = driftMs || 0;
-  var rise = null, fall = null, maskOn = null, maskOff = null;
+  var wins = [], cur = null, maskOn = null, maskOff = null;
   var lines = text.split('\n');
   for (var i = 0; i < lines.length; i++) {
     var ln = lines[i].trim();
@@ -5294,23 +5294,49 @@ function parseSessionGate(text, driftMs) {
       var ev = p.events[j];
       if (!ev) continue;
       var t = Date.parse(ev.reportTime);
-      if (isNaN(t)) continue;
-      t += d;
+      if (isNaN(t)) {
+        if (typeof ev.ntpTimeMs === 'number' && ev.ntpTimeMs > 0) t = ev.ntpTimeMs;
+        else continue;
+      } else {
+        t += d;
+      }
       if (p.dataId === '_ZLE' && typeof ev.value === 'number') {
-        if (ev.value === 1) { if (rise === null) rise = t; }   /* first rising */
-        else if (ev.value === 0) { fall = t; }                  /* last falling */
+        if (ev.value === 1) {
+          if (!cur) cur = { start: t, end: null };
+        } else if (ev.value === 0) {
+          if (cur && t > cur.start) {
+            cur.end = t;
+            wins.push(cur);
+            cur = null;
+          }
+        }
       }
       if (ev.event === 'MaskOn' && maskOn === null) maskOn = t;
       if (ev.event === 'MaskOff') maskOff = t;
     }
   }
-  g.start = (rise !== null) ? rise : maskOn;
-  g.end   = (fall !== null) ? fall : maskOff;
-  g.gated = (g.start !== null);
+  if (cur) {
+    if (maskOff !== null && maskOff > cur.start) cur.end = maskOff;
+    wins.push(cur);
+  }
+  if (wins.length > 1) {
+    var kept = wins.filter(function(w) { return w.end === null || (w.end - w.start) >= 60000; });
+    if (kept.length) wins = kept;
+    else wins = [wins[0]];
+  }
+  if (!wins.length && maskOn !== null) {
+    wins.push({ start: maskOn, end: (maskOff !== null && maskOff > maskOn) ? maskOff : null });
+  }
+  if (wins.length) {
+    g.start = wins[0].start;
+    g.end = wins[wins.length - 1].end;
+    g.gated = true;
+    g.windows = wins;
+  }
   return g;
 }
 
-/* Trim a parsed .snt object to the gating window, in sample-index space so it
+/* Trim a parsed .snt object to the gating window(s), in sample-index space so it
  * matches convert_snt_to_edf() exactly:
  *   skip    = round((gateStart - startMs) / msPerRec)
  *   maxN    = round((gateEnd - gateStart) / msPerRec)   (no end trim if absent)
@@ -5318,6 +5344,8 @@ function parseSessionGate(text, driftMs) {
  *                                         packets were lost / capture cut short
  *   records = floor(total / spr)       <- partial trailing record dropped,
  *                                         as AS11 does not zero-pad
+ * For multi-window sessions (_ZLE 1→0→1 toilet breaks), samples falling inside
+ * _ZLE=0 gaps are blanked to NaN so charts show gaps and stats exclude them.
  * Returns a view-sliced copy, the original object when nothing to trim, or
  * null when not even one complete 60 s record survives. */
 function gateTrim(parsed, gate) {
@@ -5338,14 +5366,40 @@ function gateTrim(parsed, gate) {
   }
   var keep = Math.floor(total / spr) * spr;
   if (keep <= 0) return null;
-  if (skip === 0 && keep === n) return parsed;
+  var multi = gate.windows && gate.windows.length > 1;
+  if (!multi && skip === 0 && keep === n) return parsed;
   var out = {};
   for (var k in parsed) {
     var v = parsed[k];
-    if (v && v.length === n && typeof v.subarray === 'function')
-      out[k] = v.subarray(skip, skip + keep);
-    else
+    if (v && v.length === n && typeof v.subarray === 'function') {
+      var sub = v.subarray(skip, skip + keep);
+      out[k] = (multi && k !== 't') ? new v.constructor(sub) : sub;
+    } else {
       out[k] = v;
+    }
+  }
+  if (multi) {
+    var wins = gate.windows;
+    var ot = out.t, m = ot.length;
+    var gapMask = new Uint8Array(m);
+    for (var wi = 0; wi < wins.length - 1; wi++) {
+      var wEnd = wins[wi].end, nextStart = wins[wi + 1].start;
+      if (wEnd == null || !(nextStart > wEnd)) continue;
+      var wStartIdx = Math.max(0, Math.round((wins[wi].start - ot[0]) / msPerRec));
+      var wKeep = Math.floor(Math.round((wEnd - wins[wi].start) / msPerRec) / spr) * spr;
+      var g0 = Math.max(0, Math.min(m, wStartIdx + wKeep));
+      var g1 = Math.max(0, Math.min(m, Math.round((nextStart - ot[0]) / msPerRec)));
+      for (var j = g0; j < g1; j++) gapMask[j] = 1;
+    }
+    for (var k2 in out) {
+      if (k2 === 't') continue;
+      var arr = out[k2];
+      if (arr && arr.length === m && typeof arr.subarray === 'function') {
+        for (var j2 = 0; j2 < m; j2++) {
+          if (gapMask[j2]) arr[j2] = NaN;
+        }
+      }
+    }
   }
   return out;
 }

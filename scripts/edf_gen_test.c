@@ -2828,6 +2828,122 @@ static void test_wf_zle_a_drift_cancelled_time_is_not_a_time(void)
     assert(edf_find_zle_edge_time(q, 1, -as11) == -1);
 }
 
+static void test_wf_zle_windows_state_machine(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_zle_wins.jsonl");
+    /* Leading stray 0, then (1000..2000) with duplicate 1 and duplicate 0,
+     * then an open final rising edge at 3000 (StandbyStarted race). */
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":0,\"ntpTimeMs\":500}]}}\n"
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,\"ntpTimeMs\":1000}]}}\n"
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,\"ntpTimeMs\":1200}]}}\n"
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":0,\"ntpTimeMs\":2000}]}}\n"
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":0,\"ntpTimeMs\":2100}]}}\n"
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,\"ntpTimeMs\":3000}]}}\n");
+    edf_zle_window_t w[4];
+    int n = edf_find_zle_windows(p, 0, w, 4);
+    CHECK(n == 2, "expected 2 windows, got %d", n);
+    if (n == 2) {
+        CHECK(w[0].start_ms == 1000 && w[0].end_ms == 2000,
+              "window 0 [%lld..%lld]", (long long)w[0].start_ms, (long long)w[0].end_ms);
+        CHECK(w[1].start_ms == 3000 && w[1].end_ms == 0,
+              "window 1 [%lld..%lld] should stay open", (long long)w[1].start_ms, (long long)w[1].end_ms);
+    }
+}
+
+static void test_zle_multi_window_splits_waveforms(void)
+{
+    set_tz("UTC");
+    char rootm[300], sdm[400], outm[400];
+    char root0[300], sd0[400], out0[400], p[600];
+    snprintf(rootm, sizeof(rootm), "%s/zle_multi", g_root);
+    snprintf(root0, sizeof(root0), "%s/zle_multi_ref", g_root);
+    /* 3-minute session (180 s): two >=60 s windows separated by a 20 s break.
+     * Window 1: +10 s → +75 s  (65 s → 1 complete 60 s record, starts 22:00:10)
+     * Gap:      +75 s → +95 s  (toilet break, excluded)
+     * Window 2: +95 s → +165 s (70 s → 1 complete 60 s record, starts 22:01:35) */
+    build_session(rootm, 2, SA2_N, sdm, sizeof(sdm));
+    build_session(root0, 2, SA2_N, sd0, sizeof(sd0));
+    static const int64_t zle_at[] = { 10000, 75000, 95000, 165000 };
+    static const int     zle_v[]  = {     1,     0,     1,      0 };
+    write_zle_sequence(sdm, zle_at, zle_v, 4);
+
+    CHECK(generate(rootm, sdm, outm, sizeof(outm)) == ESP_OK, "multi-window generate failed");
+    CHECK(generate(root0, sd0, out0, sizeof(out0)) == ESP_OK, "reference generate failed");
+
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/%s_BRP.edf", out0, SID);
+    size_t n0 = 0; uint8_t *b0 = read_file(p, &n0);
+    edf_t eu;
+    CHECK(b0 && edf_parse(b0, n0, &eu), "reference BRP missing");
+
+    /* Window 1 triplet */
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/20260301_220010_BRP.edf", outm);
+    size_t n1 = 0; uint8_t *b1 = read_file(p, &n1);
+    CHECK(b1 != NULL, "window 1 BRP missing (22:00:10)");
+    if (b1 && b0) {
+        edf_t e1;
+        CHECK(edf_parse(b1, n1, &e1) && e1.ndr == 1,
+              "window 1 should have 1 record, got %d", e1.ndr);
+        if (e1.ndr == 1) {
+            int j = 250; /* +10 s at 25 Hz */
+            CHECK(edf_sample(b1, &e1, 0, 0, 0) == edf_sample(b0, &eu, j / eu.spr[0], 0, j % eu.spr[0]),
+                  "window 1 first sample matches +10 s");
+        }
+    }
+    free(b1);
+
+    /* Window 2 triplet */
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/20260301_220135_BRP.edf", outm);
+    size_t n2 = 0; uint8_t *b2 = read_file(p, &n2);
+    CHECK(b2 != NULL, "window 2 BRP missing (22:01:35)");
+    if (b2 && b0) {
+        edf_t e2;
+        CHECK(edf_parse(b2, n2, &e2) && e2.ndr == 1,
+              "window 2 should have 1 record, got %d", e2.ndr);
+        if (e2.ndr == 1) {
+            int j = 2375; /* +95 s at 25 Hz */
+            CHECK(edf_sample(b2, &e2, 0, 0, 0) == edf_sample(b0, &eu, j / eu.spr[0], 0, j % eu.spr[0]),
+                  "window 2 first sample matches +95 s");
+        }
+    }
+    free(b2);
+
+    /* Only ONE EVE/CSL pair at TherapyStart (22:00:00) */
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/%s_EVE.edf", outm, SID);
+    CHECK(access(p, F_OK) == 0, "TherapyStart EVE.edf missing");
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/20260301_220135_EVE.edf", outm);
+    CHECK(access(p, F_OK) != 0, "second window must not emit a duplicate EVE.edf");
+
+    free(b0);
+}
+
+static void test_zle_open_final_window_not_truncated(void)
+{
+    set_tz("UTC");
+    char rooto[300], sdo[400], outo[400], p[600];
+    snprintf(rooto, sizeof(rooto), "%s/zle_open", g_root);
+    /* StandbyStarted race: final _ZLE=0 never written after second _ZLE=1.
+     * Window 2 (+95 s → EOF +180 s = 85 s) must produce 1 record, NOT be
+     * truncated back to Window 1's falling edge (+75 s). */
+    build_session(rooto, 2, SA2_N, sdo, sizeof(sdo));
+    static const int64_t zle_at[] = { 10000, 75000, 95000 };
+    static const int     zle_v[]  = {     1,     0,     1 };
+    write_zle_sequence(sdo, zle_at, zle_v, 3);
+
+    CHECK(generate(rooto, sdo, outo, sizeof(outo)) == ESP_OK, "open-final generate failed");
+
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/20260301_220135_BRP.edf", outo);
+    size_t n2 = 0; uint8_t *b2 = read_file(p, &n2);
+    CHECK(b2 != NULL, "open final window BRP missing (22:01:35)");
+    if (b2) {
+        edf_t e2;
+        CHECK(edf_parse(b2, n2, &e2) && e2.ndr == 1,
+              "open final window should keep 1 record through EOF, got %d", e2.ndr);
+    }
+    free(b2);
+}
+
 /* The dedup pass compares each event only against the previous KEPT one, so it
  * is correct only if identical (onset, label) pairs are adjacent after sorting.
  * Ordering on onset alone did not guarantee that. */
@@ -3072,6 +3188,12 @@ int main(void)
 
     run("_ZLE rejects an AS11 time cancelled by the drift",
         test_wf_zle_a_drift_cancelled_time_is_not_a_time, NULL);
+    run("_ZLE multi-window state machine",
+        test_wf_zle_windows_state_machine, NULL);
+    run("_ZLE multi-window splits BRP/PLD/SA2 on toilet breaks",
+        test_zle_multi_window_splits_waveforms, NULL);
+    run("_ZLE open final window is not truncated to prior falling edge",
+        test_zle_open_final_window_not_truncated, NULL);
 
     if (!getenv("KEEP_TEST_TREE")) rmtree(g_root);
     else printf("test tree kept at %s\n", g_root);

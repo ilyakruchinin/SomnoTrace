@@ -768,14 +768,22 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     as11_time_format_edf_datetime(edf_start_ms, start_date, sizeof(start_date),
                         start_time, sizeof(start_time));
 
-    /* BRP/PLD/SA2 start timestamp (NTP clock domain).
+    /* BRP/PLD/SA2 gating windows (NTP clock domain).
      * Prefer _ZLE (Zero Leak Estimate) ValueChange — the AS11's actual
      * data gating signal — over MaskOn.  Fall back to MaskOn if _ZLE
      * is not available (e.g. older sessions or subscription not accepted).
-     * Rationale: https://github.com/ilyakruchinin/SomnoTrace/issues/20#issuecomment-4975037843 */
-    int64_t maskon_start_ms = start_epoch_ms;
-    uint32_t brp_skip = 0, sa2_skip = 0, pld_skip = 0;
-    uint32_t brp_max = 0, sa2_max = 0, pld_max = 0;
+     * Rationale: https://github.com/ilyakruchinin/SomnoTrace/issues/20#issuecomment-4975037843
+     *
+     * When a user removes the mask mid-session without stopping therapy,
+     * the AS11 toggles _ZLE 1→0→1 and emits one BRP/PLD/SA2 triplet per
+     * (_ZLE=1 → _ZLE=0) window while keeping a single EVE/CSL pair. */
+    typedef struct {
+        int64_t  start_ms;
+        uint32_t brp_skip, sa2_skip, pld_skip;
+        uint32_t brp_max,  sa2_max,  pld_max;
+    } edf_wave_win_t;
+    edf_wave_win_t wave_wins[EDF_MAX_ZLE_WINDOWS];
+    int n_wave_wins = 0;
     /* True once a real data-gating signal (_ZLE rising or MaskOn) was found.
      * When false the AS11 never began delivering gated flow data. */
     bool therapy_gated = false;
@@ -794,114 +802,171 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         read_pre_gate_info(session_dir, session_id, &pg);
         bool pre_gated = pg.pre_gated;
         if (pre_gated) {
-            maskon_start_ms = start_epoch_ms + pg.wav_off;
-            if (maskon_start_ms >= end_epoch_ms)
-                maskon_start_ms = start_epoch_ms;
+            int64_t ws = start_epoch_ms + pg.wav_off;
+            if (ws >= end_epoch_ms)
+                ws = start_epoch_ms;
+            memset(&wave_wins[0], 0, sizeof(wave_wins[0]));
+            wave_wins[0].start_ms = ws;
+            n_wave_wins = 1;
             therapy_gated = true;
             emit_brp = pg.emit_brp;
             emit_sa2 = pg.emit_sa2;
             emit_pld = pg.emit_pld;
             ESP_LOGI(TAG, "pre_gated: maskon_start=%lld (offset %lld ms, "
                           "streams already gated — no skip)",
-                     (long long)maskon_start_ms, (long long)pg.wav_off);
+                     (long long)ws, (long long)pg.wav_off);
         }
 
         if (!pre_gated) {
-        int64_t zle_ntp = edf_find_zle_edge_time(events_snt_path, 1, clock_drift_ms);
-        if (zle_ntp > 0 && zle_ntp > start_epoch_ms && zle_ntp < end_epoch_ms) {
-            maskon_start_ms = zle_ntp;
-            therapy_gated = true;
-            int64_t skip_ms = zle_ntp - start_epoch_ms;
-            brp_skip = edf_ms_to_samples_25hz(skip_ms);
-            sa2_skip = edf_ms_to_samples_1hz(skip_ms);
-            pld_skip = edf_ms_to_samples_pld(skip_ms);
-            ESP_LOGI(TAG, "_ZLE: ntp=%lld skip_ms=%lld "
-                         "brp_skip=%u sa2_skip=%u pld_skip=%u",
-                     (long long)zle_ntp, (long long)skip_ms,
-                     (unsigned)brp_skip, (unsigned)sa2_skip,
-                     (unsigned)pld_skip);
-        } else {
-            if (zle_ntp > 0) {
-                ESP_LOGW(TAG, "_ZLE NTP time %lld out of session range "
-                             "[%lld, %lld], falling back to MaskOn",
-                         (long long)zle_ntp,
-                         (long long)start_epoch_ms,
-                         (long long)end_epoch_ms);
-            } else {
-                ESP_LOGI(TAG, "_ZLE not found in events.snt, using MaskOn");
-            }
-            /* Fall back to MaskOn */
-            int64_t maskon_as11 = edf_find_mask_on_time(events_snt_path);
-            if (maskon_as11 > 0) {
-                int64_t maskon_ntp = maskon_as11 + clock_drift_ms;
-                if (maskon_ntp > start_epoch_ms && maskon_ntp < end_epoch_ms) {
-                    maskon_start_ms = maskon_ntp;
-                    therapy_gated = true;
-                    int64_t skip_ms = maskon_ntp - start_epoch_ms;
-                    brp_skip = edf_ms_to_samples_25hz(skip_ms);
-                    sa2_skip = edf_ms_to_samples_1hz(skip_ms);
-                    pld_skip = edf_ms_to_samples_pld(skip_ms);
-                    ESP_LOGI(TAG, "MaskOn: as11=%lld ntp=%lld skip_ms=%lld "
-                                 "brp_skip=%u sa2_skip=%u pld_skip=%u",
-                             (long long)maskon_as11, (long long)maskon_ntp,
-                             (long long)skip_ms,
-                             (unsigned)brp_skip, (unsigned)sa2_skip,
-                             (unsigned)pld_skip);
-                } else {
-                    ESP_LOGW(TAG, "MaskOn NTP time %lld out of session range "
-                                 "[%lld, %lld], using TherapyStart",
-                             (long long)maskon_ntp,
+            edf_zle_window_t zle_wins[EDF_MAX_ZLE_WINDOWS];
+            int nz = edf_find_zle_windows(events_snt_path, clock_drift_ms,
+                                          zle_wins, EDF_MAX_ZLE_WINDOWS);
+            int64_t win_durs[EDF_MAX_ZLE_WINDOWS];
+            int64_t maskoff_ntp_cached = -1;
+            bool maskoff_checked = false;
+
+            for (int i = 0; i < nz; i++) {
+                int64_t ws = zle_wins[i].start_ms;
+                if (!(ws > start_epoch_ms && ws < end_epoch_ms)) {
+                    ESP_LOGW(TAG, "_ZLE[%d] NTP time %lld out of session range "
+                                 "[%lld, %lld], skipping",
+                             i, (long long)ws,
                              (long long)start_epoch_ms,
                              (long long)end_epoch_ms);
+                    continue;
+                }
+                int64_t we = zle_wins[i].end_ms;
+                const char *end_src = "_ZLE-falling";
+                if (we == 0) {
+                    if (!maskoff_checked) {
+                        int64_t moff_as11 = edf_find_mask_off_time(events_snt_path);
+                        if (moff_as11 > 0)
+                            maskoff_ntp_cached = moff_as11 + clock_drift_ms;
+                        maskoff_checked = true;
+                    }
+                    if (maskoff_ntp_cached > ws && maskoff_ntp_cached <= end_epoch_ms) {
+                        we = maskoff_ntp_cached;
+                        end_src = "MaskOff";
+                    }
+                }
+                (void)end_src;
+
+                edf_wave_win_t w;
+                memset(&w, 0, sizeof(w));
+                w.start_ms = ws;
+                int64_t skip_ms = ws - start_epoch_ms;
+                w.brp_skip = edf_ms_to_samples_25hz(skip_ms);
+                w.sa2_skip = edf_ms_to_samples_1hz(skip_ms);
+                w.pld_skip = edf_ms_to_samples_pld(skip_ms);
+                ESP_LOGI(TAG, "_ZLE[%d]: ntp=%lld skip_ms=%lld "
+                             "brp_skip=%u sa2_skip=%u pld_skip=%u",
+                         i, (long long)ws, (long long)skip_ms,
+                         (unsigned)w.brp_skip, (unsigned)w.sa2_skip,
+                         (unsigned)w.pld_skip);
+
+                int64_t eff_end = end_epoch_ms;
+                if (we > 0) {
+                    if (we > ws && we <= end_epoch_ms) {
+                        int64_t dur_ms = we - ws;
+                        eff_end = we;
+                        w.brp_max = edf_ms_to_samples_25hz(dur_ms);
+                        w.sa2_max = edf_ms_to_samples_1hz(dur_ms);
+                        w.pld_max = edf_ms_to_samples_pld(dur_ms);
+                        ESP_LOGI(TAG, "end[%d] (%s): ntp=%lld dur_ms=%lld "
+                                     "brp_max=%u sa2_max=%u pld_max=%u",
+                                 i, end_src, (long long)we, (long long)dur_ms,
+                                 (unsigned)w.brp_max, (unsigned)w.sa2_max,
+                                 (unsigned)w.pld_max);
+                    } else {
+                        ESP_LOGW(TAG, "end[%d] (%s) NTP time %lld out of range "
+                                     "(%lld, %lld], no end truncation",
+                                 i, end_src, (long long)we,
+                                 (long long)ws, (long long)end_epoch_ms);
+                    }
+                } else {
+                    ESP_LOGI(TAG, "_ZLE[%d]: open at EOF, no end truncation", i);
+                }
+
+                win_durs[n_wave_wins] = eff_end - ws;
+                wave_wins[n_wave_wins++] = w;
+            }
+
+            if (n_wave_wins > 0) {
+                therapy_gated = true;
+                if (n_wave_wins > 1) {
+                    int kept = 0;
+                    for (int i = 0; i < n_wave_wins; i++) {
+                        if (win_durs[i] >= 60000)
+                            wave_wins[kept++] = wave_wins[i];
+                    }
+                    if (kept > 0)
+                        n_wave_wins = kept;
+                    else
+                        n_wave_wins = 1;
                 }
             } else {
-                ESP_LOGI(TAG, "MaskOn not found in events.snt, using TherapyStart "
-                             "for BRP/PLD/SA2");
-            }
-        }
+                if (nz == 0)
+                    ESP_LOGI(TAG, "_ZLE not found in events.snt, using MaskOn");
+                /* Fall back to MaskOn / MaskOff */
+                edf_wave_win_t w;
+                memset(&w, 0, sizeof(w));
+                w.start_ms = start_epoch_ms;
 
-        /* BRP/PLD/SA2 end timestamp (for end truncation).
-         * AS11 EDF data spans exactly the _ZLE gating window, but .snt
-         * captures TherapyStart→TherapyStop, so the tail must be truncated.
-         *
-         * Prefer the _ZLE falling edge — the symmetric counterpart of the
-         * rising edge used for the start, in the same clock domain.  Fall back
-         * to the last MaskOff only when no falling edge is present.  MaskOff
-         * alone is unreliable: many sessions emit no MaskOff event at all
-         * (e.g. SmartStop), in which case end truncation silently never ran
-         * and the file simply ended wherever the .snt capture stopped. */
-        int64_t end_ntp = edf_find_zle_edge_time(events_snt_path, 0, clock_drift_ms);
-        const char *end_src = "_ZLE-falling";
-        (void)end_src;   /* host ESP_LOG* are no-ops — string is log-only */
-        if (end_ntp <= 0) {
-            int64_t maskoff_as11 = edf_find_mask_off_time(events_snt_path);
-            if (maskoff_as11 > 0) {
-                end_ntp = maskoff_as11 + clock_drift_ms;
-                end_src = "MaskOff";
+                int64_t maskon_as11 = edf_find_mask_on_time(events_snt_path);
+                if (maskon_as11 > 0) {
+                    int64_t maskon_ntp = maskon_as11 + clock_drift_ms;
+                    if (maskon_ntp > start_epoch_ms && maskon_ntp < end_epoch_ms) {
+                        w.start_ms = maskon_ntp;
+                        therapy_gated = true;
+                        int64_t skip_ms = maskon_ntp - start_epoch_ms;
+                        w.brp_skip = edf_ms_to_samples_25hz(skip_ms);
+                        w.sa2_skip = edf_ms_to_samples_1hz(skip_ms);
+                        w.pld_skip = edf_ms_to_samples_pld(skip_ms);
+                        ESP_LOGI(TAG, "MaskOn: as11=%lld ntp=%lld skip_ms=%lld "
+                                     "brp_skip=%u sa2_skip=%u pld_skip=%u",
+                                 (long long)maskon_as11, (long long)maskon_ntp,
+                                 (long long)skip_ms,
+                                 (unsigned)w.brp_skip, (unsigned)w.sa2_skip,
+                                 (unsigned)w.pld_skip);
+                    } else {
+                        ESP_LOGW(TAG, "MaskOn NTP time %lld out of session range "
+                                     "[%lld, %lld], using TherapyStart",
+                                 (long long)maskon_ntp,
+                                 (long long)start_epoch_ms,
+                                 (long long)end_epoch_ms);
+                    }
+                } else {
+                    ESP_LOGI(TAG, "MaskOn not found in events.snt, using TherapyStart "
+                                 "for BRP/PLD/SA2");
+                }
+
+                int64_t maskoff_as11 = edf_find_mask_off_time(events_snt_path);
+                if (maskoff_as11 > 0) {
+                    int64_t end_ntp = maskoff_as11 + clock_drift_ms;
+                    if (end_ntp > w.start_ms && end_ntp <= end_epoch_ms) {
+                        int64_t dur_ms = end_ntp - w.start_ms;
+                        w.brp_max = edf_ms_to_samples_25hz(dur_ms);
+                        w.sa2_max = edf_ms_to_samples_1hz(dur_ms);
+                        w.pld_max = edf_ms_to_samples_pld(dur_ms);
+                        ESP_LOGI(TAG, "end (MaskOff): ntp=%lld dur_ms=%lld "
+                                     "brp_max=%u sa2_max=%u pld_max=%u",
+                                 (long long)end_ntp, (long long)dur_ms,
+                                 (unsigned)w.brp_max, (unsigned)w.sa2_max,
+                                 (unsigned)w.pld_max);
+                    } else {
+                        ESP_LOGW(TAG, "end (MaskOff) NTP time %lld out of range "
+                                     "(%lld, %lld], no end truncation",
+                                 (long long)end_ntp,
+                                 (long long)w.start_ms,
+                                 (long long)end_epoch_ms);
+                    }
+                } else {
+                    ESP_LOGI(TAG, "no _ZLE falling edge or MaskOff in events.snt, "
+                                  "no end truncation");
+                }
+                wave_wins[0] = w;
+                n_wave_wins = 1;
             }
-        }
-        if (end_ntp > 0) {
-            if (end_ntp > maskon_start_ms && end_ntp <= end_epoch_ms) {
-                int64_t dur_ms = end_ntp - maskon_start_ms;
-                brp_max = edf_ms_to_samples_25hz(dur_ms);
-                sa2_max = edf_ms_to_samples_1hz(dur_ms);
-                pld_max = edf_ms_to_samples_pld(dur_ms);
-                ESP_LOGI(TAG, "end (%s): ntp=%lld dur_ms=%lld "
-                             "brp_max=%u sa2_max=%u pld_max=%u",
-                         end_src, (long long)end_ntp, (long long)dur_ms,
-                         (unsigned)brp_max, (unsigned)sa2_max,
-                         (unsigned)pld_max);
-            } else {
-                ESP_LOGW(TAG, "end (%s) NTP time %lld out of range "
-                             "(%lld, %lld], no end truncation",
-                         end_src, (long long)end_ntp,
-                         (long long)maskon_start_ms,
-                         (long long)end_epoch_ms);
-            }
-        } else {
-            ESP_LOGI(TAG, "no _ZLE falling edge or MaskOff in events.snt, "
-                          "no end truncation");
-        }
         }   /* !pre_gated */
     }
     /* ── Aborted session with no therapy: emit no per-session files ──
@@ -953,20 +1018,10 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         }
     }
 
-    char maskon_date[16], maskon_time[16];
-    as11_time_format_edf_datetime(maskon_start_ms, maskon_date, sizeof(maskon_date),
-                        maskon_time, sizeof(maskon_time));
-    char maskon_ts_prefix[32];
-    as11_time_format_session_prefix(maskon_start_ms, maskon_ts_prefix,
-                      sizeof(maskon_ts_prefix));
-
-    /* Recording ID: TherapyStart for EVE/CSL, MaskOn for BRP/PLD/SA2. */
+    /* Recording ID: TherapyStart for EVE/CSL, MaskOn/_ZLE for BRP/PLD/SA2. */
     char recording_id[128];       /* TherapyStart-based (EVE/CSL) */
     format_recording_id_from_ident(recording_id, sizeof(recording_id),
                         edf_start_ms, ident);
-    char maskon_recording_id[128]; /* MaskOn-based (BRP/PLD/SA2) */
-    format_recording_id_from_ident(maskon_recording_id, sizeof(maskon_recording_id),
-                        maskon_start_ms, ident);
 
     /* Patient ID has CRC filled in by edf_write_header.
      * Initial value is the "X X X X" prefix with placeholder zeros. */
@@ -975,146 +1030,159 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     int errors = 0;
     bool allocation_failed = false;
 
-    /* ── Generate BRP.edf (25 Hz breath waveform) ──
-     * v2 format: flow.snt + press.snt (separate 1-ch files).
-     * v1 (backwards compat): brp.snt (single 2-ch interleaved file).
-     * Try v2 first; if flow.snt doesn't exist, fall back to v1 brp.snt. */
-    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy && emit_brp) {
-        char snt_path[300], edf_path[350], press_path[300];
-        snprintf(snt_path, sizeof(snt_path), "%s/%s_flow.snt", session_dir, session_id);
-        snprintf(press_path, sizeof(press_path), "%s/%s_press.snt", session_dir, session_id);
-        snprintf(edf_path, sizeof(edf_path), "%s/%s_BRP.edf", day_dir, maskon_ts_prefix);
+    for (int wi = 0; wi < n_wave_wins && (flags & EDF_GEN_PER_SESSION) && !no_therapy; wi++) {
+        const edf_wave_win_t *w = &wave_wins[wi];
+        char maskon_date[16], maskon_time[16];
+        as11_time_format_edf_datetime(w->start_ms, maskon_date, sizeof(maskon_date),
+                            maskon_time, sizeof(maskon_time));
+        char maskon_ts_prefix[32];
+        as11_time_format_session_prefix(w->start_ms, maskon_ts_prefix,
+                          sizeof(maskon_ts_prefix));
+        char maskon_recording_id[128]; /* MaskOn-based (BRP/PLD/SA2) */
+        format_recording_id_from_ident(maskon_recording_id, sizeof(maskon_recording_id),
+                            w->start_ms, ident);
 
-        static const edf_signal_def_t brp_sigs[] = {
-            { .label = "Flow.40ms", .transducer = "",
-              .unit = "L/s", .phys_min = -2.0, .phys_max = 3.0,
-              .dig_min = -1000, .dig_max = 1500,
-              .prefilter = "", .samples_per_record = 1500 },
-            { .label = "Press.40ms", .transducer = "",
-              .unit = "cmH2O", .phys_min = 0.0, .phys_max = 40.0,
-              .dig_min = 0, .dig_max = 2000,
-              .prefilter = "", .samples_per_record = 1500 },
-        };
+        /* ── Generate BRP.edf (25 Hz breath waveform) ──
+         * v2 format: flow.snt + press.snt (separate 1-ch files).
+         * v1 (backwards compat): brp.snt (single 2-ch interleaved file).
+         * Try v2 first; if flow.snt doesn't exist, fall back to v1 brp.snt. */
+        if (emit_brp) {
+            char snt_path[300], edf_path[350], press_path[300];
+            snprintf(snt_path, sizeof(snt_path), "%s/%s_flow.snt", session_dir, session_id);
+            snprintf(press_path, sizeof(press_path), "%s/%s_press.snt", session_dir, session_id);
+            snprintf(edf_path, sizeof(edf_path), "%s/%s_BRP.edf", day_dir, maskon_ts_prefix);
 
-        /* Check if v2 flow.snt exists; if not, fall back to v1 brp.snt */
-        struct stat st_test;
-        const char *press_arg = press_path;
-        if (stat(snt_path, &st_test) != 0) {
-            /* v1 fallback: use brp.snt (2-ch interleaved, no second file) */
-            snprintf(snt_path, sizeof(snt_path), "%s/%s_brp.snt", session_dir, session_id);
-            press_arg = NULL;
+            static const edf_signal_def_t brp_sigs[] = {
+                { .label = "Flow.40ms", .transducer = "",
+                  .unit = "L/s", .phys_min = -2.0, .phys_max = 3.0,
+                  .dig_min = -1000, .dig_max = 1500,
+                  .prefilter = "", .samples_per_record = 1500 },
+                { .label = "Press.40ms", .transducer = "",
+                  .unit = "cmH2O", .phys_min = 0.0, .phys_max = 40.0,
+                  .dig_min = 0, .dig_max = 2000,
+                  .prefilter = "", .samples_per_record = 1500 },
+            };
+
+            /* Check if v2 flow.snt exists; if not, fall back to v1 brp.snt */
+            struct stat st_test;
+            const char *press_arg = press_path;
+            if (stat(snt_path, &st_test) != 0) {
+                /* v1 fallback: use brp.snt (2-ch interleaved, no second file) */
+                snprintf(snt_path, sizeof(snt_path), "%s/%s_brp.snt", session_dir, session_id);
+                press_arg = NULL;
+            }
+            esp_err_t err = edf_convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
+                                                   maskon_date, maskon_time, brp_sigs, 2, "60.00",
+                                                   NULL, w->brp_skip, w->brp_max, press_arg);
+            if (err != ESP_OK) {
+                allocation_failed |= err == ESP_ERR_NO_MEM;
+                errors++;
+            }
         }
-        esp_err_t err = edf_convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
-                                               maskon_date, maskon_time, brp_sigs, 2, "60.00",
-                                               NULL, brp_skip, brp_max, press_arg);
-        if (err != ESP_OK) {
-            allocation_failed |= err == ESP_ERR_NO_MEM;
-            errors++;
+
+        /* ── Generate SA2.edf (1 Hz SpO2/pulse) ── */
+        if (emit_sa2) {
+            char snt_path[300], edf_path[350];
+            snprintf(snt_path, sizeof(snt_path), "%s/%s_sa2.snt", session_dir, session_id);
+            snprintf(edf_path, sizeof(edf_path), "%s/%s_SA2.edf", day_dir, maskon_ts_prefix);
+
+            static const edf_signal_def_t sa2_sigs[] = {
+                { .label = "Pulse.1s", .transducer = "",
+                  .unit = "bpm", .phys_min = 0.0, .phys_max = 300.0,
+                  .dig_min = 0, .dig_max = 300,
+                  .prefilter = "", .samples_per_record = 60,
+                  .invalid_passthrough = true },
+                { .label = "SpO2.1s", .transducer = "",
+                  .unit = "%", .phys_min = 0.0, .phys_max = 100.0,
+                  .dig_min = 0, .dig_max = 100,
+                  .prefilter = "", .samples_per_record = 60,
+                  .invalid_passthrough = true },
+            };
+            esp_err_t err = edf_convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
+                                                   maskon_date, maskon_time, sa2_sigs, 2, "60.00",
+                                                   NULL, w->sa2_skip, w->sa2_max, NULL);
+            if (err != ESP_OK) {
+                allocation_failed |= err == ESP_ERR_NO_MEM;
+                errors++;
+            }
         }
-    }
 
-    /* ── Generate SA2.edf (1 Hz SpO2/pulse) ── */
-    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy && emit_sa2) {
-        char snt_path[300], edf_path[350];
-        snprintf(snt_path, sizeof(snt_path), "%s/%s_sa2.snt", session_dir, session_id);
-        snprintf(edf_path, sizeof(edf_path), "%s/%s_SA2.edf", day_dir, maskon_ts_prefix);
+        /* ── Generate PLD.edf (0.5 Hz per-breath stats) ──
+         *
+         * BLE quantisation note (2026-07-05 reverse-engineering):
+         * The AS11 sends PLD values via BLE at phys×100 (integer physical
+         * units).  Some channels have coarser BLE resolution than the AS11's
+         * internal SD-card EDF:
+         *   - RespRate: BLE sends integer bpm; AS11 internal EDF has 0.2 bpm
+         *     resolution (dig_max=450, phys_max=90).  ~20 % of samples differ
+         *     by ±0.2–1.0 bpm.
+         *   - MinVent: BLE sends 0.01 L/min; AS11 internal EDF has 0.125 L/min
+         *     resolution.  ~24 % of samples differ by ±0.02–0.12.
+         *   - MaskPress: during pressure ramp-up (first ~20 s) BLE and SD sample
+         *     at slightly different moments within the 2 s window, causing
+         *     ±0.02–0.16 cmH2O differences.  Converges to ≤0.04 once stable.
+         * Other channels (Press, EprPress, Leak, TidVol, Snore, FlowLim) match
+         * ≥94 % at offset=0.  These differences are a fundamental BLE data-path
+         * limitation and cannot be fixed by firmware changes.
+         * See spec/archive/edf-as11-comparison-20260629.md §3.6. */
+        if (emit_pld) {
+            char snt_path[300], edf_path[350];
+            snprintf(snt_path, sizeof(snt_path), "%s/%s_pld.snt", session_dir, session_id);
+            snprintf(edf_path, sizeof(edf_path), "%s/%s_PLD.edf", day_dir, maskon_ts_prefix);
 
-        static const edf_signal_def_t sa2_sigs[] = {
-            { .label = "Pulse.1s", .transducer = "",
-              .unit = "bpm", .phys_min = 0.0, .phys_max = 300.0,
-              .dig_min = 0, .dig_max = 300,
-              .prefilter = "", .samples_per_record = 60,
-              .invalid_passthrough = true },
-            { .label = "SpO2.1s", .transducer = "",
-              .unit = "%", .phys_min = 0.0, .phys_max = 100.0,
-              .dig_min = 0, .dig_max = 100,
-              .prefilter = "", .samples_per_record = 60,
-              .invalid_passthrough = true },
-        };
-        esp_err_t err = edf_convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
-                                               maskon_date, maskon_time, sa2_sigs, 2, "60.00",
-                                               NULL, sa2_skip, sa2_max, NULL);
-        if (err != ESP_OK) {
-            allocation_failed |= err == ESP_ERR_NO_MEM;
-            errors++;
-        }
-    }
-
-    /* ── Generate PLD.edf (0.5 Hz per-breath stats) ──
-     *
-     * BLE quantisation note (2026-07-05 reverse-engineering):
-     * The AS11 sends PLD values via BLE at phys×100 (integer physical
-     * units).  Some channels have coarser BLE resolution than the AS11's
-     * internal SD-card EDF:
-     *   - RespRate: BLE sends integer bpm; AS11 internal EDF has 0.2 bpm
-     *     resolution (dig_max=450, phys_max=90).  ~20 % of samples differ
-     *     by ±0.2–1.0 bpm.
-     *   - MinVent: BLE sends 0.01 L/min; AS11 internal EDF has 0.125 L/min
-     *     resolution.  ~24 % of samples differ by ±0.02–0.12.
-     *   - MaskPress: during pressure ramp-up (first ~20 s) BLE and SD sample
-     *     at slightly different moments within the 2 s window, causing
-     *     ±0.02–0.16 cmH2O differences.  Converges to ≤0.04 once stable.
-     * Other channels (Press, EprPress, Leak, TidVol, Snore, FlowLim) match
-     * ≥94 % at offset=0.  These differences are a fundamental BLE data-path
-     * limitation and cannot be fixed by firmware changes.
-     * See spec/archive/edf-as11-comparison-20260629.md §3.6. */
-    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy && emit_pld) {
-        char snt_path[300], edf_path[350];
-        snprintf(snt_path, sizeof(snt_path), "%s/%s_pld.snt", session_dir, session_id);
-        snprintf(edf_path, sizeof(edf_path), "%s/%s_PLD.edf", day_dir, maskon_ts_prefix);
-
-        static const edf_signal_def_t pld_sigs[] = {
-            { .label = "MaskPress.2s", .transducer = "",
-              .unit = "cmH2O", .phys_min = 0.0, .phys_max = 40.0,
-              .dig_min = 0, .dig_max = 2000,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "Press.2s", .transducer = "",
-              .unit = "cmH2O", .phys_min = 0.0, .phys_max = 50.0,
-              .dig_min = 0, .dig_max = 2500,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "EprPress.2s", .transducer = "",
-              .unit = "cmH2O", .phys_min = 0.0, .phys_max = 30.0,
-              .dig_min = 0, .dig_max = 1500,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "Leak.2s", .transducer = "",
-              .unit = "L/s", .phys_min = 0.0, .phys_max = 2.0,
-              .dig_min = 0, .dig_max = 100,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "RespRate.2s", .transducer = "",
-              .unit = "bpm", .phys_min = 0.0, .phys_max = 90.0,
-              .dig_min = 0, .dig_max = 450,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "TidVol.2s", .transducer = "",
-              .unit = "L", .phys_min = 0.0, .phys_max = 4.0,
-              .dig_min = 0, .dig_max = 200,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "MinVent.2s", .transducer = "",
-              .unit = "L/min", .phys_min = 0.0, .phys_max = 30.0,
-              .dig_min = 0, .dig_max = 240,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "Snore.2s", .transducer = "",
-              .unit = "", .phys_min = 0.0, .phys_max = 5.0,
-              .dig_min = 0, .dig_max = 250,
-              .prefilter = "", .samples_per_record = 30,
-              .invalid_passthrough = true, .clamp_valid = true },
-            { .label = "FlowLim.2s", .transducer = "",
-              .unit = "", .phys_min = 0.0, .phys_max = 1.0,
-              .dig_min = 0, .dig_max = 100,
-              .prefilter = "", .samples_per_record = 30,
-              .invalid_passthrough = true },
-        };
-        /* PLD .snt has 12 channels but AS11 EDF (VID=3) only has 9.
-         * Channel order in .snt: 0=MaskPress, 1=Press, 2=EprPress, 3=Leak,
-         * 4=RespRate, 5=TidVol, 6=MinVent, 7=TgtVent, 8=IERatio,
-         * 9=Snore, 10=FlowLim, 11=Ti
-         * EDF drops TgtVent(7), IERatio(8), Ti(11). */
-        static const int pld_ch_map[] = {0, 1, 2, 3, 4, 5, 6, 9, 10};
-        esp_err_t err = edf_convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
-                                               maskon_date, maskon_time, pld_sigs, 9, "60.00",
-                                               pld_ch_map, pld_skip, pld_max, NULL);
-        if (err != ESP_OK) {
-            allocation_failed |= err == ESP_ERR_NO_MEM;
-            errors++;
+            static const edf_signal_def_t pld_sigs[] = {
+                { .label = "MaskPress.2s", .transducer = "",
+                  .unit = "cmH2O", .phys_min = 0.0, .phys_max = 40.0,
+                  .dig_min = 0, .dig_max = 2000,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "Press.2s", .transducer = "",
+                  .unit = "cmH2O", .phys_min = 0.0, .phys_max = 50.0,
+                  .dig_min = 0, .dig_max = 2500,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "EprPress.2s", .transducer = "",
+                  .unit = "cmH2O", .phys_min = 0.0, .phys_max = 30.0,
+                  .dig_min = 0, .dig_max = 1500,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "Leak.2s", .transducer = "",
+                  .unit = "L/s", .phys_min = 0.0, .phys_max = 2.0,
+                  .dig_min = 0, .dig_max = 100,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "RespRate.2s", .transducer = "",
+                  .unit = "bpm", .phys_min = 0.0, .phys_max = 90.0,
+                  .dig_min = 0, .dig_max = 450,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "TidVol.2s", .transducer = "",
+                  .unit = "L", .phys_min = 0.0, .phys_max = 4.0,
+                  .dig_min = 0, .dig_max = 200,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "MinVent.2s", .transducer = "",
+                  .unit = "L/min", .phys_min = 0.0, .phys_max = 30.0,
+                  .dig_min = 0, .dig_max = 240,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "Snore.2s", .transducer = "",
+                  .unit = "", .phys_min = 0.0, .phys_max = 5.0,
+                  .dig_min = 0, .dig_max = 250,
+                  .prefilter = "", .samples_per_record = 30,
+                  .invalid_passthrough = true, .clamp_valid = true },
+                { .label = "FlowLim.2s", .transducer = "",
+                  .unit = "", .phys_min = 0.0, .phys_max = 1.0,
+                  .dig_min = 0, .dig_max = 100,
+                  .prefilter = "", .samples_per_record = 30,
+                  .invalid_passthrough = true },
+            };
+            /* PLD .snt has 12 channels but AS11 EDF (VID=3) only has 9.
+             * Channel order in .snt: 0=MaskPress, 1=Press, 2=EprPress, 3=Leak,
+             * 4=RespRate, 5=TidVol, 6=MinVent, 7=TgtVent, 8=IERatio,
+             * 9=Snore, 10=FlowLim, 11=Ti
+             * EDF drops TgtVent(7), IERatio(8), Ti(11). */
+            static const int pld_ch_map[] = {0, 1, 2, 3, 4, 5, 6, 9, 10};
+            esp_err_t err = edf_convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
+                                                   maskon_date, maskon_time, pld_sigs, 9, "60.00",
+                                                   pld_ch_map, w->pld_skip, w->pld_max, NULL);
+            if (err != ESP_OK) {
+                allocation_failed |= err == ESP_ERR_NO_MEM;
+                errors++;
+            }
         }
     }
 

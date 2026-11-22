@@ -29,10 +29,19 @@
 extern "C" {
 #endif
 
+#define EDF_MAX_ZLE_WINDOWS 20
+
+typedef struct {
+    int64_t start_ms; /* NTP epoch ms of _ZLE rising edge (1) */
+    int64_t end_ms;   /* NTP epoch ms of _ZLE falling edge (0), or 0 if still open at EOF */
+} edf_zle_window_t;
+
 int64_t edf_find_mask_on_time(const char *events_snt_path);
 int64_t edf_find_mask_off_time(const char *events_snt_path);
 int64_t edf_find_zle_edge_time(const char *events_snt_path, int want_value,
                                int64_t clock_drift_ms);
+int edf_find_zle_windows(const char *events_snt_path, int64_t clock_drift_ms,
+                         edf_zle_window_t *out, int max_windows);
 
 static inline uint32_t edf_ms_to_samples_25hz(int64_t ms)
 {
