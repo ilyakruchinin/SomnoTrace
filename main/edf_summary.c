@@ -480,6 +480,16 @@ static int easy_breathe_to_edf(const char *s)
     return -1;
 }
 
+/* Map RiseTimeEnable to EDF value (Off/Min=1, On=2).
+ * AirCurve 11 reports "Min" when Rise Time is off/minimum; stock STR writes 1. */
+static int rise_time_enable_to_edf(const char *s)
+{
+    if (!s) return -1;
+    if (strcmp(s, "Off") == 0 || strcmp(s, "Min") == 0) return 1;
+    if (strcmp(s, "On") == 0) return 2;
+    return -1;
+}
+
 /* Map RespiratoryRateEnable to EDF value.
  * Export map [1,3]: raw 0→1 (Off), raw 1→3 (On).
  * See edf_signals.md "STR enum export maps". */
@@ -597,7 +607,7 @@ static void build_str_settings_values(int16_t *str_values, const cJSON *settings
             }
 
             /* VAuto settings [14-21]: pressures cmH2O × 50, Ti × 50,
-             * trigger/cycle via trigger_cycle_to_edf (raw + 1). */
+             * trigger/cycle via sensitivity_to_edf (strings or raw + 1). */
             cJSON *vauto = cJSON_GetObjectItem(tp, "VAutoProfile");
             if (vauto) {
                 if ((v = cJSON_GetObjectItem(vauto, "StartPressure")) && cJSON_IsNumber(v))
@@ -608,18 +618,22 @@ static void build_str_settings_values(int16_t *str_values, const cJSON *settings
                     str_values[16] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(vauto, "SetPressureSupport")) && cJSON_IsNumber(v))
                     str_values[17] = settings_x50(v->valuedouble);
-                if ((v = cJSON_GetObjectItem(vauto, "SetMaxInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[18] = settings_x50(v->valuedouble);
-                if ((v = cJSON_GetObjectItem(vauto, "SetMinInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[19] = settings_x50(v->valuedouble);
-                if ((v = cJSON_GetObjectItem(vauto, "TriggerSensitivity")) && cJSON_IsNumber(v))
-                    str_values[20] = (int16_t)trigger_cycle_to_edf(v->valueint);
-                if ((v = cJSON_GetObjectItem(vauto, "CycleSensitivity")) && cJSON_IsNumber(v))
-                    str_values[21] = (int16_t)trigger_cycle_to_edf(v->valueint);
+                if ((v = cJSON_GetObjectItem(vauto, "SetMaxInspiratoryTime"))) {
+                    str_values[18] = cJSON_IsNumber(v) ? settings_x50(v->valuedouble) :
+                                     (int16_t)duration_string_to_edf(v, 50.0, 200);
+                }
+                if ((v = cJSON_GetObjectItem(vauto, "SetMinInspiratoryTime"))) {
+                    str_values[19] = cJSON_IsNumber(v) ? settings_x50(v->valuedouble) :
+                                     (int16_t)duration_string_to_edf(v, 50.0, 200);
+                }
+                if ((v = cJSON_GetObjectItem(vauto, "TriggerSensitivity")))
+                    str_values[20] = (int16_t)sensitivity_to_edf(v);
+                if ((v = cJSON_GetObjectItem(vauto, "CycleSensitivity")))
+                    str_values[21] = (int16_t)sensitivity_to_edf(v);
             }
 
             /* Spont settings [22-32]: pressures cmH2O × 50, Ti × 50,
-             * EasyBreathe/RespRateEn via helpers, RiseEnable via on_off,
+             * EasyBreathe/RespRateEn via helpers, RiseEnable via rise_time_enable_to_edf,
              * RiseTime in msec, trigger/cycle via helper. */
             cJSON *spont = cJSON_GetObjectItem(tp, "SpontProfile");
             if (spont) {
@@ -642,7 +656,7 @@ static void build_str_settings_values(int16_t *str_values, const cJSON *settings
                                      (int16_t)duration_string_to_edf(v, 50.0, 200);
                 }
                 if ((v = cJSON_GetObjectItem(spont, "RiseTimeEnable")) && cJSON_IsString(v))
-                    str_values[29] = (int16_t)on_off_to_edf(v->valuestring);
+                    str_values[29] = (int16_t)rise_time_enable_to_edf(v->valuestring);
                 if ((v = cJSON_GetObjectItem(spont, "RiseTime"))) {
                     str_values[30] = cJSON_IsNumber(v) ? (int16_t)v->valuedouble :
                                      (int16_t)duration_string_to_edf(v, 1000.0, 2000);
@@ -654,7 +668,7 @@ static void build_str_settings_values(int16_t *str_values, const cJSON *settings
             }
 
             /* ST settings [33-42]: pressures cmH2O × 50, RespRate × 5,
-             * Ti × 50, RiseEnable/RiseTime, trigger via helper, cycle raw+1. */
+             * Ti × 50, RiseEnable/RiseTime, trigger/cycle via sensitivity_to_edf. */
             cJSON *st = cJSON_GetObjectItem(tp, "STProfile");
             if (st) {
                 if ((v = cJSON_GetObjectItem(st, "StartPressure")) && cJSON_IsNumber(v))
@@ -665,18 +679,24 @@ static void build_str_settings_values(int16_t *str_values, const cJSON *settings
                     str_values[35] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(st, "SetRespiratoryRate")) && cJSON_IsNumber(v))
                     str_values[36] = (int16_t)(v->valuedouble * 5);
-                if ((v = cJSON_GetObjectItem(st, "SetMaxInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[37] = settings_x50(v->valuedouble);
-                if ((v = cJSON_GetObjectItem(st, "SetMinInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[38] = settings_x50(v->valuedouble);
+                if ((v = cJSON_GetObjectItem(st, "SetMaxInspiratoryTime"))) {
+                    str_values[37] = cJSON_IsNumber(v) ? settings_x50(v->valuedouble) :
+                                     (int16_t)duration_string_to_edf(v, 50.0, 200);
+                }
+                if ((v = cJSON_GetObjectItem(st, "SetMinInspiratoryTime"))) {
+                    str_values[38] = cJSON_IsNumber(v) ? settings_x50(v->valuedouble) :
+                                     (int16_t)duration_string_to_edf(v, 50.0, 200);
+                }
                 if ((v = cJSON_GetObjectItem(st, "RiseTimeEnable")) && cJSON_IsString(v))
-                    str_values[39] = (int16_t)on_off_to_edf(v->valuestring);
-                if ((v = cJSON_GetObjectItem(st, "RiseTime")) && cJSON_IsNumber(v))
-                    str_values[40] = (int16_t)v->valuedouble;
-                if ((v = cJSON_GetObjectItem(st, "TriggerSensitivity")) && cJSON_IsNumber(v))
-                    str_values[41] = (int16_t)trigger_cycle_to_edf(v->valueint);
-                if ((v = cJSON_GetObjectItem(st, "CycleSensitivity")) && cJSON_IsNumber(v))
-                    str_values[42] = (int16_t)(v->valueint + 1);
+                    str_values[39] = (int16_t)rise_time_enable_to_edf(v->valuestring);
+                if ((v = cJSON_GetObjectItem(st, "RiseTime"))) {
+                    str_values[40] = cJSON_IsNumber(v) ? (int16_t)v->valuedouble :
+                                     (int16_t)duration_string_to_edf(v, 1000.0, 2000);
+                }
+                if ((v = cJSON_GetObjectItem(st, "TriggerSensitivity")))
+                    str_values[41] = (int16_t)sensitivity_to_edf(v);
+                if ((v = cJSON_GetObjectItem(st, "CycleSensitivity")))
+                    str_values[42] = (int16_t)sensitivity_to_edf(v);
             }
 
             /* Timed settings [43-49]: pressures cmH2O × 50, RespRate × 5,
@@ -691,12 +711,16 @@ static void build_str_settings_values(int16_t *str_values, const cJSON *settings
                     str_values[45] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(timed, "SetRespiratoryRate")) && cJSON_IsNumber(v))
                     str_values[46] = (int16_t)(v->valuedouble * 5);
-                if ((v = cJSON_GetObjectItem(timed, "SetInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[47] = settings_x50(v->valuedouble);
+                if ((v = cJSON_GetObjectItem(timed, "SetInspiratoryTime"))) {
+                    str_values[47] = cJSON_IsNumber(v) ? settings_x50(v->valuedouble) :
+                                     (int16_t)duration_string_to_edf(v, 50.0, 200);
+                }
                 if ((v = cJSON_GetObjectItem(timed, "RiseTimeEnable")) && cJSON_IsString(v))
-                    str_values[48] = (int16_t)on_off_to_edf(v->valuestring);
-                if ((v = cJSON_GetObjectItem(timed, "RiseTime")) && cJSON_IsNumber(v))
-                    str_values[49] = (int16_t)v->valuedouble;
+                    str_values[48] = (int16_t)rise_time_enable_to_edf(v->valuestring);
+                if ((v = cJSON_GetObjectItem(timed, "RiseTime"))) {
+                    str_values[49] = cJSON_IsNumber(v) ? (int16_t)v->valuedouble :
+                                     (int16_t)duration_string_to_edf(v, 1000.0, 2000);
+                }
             }
 
             /* ASV settings [50-53]: pressures cmH2O × 50 */

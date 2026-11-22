@@ -1341,33 +1341,65 @@ static void test_str_pressure_settings_exact(void)
 static void test_spont_settings_strings_and_numeric(void)
 {
     const char *json =
-        "{\"SettingProfiles\":{\"TherapyProfiles\":{\"SpontProfile\":{"
+        "{\"SettingProfiles\":{\"TherapyProfiles\":{"
+        "\"VAutoProfile\":{"
+        "\"SetMaxInspiratoryTime\":\"PT2S\",\"SetMinInspiratoryTime\":\"PT0.3S\","
+        "\"TriggerSensitivity\":\"Medium\",\"CycleSensitivity\":\"High\""
+        "},"
+        "\"SpontProfile\":{"
         "\"SetMaxInspiratoryTime\":\"PT1.2S\","
         "\"SetMinInspiratoryTime\":\"PT0.4S\","
+        "\"RiseTimeEnable\":\"Min\","
         "\"RiseTime\":\"PT0.25S\","
         "\"TriggerSensitivity\":\"Low\",\"CycleSensitivity\":\"High\""
+        "},"
+        "\"STProfile\":{"
+        "\"SetMaxInspiratoryTime\":\"PT2.5S\",\"SetMinInspiratoryTime\":\"PT0.5S\","
+        "\"RiseTimeEnable\":\"Min\",\"RiseTime\":\"PT0.3S\","
+        "\"TriggerSensitivity\":\"VeryLow\",\"CycleSensitivity\":\"VeryHigh\""
+        "},"
+        "\"TimedProfile\":{"
+        "\"SetInspiratoryTime\":\"PT1.5S\",\"RiseTimeEnable\":\"On\",\"RiseTime\":\"PT0.4S\""
         "}}}}";
     cJSON *settings = cJSON_Parse(json);
-    CHECK(settings != NULL, "Spont JSON did not parse");
+    CHECK(settings != NULL, "bilevel JSON did not parse");
     if (!settings) return;
     summary_ctx_t ctx = {0};
     int16_t values[STR_DATA_COUNT];
     memset(values, 0xFF, sizeof(values));
     build_str_data_values(&ctx, values, settings);
+    CHECK(values[18] == 100 && values[19] == 15 && values[20] == 3 && values[21] == 4,
+          "VAuto string settings not mapped (%d,%d,%d,%d)",
+          values[18], values[19], values[20], values[21]);
     CHECK(values[27] == 60 && values[28] == 20, "duration strings not scaled to Ti");
+    CHECK(values[29] == 1, "Spont RiseTimeEnable 'Min' should map to 1, got %d", values[29]);
     CHECK(values[30] == 250, "rise-time string not converted to milliseconds");
     CHECK(values[31] == 2 && values[32] == 4, "named sensitivities mapped incorrectly");
+    CHECK(values[37] == 125 && values[38] == 25 && values[39] == 1 && values[40] == 300 &&
+          values[41] == 1 && values[42] == 5,
+          "ST string settings not mapped (%d,%d,%d,%d,%d,%d)",
+          values[37], values[38], values[39], values[40], values[41], values[42]);
+    CHECK(values[47] == 75 && values[48] == 2 && values[49] == 400,
+          "Timed string settings not mapped (%d,%d,%d)",
+          values[47], values[48], values[49]);
     cJSON_Delete(settings);
 
     settings = cJSON_Parse(
-        "{\"SettingProfiles\":{\"TherapyProfiles\":{\"SpontProfile\":{"
+        "{\"SettingProfiles\":{\"TherapyProfiles\":{"
+        "\"VAutoProfile\":{"
+        "\"SetMaxInspiratoryTime\":2.0,\"SetMinInspiratoryTime\":0.3,"
+        "\"TriggerSensitivity\":2,\"CycleSensitivity\":3"
+        "},"
+        "\"SpontProfile\":{"
         "\"SetMaxInspiratoryTime\":1.2,\"SetMinInspiratoryTime\":0.4,"
         "\"RiseTime\":250,\"TriggerSensitivity\":1,\"CycleSensitivity\":3"
         "}}}}");
-    CHECK(settings != NULL, "numeric Spont JSON did not parse");
+    CHECK(settings != NULL, "numeric bilevel JSON did not parse");
     if (!settings) return;
     memset(values, 0xFF, sizeof(values));
     build_str_data_values(&ctx, values, settings);
+    CHECK(values[18] == 100 && values[19] == 15 && values[20] == 3 && values[21] == 4,
+          "numeric VAuto settings changed");
     CHECK(values[27] == 60 && values[28] == 20 && values[30] == 250 &&
           values[31] == 2 && values[32] == 4,
           "imported numeric settings changed");
