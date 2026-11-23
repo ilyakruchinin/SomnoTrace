@@ -63,17 +63,17 @@ main/edf_waveform.c:40:relational:<=→<
 main/edf_waveform.c:63:relational:<→<=
 main/edf_waveform.c:101:relational:<→<=
 main/edf_waveform.c:140:relational:<→<=
-# edf_find_zle_edge_time's reportTime guard: `rt && cJSON_IsString(rt)` vs `||`. With a
+# edf_find_zle_windows's reportTime guard: `rt && cJSON_IsString(rt)` vs `||`. With a
 # non-string rt the mutant enters and parses rt->valuestring, which is NULL for a number;
 # the parser returns a non-positive value, so `as11_ms > 0` fails and cand stays -1 —
 # exactly where the original leaves it by skipping the block. The ntpTimeMs fallback then
 # answers in both. Demonstrated by the "_ZLE falls back to ntpTimeMs" test, which passes
 # unchanged under this mutant.
-main/edf_waveform.c:148:logical:&&→||
+main/edf_waveform.c:153:logical:&&→||
 # The ntp guard: `ntp && cJSON_IsNumber(ntp)` vs `||`. A non-number ntpTimeMs has
-# valuedouble 0, so the mutant sets cand = 0 and the following `cand > 0` rejects it —
+# valuedouble 0, so the mutant sets cand = 0 and the following `cand <= 0` rejects it —
 # the same outcome as never entering.
-main/edf_waveform.c:156:logical:&&→||
+main/edf_waveform.c:161:logical:&&→||
 
 # as11_events.c — the loop bound, once the parser became linkable (2026-09-17).
 main/as11_events.c:38:relational:<→<=      # cJSON_GetArrayItem(events, n) returns NULL for an index at

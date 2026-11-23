@@ -5269,7 +5269,7 @@ var DASH_SIGNALS = [
  * OSCAR/SleepHQ compute from the AS11's EDF files.
  *
  * IMPORTANT: this mirrors the boundary logic in main/edf_gen.c
- * (find_zle_edge_time() + the skip/max block in the session EDF generator).
+ * (edf_find_zle_windows() + the skip/max block in the session EDF generator).
  * If the gating rule changes there, update it here too — the two are
  * deliberately independent so the web UI never depends on export-time output.
  *

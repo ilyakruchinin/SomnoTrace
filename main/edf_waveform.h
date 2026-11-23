@@ -38,8 +38,6 @@ typedef struct {
 
 int64_t edf_find_mask_on_time(const char *events_snt_path);
 int64_t edf_find_mask_off_time(const char *events_snt_path);
-int64_t edf_find_zle_edge_time(const char *events_snt_path, int want_value,
-                               int64_t clock_drift_ms);
 int edf_find_zle_windows(const char *events_snt_path, int64_t clock_drift_ms,
                          edf_zle_window_t *out, int max_windows);
 

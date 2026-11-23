@@ -2694,7 +2694,7 @@ static void test_wf_a_non_string_report_time_is_skipped(void)
     assert(edf_find_mask_off_time(p) == -1);
 }
 
-/* ---- edf_find_zle_edge_time --------------------------------------------------- */
+/* ---- edf_find_zle_windows ----------------------------------------------------- */
 
 static void test_wf_zle_only_reads_zle_records(void)
 {
@@ -2707,7 +2707,8 @@ static void test_wf_zle_only_reads_zle_records(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"OTHER\",\"events\":[{\"value\":1,"
         "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
-    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 0);
 }
 
 static void test_wf_zle_value_must_be_a_number(void)
@@ -2719,7 +2720,8 @@ static void test_wf_zle_value_must_be_a_number(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":\"1\","
         "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
-    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 0);
 }
 
 static void test_wf_zle_falls_back_to_ntp_when_report_time_is_unusable(void)
@@ -2731,7 +2733,9 @@ static void test_wf_zle_falls_back_to_ntp_when_report_time_is_unusable(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
         "\"reportTime\":7,\"ntpTimeMs\":1756000000000}]}}\n");
-    assert(edf_find_zle_edge_time(p, 1, 0) == 1756000000000LL);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 1);
+    assert(w[0].start_ms == 1756000000000LL);
 }
 
 static void test_wf_zle_clock_drift_is_added_to_the_as11_time(void)
@@ -2741,8 +2745,11 @@ static void test_wf_zle_clock_drift_is_added_to_the_as11_time(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
         "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
-    int64_t zero = edf_find_zle_edge_time(p, 1, 0);
-    int64_t plus = edf_find_zle_edge_time(p, 1, 4321);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 1);
+    int64_t zero = w[0].start_ms;
+    assert(edf_find_zle_windows(p, 4321, w, 2) == 1);
+    int64_t plus = w[0].start_ms;
     assert(zero > 0);
     assert(plus - zero == 4321);
 }
@@ -2801,7 +2808,8 @@ static void test_wf_zle_events_must_be_an_array(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":{\"x\":{\"value\":1,"
         "\"ntpTimeMs\":1756000000000}}}}\n");
-    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 0);
 }
 
 static void test_wf_zle_rejects_a_zero_ntp_time(void)
@@ -2813,7 +2821,8 @@ static void test_wf_zle_rejects_a_zero_ntp_time(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
         "\"ntpTimeMs\":0}]}}\n");
-    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 0);
 }
 
 static void test_wf_zle_an_epoch_report_time_is_not_a_time(void)
@@ -2829,7 +2838,9 @@ static void test_wf_zle_an_epoch_report_time_is_not_a_time(void)
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
         "\"reportTime\":\"1970-01-01T00:00:00.000\","
         "\"ntpTimeMs\":1756000000000}]}}\n");
-    assert(edf_find_zle_edge_time(p, 1, 60000) == 1756000000000LL);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 60000, w, 2) == 1);
+    assert(w[0].start_ms == 1756000000000LL);
 }
 
 static void test_wf_zle_a_drift_cancelled_time_is_not_a_time(void)
@@ -2847,7 +2858,9 @@ static void test_wf_zle_a_drift_cancelled_time_is_not_a_time(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
         "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
-    int64_t as11 = edf_find_zle_edge_time(p, 1, 0);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 1);
+    int64_t as11 = w[0].start_ms;
     assert(as11 > 0);
 
     wf_path(q, sizeof(q), "wf_zle_cancel.jsonl");
@@ -2857,7 +2870,7 @@ static void test_wf_zle_a_drift_cancelled_time_is_not_a_time(void)
         "\"ntpTimeMs\":1756000000000}]}}\n");
     /* as11 + (-as11) == 0, which is not a time. The ntp value must NOT rescue it:
      * the AS11 path answered, and it answered zero. */
-    assert(edf_find_zle_edge_time(q, 1, -as11) == -1);
+    assert(edf_find_zle_windows(q, -as11, w, 2) == 0);
 }
 
 static void test_wf_zle_windows_state_machine(void)

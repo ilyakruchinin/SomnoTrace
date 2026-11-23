@@ -118,63 +118,6 @@ int64_t edf_find_mask_off_time(const char *events_snt_path)
     return mask_off_ms;
 }
 
-int64_t edf_find_zle_edge_time(const char *events_snt_path, int want_value,
-                               int64_t clock_drift_ms)
-{
-    FILE *f = fopen(events_snt_path, "r");
-    if (!f) return -1;
-
-    int64_t zle_ms = -1;
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        cJSON *msg = cJSON_Parse(line);
-        if (!msg) continue;
-        cJSON *params = cJSON_GetObjectItem(msg, "params");
-        if (params) {
-            cJSON *data_id = cJSON_GetObjectItem(params, "dataId");
-            if (data_id && cJSON_IsString(data_id) &&
-                strcmp(data_id->valuestring, "_ZLE") == 0) {
-                cJSON *events = cJSON_GetObjectItem(params, "events");
-                if (events && cJSON_IsArray(events)) {
-                    int n = cJSON_GetArraySize(events);
-                    for (int i = 0; i < n; i++) {
-                        cJSON *ev = cJSON_GetArrayItem(events, i);
-                        if (!ev) continue;
-                        cJSON *val = cJSON_GetObjectItem(ev, "value");
-                        if (val && cJSON_IsNumber(val) &&
-                            (int)val->valuedouble == want_value) {
-                            int64_t cand = -1;
-                            cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
-                            if (rt && cJSON_IsString(rt)) {
-                                int64_t as11_ms =
-                                    as11_time_parse_iso8601_ms(rt->valuestring);
-                                if (as11_ms > 0)
-                                    cand = as11_ms + clock_drift_ms;
-                            }
-                            if (cand < 0) {
-                                cJSON *ntp = cJSON_GetObjectItem(ev, "ntpTimeMs");
-                                if (ntp && cJSON_IsNumber(ntp))
-                                    cand = (int64_t)ntp->valuedouble;
-                            }
-                            if (cand > 0) {
-                                zle_ms = cand;
-                                if (want_value == 1) {
-                                    cJSON_Delete(msg);
-                                    fclose(f);
-                                    return zle_ms;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        cJSON_Delete(msg);
-    }
-    fclose(f);
-    return zle_ms;
-}
-
 int edf_find_zle_windows(const char *events_snt_path, int64_t clock_drift_ms,
                          edf_zle_window_t *out, int max_windows)
 {
