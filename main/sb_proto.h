@@ -103,6 +103,16 @@ bool sb_stream_begin_matches(const struct cJSON *result,
  * short settle.  0 for anything not retryable. */
 unsigned sb_stream_retry_ms(const char *code);
 
+/* Retry policy for the GET_DRIFT sidecar fetch that runs at the end of
+ * each day's file sync.  An empty code is a transport failure (timeout,
+ * dead air, invalid response) — observed when the request lands while the
+ * bridge is still tearing the previous stream down.  BUSY/STALE are the
+ * same deferrable bridge refusals as on the stream path.  Any other
+ * explicit bridge answer — METADATA_UNAVAILABLE ("nothing for this day"),
+ * BAD_REQUEST, therapy gates — is final and must not be retried.
+ * `attempt` is the 0-based attempt index so waits can lengthen mildly. */
+unsigned sb_get_drift_retry_ms(const char *code, int attempt);
+
 /* Compact-frame sequence check, modulo 65536.  Frames behind the expected
  * counter by >= 0x8000 (a backward distance) are duplicates of already
  * received frames — the sender never reuses seq — and must be dropped.

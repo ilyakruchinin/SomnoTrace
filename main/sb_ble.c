@@ -1468,6 +1468,57 @@ static void ledger_mark(const char *day, const char *name, const char *size,
     else cJSON_AddStringToObject(e, "ts", ts ? ts : "");
 }
 
+/* A day's drift sidecar that could not be fetched stays owed across
+ * passes: a failed GET_DRIFT otherwise lets the importer bake drift=0
+ * into every session manifest with no way back.  The flag lives inside
+ * the per-day ledger object — file tuples are looked up by name, so a
+ * non-tuple member never collides. */
+static bool ledger_drift_pending(const char *day)
+{
+    cJSON *d = ledger_day(day, false);
+    return d && cJSON_IsTrue(cJSON_GetObjectItem(d, "drift_pending"));
+}
+
+static void ledger_drift_pending_set(const char *day, bool on)
+{
+    cJSON *d = ledger_day(day, on);
+    if (!d) return;
+    bool was = cJSON_IsTrue(cJSON_GetObjectItem(d, "drift_pending"));
+    if (was == on) return;
+    if (on) cJSON_AddBoolToObject(d, "drift_pending", true);
+    else    cJSON_DeleteItemFromObject(d, "drift_pending");
+    if (!ledger_save())
+        ESP_LOGW(TAG, "sync: drift-pending ledger save failed for %s", day);
+}
+
+/* D5c: the AS11 rewrites the current day's STR record in place under an
+ * unchanged (name, size, ts) tuple, so the tuple ledger alone can never
+ * see a same-tuple rewrite.  Any pass that pulled DATALOG files owes STR
+ * a content recheck after the day loop; the obligation is persisted in
+ * the ledger's "meta" object so a failed or interrupted recheck is
+ * retried on the next pass instead of silently freezing the day record. */
+static bool s_str_recheck;
+
+static bool ledger_str_recheck(void)
+{
+    cJSON *m = cJSON_GetObjectItem(s_ledger, "meta");
+    return m && cJSON_IsTrue(cJSON_GetObjectItem(m, "str_recheck"));
+}
+
+static void ledger_str_recheck_set(bool on)
+{
+    cJSON *m = cJSON_GetObjectItem(s_ledger, "meta");
+    if (!cJSON_IsObject(m)) m = cJSON_AddObjectToObject(s_ledger, "meta");
+    if (!m) return;
+    bool was = cJSON_IsTrue(cJSON_GetObjectItem(m, "str_recheck"));
+    if (was == on) { s_str_recheck = on; return; }
+    if (on) cJSON_AddBoolToObject(m, "str_recheck", true);
+    else    cJSON_DeleteItemFromObject(m, "str_recheck");
+    if (!ledger_save())
+        ESP_LOGW(TAG, "sync: str_recheck ledger save failed");
+    s_str_recheck = on;
+}
+
 /* A listing's `ts` is either a string or JSON null; a missing/malformed
  * field is not the same as null and must not be treated as a tuple. */
 static bool sb_ts_field(const cJSON *f, const char **ts, bool *is_null)
@@ -1757,6 +1808,10 @@ static root_sync_result_t sync_root_dir(const char *directory,
         int idx = sb_root_name_index(fn);
         if (idx < 0) continue;
         if (ambiguous[idx]) continue;
+        /* D5c recheck: STR only — its bytes may have been rewritten in
+         * place under an identical tuple, so the cached checks below
+         * must not keep us off the network. */
+        const bool force_pull = s_str_recheck && idx == 0;
         if (sb_root_name_has_path_separator(fn) ||
             !size || !sb_ts_field(f, &ts, &ts_null)) {
             ESP_LOGW(TAG, "root: %s malformed file row", directory);
@@ -1796,7 +1851,7 @@ static root_sync_result_t sync_root_dir(const char *directory,
             if (!proven)
                 proven = staged_root_matches(canonical_key, size, ts, ts_null,
                                              canonical_local);
-            if (proven) {
+            if (proven && !force_pull) {
                 if ((!same || ledger_count != 1 || !e ||
                      strcmp(e->string, canonical_key)) &&
                     !root_ledger_store(canonical_key, size, ts, ts_null)) {
@@ -1847,7 +1902,12 @@ static root_sync_result_t sync_root_dir(const char *directory,
             }
         }
 
+        /* D5c recheck: a committed staged copy or a source-store restore
+         * would only hand back the same stale bytes — go straight to the
+         * network so genuinely new STR content can arrive. */
         char tx_id[96] = "";
+        if (force_pull) goto network_pull;
+
         if (!local_present && s_source_store_ready && source_store_lock()) {
             char stored_id[SOURCE_STORE_ID_HEX + 1];
             esp_err_t sf = source_store_find("root", canonical_key, size, ts,
@@ -1913,6 +1973,35 @@ network_pull:
                            fn, directory);
         s_root_recheck_ms[idx] = esp_timer_get_time() / 1000;
 
+        if (force_pull) {
+            /* The recheck landed — settle the obligation, then compare
+             * content against the last fully processed STR: identical
+             * bytes need no importer pass at all. */
+            ledger_str_recheck_set(false);
+            bool identical = false;
+            if (s_source_store_ready && source_store_lock()) {
+                source_store_put_result_t put;
+                identical =
+                    source_store_put_path("root", canonical_local, &put) ==
+                        ESP_OK &&
+                    (source_store_has_observation(put.id,
+                                                  s_root_processed_ids[idx],
+                                                  "processed_root") ||
+                     source_store_has_observation(put.id,
+                                                  "root-evaluated",
+                                                  "native_str_import"));
+                source_store_unlock();
+            }
+            if (identical) {
+                if (unlink(canonical_local) == 0)
+                    ESP_LOGI(TAG, "root: %s unchanged under same tuple",
+                             canonical_key);
+                else
+                    ESP_LOGW(TAG, "root: cannot drop unchanged %s",
+                             canonical_key);
+            }
+        }
+
         bool ledger_ok = root_ledger_store(canonical_key, size, ts, ts_null);
         if (!ledger_ok) {
             ESP_LOGW(TAG, "root: ledger save failed for %s", canonical_key);
@@ -1962,6 +2051,117 @@ static void drift_probe_log(void)
              view ? view : "none",
              tzr ? tzr : "?");
     cJSON_Delete(res);
+}
+
+/* True when <path> is one of our own pending placeholders — a settled
+ * answer or the real record must replace it, while a real sidecar is
+ * never overwritten. */
+static bool drift_sidecar_is_pending(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char buf[192];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    cJSON *j = cJSON_Parse(buf);
+    bool pending = j && cJSON_IsTrue(cJSON_GetObjectItem(j, "pending"));
+    cJSON_Delete(j);
+    return pending;
+}
+
+/* Fetch the GET_DRIFT sidecar for one day, with retries on transport
+ * failures.  The bridge can still be tearing down the previous stream
+ * when this call lands — a one-shot timeout would bake drift=0 into
+ * every session manifest the importer produces for the day.  Transport
+ * failures (empty s_last_code) and deferrable refusals (BUSY/STALE)
+ * retry with a short backoff; an explicit bridge answer such as
+ * METADATA_UNAVAILABLE is final.
+ *
+ * On exhausted transport retries the day is marked drift-pending in the
+ * ledger so a later pass re-fetches when its files are already synced —
+ * the day must not count as fully successful.
+ *
+ * Returns ESP_OK when the outcome is settled (sidecar written, or a
+ * clean bridge refusal recorded), ESP_FAIL on transport failure. */
+static esp_err_t sync_drift_sidecar(const char *day)
+{
+    char ddir[240];
+    snprintf(ddir, sizeof(ddir), SD_IMPORT_DIR "/DATALOG/%s", day);
+    struct stat dst;
+    if (stat(ddir, &dst) != 0 || !S_ISDIR(dst.st_mode)) {
+        /* A consumed day cannot take a late sidecar — imported manifests
+         * are immutable — so any pending obligation ends here. */
+        ledger_drift_pending_set(day, false);
+        return ESP_OK;
+    }
+    char dp[260];
+    snprintf(dp, sizeof(dp), "%s/_bridge_drift.json", ddir);
+
+    cJSON *gres = NULL;
+    esp_err_t derr = ESP_FAIL;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        /* json_op() consumes args — rebuild each attempt. */
+        cJSON *ga = cJSON_CreateObject();
+        cJSON_AddStringToObject(ga, "day", day);
+        cJSON_AddBoolToObject(ga, "best_available", true);
+        derr = json_op("GET_DRIFT", ga, &gres);
+        if (derr == ESP_OK && gres) break;
+        cJSON_Delete(gres);
+        gres = NULL;
+        derr = ESP_FAIL;
+        unsigned wait = sb_get_drift_retry_ms(s_last_code, attempt);
+        if (!wait || attempt + 1 >= 3) break;
+        if (s_conn == BLE_HS_CONN_HANDLE_NONE) break;
+        vTaskDelay(pdMS_TO_TICKS(wait));
+    }
+
+    if (derr == ESP_OK && gres) {
+        char *txt = cJSON_PrintUnformatted(gres);
+        cJSON_Delete(gres);
+        if (!txt) return ESP_FAIL;
+        bool wrote = sb_write_file_atomic(dp, txt);
+        free(txt);
+        if (!wrote) {
+            ESP_LOGW(TAG, "sync: %s drift sidecar write failed", day);
+            return ESP_FAIL;
+        }
+        ledger_drift_pending_set(day, false);
+        return ESP_OK;
+    }
+    cJSON_Delete(gres);
+
+    if (s_last_code[0]) {
+        /* The bridge answered: METADATA_UNAVAILABLE or another explicit
+         * refusal is a settled outcome — record it and stop pending.
+         * Keep somnobridge provenance, but never overwrite a known-good
+         * sidecar; a stale transport placeholder is superseded. */
+        struct stat st;
+        if (stat(dp, &st) != 0 || drift_sidecar_is_pending(dp)) {
+            const char *pending = "{\"schema\":5,\"pending\":true,"
+                                  "\"reason\":\"metadata_unavailable\"}";
+            if (!sb_write_file_atomic(dp, pending))
+                ESP_LOGW(TAG, "sync: %s pending drift write failed", day);
+        }
+        ledger_drift_pending_set(day, false);
+        return ESP_OK;
+    }
+
+    /* Transport failure after retries: the day's correction evidence
+     * never arrived.  Stage a pending placeholder for provenance and
+     * keep the day owed so the next pass re-fetches — importing now
+     * would bake drift=0 into every session manifest. */
+    ESP_LOGW(TAG, "sync: %s drift fetch failed after retries; day stays pending",
+             day);
+    ledger_drift_pending_set(day, true);
+    struct stat st;
+    if (stat(dp, &st) != 0) {
+        const char *pending = "{\"schema\":5,\"pending\":true,"
+                              "\"reason\":\"transport_error\"}";
+        if (!sb_write_file_atomic(dp, pending))
+            ESP_LOGW(TAG, "sync: %s pending drift write failed", day);
+    }
+    return ESP_FAIL;
 }
 
 /* One sync pass: days newest-first, files smallest-first, BRP last. */
@@ -2026,6 +2226,7 @@ static void sync_run(bool full)
             ESP_LOGW(TAG, "source store unavailable; root evidence will not be retained");
     }
     int pass_fail = 0;
+    s_str_recheck = ledger_str_recheck();
     root_sync_result_t root_a = sync_root_dir("A:\\", "");
     root_sync_result_t root_s = sync_root_dir("A:\\SETTINGS", "SETTINGS/");
     if (root_a.deferred || root_s.deferred) {
@@ -2050,6 +2251,7 @@ static void sync_run(bool full)
     int n = cJSON_GetArraySize(list);
     sb_catalog_window_t window;
     sb_catalog_window_init(&window, days, n, catalog_complete, hot_ready);
+    int datalog_pulled = 0;
     if (!sb_catalog_unpaged(res)) {
         ESP_LOGW(TAG, "sync: incomplete paginated day listing");
         sb_catalog_window_failed(&window, NULL);
@@ -2116,7 +2318,15 @@ static void sync_run(bool full)
             pass_fail++; cJSON_Delete(dres); continue;
         }
         window.checked++;
-        if (pending == 0) { cJSON_Delete(dres); continue; }
+        if (pending == 0) {
+            cJSON_Delete(dres);
+            /* Files are complete, but an earlier transport failure may
+             * still owe this day its drift sidecar — re-fetch now. */
+            if (ledger_drift_pending(day) &&
+                sync_drift_sidecar(day) != ESP_OK)
+                pass_fail++;
+            continue;
+        }
 
         /* Pre-warm the bridge's freshness guard. */
         cJSON *pa = cJSON_CreateObject();
@@ -2166,40 +2376,17 @@ static void sync_run(bool full)
                     ESP_LOGW(TAG, "sync: %s/%s ledger save failed", day, fn);
                 }
                 s_sync_files_done++;
+                datalog_pulled++;
             }
         }
 
         /* Drift sidecar: the importer embeds it in every session manifest.
          * best_available opts in to the bridge's best-effort correction
          * (current estimate or previous-session fallback) — without it the
-         * field stays null even when a usable candidate exists. */
-        cJSON *ga = cJSON_CreateObject();
-        cJSON_AddStringToObject(ga, "day", day);
-        cJSON_AddBoolToObject(ga, "best_available", true);
-        cJSON *gres = NULL;
-        char dp[200];
-        snprintf(dp, sizeof(dp),
-                 SD_IMPORT_DIR "/DATALOG/%s/_bridge_drift.json", day);
-        if (json_op("GET_DRIFT", ga, &gres) == ESP_OK && gres) {
-            char *txt = cJSON_PrintUnformatted(gres);
-            if (txt) {
-                if (!sb_write_file_atomic(dp, txt))
-                    ESP_LOGW(TAG, "sync: %s drift sidecar write failed", day);
-                free(txt);
-            }
-        } else {
-            /* Keep somnobridge provenance when drift metadata is
-             * unavailable, but never overwrite a known-good sidecar. */
-            struct stat st;
-            if (stat(dp, &st) != 0) {
-                const char *pending =
-                    "{\"schema\":5,\"pending\":true,"
-                    "\"reason\":\"metadata_unavailable\"}";
-                if (!sb_write_file_atomic(dp, pending))
-                    ESP_LOGW(TAG, "sync: %s pending drift write failed", day);
-            }
-        }
-        cJSON_Delete(gres);
+         * field stays null even when a usable candidate exists.  A
+         * transport failure is not benign: it keeps the day owed. */
+        if (sync_drift_sidecar(day) != ESP_OK)
+            day_fail++;
         cJSON_Delete(dres);
 
         s_sync_days_done++;
@@ -2215,6 +2402,18 @@ static void sync_run(bool full)
         ESP_LOGI(TAG, "sync: %d of %d catalog day(s) await scanning",
                  window.warming, window.offered);
     if (!sb_catalog_window_ready(&window)) pass_fail++;
+
+    /* D5c: the AS11 rewrites the day's STR record in place after each
+     * session completes, leaving the (size, ts) tuple untouched, so a
+     * pass that pulled DATALOG files owes STR a content recheck.  The
+     * obligation persists until a recheck pull actually lands. */
+    if (datalog_pulled > 0 && !s_str_recheck)
+        ledger_str_recheck_set(true);
+    if (s_str_recheck && s_conn != BLE_HS_CONN_HANDLE_NONE) {
+        root_sync_result_t recheck = sync_root_dir("A:\\", "");
+        pass_fail += recheck.failed;
+        if (!recheck.listing_ok) pass_fail++;
+    }
     drift_probe_log();
     cJSON_Delete(res);
     if (pass_fail == 0)

@@ -1828,7 +1828,8 @@ static void warn_unsupported_setting_labels(const imp_edf_t *e, bool as10)
 static esp_err_t mark_native_dirty(void);
 
 /* Write summaries/<day>.spool (atomic) for one decoded STR day. */
-static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite, bool *wrote)
+static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite,
+                                     bool as10, bool *wrote)
 {
     if (wrote) *wrote = false;
     /* Date is days since epoch → noon-day label = that civil date */
@@ -1845,13 +1846,26 @@ static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite, bool *w
     if (imp_recover_replace(spool_path, backup, sizeof(backup)) != 0)
         return ESP_FAIL;
     bool native_overlay = false;
+    bool str_refresh = false;
     if (!overwrite) {
         struct stat st;
         if (stat(spool_path, &st) == 0) {
-            if (!import_spool_is_synthetic(spool_path)) return ESP_OK;
-            snprintf(spool_path, sizeof(spool_path), "%s/%s.native.spool",
-                     SD_SUMMARIES_DIR, label);
-            native_overlay = true;
+            if (!import_spool_is_synthetic(spool_path)) {
+                /* A non-synthetic spool is either live (post_therapy —
+                 * live always wins) or an earlier native STR import,
+                 * which a refreshed STR record may legitimately update
+                 * in place: the AS11 rewrites the day's record as
+                 * sessions complete.  STR-sourced spools carry a marker;
+                 * for AS10 sources no live pull exists at all, so a
+                 * non-synthetic spool can only be ours. */
+                if (!import_spool_is_native_str(spool_path) && !as10)
+                    return ESP_OK;
+                str_refresh = true;
+            } else {
+                snprintf(spool_path, sizeof(spool_path), "%s/%s.native.spool",
+                         SD_SUMMARIES_DIR, label);
+                native_overlay = true;
+            }
         } else if (errno != ENOENT) return ESP_FAIL;
     }
 
@@ -1860,8 +1874,10 @@ static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite, bool *w
     if (noon_ms <= 0) noon_ms = d->day_number * 86400000LL + 43200000LL;
     pbuf_t b = {0};
     encode_spool_day(&b, d, noon_ms, noon_ms + 86400000LL);
+    pbuf_put(&b, (const uint8_t *)IMPORT_SPOOL_NATSTR_MARKER,
+             IMPORT_SPOOL_NATSTR_MARKER_LEN);
     esp_err_t ret = b.ovf ? ESP_ERR_NO_MEM : ESP_OK;
-    if (ret == ESP_OK && native_overlay) {
+    if (ret == ESP_OK && (native_overlay || str_refresh)) {
         FILE *old = fopen(spool_path, "rb");
         if (old) {
             bool same = true;
@@ -2282,7 +2298,7 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
             snprintf(spool_path, sizeof(spool_path), "%s/%s.spool", SD_SUMMARIES_DIR, day);
             int spool_status = stat(spool_path, &spool_st);
             if ((spool_status != 0 && (errno != ENOENT || mark_native_dirty() != ESP_OK)) ||
-                write_spool_for_day(d, false, &spool_new) != ESP_OK) retry = true;
+                write_spool_for_day(d, false, as10, &spool_new) != ESP_OK) retry = true;
             else if (spool_new) written++;
         }
         if (retry) break;
@@ -2400,6 +2416,10 @@ typedef struct {
     int64_t  half_ms;           /* accuracy bound of the chosen record, -1 absent */
     int64_t  measured_at_ms;    /* reference_at_ms from the sidecar, 0 when absent */
     bool     valid, usable;
+    /* Sidecar is a transport-failure placeholder: the bridge evidence is
+     * owed but not yet arrived — importing now would bake drift=0 into
+     * every session manifest. */
+    bool     pending_transport;
     char     source[48];     /* clock_drift_source / import provenance */
     /* Source-device fixed zone: civil times inside the EDFs are the
      * device's own local civil — when the bridge confirms a fixed-offset
@@ -2561,6 +2581,20 @@ static void parse_drift_sidecar(const char *path, imp_drift_t *d)
     if (!d->raw) {
         ESP_LOGW(TAG, "import: %s unreadable — file_import drift", path);
         return;
+    }
+
+    /* A pending placeholder is not evidence: "metadata_unavailable" is a
+     * settled bridge answer (drift 0 is honest); "transport_error" means
+     * the sync side still owes this day its real record — the caller
+     * defers the group instead of committing zero drift. */
+    if (json_bool(d->raw, "pending", false)) {
+        const char *reason = cJSON_GetStringValue(
+            cJSON_GetObjectItem(d->raw, "reason"));
+        if (reason && !strcmp(reason, "transport_error")) {
+            d->pending_transport = true;
+            snprintf(d->source, sizeof(d->source), "somnobridge_pending");
+            return;
+        }
     }
 
     const cJSON *est = cJSON_GetObjectItem(d->raw, "estimate");
@@ -4518,6 +4552,49 @@ static void group_state_write(const imp_group_t *g, int seen, int skipped)
     fclose(f);
 }
 
+/* Staged-outcome warnings repeat verbatim on every re-evaluation while
+ * neither the surviving file set nor the evidence epoch has changed —
+ * report them once per (signature, epoch) instead of once per pass.
+ * Entries live for the process lifetime, the same horizon as the log
+ * volume they exist to limit; a change in bytes, membership or evidence
+ * re-arms the warnings immediately. */
+#define IMP_WARN_MARK_MAX 8
+
+typedef struct {
+    char     key[9];
+    uint64_t sig;
+    uint32_t epoch;
+} imp_warn_mark_t;
+
+static imp_warn_mark_t s_warn_mark[IMP_WARN_MARK_MAX];
+static int s_warn_mark_n, s_warn_mark_next;
+
+static bool imp_staged_warn_fresh(const imp_group_t *g, uint64_t sig)
+{
+    uint32_t epoch = import_epoch();
+    for (int i = 0; i < s_warn_mark_n; i++) {
+        if (!strcmp(s_warn_mark[i].key, g->key)) {
+            bool fresh = s_warn_mark[i].sig != sig ||
+                         s_warn_mark[i].epoch != epoch;
+            s_warn_mark[i].sig = sig;
+            s_warn_mark[i].epoch = epoch;
+            return fresh;
+        }
+    }
+    int slot = s_warn_mark_n < IMP_WARN_MARK_MAX
+               ? s_warn_mark_n++ : s_warn_mark_next++ % IMP_WARN_MARK_MAX;
+    memcpy(s_warn_mark[slot].key, g->key, sizeof(s_warn_mark[0].key));
+    s_warn_mark[slot].sig = sig;
+    s_warn_mark[slot].epoch = epoch;
+    return true;
+}
+
+#define imp_staged_logw(fresh, ...)                                    \
+    do {                                                               \
+        if (fresh) ESP_LOGW(TAG, __VA_ARGS__);                         \
+        else       ESP_LOGI(TAG, __VA_ARGS__);                         \
+    } while (0)
+
 static bool name_is_dir8(const char *n)
 {
     if (strlen(n) != 8) return false;
@@ -5393,8 +5470,10 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
         return;
     }
     memcpy(u->day_label, g->key, sizeof(u->day_label));
+    uint64_t g_sig = group_signature(g);
+    const bool warn_staged = imp_staged_warn_fresh(g, g_sig);
     if (g->capacity_exceeded) {
-        ESP_LOGW(TAG, "import: group exceeds source capacity; all sources kept");
+        imp_staged_logw(warn_staged, "import: group exceeds source capacity; all sources kept");
         skip_group(ctx, g);
         u->sessions_failed++;
         u->deferred_capacity++;
@@ -5407,7 +5486,7 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
      * confirmation pass is always granted: identical input can still
      * advance a staged resolution. */
     int state_seen = 0, state_skipped = 0;
-    if (group_state_check(g, group_signature(g),
+    if (group_state_check(g, g_sig,
                           &state_seen, &state_skipped) == GROUP_STATE_SKIP) {
         skip_group(ctx, g);
         u->sessions_skipped += state_skipped;
@@ -5420,6 +5499,18 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
 
     imp_drift_t drift;
     parse_drift_sidecar(g->drift_path[0] ? g->drift_path : NULL, &drift);
+    if (drift.pending_transport) {
+        /* The sync pass is still retrying GET_DRIFT for this day — a
+         * zero-drift commit now would bake the transport failure into
+         * every session manifest.  Keep the group staged; a later pass
+         * lands the real sidecar (or a settled placeholder). */
+        imp_staged_logw(warn_staged,
+                        "import: %s drift record still in flight — deferred",
+                        g->src_dir);
+        if (drift.raw) cJSON_Delete(drift.raw);
+        u->deferred = true;
+        return;
+    }
     const char *import_src = g->drift_path[0] ? "somnobridge" : "file_import";
 
     imp_cluster_t *cl = imp_psram_calloc(IMP_MAX_SESSIONS, sizeof(*cl));
@@ -5475,7 +5566,7 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
             u->sessions_skipped++;
             u->deferred_association++;
             source_retained = true;
-            ESP_LOGW(TAG, "import: association unknown or conflicting; sources kept");
+            imp_staged_logw(warn_staged, "import: association unknown or conflicting; sources kept");
             continue;
         }
         imp_work_t w;
@@ -5510,8 +5601,9 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
             (void)stalled;               /* host ESP_LOGW is a no-op */
             u->sessions_skipped++;
             u->deferred_inflight++;
-            ESP_LOGW(TAG, "import: %s — incomplete upload %s; source(s) kept",
-                     g->src_dir, stalled ? "stalled" : "still in flight");
+            imp_staged_logw(warn_staged,
+                            "import: %s — incomplete upload %s; source(s) kept",
+                            g->src_dir, stalled ? "stalled" : "still in flight");
             continue;
         }
         if (input_failed) {
@@ -5525,7 +5617,7 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
             source_retained = true;
             u->sessions_skipped++;
             u->deferred_identity++;
-            ESP_LOGW(TAG, "import: source identity unknown or conflicting; sources kept");
+            imp_staged_logw(warn_staged, "import: source identity unknown or conflicting; sources kept");
             continue;
         }
         if (rec_ident) {
@@ -5598,11 +5690,12 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
                 }
             if (associations->retain_raw[i] || w.retain_raw) source_retained = true;
             if (r == ESP_ERR_NOT_SUPPORTED)
-                ESP_LOGW(TAG, "import: %s session %s — %ssource(s) kept "
-                         "for a later pass",
-                         g->src_dir, w.id,
-                         w.src_consumed ? "merged; remaining unverifiable "
-                                        : "unverifiable ");
+                imp_staged_logw(warn_staged,
+                                "import: %s session %s — %ssource(s) kept "
+                                "for a later pass",
+                                g->src_dir, w.id,
+                                w.src_consumed ? "merged; remaining unverifiable "
+                                               : "unverifiable ");
             if (r == ESP_ERR_NOT_SUPPORTED) {
                 if (w.frozen) u->deferred_frozen++;
                 else u->deferred_conflict++;
@@ -5611,15 +5704,16 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
         } else {
             u->sessions_failed++;
             source_retained = true;
-            ESP_LOGW(TAG, "import: session failed; source files retained for retry");
+            imp_staged_logw(warn_staged, "import: session failed; source files retained for retry");
         }
     }
 
     if (u->deferred_association || u->deferred_identity || u->deferred_frozen ||
         u->deferred_conflict || u->deferred_capacity || u->deferred_inflight) {
-        ESP_LOGW(TAG, "import: staged association=%d identity=%d frozen=%d conflict=%d capacity=%d inflight=%d",
-                 u->deferred_association, u->deferred_identity, u->deferred_frozen,
-                 u->deferred_conflict, u->deferred_capacity, u->deferred_inflight);
+        imp_staged_logw(warn_staged,
+                        "import: staged association=%d identity=%d frozen=%d conflict=%d capacity=%d inflight=%d",
+                        u->deferred_association, u->deferred_identity, u->deferred_frozen,
+                        u->deferred_conflict, u->deferred_capacity, u->deferred_inflight);
     }
 
     /* Orphan files in the group that never joined a cluster (unknown
@@ -5636,8 +5730,9 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
              * → MaskOn gap) — leave it for the user rather than guessing. */
             u->files_rejected++;
             source_retained = true;
-            ESP_LOGW(TAG, "import: %s joined no session — left in place",
-                     g->files[i].path);
+            imp_staged_logw(warn_staged,
+                            "import: %s joined no session — left in place",
+                            g->files[i].path);
         }
     }
 

@@ -1599,8 +1599,20 @@ static esp_err_t rebuild_read_manifest(const char *day_path, const char *fname,
             bool usable = ju ? cJSON_IsTrue(ju) : measured;
             (void)usable;   /* host ESP_LOG* are no-ops — value is log-only */
             if (!measured) {
-                ESP_LOGW(TAG, "rebuild: %s drift is an estimate (usable=%d)",
-                         out->session_id, (int)usable);
+                /* Bridge-imported sessions with no usable drift evidence
+                 * keep the warning; everywhere else (NTP-timed captures
+                 * where drift 0 is the expected value, or imports carrying
+                 * a usable estimate) it is informational, not a defect. */
+                cJSON *jsrc = cJSON_GetObjectItem(j, "clock_drift_source");
+                bool imported = cJSON_IsString(jsrc) && jsrc->valuestring &&
+                                !strncmp(jsrc->valuestring, "somnobridge", 11);
+                if (imported && !usable) {
+                    ESP_LOGW(TAG, "rebuild: %s drift is an estimate (usable=%d)",
+                             out->session_id, (int)usable);
+                } else {
+                    ESP_LOGI(TAG, "rebuild: %s drift is an estimate (usable=%d)",
+                             out->session_id, (int)usable);
+                }
             }
             ok = true;
         } else {

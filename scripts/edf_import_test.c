@@ -1169,6 +1169,70 @@ static void phase_e(void)
         cJSON_Delete(m11);
     }
     edf_import_ctx_destroy(c);
+
+    /* pending transport-error placeholder → the group defers instead of
+     * committing drift=0; the settled record then imports with the real
+     * drift applied.  (Regression: a one-shot GET_DRIFT timeout used to
+     * bake a ~51-minute shift into every session of that day.) */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"schema\":5,\"pending\":true,\"reason\":\"transport_error\"}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    edf_import_unit_t pu;
+    CHECK(edf_import_process_next(c, &pu) == ESP_OK && pu.deferred,
+          "pending drift → unit deferred");
+    CHECK(pu.sessions_imported == 0 && pu.sessions_failed == 0,
+          "pending drift → nothing committed");
+    CHECK(file_exists(dp), "pending sidecar kept staged");
+    /* The real record lands — the same day now imports with drift. */
+    f = fopen(dp, "w");
+    fputs("{\"source_of_truth\":{\"clock_drift_ms\":\"214000\",\"half_ms\":300,"
+          "\"quality\":\"qualified\",\"basis\":\"anchor\",\"generation\":4}}", f);
+    fclose(f);
+    edf_import_unit_t ru;
+    CHECK(edf_import_process_next(c, &ru) == ESP_OK &&
+          ru.sessions_imported == 1,
+          "settled drift → session imported");
+    snprintf(p, sizeof(p), "%s/%s/20240115_221334_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *mp = parse_json_file(p);
+    CHECK(mp != NULL, "post-pending manifest parses");
+    if (mp) {
+        cJSON *v = cJSON_GetObjectItem(mp, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == 214000,
+              "settled drift applied after pending");
+        cJSON_Delete(mp);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* A settled placeholder (bridge answered "nothing for this day")
+     * imports immediately — drift 0 is the honest outcome. */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"schema\":5,\"pending\":true,"
+          "\"reason\":\"metadata_unavailable\"}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    edf_import_unit_t st = drain(c, &units);
+    CHECK(st.sessions_imported == 1, "settled placeholder imports");
+    snprintf(p, sizeof(p), "%s/%s/20240115_221000_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *ms = parse_json_file(p);
+    CHECK(ms != NULL, "settled-placeholder manifest parses");
+    if (ms) {
+        cJSON *v = cJSON_GetObjectItem(ms, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == 0, "settled → drift 0");
+        v = cJSON_GetObjectItem(ms, "clock_drift_source");
+        CHECK(v && !strcmp(v->valuestring, "somnobridge_none"),
+              "settled → none source");
+        cJSON_Delete(ms);
+    }
+    edf_import_ctx_destroy(c);
     s_fixture_mask_2210 = false;
     printf("phase e OK (%d checks)\n", g_checks);
 }
@@ -2806,6 +2870,35 @@ static void write_near_mask_str(void)
                  2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, sig, 4, 0);
 }
 
+/* Machine-side STR.edf grows the current day's MaskOn/MaskOff vectors in
+ * place — same name, same record shape, more pairs. */
+static void write_mask_str_pairs(const int16_t *on, const int16_t *off,
+                                 int n, const char *rec_id)
+{
+    int16_t date[] = {19737}, mode[] = {3};
+    const fx_sig_t sig[] = {
+        { "Date", "d", 0, 32767, 0, 32767, 1, date, NULL, 0 },
+        { "Mode", "", 0, 32, 0, 32, 1, mode, NULL, 0 },
+        { "MaskOn", "min", 0, 1440, 0, 1440, n, on, NULL, 0 },
+        { "MaskOff", "min", 0, 1440, 0, 1440, n, off, NULL, 0 },
+    };
+    char path[640];
+    snprintf(path, sizeof(path), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(path, rec_id,
+                 2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, sig, 4, 0);
+}
+
+static char *file_snapshot(const char *path, long *n)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); *n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *b = malloc(*n ? *n : 1);
+    if (b && fread(b, 1, (size_t)*n, f) != (size_t)*n) { free(b); b = NULL; }
+    fclose(f);
+    return b;
+}
+
 static void phase_incremental_sources(void)
 {
     char dir[300], path[700], mp[700];
@@ -3413,6 +3506,91 @@ static void phase_incremental_sources(void)
     printf("incremental source reconciliation OK (%d checks)\n", g_checks);
 }
 
+/* A re-pulled STR.edf carries a grown MaskOn/MaskOff table under the same
+ * filename (the machine rewrites today's record in place). Re-import must
+ * refresh the STR-sourced base spool; an unmarked AS11 spool (live pull, or
+ * a pre-marker STR write) stays authoritative and is never rewritten. */
+static void phase_str_regrowth(void)
+{
+    char path[700];
+    snprintf(path, sizeof(path), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    int16_t on3[] = {610, 640, 660}, off3[] = {620, 650, 700};
+    int16_t on5[] = {610, 640, 660, 690, 710};
+    int16_t off5[] = {620, 650, 670, 700, 720};
+
+    fresh_tree();
+    write_mask_str_pairs(on3, off3, 3, "SRN=22199999999 MID=46 VID=1");
+    int units;
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(file_exists(path), "STR-sourced day summary written");
+    CHECK(!import_spool_is_synthetic(path), "STR summary is not synthetic");
+    CHECK(import_spool_is_native_str(path), "STR summary carries provenance");
+    long n1 = 0;
+    char *v1 = file_snapshot(path, &n1);
+    CHECK(v1 != NULL, "first STR summary readable");
+
+    write_mask_str_pairs(on5, off5, 5, "SRN=22199999999 MID=46 VID=1");
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    edf_import_ctx_destroy(c);
+    long n2 = 0;
+    char *v2 = file_snapshot(path, &n2);
+    CHECK(v2 != NULL, "refreshed STR summary readable");
+    if (v1 && v2) {
+        long head = n1 < n2 ? n1 : n2;
+        CHECK(n1 != n2 || memcmp(v1, v2, (size_t)head) != 0,
+              "regrown STR refreshes the day summary");
+    }
+    snprintf(path, sizeof(path), "%s/20240115.native.spool",
+             SD_SUMMARIES_DIR);
+    CHECK(!file_exists(path), "base spool refresh leaves no overlay");
+    snprintf(path, sizeof(path),
+             "%s/20240115.native.mask-intervals.json", SD_SUMMARIES_DIR);
+    cJSON *m = parse_json_file(path);
+    CHECK(m != NULL, "regrown mask evidence parses");
+    if (m) {
+        cJSON *pairs = cJSON_GetObjectItem(m, "pairs");
+        CHECK(cJSON_IsArray(pairs) && cJSON_GetArraySize(pairs) == 5,
+              "mask evidence tracks all five sessions");
+    }
+    cJSON_Delete(m);
+
+    /* The identical record re-staged must not rewrite the summary. */
+    write_mask_str_pairs(on5, off5, 5, "SRN=22199999999 MID=46 VID=1");
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    long n3 = 0;
+    char *v3 = file_snapshot(path, &n3);
+    if (v2 && v3)
+        CHECK(n2 == n3 && !memcmp(v2, v3, (size_t)n2),
+              "unchanged STR does not rewrite the summary");
+    free(v1); free(v2); free(v3);
+
+    fresh_tree();
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL, "create stand-in live summary");
+    if (f) { fputs("LIVE", f); fclose(f); }
+    write_mask_str_pairs(on5, off5, 5, "SRN=22199999999 MID=46 VID=1");
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    edf_import_ctx_destroy(c);
+    long n4 = 0;
+    char *v4 = file_snapshot(path, &n4);
+    if (v4)
+        CHECK(n4 == 4 && !memcmp(v4, "LIVE", 4),
+              "unmarked AS11 summary is never rewritten");
+    free(v4);
+    snprintf(path, sizeof(path), "%s/20240115.native.spool",
+             SD_SUMMARIES_DIR);
+    CHECK(!file_exists(path),
+          "unmarked AS11 summary keeps STR out of the overlay slot");
+    printf("STR regrowth OK (%d checks)\n", g_checks);
+}
+
 /* Arrival order must not turn a timing guess into durable source ownership. */
 static void phase_grouping_arrival_safety(void)
 {
@@ -3865,6 +4043,7 @@ int main(void)
     phase_native_corruption();
     phase_store_budget();
     phase_incremental_sources();
+    phase_str_regrowth();
     phase_grouping_arrival_safety();
     phase_grouping_capacity();
     phase_stale_part_does_not_block();

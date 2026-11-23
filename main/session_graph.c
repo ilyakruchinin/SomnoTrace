@@ -64,27 +64,13 @@ typedef struct __attribute__((packed)) {
 #define SNT_HDR_SIZE sizeof(snt_hdr_t)   /* 28 bytes (packed) */
 #define GRAPH_MAX_POINTS 50000  /* upper bound for ?points=all */
 
-/* ── Physical-unit scaling factors ────────────────────────────────────
- * Raw .snt files store int16 digital values.  These scale factors convert
- * digital values to physical units matching the EDF signal definitions in
- * edf_gen.c.  The graph API emits pre-scaled physical values so the
- * frontend can display them directly without additional conversion.
- *
- * Formula: phys = (dig - dig_min) * (phys_max - phys_min)
- *                                  / (dig_max - dig_min)  + phys_min
- * For all channels below dig_min=0 simplifies to: phys = dig * scale.
- * Flow is the exception: dig_min=-1000, phys_min=-2.0.
- */
-
-/* BRP: Flow.40ms  — phys [-2.0, 3.0] dig [-1000, 1500] → 0.002 L/s per digit
- *      Press.40ms — phys [0.0, 40.0]  dig [0, 2000]     → 0.02 cmH2O per digit */
-#define BRP_FLOW_SCALE   0.002f    /* L/s per digit */
-#define BRP_FLOW_OFFSET  (-2.0f)   /* phys_min */
-#define BRP_FLOW_DIG_MIN (-1000)   /* dig_min */
-#define BRP_PRESS_SCALE  0.02f     /* cmH2O per digit */
-
-/* PLD ch3: Leak — phys [0.0, 2.0] dig [0, 100] → 0.02 L/s per digit */
-#define PLD_LEAK_SCALE   0.02f     /* L/s per digit */
+/* ── Physical-unit scaling ────────────────────────────────────────────
+ * Raw .snt files store int16 digital values scaled ×100 from the physical
+ * unit (hundredths of L/s for flow and leak, hundredths of cmH2O for
+ * pressure).  The graph API emits pre-scaled physical values — L/min for
+ * flow and leak (dig × 0.6), cmH2O for pressure (dig × 0.01) — so the
+ * frontend can display them directly; see brp_flow_phys()/brp_press_phys()/
+ * pld_leak_phys() below. */
 
 /* URL-decode a query parameter value.  Returns decoded length or -1 on overflow. */
 static int graph_url_decode(char *dst, const char *src, int max_len)
@@ -747,32 +733,45 @@ static esp_err_t session_graph_impl(httpd_req_t *req)
     }
 
     /* Determine which .snt file to read.
-     * Flow overview prefers *_brp_mm.snt (L1 MinMax) and falls back to *_brp.snt (L0 raw).
-     * Flow zoom always uses *_brp.snt. Leak uses *_pld.snt. */
-    char file_path[400];
-    char alt_path[400];
-    bool have_alt = false;
+     * v2 keeps flow and pressure in separate single-channel files
+     * (_flow.snt / _flow_mm.snt / _press.snt); v1 multiplexes both into
+     * _brp.snt (2ch) and _brp_mm.snt (4ch).
+     * Flow overview prefers the L1 MinMax file and falls back to L0 raw;
+     * flow zoom always uses L0 raw.  Leak uses *_pld.snt. */
+    char file_path[400], cand2[400], cand3[400], cand4[400];
+    const char *cands[4] = { file_path, cand2, cand3, cand4 };
+    int n_cands = 0;
 
     if (strcmp(channel, "flow") == 0) {
         if (is_zoom) {
-            snprintf(file_path, sizeof(file_path), "%s/%s_brp.snt", day_dir, session_id);
+            snprintf(file_path, sizeof(file_path), "%s/%s_flow.snt", day_dir, session_id);
+            snprintf(cand2, sizeof(cand2), "%s/%s_brp.snt", day_dir, session_id);
+            n_cands = 2;
         } else {
-            snprintf(file_path, sizeof(file_path), "%s/%s_brp_mm.snt", day_dir, session_id);
-            snprintf(alt_path, sizeof(alt_path), "%s/%s_brp.snt", day_dir, session_id);
-            have_alt = true;
+            snprintf(file_path, sizeof(file_path), "%s/%s_flow_mm.snt", day_dir, session_id);
+            snprintf(cand2, sizeof(cand2), "%s/%s_flow.snt", day_dir, session_id);
+            snprintf(cand3, sizeof(cand3), "%s/%s_brp_mm.snt", day_dir, session_id);
+            snprintf(cand4, sizeof(cand4), "%s/%s_brp.snt", day_dir, session_id);
+            n_cands = 4;
         }
     } else if (strcmp(channel, "leak") == 0) {
         snprintf(file_path, sizeof(file_path), "%s/%s_pld.snt", day_dir, session_id);
+        n_cands = 1;
     } else {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown channel");
         return ESP_FAIL;
     }
 
-    FILE *f = fopen(file_path, "rb");
-    if (!f && have_alt) {
-        ESP_LOGI(TAG, "graph: falling back to L0 raw: %s", alt_path);
-        f = fopen(alt_path, "rb");
-        if (f) strlcpy(file_path, alt_path, sizeof(file_path));
+    FILE *f = NULL;
+    for (int i = 0; i < n_cands; i++) {
+        f = fopen(cands[i], "rb");
+        if (f) {
+            if (i > 0) {
+                ESP_LOGI(TAG, "graph: falling back to %s", cands[i]);
+                strlcpy(file_path, cands[i], sizeof(file_path));
+            }
+            break;
+        }
     }
     if (!f) {
         ESP_LOGW(TAG, "graph: file not found: %s", file_path);
@@ -798,6 +797,27 @@ static esp_err_t session_graph_impl(httpd_req_t *req)
     int rec_bytes = n_ch * hdr.sample_bytes;
     int ms_per_rec = 10000 / hdr.sample_hz_x10;
     int16_t missing = snt_missing_for(hdr.version);
+
+    /* v2 sessions store pressure in a sibling _press.snt (L0, 1ch) while
+     * the opened file carries flow only (1ch L0 or 2ch MinMax). */
+    bool v2_split = strcmp(channel, "flow") == 0 &&
+                    ((hdr.tier == 0 && n_ch == 1) || (hdr.tier == 1 && n_ch == 2));
+    FILE *fp = NULL;
+    snt_hdr_t phdr;
+    memset(&phdr, 0, sizeof(phdr));
+    int press_ms_per_rec = 0;
+    if (v2_split) {
+        char ppath[400];
+        snprintf(ppath, sizeof(ppath), "%s/%s_press.snt", day_dir, session_id);
+        fp = fopen(ppath, "rb");
+        if (fp && (fread(&phdr, sizeof(phdr), 1, fp) != 1 ||
+                   phdr.magic != SNT_MAGIC)) {
+            fclose(fp);
+            fp = NULL;
+        }
+        if (fp && phdr.sample_hz_x10 > 0)
+            press_ms_per_rec = 10000 / phdr.sample_hz_x10;
+    }
 
     /* If the caller asked for every point, target the file's sample count
      * but cap it so we do not try to build a multi-megabyte JSON buffer. */
@@ -836,13 +856,32 @@ static esp_err_t session_graph_impl(httpd_req_t *req)
     if (strcmp(channel, "flow") == 0) {
         if (emit_raw && n_samples > 0) {
             /* ── Flow raw window: emit un-decimated L0 samples ── */
-            int16_t *buf = heap_caps_malloc(n_samples * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-            if (!buf) { fclose(f); free(json); httpd_resp_send_500(req); return ESP_FAIL; }
+            int16_t *buf = heap_caps_malloc(n_samples * rec_bytes,
+                                          MALLOC_CAP_SPIRAM);
+            if (!buf) { if (fp) fclose(fp); fclose(f); free(json);
+                        httpd_resp_send_500(req); return ESP_FAIL; }
 
             long file_offset = SNT_HDR_SIZE + (long)start_sample * rec_bytes;
             fseek(f, file_offset, SEEK_SET);
-            size_t got = fread(buf, 2 * sizeof(int16_t), n_samples, f);
+            size_t got = fread(buf, rec_bytes, n_samples, f);
             n_samples = (uint32_t)got;
+
+            /* v2 pressure lives in the companion _press.snt on the same
+             * time base — map flow index i to its press sample by time. */
+            int16_t *pbuf = NULL;
+            size_t pgot = 0;
+            if (v2_split && fp && press_ms_per_rec > 0) {
+                pbuf = heap_caps_malloc(n_samples * sizeof(int16_t),
+                                        MALLOC_CAP_SPIRAM);
+                if (pbuf) {
+                    int64_t p_lo = (int64_t)start_sample * ms_per_rec /
+                                   press_ms_per_rec;
+                    if (p_lo > phdr.sample_count) p_lo = phdr.sample_count;
+                    fseek(fp, SNT_HDR_SIZE + (long)p_lo * sizeof(int16_t),
+                          SEEK_SET);
+                    pgot = fread(pbuf, sizeof(int16_t), n_samples, fp);
+                }
+            }
 
             pos += snprintf(json + pos, json_cap - pos, "{\"t\":[");
             for (uint32_t i = 0; i < n_samples; i++) {
@@ -853,14 +892,28 @@ static esp_err_t session_graph_impl(httpd_req_t *req)
             pos += snprintf(json + pos, json_cap - pos, "],\"flow\":[");
             for (uint32_t i = 0; i < n_samples; i++) {
                 if (i > 0) pos += snprintf(json + pos, json_cap - pos, ",");
-                pos += snprintf(json + pos, json_cap - pos, "%.2f", brp_flow_phys(buf[i * 2], missing));
+                pos += snprintf(json + pos, json_cap - pos, "%.2f",
+                                brp_flow_phys(buf[i * n_ch], missing));
             }
             pos += snprintf(json + pos, json_cap - pos, "],\"press\":[");
-            for (uint32_t i = 0; i < n_samples; i++) {
-                if (i > 0) pos += snprintf(json + pos, json_cap - pos, ",");
-                pos += snprintf(json + pos, json_cap - pos, "%.2f", brp_press_phys(buf[i * 2 + 1], missing));
+            /* v2 without a readable _press.snt emits an empty array —
+             * fabricating zeros would draw a false flat line. */
+            if (!v2_split || pbuf) {
+                for (uint32_t i = 0; i < n_samples; i++) {
+                    if (i > 0) pos += snprintf(json + pos, json_cap - pos, ",");
+                    float v = 0.0f;
+                    if (pbuf && press_ms_per_rec > 0) {
+                        uint32_t pi = (uint32_t)((int64_t)i * ms_per_rec /
+                                                 press_ms_per_rec);
+                        if (pi < pgot) v = brp_press_phys(pbuf[pi], missing);
+                    } else if (!v2_split) {
+                        v = brp_press_phys(buf[i * n_ch + 1], missing);
+                    }
+                    pos += snprintf(json + pos, json_cap - pos, "%.2f", v);
+                }
             }
             pos += snprintf(json + pos, json_cap - pos, "]}");
+            free(pbuf);
             free(buf);
         } else {
             /* ── Flow decimated: L1 or L0 MinMax envelope over requested window ── */
@@ -871,25 +924,43 @@ static esp_err_t session_graph_impl(httpd_req_t *req)
 
             float *flow = heap_caps_malloc(n_out * sizeof(float) * 2, MALLOC_CAP_SPIRAM);
         if (!flow) flow = malloc(n_out * sizeof(float) * 2);
-            if (!flow) { fclose(f); free(json); httpd_resp_send_500(req); return ESP_FAIL; }
+            if (!flow) { if (fp) fclose(fp); fclose(f); free(json);
+                         httpd_resp_send_500(req); return ESP_FAIL; }
             float *press = flow + n_out;
 
-            bool is_l1 = (hdr.tier == 1 && n_ch == 4);
+            bool is_l1 = hdr.tier == 1 && (n_ch == 4 || n_ch == 2);
             fseek(f, SNT_HDR_SIZE + (long)start_sample * rec_bytes, SEEK_SET);
+
+            /* v2 press companion: sequential cursor over each flow
+             * record's time span (records and output stay ordered). */
+            uint32_t p_next = 0;
+            if (v2_split && fp && press_ms_per_rec > 0) {
+                int64_t p_lo = (int64_t)start_sample * ms_per_rec /
+                               press_ms_per_rec;
+                if (p_lo > phdr.sample_count) p_lo = phdr.sample_count;
+                p_next = (uint32_t)p_lo;
+                fseek(fp, SNT_HDR_SIZE + (long)p_next * sizeof(int16_t),
+                      SEEK_SET);
+            }
 
             int out = 0; uint32_t ri = 0;
             while (ri < n_samples && out < n_out) {
                 float g_fmn = 1e9f, g_fmx = -1e9f;
                 float g_pmn = 1e9f, g_pmx = -1e9f;
                 for (int g = 0; g < group && ri < n_samples; g++) {
-                    if (is_l1) {
+                    if (is_l1 && n_ch == 4) {
                         int16_t rec[4];
                         if (fread(rec, sizeof(int16_t), 4, f) != 4) { ri = n_samples; break; }
                         if (rec[0] != missing) { float v = brp_flow_phys(rec[0], missing); if (v < g_fmn) g_fmn = v; }
                         if (rec[1] != missing) { float v = brp_flow_phys(rec[1], missing); if (v > g_fmx) g_fmx = v; }
                         if (rec[2] != missing) { float v = brp_press_phys(rec[2], missing); if (v < g_pmn) g_pmn = v; }
                         if (rec[3] != missing) { float v = brp_press_phys(rec[3], missing); if (v > g_pmx) g_pmx = v; }
-                    } else {
+                    } else if (is_l1 && n_ch == 2) {
+                        int16_t rec[2];
+                        if (fread(rec, sizeof(int16_t), 2, f) != 2) { ri = n_samples; break; }
+                        if (rec[0] != missing) { float v = brp_flow_phys(rec[0], missing); if (v < g_fmn) g_fmn = v; }
+                        if (rec[1] != missing) { float v = brp_flow_phys(rec[1], missing); if (v > g_fmx) g_fmx = v; }
+                    } else if (n_ch >= 2) {
                         int16_t rec[2];
                         if (fread(rec, sizeof(int16_t), 2, f) != 2) { ri = n_samples; break; }
                         if (rec[0] != missing) {
@@ -901,6 +972,36 @@ static esp_err_t session_graph_impl(httpd_req_t *req)
                             float v = brp_press_phys(rec[1], missing);
                             if (v < g_pmn) g_pmn = v;
                             if (v > g_pmx) g_pmx = v;
+                        }
+                    } else {
+                        int16_t rec;
+                        if (fread(&rec, sizeof(int16_t), 1, f) != 1) { ri = n_samples; break; }
+                        if (rec != missing) {
+                            float v = brp_flow_phys(rec, missing);
+                            if (v < g_fmn) g_fmn = v;
+                            if (v > g_fmx) g_fmx = v;
+                        }
+                    }
+                    /* Pressure span covered by this flow record (v2 only —
+                     * v1 already decoded its pressure channel inline). */
+                    if (v2_split && fp && press_ms_per_rec > 0) {
+                        uint32_t p_lo = (uint32_t)(((int64_t)(start_sample + ri) *
+                                                    ms_per_rec) / press_ms_per_rec);
+                        uint32_t p_hi = (uint32_t)(((int64_t)(start_sample + ri + 1) *
+                                                    ms_per_rec) / press_ms_per_rec);
+                        if (p_hi > phdr.sample_count) p_hi = phdr.sample_count;
+                        int16_t pv;
+                        while (p_next < p_hi) {
+                            if (fread(&pv, sizeof(int16_t), 1, fp) != 1) {
+                                p_next = p_hi;
+                                break;
+                            }
+                            if (p_next >= p_lo && pv != missing) {
+                                float v = brp_press_phys(pv, missing);
+                                if (v < g_pmn) g_pmn = v;
+                                if (v > g_pmx) g_pmx = v;
+                            }
+                            p_next++;
                         }
                     }
                     ri++;
@@ -928,9 +1029,11 @@ static esp_err_t session_graph_impl(httpd_req_t *req)
                 pos += snprintf(json + pos, json_cap - pos, "%.2f", flow[i]);
             }
             pos += snprintf(json + pos, json_cap - pos, "],\"press\":[");
-            for (int i = 0; i < out; i++) {
-                if (i > 0) pos += snprintf(json + pos, json_cap - pos, ",");
-                pos += snprintf(json + pos, json_cap - pos, "%.2f", press[i]);
+            if (!v2_split || fp) {
+                for (int i = 0; i < out; i++) {
+                    if (i > 0) pos += snprintf(json + pos, json_cap - pos, ",");
+                    pos += snprintf(json + pos, json_cap - pos, "%.2f", press[i]);
+                }
             }
             pos += snprintf(json + pos, json_cap - pos, "]}");
             free(flow);
@@ -1004,6 +1107,7 @@ static esp_err_t session_graph_impl(httpd_req_t *req)
         pos += snprintf(json + pos, json_cap - pos, "{\"error\":\"unsupported channel\"}");
     }
 
+    if (fp) fclose(fp);
     fclose(f);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, pos);

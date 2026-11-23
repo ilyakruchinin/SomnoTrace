@@ -311,6 +311,20 @@ unsigned sb_stream_retry_ms(const char *code)
     return 0;
 }
 
+unsigned sb_get_drift_retry_ms(const char *code, int attempt)
+{
+    if (!code || !code[0]) {
+        /* Transport failure: the response died on the wire, typically
+         * while the bridge is still draining the previous stream's
+         * mbuf pool.  Back off 1 s, 2 s, ... between attempts. */
+        return attempt >= 0 && attempt < 30 ? 1000u * (unsigned)(attempt + 1)
+                                            : 30000u;
+    }
+    if (!strcmp(code, "BUSY"))  return 1500;
+    if (!strcmp(code, "STALE")) return 12000;
+    return 0;
+}
+
 sb_seq_kind_t sb_seq_class(uint16_t seq, uint16_t expected)
 {
     /* back = how far seq sits BEHIND expected (mod 65536).  A frame

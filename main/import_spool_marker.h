@@ -32,6 +32,14 @@
 #define IMPORT_SPOOL_MARKER "\x82\xb5\x18\x13" "SOMNOTRACE_SYNTH_V1"
 #define IMPORT_SPOOL_MARKER_LEN (sizeof(IMPORT_SPOOL_MARKER) - 1)
 
+/* Same framing, different tag: marks a <day>.spool (or <day>.native.spool)
+ * encoded from a native STR.edf record, as opposed to the verbatim record
+ * the live AS11 Summary-spool pull stores — STR-sourced spools may be
+ * refreshed in place when the record grows. */
+#define IMPORT_SPOOL_NATSTR_MARKER "\x82\xb5\x18\x13" "SOMNOTRACE_NATSTRV1"
+#define IMPORT_SPOOL_NATSTR_MARKER_LEN \
+    (sizeof(IMPORT_SPOOL_NATSTR_MARKER) - 1)
+
 static inline bool import_spool_is_synthetic(const char *path)
 {
     unsigned char tail[IMPORT_SPOOL_MARKER_LEN];
@@ -40,6 +48,18 @@ static inline bool import_spool_is_synthetic(const char *path)
     bool match = fseek(f, -(long)sizeof(tail), SEEK_END) == 0 &&
                  fread(tail, 1, sizeof(tail), f) == sizeof(tail) &&
                  memcmp(tail, IMPORT_SPOOL_MARKER, sizeof(tail)) == 0;
+    fclose(f);
+    return match;
+}
+
+static inline bool import_spool_is_native_str(const char *path)
+{
+    unsigned char tail[IMPORT_SPOOL_NATSTR_MARKER_LEN];
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    bool match = fseek(f, -(long)sizeof(tail), SEEK_END) == 0 &&
+                 fread(tail, 1, sizeof(tail), f) == sizeof(tail) &&
+                 memcmp(tail, IMPORT_SPOOL_NATSTR_MARKER, sizeof(tail)) == 0;
     fclose(f);
     return match;
 }

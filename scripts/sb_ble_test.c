@@ -358,6 +358,28 @@ static void test_retry_policy(void)
     CHECK(sb_stream_retry_ms("seq") == 0, "prefix of seq gap not retried");
 }
 
+static void test_get_drift_retry_policy(void)
+{
+    /* Transport failures (empty code) retry with a lengthening backoff —
+     * the request typically lands while the bridge is still tearing the
+     * previous stream down. */
+    CHECK(sb_get_drift_retry_ms("", 0) == 1000, "transport retry 1 s");
+    CHECK(sb_get_drift_retry_ms("", 1) == 2000, "transport retry 2 s");
+    CHECK(sb_get_drift_retry_ms("", 2) == 3000, "transport retry 3 s");
+    CHECK(sb_get_drift_retry_ms(NULL, 0) == 1000, "NULL code is transport");
+    /* Deferrable bridge refusals mirror the stream policy. */
+    CHECK(sb_get_drift_retry_ms("BUSY", 0) == 1500, "BUSY waits out teardown");
+    CHECK(sb_get_drift_retry_ms("STALE", 0) == 12000, "STALE waits out rescan");
+    /* Explicit bridge answers are final — the bridge cleanly refused, so
+     * retrying can only return the same verdict. */
+    CHECK(sb_get_drift_retry_ms("METADATA_UNAVAILABLE", 0) == 0,
+          "metadata-unavailable is final");
+    CHECK(sb_get_drift_retry_ms("BAD_REQUEST", 0) == 0, "bad request final");
+    CHECK(sb_get_drift_retry_ms("THERAPY_ACTIVE", 0) == 0,
+          "therapy gate is final");
+    CHECK(sb_get_drift_retry_ms("SIZE_MISMATCH", 0) == 0, "mismatch final");
+}
+
 /* Compact-frame sequence check, modulo 65536: duplicates behind the
  * expected position must be dropped, forward jumps are lost frames. */
 static void test_seq_class(void)
@@ -599,6 +621,7 @@ int main(void)
     test_rsp_classify();
     test_stream_begin_match();
     test_retry_policy();
+    test_get_drift_retry_policy();
     test_seq_class();
     test_parse_u64();
     test_hex_str_ok();
