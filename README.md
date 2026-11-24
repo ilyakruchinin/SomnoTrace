@@ -4,12 +4,12 @@
 
 **SomnoTrace** is firmware for an inexpensive (~US$20) bedside device that:
 
-- 📥 **Automatically pulls therapy data from your ResMed Series 10/11** (AirSense / AirCurve)
-  - <ins><b>Series 11</b></ins> - Directly, wirelessly over Bluetooth (<ins><b>no SD card required in the machine</b></ins>)
-  - <ins><b>Series 10</b></ins> - Through [SomnoBridge](https://github.com/ilyakruchinin/somnobridge) and an EZShare WiFi SD card in the machine (Series 10 doesn't have Bluetooth support)
-- 💓 **Downloads your O2 Ring pulse-oximetry recordings** over Bluetooth (wirelessly).
-- ⏱️ **Corrects the machine's clock drift** so therapy records align to real internet time — <ins><b>your CPAP and oximeter graphs line up properly</b></ins>.
-- 📤 **Writes standard EDF files and uploads them automatically** to your NAS/PC share (SMB) for <ins><b>[OSCAR](https://www.sleepfiles.com/OSCAR/), [SleepHQ](https://sleephq.com), [Aerivue](https://aerivue.app), or [BreathingRoom](https://breathingroom.io)</b></ins> — no SD card swapping.
+- 📥 Automatically pulls therapy data from your ResMed Series 10/11 (AirSense / AirCurve)
+  - <ins>Series 11</ins> - Directly, wirelessly over Bluetooth (<ins><b>no SD card required in the machine</b></ins>)
+  - <ins>Series 10</ins> - Through [SomnoBridge](https://github.com/ilyakruchinin/somnobridge) and an EZShare WiFi SD card in the machine (Series 10 doesn't have Bluetooth support)
+- 💓 Downloads your O2 Ring pulse-oximetry recordings over Bluetooth (wirelessly).
+- ⏱️ Corrects the machine's clock drift so therapy records align to real internet time — <ins><b>your CPAP and oximeter graphs line up properly</b></ins>.
+- 📤 Writes standard EDF files and uploads them automatically to your NAS/PC share (SMB) for <ins><b>[OSCAR](https://www.sleepfiles.com/OSCAR/), [SleepHQ](https://sleephq.com), [Aerivue](https://aerivue.app), or [BreathingRoom](https://breathingroom.io)</b></ins> — no SD card swapping.
 
 ---
 
