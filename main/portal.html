@@ -721,6 +721,14 @@ Scan for O2 Ring
 <button class="btn btn-primary btn-sm" type="button" id="btn-ox-pair" style="display:none;margin-top:8px" onclick="oxPair()">Pair Device</button>
 </div>
 </div>
+<div class="form-group" id="ox-mode-group" style="margin-top:10px">
+<label for="ox-rec-mode">Recording Mode (Gen2 / O2 Ring S)</label>
+<select id="ox-rec-mode" class="form-control" onchange="oxSetMode(this.value)">
+<option value="persistent">Download after sleep (standard)</option>
+<option value="live_ppg">Live PPG Recording (raw PPG + vitals to /PPG/)</option>
+</select>
+<div id="ox-mode-hint" style="font-size:.78rem;color:var(--text-muted);margin-top:4px">Standard mode downloads stored oximetry after you take the ring off. Live PPG streams raw dual-wavelength PPG + vitals continuously while worn, saves CSVs to /PPG/ on SD, and updates the Web UI &amp; uploads on finish.</div>
+</div>
 <button class="btn btn-danger btn-sm" type="button" id="btn-ox-forget" style="display:none;margin-top:10px;width:fit-content" onclick="oxForget()">Unpair Device</button>
 <div id="ox-status" class="status-msg"></div>
 </div>
@@ -2459,11 +2467,13 @@ function loadStatusTab(d) {
     var ost = ox.state || 'idle';
     var olabels = {
       'idle': 'Not paired', 'scanning': 'Scanning…', 'connecting': 'Connecting…',
+      'monitoring': 'Monitoring', 'recording_ppg': 'Recording PPG',
       'pulling': 'Syncing…', 'paired': (ox.device && ox.device.ble_name) ? ox.device.ble_name
                  : (ox.device && ox.device.serial) ? ox.device.serial : 'Paired', 'error': 'Error'
     };
     var ocolors = {
       'idle': 'var(--text-muted)', 'scanning': 'var(--warning)', 'connecting': 'var(--warning)',
+      'monitoring': 'var(--success)', 'recording_ppg': 'var(--accent, var(--success))',
       'pulling': 'var(--warning)', 'paired': 'var(--success)', 'error': 'var(--danger)'
     };
     oxEl.textContent = olabels[ost] || ost;
@@ -3253,9 +3263,19 @@ function oxScan() {
 function oxPair() {
   var sel = document.getElementById('ox-dev');
   if (!sel || !sel.value) { oxStatusMsg('Select a device first'); return; }
+  var modeEl = document.getElementById('ox-rec-mode');
+  var mode = modeEl ? modeEl.value : 'persistent';
   oxStatusMsg('Connecting…');
-  fetch('/api/ox/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ addr: sel.value, type: 'auto' }) })
+  fetch('/api/ox/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ addr: sel.value, type: 'auto', probe_mode: mode }) })
     .then(function(r){ return r.json(); }).then(function() { oxPoll(); }).catch(function() { oxStatusMsg('Pair failed'); });
+}
+
+function oxSetMode(mode) {
+  fetch('/api/ox/probe-mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: mode }) })
+    .then(function(r){ return r.json(); })
+    .then(function(d) {
+      if (d && d.ok) oxStatusMsg(mode === 'live_ppg' ? 'Mode: Live PPG Recording' : 'Mode: Download after sleep');
+    }).catch(function() { oxStatusMsg('Failed to save recording mode'); });
 }
 
 function oxForget() {
@@ -3279,6 +3299,14 @@ function updateOxUI(ox) {
   var paired = document.getElementById('ox-paired');
   var unp = document.getElementById('ox-unpaired');
   var fgt = document.getElementById('btn-ox-forget');
+  var modeGroup = document.getElementById('ox-mode-group');
+  var modeSel = document.getElementById('ox-rec-mode');
+
+  var isLegacy = !!(ox.paired && ox.device && ox.device.driver === 'wellue_legacy');
+  if (modeGroup) modeGroup.style.display = isLegacy ? 'none' : '';
+  if (modeSel && ox.probe_mode && document.activeElement !== modeSel) {
+    if (ox.probe_mode === 'live_ppg' || ox.probe_mode === 'persistent') modeSel.value = ox.probe_mode;
+  }
 
   if (ox.state === 'error') {
     if (oxPollTimer) clearInterval(oxPollTimer);
@@ -3303,6 +3331,8 @@ function updateOxUI(ox) {
       di.textContent = info;
     }
     if (ox.state === 'connecting') { oxStatusMsg('Syncing…'); }
+    else if (ox.state === 'recording_ppg') { oxStatusMsg('Recording live PPG…'); }
+    else if (ox.state === 'monitoring') { oxStatusMsg('Monitoring (worn)…'); }
     else if (ox.state === 'pulling') { oxStatusMsg('Syncing…'); }
     else if (ox.state === 'scanning') { oxStatusMsg('Scanning…'); }
     else { if (oxPollTimer) clearInterval(oxPollTimer); oxStatusMsg(''); }

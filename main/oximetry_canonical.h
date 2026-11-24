@@ -68,6 +68,15 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
                                                const char *source_path,
                                                int64_t start_utc_ms);
 
+/* Convert a completed live-recorded 1 Hz metrics CSV (from Gen2 LIVE/PPG mode)
+ * into a durable SNTv3 canonical recording package + Format A source.bin so
+ * Web UI, SomnoML stage CSV, SleepHQ, and SMB uploads all work even if the
+ * ring did not flush its own internal recording file. */
+esp_err_t oximetry_canonical_convert_live_metrics(const char *device_id,
+                                                  const char *recording_id,
+                                                  const char *metrics_csv_path,
+                                                  int64_t start_utc_ms);
+
 /* Convert one completed O2 Ring (Gen1) VLD3 file into a durable recording
  * package.  Vendor-layout metadata provides cadence; header and filename
  * timestamps are validated independently with provenance retained.  The source

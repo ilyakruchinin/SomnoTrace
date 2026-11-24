@@ -1274,9 +1274,10 @@ cJSON *netprov_build_status_json(void)
         cJSON_AddStringToObject(ox, "state", oximeter_get_status());
         cJSON_AddStringToObject(ox, "error", oximeter_get_error());
         cJSON_AddBoolToObject(ox, "paired", oximeter_is_paired());
-        cJSON_AddStringToObject(ox, "probe_mode",
-                oximeter_get_probe_mode() == OX_PROBE_PERSISTENT
-                    ? "persistent" : "legacy");
+        ox_probe_mode_t pm = oximeter_get_probe_mode();
+        const char *pm_str = pm == OX_PROBE_LIVE_PPG ? "live_ppg"
+                             : (pm == OX_PROBE_PERSISTENT ? "persistent" : "legacy");
+        cJSON_AddStringToObject(ox, "probe_mode", pm_str);
         if (oximeter_is_paired()) {
             cJSON *oinfo = oximeter_get_paired_info();
             if (oinfo) {
@@ -1669,6 +1670,15 @@ static esp_err_t ox_pair_handler(httpd_req_t *req)
         else if (strcmp(type->valuestring, "auto") == 0)
             driver = OX_DRIVER_AUTO;
     }
+    cJSON *pm_j = j ? cJSON_GetObjectItem(j, "probe_mode") : NULL;
+    if (cJSON_IsString(pm_j) && driver != OX_DRIVER_LEGACY) {
+        if (strcmp(pm_j->valuestring, "live_ppg") == 0)
+            oximeter_set_probe_mode(OX_PROBE_LIVE_PPG);
+        else if (strcmp(pm_j->valuestring, "persistent") == 0)
+            oximeter_set_probe_mode(OX_PROBE_PERSISTENT);
+        else if (strcmp(pm_j->valuestring, "legacy") == 0)
+            oximeter_set_probe_mode(OX_PROBE_LEGACY);
+    }
     esp_err_t e = oximeter_pair(addr->valuestring, driver);
     cJSON_Delete(j);
     if (e != ESP_OK) {
@@ -1703,7 +1713,9 @@ static esp_err_t ox_probe_mode_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     ox_probe_mode_t pm;
-    if (strcmp(mode->valuestring, "persistent") == 0)
+    if (strcmp(mode->valuestring, "live_ppg") == 0)
+        pm = OX_PROBE_LIVE_PPG;
+    else if (strcmp(mode->valuestring, "persistent") == 0)
         pm = OX_PROBE_PERSISTENT;
     else if (strcmp(mode->valuestring, "legacy") == 0)
         pm = OX_PROBE_LEGACY;

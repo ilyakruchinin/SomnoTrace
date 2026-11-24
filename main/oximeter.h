@@ -46,8 +46,9 @@ typedef enum {
 #define OX_STATUS_CONNECTING "connecting"
 #define OX_STATUS_PULLING    "pulling"
 #define OX_STATUS_PAIRED     "paired"
-#define OX_STATUS_ERROR      "error"
-#define OX_STATUS_MONITORING "monitoring"  /* persistent connection held, polling LIVE_B */
+#define OX_STATUS_ERROR         "error"
+#define OX_STATUS_MONITORING    "monitoring"     /* persistent connection held, polling LIVE_B */
+#define OX_STATUS_RECORDING_PPG "recording_ppg"  /* live PPG mode held, polling LIVE_B + RT_PPG */
 
 /* Probe mode determines how the watch task monitors a worn ring.
  *
@@ -57,10 +58,15 @@ typedef enum {
  * OX_PROBE_PERSISTENT: Hold one GATT connection, poll unauthenticated LIVE_B
  *                      (cmd=0x04) every 30 s.  AUTH/SETUP/GET_INFO and file
  *                      transfer are deferred until off-finger is detected.
- *                      Recommended mode (see .ai/OXIMETRY2.md). */
+ *                      Recommended mode (see .ai/OXIMETRY2.md).
+ * OX_PROBE_LIVE_PPG:   Gen2 (OxyII) only. Hold one GATT connection, poll
+ *                      LIVE_B (cmd=0x04) + RT_PPG (cmd=0x05) at 1 Hz while worn,
+ *                      save raw PPG & metrics CSVs under /PPG/, and finalize
+ *                      canonical SNTv3 + uploads on off-finger. */
 typedef enum {
     OX_PROBE_LEGACY     = 0,
     OX_PROBE_PERSISTENT = 1,
+    OX_PROBE_LIVE_PPG   = 2,
 } ox_probe_mode_t;
 
 /* Initialise the oximeter module.  Must be called after as11_ble_init()

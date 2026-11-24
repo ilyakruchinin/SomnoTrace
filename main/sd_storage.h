@@ -55,6 +55,9 @@
 /* Oximetry raw files from O2 Ring (Format A blobs, not EDF) */
 #define SD_OXIMETRY_DIR       SD_APP_DIR "/oximetry"
 
+/* Live PPG & metrics CSV exports (user-visible, recorded when LIVE/PPG mode is active) */
+#define SD_PPG_DIR            SD_MOUNT_POINT "/PPG"
+
 /* SomnoStage consumer-facing exports (Zeo-compatible sleep stage CSVs,
  * derived from the internal .sst sidecars — one file per scored unit) */
 #define SD_STAGES_DIR         SD_APP_DIR "/stages"
