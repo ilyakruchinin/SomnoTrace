@@ -1,6 +1,8 @@
+<img src="assets/images/waveshare.jpeg" alt="Waveshare ESP32-S3-Touch-LCD-1.54" width="140" align="right" />
 <p align="center">
   <img src="assets/svg/logo-full.svg" alt="SomnoTrace" width="480" />
 </p>
+<br clear="right" />
 
 **SomnoTrace** is firmware for an inexpensive (~US$20) bedside device that:
 
