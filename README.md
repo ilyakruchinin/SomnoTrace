@@ -42,6 +42,7 @@
 | Feature | Availability | Notes | Exclusive to SomnoTrace 💎 |
 |---------|-----------|-----------|-------|
 | OTA firmware updates| ✅ | Simple update via web interface | |
+| Uploads to SMB network share | ✅ | For import to OSCAR or as a backup | |
 | Support for SleepHQ, Aerivue and BreathingRoom | ✅ | Automatic uploads to cloud services | 💎 widest endpoint support |
 | 3-click installation ([only takes 1 minute](#3-click-install)) | ✅ | Anyone can do it, no technical knowledge required | 💎 install from a web page |
 
