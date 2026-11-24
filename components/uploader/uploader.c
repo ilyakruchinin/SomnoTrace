@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
@@ -48,7 +49,7 @@ static const char *TAG = "uploader";
  * upload_index now; this file owns configuration, the backend registry and
  * the public API only. */
 
-static uploader_config_t s_config;
+static EXT_RAM_BSS_ATTR uploader_config_t s_config;
 static bool s_initialised = false;
 
 #define MAX_BACKENDS UPLOAD_MAX_BACKENDS

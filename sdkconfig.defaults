@@ -67,15 +67,15 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 # Threshold below which malloc() prefers internal RAM; at/above it, PSRAM is
 # preferred (with automatic fallback either way, so malloc never fails on this
-# alone).  Lowered 16384 -> 4096 -> 1024 to push the 1-4 KB allocation band
-# (HTTP header/body buffers, cJSON aggregates, misc driver/lib buffers) into
-# PSRAM and free internal RAM.  Only tiny (<1 KB) allocations stay internal.
+# alone).  Lowered 16384 -> 4096 -> 1024 -> 512 to push the 512B-1KB
+# allocation band (cJSON, FATFS, BLE notify copies, misc driver buffers) into
+# PSRAM and free internal RAM.  Only tiny (<512 B) allocations stay internal.
 # NOTE: CONFIG_SPI_FLASH_AUTO_SUSPEND does NOT make it safe for tasks that
 # do flash erase/write (NVS commit) to have PSRAM stacks —
 # esp_ota_get_running_partition() → spi_flash_cache2phys() still freezes
 # caches.  Such work is funnelled through the internal-stack nvs_writer task
 # so the httpd worker (PSRAM stack) never calls flash-write directly.
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384
 
 # Allow zero-initialized BSS to be placed in PSRAM.  This moves large static

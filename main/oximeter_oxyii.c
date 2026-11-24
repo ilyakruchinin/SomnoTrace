@@ -1690,7 +1690,7 @@ typedef struct {
     bool resumable;
 } oxyii_live_rec_t;
 
-static oxyii_live_rec_t s_live_rec = {0};
+static EXT_RAM_BSS_ATTR oxyii_live_rec_t s_live_rec;
 
 static void live_rec_pause(oxyii_live_rec_t *rec)
 {
