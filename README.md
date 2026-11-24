@@ -43,6 +43,7 @@
 |---------|-----------|-----------|-------|
 | OTA firmware updates| ✅ | Simple update via web interface | |
 | Support for SleepHQ, Aerivue and BreathingRoom | ✅ | Automatic uploads to cloud services | 💎 widest endpoint support |
+| 3-click installation (takes just 1 minute) | ✅ | Anyone can do it, no technical knowledge required | 💎 install from a web page |
 
 
 ---
