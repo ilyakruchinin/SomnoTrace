@@ -5,7 +5,7 @@
 **SomnoTrace** is firmware for an inexpensive (~US$20) bedside device that:
 
 - 📥 Automatically pulls therapy data from your **ResMed Series 10/11 (AirSense / AirCurve)**
-  - <ins>Series 11</ins> - Directly, wirelessly over Bluetooth (<ins>no SD card required in the machine</ins>)
+  - <ins>Series 11</ins> - Directly, wirelessly over Bluetooth (*<ins>no SD card required in the machine<ins>*)
   - <ins>Series 10</ins> - Through [SomnoBridge](https://github.com/ilyakruchinin/somnobridge) and an EZShare WiFi SD card in the machine (Series 10 doesn't have Bluetooth support)
 - 💓 Downloads your O2 Ring pulse-oximetry recordings over Bluetooth (wirelessly).
 - ⏱️ <ins>Corrects the machine's clock drift</ins> so therapy records align to real internet time — <ins>your CPAP and oximeter graphs line up properly</ins>.
