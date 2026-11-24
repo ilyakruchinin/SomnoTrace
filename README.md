@@ -28,8 +28,9 @@
 | Real-time high-leak alerts | ✅ | ❌ | Push notifications to your phone, smartwatch, or smart bed shaker via ntfy | 💎 PUSH notifications |
 | Optional escalating buzzer alarm | ✅ | ❌ | If you miss the notification, the device will sound an escalating buzzer alarm | 💎 if not acked |
 | Send RPC commands to the machine | ✅ | ❌ | Query machine settings or start/stop therapy remotely | |
+| Midday continuous sessions | ✅ | ❌ | Therapy spanning midday is recorded as one [continuous session](docs/cross-noon.md) | |
 | Smart home automations | ✅ | limited | Built-in MQTT publishes live telemetry with Home Assistant Auto-Discovery | 💎 live therapy data |
-| Midday continuous sessions | ✅ | ❌ | Therapy spanning midday is recorded as one continuous session | 💎 [no gap in data](docs/cross-noon.md)|
+
 
 ## Key pulse oximetry features
 | Feature | Availability | Notes | Exclusive to SomnoTrace 💎 |
