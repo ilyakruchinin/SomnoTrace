@@ -25,6 +25,8 @@
 
 #include "net_provision.h"
 #include "as11_ble.h"
+#include "sb_ble.h"
+#include "edf_import.h"
 #include "oximeter.h"
 #include "time_sync.h"
 #include "uploader.h"
@@ -37,6 +39,7 @@
 #include "log_stream.h"
 #include "device_settings.h"
 #include "session_graph.h"
+#include "httpd_defer.h"
 #include "session_writer.h"
 #include "oximetry_http.h"
 
@@ -1260,6 +1263,9 @@ cJSON *netprov_build_status_json(void)
                 cJSON_AddItemToObject(ble, "device", info);
             }
         }
+        /* SomnoBridge (Phase 2): its own state, therapy flag and sync
+         * counters.  Present even when unpaired so the portal can offer it. */
+        cJSON_AddItemToObject(ble, "bridge", sb_ble_status_json());
     }
 
     /* Oximeter (O2 Ring) status (only in connected mode) */
@@ -1470,7 +1476,7 @@ static esp_err_t recv_body(httpd_req_t *req, char *buf, size_t cap)
     return ESP_OK;
 }
 
-static esp_err_t ble_scan_handler(httpd_req_t *req)
+static esp_err_t ble_scan_impl(httpd_req_t *req)
 {
     if (as11_ble_scan(6) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ble not ready");
@@ -1482,6 +1488,53 @@ static esp_err_t ble_scan_handler(httpd_req_t *req)
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     cJSON_free(json);
     cJSON_Delete(arr);
+    return ESP_OK;
+}
+
+/* BLE scan blocks ~6 s — would freeze every other request on the httpd task. */
+static esp_err_t ble_scan_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, ble_scan_impl);
+}
+
+/* Phase 3: import status (Phase-1 inbox + bridge telemetry) and an explicit
+ * "Import now" / "Sync now" trigger. */
+static esp_err_t import_status_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "pending", edf_import_pending());
+    cJSON_AddItemToObject(root, "bridge", sb_ble_status_json());
+    char *txt = cJSON_Print(root);
+    cJSON_Delete(root);
+    if (!txt) { httpd_resp_send_500(req); return ESP_FAIL; }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_send(req, txt, HTTPD_RESP_USE_STRLEN);
+    free(txt);
+    return ESP_OK;
+}
+
+static esp_err_t import_run_handler(httpd_req_t *req)
+{
+    bool full = false, import_only = false;
+    if (req->content_len > 0) {
+        char body[96];
+        if (recv_body(req, body, sizeof(body)) == ESP_OK) {
+            cJSON *j = cJSON_Parse(body);
+            if (j) {
+                full = cJSON_IsTrue(cJSON_GetObjectItem(j, "full"));
+                import_only = cJSON_IsTrue(cJSON_GetObjectItem(j, "import_only"));
+                cJSON_Delete(j);
+            }
+        }
+    }
+    /* Pull from the bridge first (it stages into IMPORT/), then let the
+     * Phase-1 importer drain whatever is there.  import_only skips the
+     * pull — used when files were staged by hand (FTP/SD copy). */
+    if (!import_only && sb_ble_is_paired()) sb_ble_sync_now(full);
+    edf_import_kick_now();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
 }
 
@@ -1499,7 +1552,23 @@ static esp_err_t ble_pair_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing addr");
         return ESP_FAIL;
     }
-    esp_err_t e = as11_ble_start_pair(addr->valuestring);
+    cJSON *jt = cJSON_GetObjectItem(j, "type");
+    const char *type = cJSON_GetStringValue(jt);
+    bool bridge = type && strcmp(type, "somnobridge") == 0;
+    uint8_t addr_type = 0;   /* BLE_ADDR_PUBLIC; replaced by the scan hit */
+    bool scanned_bridge = false;
+    if (as11_ble_scan_lookup_ex(addr->valuestring, &addr_type, &scanned_bridge))
+        bridge = scanned_bridge;    /* the scan is authoritative */
+    /* Slot 1 is a single source: pairing a device of the other type
+     * drops the previous bond, or the stranded peer would keep owning
+     * the slot (bridge_owns_slot1 suppresses AS11 reconnect forever). */
+    if (bridge) {
+        if (as11_ble_is_paired()) as11_ble_forget();
+    } else {
+        if (sb_ble_is_paired()) sb_ble_forget();
+    }
+    esp_err_t e = bridge ? sb_ble_start_pair_ex(addr->valuestring, addr_type)
+                         : as11_ble_start_pair(addr->valuestring);
     cJSON_Delete(j);
     if (e != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "pair start failed");
@@ -1524,10 +1593,19 @@ static esp_err_t ble_confirm_handler(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing passkey");
         return ESP_FAIL;
     }
-    esp_err_t e = as11_ble_confirm_pair(pk->valuestring);
+    /* SomnoBridge uses a 6-digit BLE-SM PIN; the AS11 uses 4-digit SRP. */
+    bool bridge = strlen(pk->valuestring) >= 6 ||
+                  strcmp(sb_ble_get_status(), SB_STATUS_WAIT_PASSKEY) == 0;
+    esp_err_t e = bridge ? sb_ble_confirm_pair(pk->valuestring)
+                         : as11_ble_confirm_pair(pk->valuestring);
     cJSON_Delete(j);
     if (e != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "confirm failed");
+        char msg[128];
+        snprintf(msg, sizeof(msg), "{\"ok\":false,\"error\":\"%s\"}",
+                 bridge ? sb_ble_get_error() : as11_ble_get_error());
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_sendstr(req, msg);
         return ESP_FAIL;
     }
     httpd_resp_set_type(req, "application/json");
@@ -1537,14 +1615,16 @@ static esp_err_t ble_confirm_handler(httpd_req_t *req)
 
 static esp_err_t ble_forget_handler(httpd_req_t *req)
 {
-    as11_ble_forget();
+    /* SomnoBridge owns slot 1 when it is the bonded source. */
+    if (sb_ble_is_paired()) sb_ble_forget();
+    else as11_ble_forget();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"ok\":true}");
     return ESP_OK;
 }
 
 /* ── Oximeter (O2 Ring) endpoints ──────────────────────────────────── */
-static esp_err_t ox_scan_handler(httpd_req_t *req)
+static esp_err_t ox_scan_impl(httpd_req_t *req)
 {
     if (oximeter_scan(6) != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oximeter not ready");
@@ -1557,6 +1637,12 @@ static esp_err_t ox_scan_handler(httpd_req_t *req)
     cJSON_free(json);
     cJSON_Delete(arr);
     return ESP_OK;
+}
+
+/* Oximeter BLE scan blocks ~6 s — deferred off the httpd task. */
+static esp_err_t ox_scan_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, ox_scan_impl);
 }
 
 static esp_err_t ox_pair_handler(httpd_req_t *req)
@@ -1637,7 +1723,7 @@ static esp_err_t ox_probe_mode_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t ble_passthrough_handler(httpd_req_t *req)
+static esp_err_t ble_passthrough_impl(httpd_req_t *req)
 {
     int total = req->content_len;
     if (total <= 0 || total > 2048) {
@@ -1681,6 +1767,88 @@ static esp_err_t ble_passthrough_handler(httpd_req_t *req)
     httpd_resp_send(req, out_json, HTTPD_RESP_USE_STRLEN);
     free(out_json);
     return ESP_OK;
+}
+
+/* BLE RPC round-trip can take up to 10 s — deferred off the httpd task. */
+static esp_err_t ble_passthrough_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, ble_passthrough_impl);
+}
+
+/* POST /api/sb/op — proxy a provisioning op to the bonded SomnoBridge so
+ * the portal can configure the bridge's Wi-Fi/EZShare without its setup
+ * AP. Whitelisted ops only; file/stream ops stay on the sync path. */
+static esp_err_t sb_op_impl(httpd_req_t *req)
+{
+    int total = req->content_len;
+    if (total <= 0 || total > 1024) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body (1..1024 bytes)");
+        return ESP_FAIL;
+    }
+
+    char *body = malloc(total + 1);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    int received = httpd_req_recv(req, body, total);
+    if (received < 0) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+        return ESP_FAIL;
+    }
+    body[received] = '\0';
+
+    cJSON *j = cJSON_Parse(body);
+    free(body);
+    const char *op = j ? cJSON_GetStringValue(cJSON_GetObjectItem(j, "op"))
+                       : NULL;
+    static const char *const allowed[] = {
+        "GET_CONFIG", "SET_CONFIG", "WIFI_SCAN", "EZSHARE_CHECK",
+        "CARD_GET", "EZSHARE_ADMIN", "GET_STATUS"
+    };
+    bool ok = false;
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        if (op && strcmp(op, allowed[i]) == 0) { ok = true; break; }
+    }
+    if (!ok) {
+        cJSON_Delete(j);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unsupported op");
+        return ESP_FAIL;
+    }
+
+    /* EZSHARE_CHECK runs a live probe-join on the bridge (~10 s worst
+     * case); EZSHARE_ADMIN logs into the card and reboots its AP (~15 s);
+     * the others answer from RAM/NVS state quickly. */
+    uint32_t tmo = strcmp(op, "EZSHARE_CHECK") == 0 ? 32000 :
+                   strcmp(op, "EZSHARE_ADMIN") == 0 ? 45000 : 12000;
+    char *out_json = NULL;
+    esp_err_t err = sb_ble_rpc(op, cJSON_GetObjectItem(j, "args"), tmo,
+                               &out_json);
+    cJSON_Delete(j);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    if (!out_json) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        const char *errmsg = (err == ESP_ERR_INVALID_STATE)
+                                 ? "bridge not connected"
+                                 : "bridge RPC failed";
+        char errbuf[128];
+        snprintf(errbuf, sizeof(errbuf), "{\"ok\":false,\"error\":\"%s\"}",
+                 errmsg);
+        httpd_resp_sendstr(req, errbuf);
+        return ESP_FAIL;
+    }
+    httpd_resp_send(req, out_json, HTTPD_RESP_USE_STRLEN);
+    free(out_json);
+    return ESP_OK;
+}
+
+/* Bridge ops can block up to 45 s (EZSHARE_ADMIN) — deferred off httpd. */
+static esp_err_t sb_op_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, sb_op_impl);
 }
 
 static void reboot_task(void *arg)
@@ -1966,7 +2134,7 @@ static bool get_query_param(httpd_req_t *req, const char *key, char *out, int ou
     return fs_url_decode(out, raw, out_len) > 0;
 }
 
-static esp_err_t dir_get_handler(httpd_req_t *req)
+static esp_err_t dir_get_impl(httpd_req_t *req)
 {
     char dir_path[256];
     if (!get_query_param(req, "dir", dir_path, sizeof(dir_path)) || dir_path[0] == '\0') {
@@ -2030,6 +2198,12 @@ static esp_err_t dir_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* readdir + per-entry stat — SD I/O that stalls under import/upload churn. */
+static esp_err_t dir_get_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, dir_get_impl);
+}
+
 static esp_err_t download_get_handler(httpd_req_t *req)
 {
     char file_path[256];
@@ -2043,42 +2217,23 @@ static esp_err_t download_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    FILE *f = fopen(file_path, "rb");
-    if (!f) {
+    /* stat (not just fopen) so directories answer 404 instead of streaming
+     * garbage — a FAT dir fopen succeeds but fread returns nothing. */
+    struct stat st;
+    if (stat(file_path, &st) != 0 || !S_ISREG(st.st_mode)) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "file not found");
         return ESP_FAIL;
     }
 
-    struct stat st;
-    if (stat(file_path, &st) == 0) {
-        char len_str[16];
-        snprintf(len_str, sizeof(len_str), "%ld", (long)st.st_size);
-        httpd_resp_set_hdr(req, "Content-Length", len_str);
-    }
-
+    /* No Content-Length: the worker streams chunked, and a stale CL on the
+     * async request suppresses the body entirely. */
     httpd_resp_set_type(req, "application/octet-stream");
     httpd_resp_set_hdr(req, "Connection", "close");
 
-    /* Heap-allocate to avoid stack overflow */
-    char *buf = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
-    if (!buf) buf = malloc(2048);
-    if (!buf) {
-        fclose(f);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    size_t n;
-    while ((n = fread(buf, 1, 2048, f)) > 0) {
-        if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) {
-            free(buf);
-            fclose(f);
-            return ESP_FAIL;
-        }
-    }
-    free(buf);
-    fclose(f);
-    httpd_resp_send_chunk(req, NULL, 0);
-    return ESP_OK;
+    /* Streaming a large file would occupy the single httpd task for the
+     * whole transfer — every other request queues behind it. Hand off to
+     * the shared download worker (same path as /api/session/file). */
+    return session_graph_enqueue_file(req, file_path, 0, (long)st.st_size);
 }
 
 /* ── Upload config and status endpoints ────────────────────────────── */
@@ -2275,24 +2430,45 @@ static esp_err_t upload_test_send(httpd_req_t *req, const char *backend_id)
     return ESP_OK;
 }
 
-static esp_err_t upload_test_smb_handler(httpd_req_t *req)
+/* Test-connection probes can block ~30 s on unreachable backends — deferred. */
+static esp_err_t upload_test_smb_impl(httpd_req_t *req)
 {
     return upload_test_send(req, "smb");
 }
 
-static esp_err_t upload_test_sleephq_handler(httpd_req_t *req)
+static esp_err_t upload_test_smb_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, upload_test_smb_impl);
+}
+
+static esp_err_t upload_test_sleephq_impl(httpd_req_t *req)
 {
     return upload_test_send(req, "sleephq");
 }
 
-static esp_err_t upload_test_aerivue_handler(httpd_req_t *req)
+static esp_err_t upload_test_sleephq_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, upload_test_sleephq_impl);
+}
+
+static esp_err_t upload_test_aerivue_impl(httpd_req_t *req)
 {
     return upload_test_send(req, "aerivue");
 }
 
-static esp_err_t upload_test_breathingroom_handler(httpd_req_t *req)
+static esp_err_t upload_test_aerivue_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, upload_test_aerivue_impl);
+}
+
+static esp_err_t upload_test_breathingroom_impl(httpd_req_t *req)
 {
     return upload_test_send(req, "breathingroom");
+}
+
+static esp_err_t upload_test_breathingroom_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, upload_test_breathingroom_impl);
 }
 
 /* ── Device settings endpoints ─────────────────────────────────────── */
@@ -2346,7 +2522,7 @@ static esp_err_t alert_config_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t alert_test_push_handler(httpd_req_t *req)
+static esp_err_t alert_test_push_impl(httpd_req_t *req)
 {
     char *body = NULL;
     int total = req->content_len;
@@ -2376,6 +2552,12 @@ static esp_err_t alert_test_push_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
+}
+
+/* Test push does a network send (MQTT/ntfy) — can block seconds; deferred. */
+static esp_err_t alert_test_push_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, alert_test_push_impl);
 }
 
 /* ── MQTT config endpoints ─────────────────────────────────────────── */
@@ -2657,12 +2839,14 @@ static void recreate_edfs_task(void *arg)
         return;
     }
     int n_sessions = 0;
+    bool collection_changed = false;
 
     /* 4. Second pass: collect all sessions. */
     d = opendir(SD_STREAMS_DIR);
     if (d) {
         struct dirent *ent;
         while ((ent = readdir(d)) != NULL) {
+            if (collection_changed) break;
             if (ent->d_type != DT_DIR) continue;
             if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
                 continue;
@@ -2711,6 +2895,11 @@ static void recreate_edfs_task(void *arg)
                         cJSON_Delete(j);
                         continue;
                     }
+                    if (n_sessions >= total_sessions) {
+                        collection_changed = true;
+                        cJSON_Delete(j);
+                        break;
+                    }
                     recreate_session_t *s = &sessions[n_sessions++];
                     strlcpy(s->session_dir, day_dir, sizeof(s->session_dir));
                     strlcpy(s->session_id, session_id, sizeof(s->session_id));
@@ -2723,6 +2912,12 @@ static void recreate_edfs_task(void *arg)
             closedir(dd);
         }
         closedir(d);
+    }
+    if (collection_changed) {
+        ESP_LOGW(TAG, "recreate_edfs_task: sessions changed during scan; retry required");
+        free(sessions);
+        vTaskDelete(NULL);
+        return;
     }
 
     ESP_LOGI(TAG, "recreate_edfs_task: found %d sessions", n_sessions);
@@ -2751,7 +2946,8 @@ static void recreate_edfs_task(void *arg)
         return;
     }
     int n_queued_days = 0;
-    int n_processed = 0;
+    int n_completed = 0;
+    psram_work_begin("recreate-days", 24 * 1024);
 
     for (int i = 0; i < n_sessions; i++) {
         char day_folder[32];
@@ -2768,30 +2964,24 @@ static void recreate_edfs_task(void *arg)
                  * older; stop processing. */
                 break;
             }
-            /* Delete just this day's existing EDF folder before recreating
-             * it, so stale files from a previous export don't survive. */
-            char old_day_dir[300];
-            snprintf(old_day_dir, sizeof(old_day_dir), "%s/%s",
-                     SD_SDCARD_DATALOG, day_folder);
-            recursive_delete(old_day_dir);
             strlcpy(queued_days[n_queued_days++], day_folder, sizeof(queued_days[0]));
+            /* Build the whole day in staging and retain the sentinel until
+             * its shared STR/settings pass also succeeds. */
+            esp_err_t err = edf_gen_rebuild_day(day_folder);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "recreate_edfs_task: rebuild %s failed (%s); "
+                         "stopping without queuing the incomplete day",
+                         day_folder, esp_err_to_name(err));
+                break;
+            }
+            uploader_on_day_invalidated(day_folder);
+            n_completed++;
         }
-
-        n_processed++;
-        ESP_LOGI(TAG, "recreate_edfs_task: generating EDFs for session %d: %s",
-                 n_processed, sessions[i].session_id);
-        edf_gen_generate(sessions[i].session_dir, sessions[i].session_id,
-                         sessions[i].start_epoch_ms, sessions[i].end_epoch_ms,
-                         sessions[i].clock_drift_ms);
     }
 
-    /* 7. Queue unique day folders for upload. */
-    for (int j = 0; j < n_queued_days; j++) {
-        uploader_on_day_invalidated(queued_days[j]);
-    }
-
-    ESP_LOGI(TAG, "recreate_edfs_task: done (%d/%d sessions processed, %d unique days queued)",
-             n_processed, n_sessions, n_queued_days);
+    ESP_LOGI(TAG, "recreate_edfs_task: done (%d days rebuilt, %d examined)",
+             n_completed, n_queued_days);
+    psram_work_end("recreate-done", 24 * 1024);
     free(queued_days);
     free(sessions);
     vTaskDelete(NULL);
@@ -2805,7 +2995,9 @@ static void rebuild_day_task(void *arg)
     char *day = (char *)arg;
     if (!day) { vTaskDelete(NULL); return; }
 
+    psram_work_begin("manual-rebuild", 24 * 1024);
     esp_err_t ret = edf_gen_rebuild_day(day);
+    psram_work_end("manual-rebuild-done", 24 * 1024);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "rebuild_day_task: %s rebuilt, queueing for upload", day);
         /* The day's files were replaced: discard what the backends were told
@@ -3376,7 +3568,7 @@ static esp_err_t actions_handler(httpd_req_t *req)
             return send_busy(req, "therapy recording in progress");
         }
         ESP_LOGW(TAG, "action: recreate ALL EDFs (destructive)");
-        TaskHandle_t h = psram_task_create(recreate_edfs_task, "recreate_edfs", 16384, NULL, 5, 1, NULL, NULL);
+        TaskHandle_t h = psram_task_create(recreate_edfs_task, "recreate_edfs", 24 * 1024, NULL, 5, 1, NULL, NULL);
         if (!h) {
             err = ESP_ERR_NO_MEM;
         }
@@ -3396,7 +3588,7 @@ static esp_err_t actions_handler(httpd_req_t *req)
         } else {
             ESP_LOGI(TAG, "action: rebuild day %s", day_arg);
             TaskHandle_t h = psram_task_create(rebuild_day_task, "rebuild_day",
-                                               16384, day_arg, 5, 1, NULL, NULL);
+                                               24 * 1024, day_arg, 5, 1, NULL, NULL);
             if (!h) {
                 free(day_arg);
                 err = ESP_ERR_NO_MEM;
@@ -3477,7 +3669,12 @@ static esp_err_t start_webserver(void)
 {
     if (s_httpd) {
         ESP_LOGI(TAG, "stopping existing webserver");
-        httpd_stop(s_httpd);
+        log_stream_ws_server_stopping(s_httpd);
+        esp_err_t stop_result = httpd_stop(s_httpd);
+        if (stop_result != ESP_OK) {
+            log_stream_ws_server_started(s_httpd);
+            return stop_result;
+        }
         s_httpd = NULL;
     }
 
@@ -3508,10 +3705,17 @@ static esp_err_t start_webserver(void)
     web_auth_init();
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.lru_purge_enable = true;
+    config.lru_purge_enable = false;  /* purge kills just-accepted (lowest-LRU)
+                                         sockets mid-request; with it off, excess
+                                         connects queue in the listen backlog and
+                                         idle keep-alives are reaped by the 1s
+                                         recv timeout instead of RSTs */
     config.max_uri_handlers = 128;
     config.stack_size = 12288;
-    config.max_open_sockets = 20;
+    config.max_open_sockets = 24;   /* ~8 for browser/WS + up to 13 pending defers */
+    config.backlog_conn = 12;       /* SYNs in backlog each hold a TCP pcb —
+                                       keep sessions+backlog under
+                                       CONFIG_LWIP_MAX_ACTIVE_TCP (56) */
     config.recv_wait_timeout = 1;       /* close idle keep-alive sockets fast */
     config.send_wait_timeout = 5;
     config.keep_alive_enable = true;    /* detect dead connections via TCP probes */
@@ -3536,10 +3740,10 @@ static esp_err_t start_webserver(void)
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         return ESP_FAIL;
     }
-
     web_auth_begin_routes();
     web_auth_register_handlers(s_httpd);
     session_graph_init();
+    httpd_defer_init();
     oximetry_http_register_handlers(s_httpd);
 
     httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
@@ -3578,18 +3782,24 @@ static esp_err_t start_webserver(void)
     reg_uri(s_httpd, &save);
 
     /* AirSense 11 BLE pairing endpoints (status folded into /api/status) */
+    httpd_uri_t import_status = { .uri = "/api/import/status", .method = HTTP_GET, .handler = import_status_handler };
+    httpd_uri_t import_run = { .uri = "/api/import/run", .method = HTTP_POST, .handler = import_run_handler };
     httpd_uri_t ble_scan = { .uri = "/api/ble/scan", .method = HTTP_GET, .handler = ble_scan_handler };
     httpd_uri_t ble_pair = { .uri = "/api/ble/pair", .method = HTTP_POST, .handler = ble_pair_handler };
     httpd_uri_t ble_conf = { .uri = "/api/ble/confirm", .method = HTTP_POST, .handler = ble_confirm_handler };
     httpd_uri_t ble_forget = { .uri = "/api/ble/forget", .method = HTTP_POST, .handler = ble_forget_handler };
     httpd_uri_t ble_pass = { .uri = "/api/ble/passthrough", .method = HTTP_POST, .handler = ble_passthrough_handler };
+    httpd_uri_t sb_op = { .uri = "/api/sb/op", .method = HTTP_POST, .handler = sb_op_handler };
     httpd_uri_t ble_exp_get = { .uri = "/api/ble/experimental", .method = HTTP_GET, .handler = ble_experimental_get_handler };
     httpd_uri_t ble_exp_post = { .uri = "/api/ble/experimental", .method = HTTP_POST, .handler = ble_experimental_post_handler };
+    reg_uri(s_httpd, &import_status);
+    reg_uri(s_httpd, &import_run);
     reg_uri(s_httpd, &ble_scan);
     reg_uri(s_httpd, &ble_pair);
     reg_uri(s_httpd, &ble_conf);
     reg_uri(s_httpd, &ble_forget);
     reg_uri(s_httpd, &ble_pass);
+    reg_uri(s_httpd, &sb_op);
     reg_uri(s_httpd, &ble_exp_get);
     reg_uri(s_httpd, &ble_exp_post);
 

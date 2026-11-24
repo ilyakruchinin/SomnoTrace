@@ -55,3 +55,11 @@ esp_err_t summary_handler(httpd_req_t *req);
  * Returns therapy mode + pressure/EPR settings parsed from the session's
  * settings.json, for the pressure-panel rendering (CPAP flat lines). */
 esp_err_t session_settings_handler(httpd_req_t *req);
+
+/* Enqueue a whole-file (or range) chunked download onto the snt_download
+ * worker, freeing the httpd task for other requests.  Shared by
+ * /api/session/file and /download.  Caller sets response headers first;
+ * the request is always answered — file body on success, 503/500 on
+ * contention/failure. */
+esp_err_t session_graph_enqueue_file(httpd_req_t *req, const char *file_path,
+                                     long range_start, long send_size);

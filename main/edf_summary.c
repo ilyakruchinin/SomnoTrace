@@ -22,8 +22,35 @@
  */
 
 #include "edf_summary.h"
+#include "settings_provenance.h"
+#include "settings_resolver.h"
+#include "edf_as10_settings.h"
+#include "import_spool_marker.h"
+#include <time.h>
 
 static const char *TAG = "edf_sum";
+
+/* Native/live spools always win. Only a spool explicitly created by the EDF
+ * importer may be replaced for reading by its newer derived or native copy. */
+static esp_err_t select_summary_spool(const char *day, char *path, size_t cap)
+{
+    snprintf(path, cap, "%s/%s.spool", SD_SUMMARIES_DIR, day);
+    if (!import_spool_is_synthetic(path)) return ESP_OK;
+    const char *suffixes[] = { "native.spool", "imported.spool" };
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        char candidate[300];
+        snprintf(candidate, sizeof(candidate), "%s/%s.%s", SD_SUMMARIES_DIR,
+                 day, suffixes[i]);
+        struct stat st;
+        if (stat(candidate, &st) == 0) {
+            if (!S_ISREG(st.st_mode)) return ESP_FAIL;
+            snprintf(path, cap, "%s", candidate);
+            return ESP_OK;
+        }
+        if (errno != ENOENT) return ESP_FAIL;
+    }
+    return ESP_OK;
+}
 
 /* ════════════════════════════════════════════════════════════════════
  *  Section 2: Minimal protobuf wire-format decoder
@@ -66,7 +93,7 @@ static uint64_t pb_decode_varint(const uint8_t *buf, size_t buf_len,
 
 /* Iterate over top-level fields in a protobuf message.
  * Calls cb(field, wire, data, len, user_data) for each field.
- * Returns number of fields decoded. */
+ * Returns the number of fields decoded, or -1 for malformed input. */
 typedef void (*pb_iter_cb)(const pb_field_t *f, void *user_data);
 
 static int pb_iter(const uint8_t *buf, size_t buf_len, pb_iter_cb cb, void *ud)
@@ -76,9 +103,12 @@ static int pb_iter(const uint8_t *buf, size_t buf_len, pb_iter_cb cb, void *ud)
     while (pos < buf_len) {
         size_t tag_start = pos;
         uint64_t tag = pb_decode_varint(buf, buf_len, &pos);
+        if (pos == tag_start || (buf[pos - 1] & 0x80) ||
+            (pos - tag_start == 10 && buf[pos - 1] > 1) ||
+            (tag >> 3) > 0x1fffffff) return -1;
         int field = (int)(tag >> 3);
         int wire = (int)(tag & 0x07);
-        if (field == 0) break;
+        if (field == 0) return -1;
 
         pb_field_t f = { .field = field, .wire = wire };
 
@@ -89,13 +119,15 @@ static int pb_iter(const uint8_t *buf, size_t buf_len, pb_iter_cb cb, void *ud)
             f.len = 0;  /* varint value is decoded by caller if needed */
             /* Skip the varint value */
             pb_decode_varint(buf, buf_len, &vpos);
+            if (vpos == pos || (buf[vpos - 1] & 0x80) ||
+                (vpos - pos == 10 && buf[vpos - 1] > 1)) return -1;
             f.len = vpos - pos;
             f.data = buf + pos;
             pos = vpos;
             break;
         }
         case 1: {  /* 64-bit */
-            if (pos + 8 > buf_len) return count;
+            if (buf_len - pos < 8) return -1;
             f.data = buf + pos;
             f.len = 8;
             pos += 8;
@@ -104,15 +136,17 @@ static int pb_iter(const uint8_t *buf, size_t buf_len, pb_iter_cb cb, void *ud)
         case 2: {  /* length-delimited */
             size_t lpos = pos;
             uint64_t flen = pb_decode_varint(buf, buf_len, &lpos);
+            if (lpos == pos || (buf[lpos - 1] & 0x80) ||
+                (lpos - pos == 10 && buf[lpos - 1] > 1)) return -1;
             pos = lpos;
-            if (pos + flen > buf_len) return count;
+            if (flen > buf_len - pos) return -1;
             f.data = buf + pos;
             f.len = (size_t)flen;
             pos += flen;
             break;
         }
         case 5: {  /* 32-bit */
-            if (pos + 4 > buf_len) return count;
+            if (buf_len - pos < 4) return -1;
             f.data = buf + pos;
             f.len = 4;
             pos += 4;
@@ -120,7 +154,7 @@ static int pb_iter(const uint8_t *buf, size_t buf_len, pb_iter_cb cb, void *ud)
         }
         default:
             /* Unknown wire type — stop */
-            return count;
+            return -1;
         }
 
         cb(&f, ud);
@@ -236,6 +270,7 @@ typedef struct {
         int64_t duration_min;  /* sub-field 2: per-session duration (minutes) */
     } session_entries[20];
     int n_session_entries;
+    bool malformed;
 } summary_ctx_t;
 
 /* Callback for pb_iter on a Summary record. */
@@ -263,6 +298,11 @@ static void summary_field_cb(const pb_field_t *f, void *ud)
                 /* Wrapper submessage for one session entry */
                 size_t lpos = pos;
                 uint64_t flen = pb_decode_varint(f->data, f->len, &lpos);
+                if (lpos == pos || (f->data[lpos - 1] & 0x80) ||
+                    flen > f->len - lpos) {
+                    ctx->malformed = true;
+                    return;
+                }
                 const uint8_t *inner = f->data + lpos;
                 size_t inner_len = (size_t)flen;
                 pos = lpos + flen;
@@ -280,6 +320,11 @@ static void summary_field_cb(const pb_field_t *f, void *ud)
                     } else if (isw == 2) {
                         size_t ilpos = ip;
                         uint64_t ilen = pb_decode_varint(inner, inner_len, &ilpos);
+                        if (ilpos == ip || (inner[ilpos - 1] & 0x80) ||
+                            ilen > inner_len - ilpos) {
+                            ctx->malformed = true;
+                            return;
+                        }
                         ip = ilpos + ilen;
                     } else if (isw == 1) {
                         ip += 8;
@@ -295,6 +340,11 @@ static void summary_field_cb(const pb_field_t *f, void *ud)
             } else if (sw == 2) {
                 size_t lpos = pos;
                 uint64_t flen = pb_decode_varint(f->data, f->len, &lpos);
+                if (lpos == pos || (f->data[lpos - 1] & 0x80) ||
+                    flen > f->len - lpos) {
+                    ctx->malformed = true;
+                    return;
+                }
                 pos = lpos + flen;
             } else if (sw == 0) {
                 (void)pb_decode_varint(f->data, f->len, &pos);
@@ -317,11 +367,14 @@ static void summary_field_cb(const pb_field_t *f, void *ud)
             int sub_wire = (int)(tag & 0x07);
             if (sub_field == 0) break;
             if (sub_wire == 0) {
-                ctx->metrics[f->field].val[sub_field] =
-                    (int64_t)pb_decode_varint(f->data, f->len, &pos);
+                int64_t value = (int64_t)pb_decode_varint(f->data, f->len, &pos);
+                if (sub_field > 0 && sub_field < 8)
+                    ctx->metrics[f->field].val[sub_field] = value;
             } else if (sub_wire == 2) {
                 size_t lpos = pos;
                 uint64_t flen = pb_decode_varint(f->data, f->len, &lpos);
+                if (lpos == pos || (f->data[lpos - 1] & 0x80) ||
+                    flen > f->len - lpos) return;
                 pos = lpos + flen;
             } else if (sub_wire == 1) {
                 pos += 8;
@@ -371,14 +424,50 @@ static int on_off_to_edf(const char *s)
     return -1;
 }
 
-/* Map trigger/cycle sensitivity to EDF value.
+/* Map numeric trigger/cycle sensitivity to EDF value.
  * Export map [1,2,3,4,5,6,7] = raw_index + 1.
- * The AS11 Get RPC returns these as numbers (raw CONF indices 0-6).
  * See edf_signals.md "STR enum export maps". */
 static int trigger_cycle_to_edf(int raw)
 {
     if (raw < 0 || raw > 6) return -1;
     return raw + 1;
+}
+
+/* Get returns named sensitivities; card imports use numeric indices. */
+static int sensitivity_to_edf(const cJSON *v)
+{
+    if (cJSON_IsNumber(v)) return trigger_cycle_to_edf(v->valueint);
+    if (!cJSON_IsString(v) || !v->valuestring) return -1;
+    const char *s = v->valuestring;
+    if (strcmp(s, "VeryLow") == 0 || strcmp(s, "Very Low") == 0) return 1;
+    if (strcmp(s, "Low") == 0) return 2;
+    if (strcmp(s, "Medium") == 0 || strcmp(s, "Med") == 0) return 3;
+    if (strcmp(s, "High") == 0) return 4;
+    if (strcmp(s, "VeryHigh") == 0 || strcmp(s, "Very High") == 0) return 5;
+    return -1;
+}
+
+/* The device represents durations as ISO 8601 seconds, e.g. PT1.5S. */
+static int duration_string_to_edf(const cJSON *v, double scale, int max_digital)
+{
+    if (!cJSON_IsString(v) || !v->valuestring) return -1;
+    const char *s = v->valuestring;
+    if (s[0] != 'P' || s[1] != 'T') return -1;
+    s += 2;
+    const char *p = s;
+    while (*p >= '0' && *p <= '9') p++;
+    if (p == s) return -1;
+    if (*p == '.') {
+        const char *fraction = ++p;
+        while (*p >= '0' && *p <= '9') p++;
+        if (p == fraction) return -1;
+    }
+    if (p[0] != 'S' || p[1] != '\0') return -1;
+    char *end = NULL;
+    double seconds = strtod(s, &end);
+    if (end != p || !isfinite(seconds) || seconds < 0 ||
+        seconds > (double)max_digital / scale) return -1;
+    return (int)lround(seconds * scale);
 }
 
 /* Map EasyBreathe enable to EDF value.
@@ -387,6 +476,16 @@ static int easy_breathe_to_edf(const char *s)
 {
     if (!s) return -1;
     if (strcmp(s, "Off") == 0) return 1;
+    if (strcmp(s, "On") == 0) return 2;
+    return -1;
+}
+
+/* Map RiseTimeEnable to EDF value (Off/Min=1, On=2).
+ * AirCurve 11 reports "Min" when Rise Time is off/minimum; stock STR writes 1. */
+static int rise_time_enable_to_edf(const char *s)
+{
+    if (!s) return -1;
+    if (strcmp(s, "Off") == 0 || strcmp(s, "Min") == 0) return 1;
     if (strcmp(s, "On") == 0) return 2;
     return -1;
 }
@@ -445,20 +544,9 @@ static int profile_name_to_mop(const char *name)
  *   Indices (AHI etc)    logical_scale = 10    → num=1, den=10
  *   Duration/enums/SAU   logical_scale = 1     → no conversion needed
  */
-/* Build STR data values [4-132] from a summary context and settings JSON.
- * str_values must be pre-filled with 0xFF (sentinel for "no data").
- *
- * Spool-derived stat fields [78-132] are raw fixed-point integers from the
- * protobuf Summary record.  Each is divided by its logical_scale (via
- * spool_to_edf) to produce the EDF digital value that the AS11 firmware
- * would write.  Settings fields [6-77] come from the Get RPC response
- * (settings.json) and are already in EDF digital units (e.g. cmH2O × 50). */
-static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
-                                  const cJSON *settings_json)
+/* Build only JSON-backed settings [5-75], leaving other fields untouched. */
+static void build_str_settings_values(int16_t *str_values, const cJSON *settings_json)
 {
-    /* Session core [4-5] — logical_scale = 1, no conversion needed */
-    str_values[4] = get_scalar(ctx, SUM_F_DURATION_MIN, 0);  /* Duration */
-
     /* Mode [5]: derived from ActiveTherapyProfile in settings.json.
      * The AS11's own export uses the MOP setting (ActiveTherapyProfile),
      * not the SessionModeEntries from the Summary spool, which contain
@@ -478,7 +566,7 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
     }
 
     /* CPAP/AutoSet settings [6-13], bi-level settings [14-58], and
-     * common comfort/settings [59-77]: from settings.json (Get RPC response
+     * common comfort/settings [59-75]: from settings.json (Get RPC response
      * captured during post-therapy).
      * Pressures are stored in cmH2O × 50, temperatures in °C × 10.
      * Ti fields use seconds × 50 (logical_scale=20, edf_output_scale=50).
@@ -519,7 +607,7 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
             }
 
             /* VAuto settings [14-21]: pressures cmH2O × 50, Ti × 50,
-             * trigger/cycle via trigger_cycle_to_edf (raw + 1). */
+             * trigger/cycle via sensitivity_to_edf (strings or raw + 1). */
             cJSON *vauto = cJSON_GetObjectItem(tp, "VAutoProfile");
             if (vauto) {
                 if ((v = cJSON_GetObjectItem(vauto, "StartPressure")) && cJSON_IsNumber(v))
@@ -530,18 +618,22 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
                     str_values[16] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(vauto, "SetPressureSupport")) && cJSON_IsNumber(v))
                     str_values[17] = settings_x50(v->valuedouble);
-                if ((v = cJSON_GetObjectItem(vauto, "SetMaxInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[18] = settings_x50(v->valuedouble);
-                if ((v = cJSON_GetObjectItem(vauto, "SetMinInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[19] = settings_x50(v->valuedouble);
-                if ((v = cJSON_GetObjectItem(vauto, "TriggerSensitivity")) && cJSON_IsNumber(v))
-                    str_values[20] = (int16_t)trigger_cycle_to_edf(v->valueint);
-                if ((v = cJSON_GetObjectItem(vauto, "CycleSensitivity")) && cJSON_IsNumber(v))
-                    str_values[21] = (int16_t)trigger_cycle_to_edf(v->valueint);
+                if ((v = cJSON_GetObjectItem(vauto, "SetMaxInspiratoryTime"))) {
+                    str_values[18] = cJSON_IsNumber(v) ? settings_x50(v->valuedouble) :
+                                     (int16_t)duration_string_to_edf(v, 50.0, 200);
+                }
+                if ((v = cJSON_GetObjectItem(vauto, "SetMinInspiratoryTime"))) {
+                    str_values[19] = cJSON_IsNumber(v) ? settings_x50(v->valuedouble) :
+                                     (int16_t)duration_string_to_edf(v, 50.0, 200);
+                }
+                if ((v = cJSON_GetObjectItem(vauto, "TriggerSensitivity")))
+                    str_values[20] = (int16_t)sensitivity_to_edf(v);
+                if ((v = cJSON_GetObjectItem(vauto, "CycleSensitivity")))
+                    str_values[21] = (int16_t)sensitivity_to_edf(v);
             }
 
             /* Spont settings [22-32]: pressures cmH2O × 50, Ti × 50,
-             * EasyBreathe/RespRateEn via helpers, RiseEnable via on_off,
+             * EasyBreathe/RespRateEn via helpers, RiseEnable via rise_time_enable_to_edf,
              * RiseTime in msec, trigger/cycle via helper. */
             cJSON *spont = cJSON_GetObjectItem(tp, "SpontProfile");
             if (spont) {
@@ -555,22 +647,28 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
                     str_values[25] = (int16_t)easy_breathe_to_edf(v->valuestring);
                 if ((v = cJSON_GetObjectItem(spont, "RespiratoryRateEnable")) && cJSON_IsString(v))
                     str_values[26] = (int16_t)resp_rate_en_to_edf(v->valuestring);
-                if ((v = cJSON_GetObjectItem(spont, "SetMaxInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[27] = settings_x50(v->valuedouble);
-                if ((v = cJSON_GetObjectItem(spont, "SetMinInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[28] = settings_x50(v->valuedouble);
+                if ((v = cJSON_GetObjectItem(spont, "SetMaxInspiratoryTime"))) {
+                    str_values[27] = cJSON_IsNumber(v) ? settings_x50(v->valuedouble) :
+                                     (int16_t)duration_string_to_edf(v, 50.0, 200);
+                }
+                if ((v = cJSON_GetObjectItem(spont, "SetMinInspiratoryTime"))) {
+                    str_values[28] = cJSON_IsNumber(v) ? settings_x50(v->valuedouble) :
+                                     (int16_t)duration_string_to_edf(v, 50.0, 200);
+                }
                 if ((v = cJSON_GetObjectItem(spont, "RiseTimeEnable")) && cJSON_IsString(v))
-                    str_values[29] = (int16_t)on_off_to_edf(v->valuestring);
-                if ((v = cJSON_GetObjectItem(spont, "RiseTime")) && cJSON_IsNumber(v))
-                    str_values[30] = (int16_t)v->valuedouble;
-                if ((v = cJSON_GetObjectItem(spont, "TriggerSensitivity")) && cJSON_IsNumber(v))
-                    str_values[31] = (int16_t)trigger_cycle_to_edf(v->valueint);
-                if ((v = cJSON_GetObjectItem(spont, "CycleSensitivity")) && cJSON_IsNumber(v))
-                    str_values[32] = (int16_t)trigger_cycle_to_edf(v->valueint);
+                    str_values[29] = (int16_t)rise_time_enable_to_edf(v->valuestring);
+                if ((v = cJSON_GetObjectItem(spont, "RiseTime"))) {
+                    str_values[30] = cJSON_IsNumber(v) ? (int16_t)v->valuedouble :
+                                     (int16_t)duration_string_to_edf(v, 1000.0, 2000);
+                }
+                if ((v = cJSON_GetObjectItem(spont, "TriggerSensitivity")))
+                    str_values[31] = (int16_t)sensitivity_to_edf(v);
+                if ((v = cJSON_GetObjectItem(spont, "CycleSensitivity")))
+                    str_values[32] = (int16_t)sensitivity_to_edf(v);
             }
 
             /* ST settings [33-42]: pressures cmH2O × 50, RespRate × 5,
-             * Ti × 50, RiseEnable/RiseTime, trigger via helper, cycle raw+1. */
+             * Ti × 50, RiseEnable/RiseTime, trigger/cycle via sensitivity_to_edf. */
             cJSON *st = cJSON_GetObjectItem(tp, "STProfile");
             if (st) {
                 if ((v = cJSON_GetObjectItem(st, "StartPressure")) && cJSON_IsNumber(v))
@@ -581,18 +679,24 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
                     str_values[35] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(st, "SetRespiratoryRate")) && cJSON_IsNumber(v))
                     str_values[36] = (int16_t)(v->valuedouble * 5);
-                if ((v = cJSON_GetObjectItem(st, "SetMaxInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[37] = settings_x50(v->valuedouble);
-                if ((v = cJSON_GetObjectItem(st, "SetMinInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[38] = settings_x50(v->valuedouble);
+                if ((v = cJSON_GetObjectItem(st, "SetMaxInspiratoryTime"))) {
+                    str_values[37] = cJSON_IsNumber(v) ? settings_x50(v->valuedouble) :
+                                     (int16_t)duration_string_to_edf(v, 50.0, 200);
+                }
+                if ((v = cJSON_GetObjectItem(st, "SetMinInspiratoryTime"))) {
+                    str_values[38] = cJSON_IsNumber(v) ? settings_x50(v->valuedouble) :
+                                     (int16_t)duration_string_to_edf(v, 50.0, 200);
+                }
                 if ((v = cJSON_GetObjectItem(st, "RiseTimeEnable")) && cJSON_IsString(v))
-                    str_values[39] = (int16_t)on_off_to_edf(v->valuestring);
-                if ((v = cJSON_GetObjectItem(st, "RiseTime")) && cJSON_IsNumber(v))
-                    str_values[40] = (int16_t)v->valuedouble;
-                if ((v = cJSON_GetObjectItem(st, "TriggerSensitivity")) && cJSON_IsNumber(v))
-                    str_values[41] = (int16_t)trigger_cycle_to_edf(v->valueint);
-                if ((v = cJSON_GetObjectItem(st, "CycleSensitivity")) && cJSON_IsNumber(v))
-                    str_values[42] = (int16_t)(v->valueint + 1);
+                    str_values[39] = (int16_t)rise_time_enable_to_edf(v->valuestring);
+                if ((v = cJSON_GetObjectItem(st, "RiseTime"))) {
+                    str_values[40] = cJSON_IsNumber(v) ? (int16_t)v->valuedouble :
+                                     (int16_t)duration_string_to_edf(v, 1000.0, 2000);
+                }
+                if ((v = cJSON_GetObjectItem(st, "TriggerSensitivity")))
+                    str_values[41] = (int16_t)sensitivity_to_edf(v);
+                if ((v = cJSON_GetObjectItem(st, "CycleSensitivity")))
+                    str_values[42] = (int16_t)sensitivity_to_edf(v);
             }
 
             /* Timed settings [43-49]: pressures cmH2O × 50, RespRate × 5,
@@ -607,12 +711,16 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
                     str_values[45] = settings_x50(v->valuedouble);
                 if ((v = cJSON_GetObjectItem(timed, "SetRespiratoryRate")) && cJSON_IsNumber(v))
                     str_values[46] = (int16_t)(v->valuedouble * 5);
-                if ((v = cJSON_GetObjectItem(timed, "SetInspiratoryTime")) && cJSON_IsNumber(v))
-                    str_values[47] = settings_x50(v->valuedouble);
+                if ((v = cJSON_GetObjectItem(timed, "SetInspiratoryTime"))) {
+                    str_values[47] = cJSON_IsNumber(v) ? settings_x50(v->valuedouble) :
+                                     (int16_t)duration_string_to_edf(v, 50.0, 200);
+                }
                 if ((v = cJSON_GetObjectItem(timed, "RiseTimeEnable")) && cJSON_IsString(v))
-                    str_values[48] = (int16_t)on_off_to_edf(v->valuestring);
-                if ((v = cJSON_GetObjectItem(timed, "RiseTime")) && cJSON_IsNumber(v))
-                    str_values[49] = (int16_t)v->valuedouble;
+                    str_values[48] = (int16_t)rise_time_enable_to_edf(v->valuestring);
+                if ((v = cJSON_GetObjectItem(timed, "RiseTime"))) {
+                    str_values[49] = cJSON_IsNumber(v) ? (int16_t)v->valuedouble :
+                                     (int16_t)duration_string_to_edf(v, 1000.0, 2000);
+                }
             }
 
             /* ASV settings [50-53]: pressures cmH2O × 50 */
@@ -742,7 +850,14 @@ static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
             }
         }
     }
+}
 
+/* Build the spool-backed data and the independently resolved settings. */
+static void build_str_data_values(summary_ctx_t *ctx, int16_t *str_values,
+                                  const cJSON *settings_json)
+{
+    str_values[4] = get_scalar(ctx, SUM_F_DURATION_MIN, 0);
+    build_str_settings_values(str_values, settings_json);
     /* [76] HeatedTube and [77] Humidifier: enum fields from Summary spool.
      * logical_scale = 1, no conversion needed. */
     str_values[76] = get_scalar(ctx, SUM_F_TUBE_CONNECTED, -1);
@@ -1117,7 +1232,7 @@ static int collect_session_mask_pairs(const char *session_dir,
  * one, so MaskEvents and the mask windows under-reported the night.
  *
  * Fills rec->values, mask_on_extra, mask_off_extra, period_start. */
-static void build_current_day_record(str_day_record_t *rec,
+static esp_err_t build_current_day_record(str_day_record_t *rec,
                                      const char *session_dir,
                                      const char *session_id,
                                      int64_t start_epoch_ms,
@@ -1135,10 +1250,11 @@ static void build_current_day_record(str_day_record_t *rec,
      * (here empty) Summary context, so it must not run after the values
      * below or it silently overwrites Duration with 0 — which is what made
      * the synthesised day report zero usage. */
-    summary_ctx_t *empty_ctx = calloc(1, sizeof(summary_ctx_t));
+    summary_ctx_t *empty_ctx = heap_caps_calloc(1, sizeof(summary_ctx_t),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!empty_ctx) {
         ESP_LOGE(TAG, "STR.edf: calloc failed for current-day ctx");
-        return;
+        return ESP_ERR_NO_MEM;
     }
     build_str_data_values(empty_ctx, rec->values, settings_json);
     free(empty_ctx);
@@ -1157,7 +1273,7 @@ static void build_current_day_record(str_day_record_t *rec,
     if (noon_secs == 0 || day_number < 0) {
         ESP_LOGW(TAG, "STR.edf: unusable day label '%s' for session %s",
                  day_label, session_id);
-        return;
+        return ESP_ERR_INVALID_ARG;
     }
     int64_t noon_epoch_ms = noon_secs * 1000;
 
@@ -1269,6 +1385,7 @@ static void build_current_day_record(str_day_record_t *rec,
              "(%d session(s), MaskOn=%d MaskOff=%d Duration=%d min)",
              day_label, n_pairs, (int)rec->values[1], (int)rec->values[2],
              (int)rec->values[4]);
+    return ESP_OK;
 }
 
 /* Resolve the drift for one AS11 Summary noon-day.  Session metadata stores
@@ -1281,30 +1398,36 @@ typedef struct {
     char as11_day[16];
 } session_drift_entry_t;
 
-/* Build an in-memory index of all session drift entries by scanning
- * .somnotrace/sessions/streams/ once.  Returns a malloc'd array (caller frees) or
- * NULL on failure.  *out_count receives the number of entries. */
-static session_drift_entry_t *build_session_drift_index(int *out_count)
+/* A partial index can silently select the wrong clock correction. */
+static esp_err_t build_session_drift_index(session_drift_entry_t **out, int *out_count)
 {
+    *out = NULL;
     *out_count = 0;
     DIR *streams_dir = opendir(SD_STREAMS_DIR);
-    if (!streams_dir) return NULL;
+    if (!streams_dir) return errno == ENOENT ? ESP_OK : ESP_FAIL;
 
     int cap = 0, n = 0;
     session_drift_entry_t *entries = NULL;
 
     struct dirent *day_ent;
-    while ((day_ent = readdir(streams_dir)) != NULL) {
+    bool failed = false;
+    for (;;) {
+        errno = 0;
+        day_ent = readdir(streams_dir);
+        if (!day_ent) { failed = errno != 0; break; }
         if (strlen(day_ent->d_name) != 8) continue;
 
         char stream_day_path[300];
-        snprintf(stream_day_path, sizeof(stream_day_path), "%s/%s",
+        snprintf(stream_day_path, sizeof(stream_day_path), "%s/%.8s",
                  SD_STREAMS_DIR, day_ent->d_name);
         DIR *stream_day_dir = opendir(stream_day_path);
         if (!stream_day_dir) continue;
 
         struct dirent *session_ent;
-        while ((session_ent = readdir(stream_day_dir)) != NULL) {
+        for (;;) {
+            errno = 0;
+            session_ent = readdir(stream_day_dir);
+            if (!session_ent) { failed = errno != 0; break; }
             size_t name_len = strlen(session_ent->d_name);
             if (name_len < 13 ||
                 strcmp(session_ent->d_name + name_len - 13, "_session.json") != 0) {
@@ -1322,11 +1445,13 @@ static session_drift_entry_t *build_session_drift_index(int *out_count)
             if (cJSON_IsNumber(start_j) && cJSON_IsNumber(drift_j)) {
                 if (n >= cap) {
                     int new_cap = cap ? cap * 2 : 16;
-                    session_drift_entry_t *tmp = realloc(entries,
-                        new_cap * sizeof(session_drift_entry_t));
+                    session_drift_entry_t *tmp = heap_caps_realloc(entries,
+                        new_cap * sizeof(session_drift_entry_t),
+                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
                     if (!tmp) {
                         cJSON_Delete(session);
-                        continue;
+                        failed = true;
+                        break;
                     }
                     entries = tmp;
                     cap = new_cap;
@@ -1344,11 +1469,17 @@ static session_drift_entry_t *build_session_drift_index(int *out_count)
             cJSON_Delete(session);
         }
         closedir(stream_day_dir);
+        if (failed) break;
     }
     closedir(streams_dir);
 
+    if (failed) {
+        free(entries);
+        return ESP_FAIL;
+    }
+    *out = entries;
     *out_count = n;
-    return entries;
+    return ESP_OK;
 }
 
 /* Look up the best-matching drift for a given AS11 noon-day and PeriodStart
@@ -1389,7 +1520,8 @@ esp_err_t edf_gen_summary_json(const char *noon_day, char **out_json)
     *out_json = NULL;
 
     char spool_path[300];
-    snprintf(spool_path, sizeof(spool_path), "%s/%s.spool", SD_SUMMARIES_DIR, noon_day);
+    if (select_summary_spool(noon_day, spool_path, sizeof(spool_path)) != ESP_OK)
+        return ESP_FAIL;
     size_t spool_len = 0;
     uint8_t *spool_data = edf_read_bin_file(spool_path, &spool_len);
     if (!spool_data || spool_len == 0) {
@@ -1397,7 +1529,8 @@ esp_err_t edf_gen_summary_json(const char *noon_day, char **out_json)
         return ESP_ERR_NOT_FOUND;
     }
 
-    summary_ctx_t *ctx = calloc(1, sizeof(summary_ctx_t));
+    summary_ctx_t *ctx = heap_caps_calloc(1, sizeof(summary_ctx_t),
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!ctx) { free(spool_data); return ESP_ERR_NO_MEM; }
     pb_iter(spool_data, spool_len, summary_field_cb, ctx);
     free(spool_data);
@@ -1459,6 +1592,467 @@ esp_err_t edf_gen_summary_json(const char *noon_day, char **out_json)
     return ESP_OK;
 }
 
+/* A day cannot be represented by one live snapshot if another session's
+ * settings are missing, borrowed, or different. An imported STR record is
+ * the source's daily choice, provided the imported file is authoritative. */
+static bool live_day_unambiguous(const char *day, const cJSON *candidate,
+                                 const char *serial, esp_err_t *error)
+{
+    if (!serial || !serial[0]) return false;
+    const cJSON *profiles = cJSON_GetObjectItem(candidate, "SettingProfiles");
+    if (!cJSON_IsObject(profiles)) return false;
+    int16_t expected[STR_DATA_COUNT];
+    memset(expected, 0xFF, sizeof(expected));
+    build_str_settings_values(expected, candidate);
+    const cJSON *meta = cJSON_GetObjectItemCaseSensitive(candidate, SETTINGS_PROVENANCE_KEY);
+    const cJSON *source_session = cJSON_GetObjectItemCaseSensitive(meta, "session");
+    if (!cJSON_IsString(source_session) || !source_session->valuestring) return false;
+    char dir_path[300];
+    snprintf(dir_path, sizeof(dir_path), "%s/%s", SD_STREAMS_DIR, day);
+    DIR *dir = opendir(dir_path);
+    if (!dir) {
+        if (errno != ENOENT) *error = ESP_FAIL;
+        return false;
+    }
+    bool found = false, found_source = false, valid = true;
+    struct dirent *ent;
+    const char suffix[] = "_session.json";
+    bool read_failed = false;
+    for (;;) {
+        errno = 0;
+        ent = readdir(dir);
+        if (!ent) { read_failed = errno != 0; break; }
+        size_t len = strlen(ent->d_name), slen = sizeof(suffix) - 1;
+        if (len <= slen || strcmp(ent->d_name + len - slen, suffix) != 0) continue;
+        size_t sid_len = len - slen;
+        if (sid_len >= 100) { valid = false; break; }
+        char sid[100], path[420];
+        memcpy(sid, ent->d_name, sid_len);
+        sid[sid_len] = '\0';
+        snprintf(path, sizeof(path), "%s/%s.live.settings.json", dir_path, sid);
+        cJSON *other = NULL;
+        esp_err_t err = edf_read_json_file_checked(path, &other);
+        if (err != ESP_OK) {
+            if (err != ESP_ERR_NOT_FOUND) *error = err;
+            valid = false;
+            break;
+        }
+        const cJSON *other_profiles = cJSON_GetObjectItem(other, "SettingProfiles");
+        int16_t actual[STR_DATA_COUNT];
+        memset(actual, 0xFF, sizeof(actual));
+        build_str_settings_values(actual, other);
+        bool matches = false, bridge = false;
+        esp_err_t session_err = settings_provenance_session_checked(
+            day, sid, serial, SETTINGS_FAMILY_AS11, &matches, &bridge);
+        if (session_err != ESP_OK) *error = session_err;
+        if (!settings_provenance_is(other, SETTINGS_SOURCE_LIVE, day, sid) ||
+            session_err != ESP_OK || !matches ||
+            !cJSON_IsObject(other_profiles) ||
+            memcmp(expected + 5, actual + 5, (76 - 5) * sizeof(int16_t)) != 0) {
+            valid = false;
+        }
+        cJSON_Delete(other);
+        if (!valid) break;
+        found = true;
+        if (strcmp(source_session->valuestring, sid) == 0) found_source = true;
+    }
+    closedir(dir);
+    if (read_failed) *error = ESP_FAIL;
+    return !read_failed && valid && found && found_source;
+}
+
+static bool native_fields_valid(const cJSON *fields, int family)
+{
+    if (!cJSON_IsObject(fields)) return false;
+    const cJSON *field;
+    cJSON_ArrayForEach(field, fields) {
+        if (!field->string || !cJSON_IsNumber(field) || !isfinite(field->valuedouble) ||
+            cJSON_GetObjectItemCaseSensitive(fields, field->string) != field)
+            return false;
+        bool known = false;
+        if (family == SETTINGS_FAMILY_AS10) {
+            for (size_t i = 0; i < sizeof(g_as10_setting_fields) / sizeof(g_as10_setting_fields[0]); i++)
+                if (!strcmp(field->string, g_as10_setting_fields[i].label)) { known = true; break; }
+        } else if (family == SETTINGS_FAMILY_AS11) {
+            for (int i = 5; i <= 75; i++)
+                if (!strcmp(field->string, g_str_signals[i].label)) { known = true; break; }
+        }
+        if (!known) return false;
+    }
+    return true;
+}
+
+static cJSON *read_daily_settings_checked(const char *day, int family,
+                                         const char *serial, esp_err_t *error)
+{
+    *error = ESP_OK;
+    if (!serial || !serial[0] || family == SETTINGS_FAMILY_UNKNOWN) return NULL;
+    char path[330];
+    struct stat st;
+    snprintf(path, sizeof(path), "%s/%s.native.settings.json", SD_SUMMARIES_DIR, day);
+    int status = stat(path, &st);
+    if (status == 0 || errno != ENOENT) {
+        if (status != 0) { *error = ESP_FAIL; return NULL; }
+        cJSON *native = NULL;
+        *error = edf_read_json_file_checked(path, &native);
+        if (*error != ESP_OK) return NULL;
+        const char *source_serial = settings_provenance_serial(native);
+        if (source_serial && source_serial[0] && strcmp(source_serial, serial)) {
+            /* The daily record declares a different machine — it carries no
+             * authority over this one's STR.  Treat it as absent and let
+             * this machine's own sources resolve below. */
+            cJSON_Delete(native);
+        } else {
+            const cJSON *fields = cJSON_GetObjectItemCaseSensitive(
+                native, family == SETTINGS_FAMILY_AS10 ? "_as10_edf_settings" : "_as11_edf_settings");
+            if (settings_provenance_is(native, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) &&
+                native_fields_valid(fields, family) &&
+                settings_provenance_is_family(native, family) &&
+                source_serial && !strcmp(source_serial, serial)) {
+                bool conflict = false;
+                *error = settings_provenance_day_conflicts_checked(day, serial, family, &conflict,
+                                                                   NULL);
+                if (*error == ESP_OK && !conflict) return native;
+            }
+            cJSON_Delete(native);
+            return NULL;
+        }
+    }
+    snprintf(path, sizeof(path), "%s/%s.imported.settings.json", SD_SUMMARIES_DIR, day);
+    cJSON *settings = NULL;
+    esp_err_t err = edf_read_json_file_checked(path, &settings);
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) { *error = err; return NULL; }
+    const char *source_serial = settings_provenance_serial(settings);
+    if (settings_provenance_is(settings, SETTINGS_SOURCE_IMPORTED_STR, day, NULL) &&
+        settings_provenance_is_family(settings, family) &&
+        source_serial && strcmp(source_serial, serial) == 0) {
+        bool covered = false, conflict = false;
+        *error = settings_provenance_covers_sessions_checked(settings, day, &covered);
+        if (*error == ESP_OK && covered)
+            *error = settings_provenance_day_conflicts_checked(day, serial, family, &conflict,
+                                                               NULL);
+        if (*error == ESP_OK && covered && !conflict) return settings;
+    }
+    cJSON_Delete(settings);
+    if (*error != ESP_OK) return NULL;
+
+    if (family != SETTINGS_FAMILY_AS11) return NULL;
+    snprintf(path, sizeof(path), "%s/%s.live.settings.json", SD_SUMMARIES_DIR, day);
+    settings = NULL;
+    err = edf_read_json_file_checked(path, &settings);
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) { *error = err; return NULL; }
+    if (settings_provenance_is(settings, SETTINGS_SOURCE_LIVE, day, NULL) &&
+        live_day_unambiguous(day, settings, serial, error))
+        return settings;
+    cJSON_Delete(settings);
+    if (*error != ESP_OK) return NULL;
+
+    /* A daily cache write may fail while the session snapshot survives. */
+    char dir_path[300];
+    snprintf(dir_path, sizeof(dir_path), "%s/%s", SD_STREAMS_DIR, day);
+    DIR *dir = opendir(dir_path);
+    if (!dir) {
+        if (errno != ENOENT) *error = ESP_FAIL;
+        return NULL;
+    }
+    struct dirent *entry;
+    const char suffix[] = ".live.settings.json";
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            if (errno != 0) *error = ESP_FAIL;
+            break;
+        }
+        size_t len = strlen(entry->d_name), tail = sizeof(suffix) - 1;
+        if (len <= tail || len - tail >= 100 ||
+            strcmp(entry->d_name + len - tail, suffix) != 0) continue;
+        char sid[100];
+        memcpy(sid, entry->d_name, len - tail);
+        sid[len - tail] = '\0';
+        char session_path[420];
+        snprintf(session_path, sizeof(session_path), "%s/%s.live.settings.json",
+                 dir_path, sid);
+        settings = NULL;
+        err = edf_read_json_file_checked(session_path, &settings);
+        if (err != ESP_OK) { *error = err; break; }
+        bool matches = false, bridge = false;
+        if (settings_provenance_is(settings, SETTINGS_SOURCE_LIVE, day, sid)) {
+            *error = settings_provenance_session_checked(
+                day, sid, serial, SETTINGS_FAMILY_AS11, &matches, &bridge);
+            if (*error != ESP_OK) { cJSON_Delete(settings); break; }
+        }
+        if (matches) {
+            bool unambiguous = live_day_unambiguous(day, settings, serial, error);
+            closedir(dir);
+            if (unambiguous) return settings;
+            cJSON_Delete(settings);
+            return NULL;
+        }
+        cJSON_Delete(settings);
+    }
+    closedir(dir);
+    return NULL;
+}
+
+/* WP4 authority gate.  The scoped resolver decides whether the daily record
+ * found by read_daily_settings() may supply settings for a day.  It is
+ * fail-closed: it can withhold a settings source but never adds one, so a
+ * resolver "unknown" overrides the legacy lookup. */
+#define RESOLVER_MAX_SESSIONS 64
+
+static uint64_t resolver_hash_str(uint64_t h, const char *s)
+{
+    for (; s && *s; s++) {
+        h ^= (uint8_t)*s;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static esp_err_t resolver_authorises_day_checked(const char *day, int family,
+                                                  const char *serial,
+                                                  const cJSON *day_settings,
+                                                  resolver_session_t *sessions,
+                                                  bool *authorised)
+{
+    if (!day || strlen(day) != 8 || !sessions || !authorised)
+        return ESP_ERR_INVALID_ARG;
+    *authorised = false;
+    size_t n = 0;
+    char dir_path[300];
+    snprintf(dir_path, sizeof(dir_path), "%s/%s", SD_STREAMS_DIR, day);
+    DIR *dir = opendir(dir_path);
+    if (dir) {
+        struct dirent *ent;
+        const char suffix[] = "_session.json";
+        for (;;) {
+            errno = 0;
+            ent = readdir(dir);
+            if (!ent) {
+                if (errno != 0) { closedir(dir); return ESP_FAIL; }
+                break;
+            }
+            size_t len = strlen(ent->d_name), tail = sizeof(suffix) - 1;
+            if (len <= tail || strcmp(ent->d_name + len - tail, suffix) != 0) continue;
+            if (n >= RESOLVER_MAX_SESSIONS || len - tail >= 100) { n = SIZE_MAX; break; }
+            char sid[100];
+            memcpy(sid, ent->d_name, len - tail);
+            sid[len - tail] = '\0';
+            resolver_session_t *s = &sessions[n];
+            memset(s, 0, sizeof(*s));
+            s->id_hash = resolver_hash_str(0xcbf29ce484222325ULL, sid);
+            bool bridge = false;
+            esp_err_t evidence_err = settings_provenance_session_checked(
+                day, sid, serial, family, &s->verified, &bridge);
+            if (evidence_err != ESP_OK) { closedir(dir); return evidence_err; }
+            s->serial_match = s->family_match = s->verified;
+            if (!s->verified && bridge) {
+                s->bridge_unverified = true;
+                s->serial_match = s->family_match = true;
+            }
+            char sp[420];
+            snprintf(sp, sizeof(sp), "%s/%s.live.settings.json", dir_path, sid);
+            cJSON *live = NULL;
+            esp_err_t err = edf_read_json_file_checked(sp, &live);
+            if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+                closedir(dir);
+                return err;
+            }
+            s->live_capture = settings_provenance_is(live, SETTINGS_SOURCE_LIVE, day, sid);
+            if (live) {
+                cJSON *profiles = cJSON_GetObjectItem(live, "SettingProfiles");
+                char *txt = profiles ? cJSON_PrintUnformatted(profiles) : NULL;
+                if (profiles && !txt) {
+                    cJSON_Delete(live);
+                    closedir(dir);
+                    return ESP_ERR_NO_MEM;
+                }
+                s->settings_digest = txt ? resolver_hash_str(0xcbf29ce484222325ULL, txt) : 0;
+                free(txt);
+                cJSON_Delete(live);
+            }
+            n++;
+        }
+        closedir(dir);
+    } else if (errno != ENOENT) {
+        return ESP_FAIL;
+    }
+    if (n == SIZE_MAX) {
+        ESP_LOGW(TAG, "resolver: day=%s has more than %d sessions; daily settings withheld",
+                 day, RESOLVER_MAX_SESSIONS);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    resolver_input_t in;
+    memset(&in, 0, sizeof(in));
+    in.export_identity_known = serial && serial[0] && family != SETTINGS_FAMILY_UNKNOWN;
+    in.native_present = day_settings != NULL &&
+        settings_provenance_is(day_settings, SETTINGS_SOURCE_IMPORTED_STR, day, NULL);
+    const char *ns = settings_provenance_serial(day_settings);
+    in.native_verified = in.native_present && ns && serial && strcmp(ns, serial) == 0 &&
+                         settings_provenance_is_family(day_settings, family);
+    in.native_serial_match = in.native_verified;
+    in.native_family_match = in.native_verified;
+    if (in.native_present) {
+        esp_err_t err = settings_provenance_covers_sessions_checked(
+            day_settings, day, &in.native_window_covers_all);
+        if (err != ESP_OK) return err;
+    }
+    in.sessions = sessions;
+    in.n_sessions = n;
+
+    resolver_state_t st = settings_resolve_day(&in);
+    *authorised = st == RES_APPLY_NATIVE || st == RES_APPLY_LIVE;
+    if (*authorised) {
+        ESP_LOGI(TAG, "resolver day=%s state=%s sessions=%u", day,
+                 settings_resolver_state_name(st), (unsigned)n);
+    } else if (!day_settings) {
+        ESP_LOGI(TAG, "resolver day=%s state=%s sessions=%u: no daily record (unknown)",
+                 day, settings_resolver_state_name(st), (unsigned)n);
+    } else {
+        ESP_LOGW(TAG, "resolver day=%s state=%s sessions=%u: daily settings withheld",
+                 day, settings_resolver_state_name(st), (unsigned)n);
+    }
+    return ESP_OK;
+}
+
+/* Gate a daily record found by read_daily_settings().  Takes ownership.  Every
+ * STR day is evaluated and logged, including days with no record; a missing
+ * record stays NULL, so output for those days is unchanged. */
+static esp_err_t resolver_gate_daily_checked(const char *day, int family,
+                                              const char *serial,
+                                              cJSON **day_settings,
+                                              resolver_session_t *sessions)
+{
+    if (settings_provenance_is(*day_settings, SETTINGS_SOURCE_NATIVE_DAY, day, NULL))
+        return ESP_OK;
+    bool authorised = false;
+    esp_err_t err = resolver_authorises_day_checked(day, family, serial,
+                                                     *day_settings, sessions,
+                                                     &authorised);
+    if (err != ESP_OK) return err;
+    if (*day_settings && !authorised) {
+        cJSON_Delete(*day_settings);
+        *day_settings = NULL;
+    }
+    return ESP_OK;
+}
+
+static bool native_identity_matches(const cJSON *ident, const char *serial, int family)
+{
+    if (!serial || !serial[0] || family == SETTINGS_FAMILY_UNKNOWN) return false;
+    cJSON *root = edf_read_json_file(SD_SUMMARIES_DIR "/native.ident.json");
+    const cJSON *source = cJSON_GetObjectItemCaseSensitive(root, "_somnotrace_native_source");
+    const cJSON *sn = cJSON_GetObjectItemCaseSensitive(root, "SerialNumber");
+    const cJSON *selected = cJSON_GetObjectItemCaseSensitive(ident, "SerialNumber");
+    bool match = cJSON_IsString(source) && source->valuestring &&
+                 !strcmp(source->valuestring, "native_str") &&
+                 cJSON_IsString(sn) && sn->valuestring &&
+                 cJSON_IsString(selected) && selected->valuestring &&
+                 !strcmp(sn->valuestring, serial) &&
+                 !strcmp(selected->valuestring, serial) &&
+                 settings_provenance_family(root) == family;
+    cJSON_Delete(root);
+    return match;
+}
+
+static bool native_day_blocked(const char *day, int family, const char *serial,
+                               const cJSON *settings)
+{
+    if (!serial || !serial[0] || family == SETTINGS_FAMILY_UNKNOWN) return false;
+    char path[330];
+    struct stat st;
+    snprintf(path, sizeof(path), "%s/%s.native.settings.json", SD_SUMMARIES_DIR, day);
+    if (stat(path, &st) != 0 && errno == ENOENT) return false;
+    /* A record declaring a different machine is not this machine's evidence
+     * and cannot gate its STR.  Unreadable or unattributable files keep the
+     * gate — fail closed. */
+    cJSON *native = NULL;
+    bool valid = edf_read_json_file_checked(path, &native) == ESP_OK;
+    const char *source_serial = settings_provenance_serial(native);
+    bool foreign = source_serial && source_serial[0] &&
+                   strcmp(source_serial, serial) != 0;
+    bool claim = valid &&
+                 settings_provenance_is(native, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) &&
+                 settings_provenance_is_family(native, family) &&
+                 source_serial && source_serial[0] &&
+                 strcmp(source_serial, serial) == 0;
+    cJSON_Delete(native);
+    if (foreign) return false;
+    if (settings_provenance_is(settings, SETTINGS_SOURCE_NATIVE_DAY, day, NULL))
+        return false;
+    /* A valid same-machine claim withheld when the day contains evidence
+     * that cannot be attributed (unreadable, rather than proven foreign)
+     * degrades to a settings-less record like any other conflict — it
+     * does not block the export.  Verified-foreign conflicts and any
+     * other unresolved reason still block. */
+    bool conflicts = false, soft = false;
+    if (claim && !settings &&
+        settings_provenance_day_conflicts_checked(day, serial, family, &conflicts,
+                                                  &soft) == ESP_OK &&
+        conflicts && soft)
+        return false;
+    return true;
+}
+
+static int apply_as10_settings(int16_t *values, const cJSON *settings)
+{
+    const cJSON *fields = cJSON_GetObjectItemCaseSensitive(settings, "_as10_edf_settings");
+    if (!cJSON_IsObject(fields)) return 0;
+    int omitted = 0;
+    for (size_t i = 0; i < sizeof(g_as10_setting_fields) / sizeof(g_as10_setting_fields[0]); i++) {
+        const as10_setting_field_t *field = &g_as10_setting_fields[i];
+        const cJSON *value = cJSON_GetObjectItemCaseSensitive(fields, field->label);
+        const edf_signal_def_t *def = &g_str_signals[field->str_index];
+        if (!cJSON_IsNumber(value) || !isfinite(value->valuedouble) ||
+            def->phys_max <= def->phys_min || def->dig_max <= def->dig_min) continue;
+        double scaled = def->dig_min + (value->valuedouble - def->phys_min) *
+                        (def->dig_max - def->dig_min) / (def->phys_max - def->phys_min);
+        if (!isfinite(scaled) || scaled < def->dig_min || scaled > def->dig_max) {
+            omitted++;
+            continue;
+        }
+        long dig = lround(scaled);
+        double restored = def->phys_min + (dig - def->dig_min) *
+                          (def->phys_max - def->phys_min) / (def->dig_max - def->dig_min);
+        if (fabs(restored - value->valuedouble) > 0.000001) {
+            omitted++;
+            continue;
+        }
+        values[field->str_index] = (int16_t)dig;
+    }
+    /* Air 10 shares S.AS.* for AutoSet and AutoSet for Her; OSCAR selects
+     * S.AFH.* when mode is 11, so expose the same sourced values there. */
+    if (values[5] == 11) {
+        values[11] = values[8];
+        values[12] = values[9];
+        values[13] = values[10];
+    }
+    return omitted;
+}
+
+static int apply_as11_native_settings(int16_t *values, const cJSON *settings)
+{
+    const cJSON *fields = cJSON_GetObjectItemCaseSensitive(settings, "_as11_edf_settings");
+    if (!cJSON_IsObject(fields)) return 0;
+    int omitted = 0;
+    for (int i = 5; i <= 75; i++) {
+        const edf_signal_def_t *def = &g_str_signals[i];
+        const cJSON *value = cJSON_GetObjectItemCaseSensitive(fields, def->label);
+        if (!cJSON_IsNumber(value) || !isfinite(value->valuedouble) ||
+            def->phys_max <= def->phys_min || def->dig_max <= def->dig_min) continue;
+        double scaled = def->dig_min + (value->valuedouble - def->phys_min) *
+                        (def->dig_max - def->dig_min) / (def->phys_max - def->phys_min);
+        if (!isfinite(scaled) || scaled < def->dig_min || scaled > def->dig_max) {
+            omitted++;
+            continue;
+        }
+        values[i] = (int16_t)lround(scaled);
+    }
+    return omitted;
+}
+
 /* Generate multi-record STR.edf from per-day summary spool files.
  * Scans .somnotrace/sessions/summaries/ for *.spool files, parses each into a
  * daily STR record, and writes them all into a single STR.edf at
@@ -1468,13 +2062,32 @@ esp_err_t edf_gen_summary_json(const char *noon_day, char **out_json)
 esp_err_t edf_generate_str_edf(const char *sdcard_dir,
                                   const char *patient_id, const char *recording_id,
                                   const char *start_date,
-                                  const cJSON *settings_json,
+                                  const cJSON *settings_json, const cJSON *ident_json,
                                   const char *session_dir,
                                   const char *session_id,
                                   int64_t start_epoch_ms, int64_t end_epoch_ms,
                                   int64_t clock_drift_ms)
 {
     (void)start_date;  /* computed internally from oldest record */
+    const cJSON *serial_item = cJSON_GetObjectItemCaseSensitive(ident_json, "SerialNumber");
+    const char *serial = cJSON_IsString(serial_item) && serial_item->valuestring
+                         ? serial_item->valuestring : NULL;
+    int family = settings_provenance_family(ident_json);
+    bool native_only = !session_dir && !session_id;
+    char current_day_label[16] = "";
+    if (!native_only)
+        as11_time_noon_day(start_epoch_ms - clock_drift_ms, current_day_label,
+                           sizeof(current_day_label));
+    if (native_only && !native_identity_matches(ident_json, serial, family))
+        return ESP_ERR_INVALID_STATE;
+    if (!native_only &&
+        !settings_provenance_session_matches(current_day_label, session_id, serial, family) &&
+        !native_identity_matches(ident_json, serial, family)) {
+        /* A display identity copied from another session is not proof of the
+         * exporting machine, even if its serial matches older snapshots. */
+        serial = NULL;
+        family = SETTINGS_FAMILY_UNKNOWN;
+    }
     /* ── Scan .somnotrace/sessions/summaries/ for per-day .spool files ── */
     DIR *dir = opendir(SD_SUMMARIES_DIR);
     if (!dir) {
@@ -1482,13 +2095,17 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         return ESP_FAIL;
     }
 
-    /* First pass: collect all spool filenames, sort, keep newest 30.
+    /* First pass: collect and sort all spool filenames.
      * readdir order is non-deterministic, so we must collect all names
      * and sort to ensure deterministic day selection. */
     char (*spool_names)[15] = NULL;
     int n_spool = 0, spool_cap = 0;
     struct dirent *ent;
-    while ((ent = readdir(dir)) != NULL) {
+    bool spool_scan_failed = false;
+    for (;;) {
+        errno = 0;
+        ent = readdir(dir);
+        if (!ent) { spool_scan_failed = errno != 0; break; }
         const char *nm = ent->d_name;
         size_t nlen = strlen(nm);
         if (nlen != 14 || strcmp(nm + 8, ".spool") != 0) continue;
@@ -1500,7 +2117,8 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
 
         if (n_spool >= spool_cap) {
             int new_cap = spool_cap ? spool_cap * 2 : 16;
-            char (*tmp)[15] = realloc(spool_names, new_cap * sizeof(*spool_names));
+            char (*tmp)[15] = heap_caps_realloc(spool_names,
+                new_cap * sizeof(*spool_names), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (!tmp) {
                 ESP_LOGE(TAG, "STR.edf: spool name array realloc failed");
                 free(spool_names);
@@ -1515,6 +2133,11 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         n_spool++;
     }
     closedir(dir);
+    if (spool_scan_failed) {
+        free(spool_names);
+        ESP_LOGE(TAG, "STR.edf: cannot scan summary spools; preserving export");
+        return ESP_FAIL;
+    }
 
     /* Sort filenames lexicographically — YYYYMMDD.spool sorts chronologically */
     for (int i = 0; i < n_spool - 1; i++) {
@@ -1528,56 +2151,70 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         }
     }
 
-    /* Walk newest → oldest and stop once 30 *distinct* days have been
-     * collected, rather than simply taking the newest 30 filenames.
+    /* Walk newest → oldest and stop once 365 *distinct* days have been
+     * collected, rather than simply taking the newest 365 filenames.
      *
      * Spool files written before the day-labelling fix carry a name that is
      * one day off, so the same night can be present under two names.  Taking
-     * the newest 30 names would let those duplicates crowd out genuinely
+     * the newest 365 names would let those duplicates crowd out genuinely
      * older days; selecting by distinct period keeps the window honest while
      * the stale names age out. */
     #define STR_MAX_DAYS  365
 
     str_day_record_t *records = heap_caps_calloc(STR_MAX_DAYS + 1, sizeof(str_day_record_t), MALLOC_CAP_SPIRAM);
-    if (!records) records = calloc(STR_MAX_DAYS + 1, sizeof(str_day_record_t));
-    summary_ctx_t *ctx = heap_caps_calloc(1, sizeof(summary_ctx_t), MALLOC_CAP_SPIRAM);
-    if (!ctx) ctx = calloc(1, sizeof(summary_ctx_t));
+    summary_ctx_t *ctx = heap_caps_calloc(
+        1, sizeof(summary_ctx_t) + RESOLVER_MAX_SESSIONS * sizeof(resolver_session_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     edf_signal_def_t *str_sigs = heap_caps_calloc(STR_DATA_COUNT, sizeof(edf_signal_def_t), MALLOC_CAP_SPIRAM);
-    if (!str_sigs) str_sigs = calloc(STR_DATA_COUNT, sizeof(edf_signal_def_t));
     if (!records || !ctx || !str_sigs) {
         ESP_LOGE(TAG, "STR.edf: malloc failed");
         free(records); free(ctx); free(str_sigs);
         free(spool_names);
         return ESP_ERR_NO_MEM;
     }
+    resolver_session_t *resolver_sessions = (resolver_session_t *)(ctx + 1);
 
     /* Build session drift index once (avoids O(days × sessions) dir scans). */
     int n_drift_entries = 0;
-    session_drift_entry_t *drift_index = build_session_drift_index(&n_drift_entries);
+    session_drift_entry_t *drift_index = NULL;
+    if (build_session_drift_index(&drift_index, &n_drift_entries) != ESP_OK) {
+        ESP_LOGE(TAG, "STR.edf: cannot build complete drift index; preserving export");
+        free(records); free(ctx); free(str_sigs); free(spool_names);
+        return ESP_FAIL;
+    }
     ESP_LOGI(TAG, "STR.edf: drift index: %d session entries", n_drift_entries);
 
     /* Second pass: parse spool files, newest first, until STR_MAX_DAYS
      * distinct days are held.  Records are sorted chronologically below. */
-    int n_records = 0;
+    int n_records = 0, omitted_settings = 0, older_spools = 0;
     for (int si = n_spool - 1; si >= 0 && n_records < STR_MAX_DAYS; si--) {
         const char *nm = spool_names[si];
 
         /* Read the spool file */
         char spool_path[300];
-        snprintf(spool_path, sizeof(spool_path), "%s/%s", SD_SUMMARIES_DIR, nm);
+        char spool_day[9];
+        memcpy(spool_day, nm, 8);
+        spool_day[8] = '\0';
+        if (select_summary_spool(spool_day, spool_path, sizeof(spool_path)) != ESP_OK) {
+            free(spool_names); free(drift_index);
+            free(records); free(ctx); free(str_sigs);
+            return ESP_FAIL;
+        }
         size_t spool_len = 0;
         uint8_t *spool_data = edf_read_bin_file(spool_path, &spool_len);
         if (!spool_data || spool_len == 0) {
-            ESP_LOGW(TAG, "STR.edf: skipping %s (empty or unreadable)", nm);
+            ESP_LOGE(TAG, "STR.edf: %s is empty or unreadable; preserving export", nm);
             free(spool_data);
-            continue;
+            free(spool_names); free(drift_index);
+            free(records); free(ctx); free(str_sigs);
+            return ESP_FAIL;
         }
 
         /* Parse the spool file directly as a Summary record.
          * collect_summary_spool writes the inner record content (not
          * wrapped in a field-2 tag), so we iterate it directly. */
         memset(ctx, 0, sizeof(*ctx));
-        pb_iter(spool_data, spool_len, summary_field_cb, ctx);
+        int parsed = pb_iter(spool_data, spool_len, summary_field_cb, ctx);
 
         int64_t period_start = 0;
         bool found_ps = false;
@@ -1587,9 +2224,11 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         }
         free(spool_data);
 
-        if (!found_ps) {
-            ESP_LOGW(TAG, "STR.edf: skipping %s (no PeriodStart)", nm);
-            continue;
+        if (parsed < 0 || ctx->malformed || !found_ps) {
+            ESP_LOGE(TAG, "STR.edf: %s is malformed or has no PeriodStart; preserving export", nm);
+            free(spool_names); free(drift_index);
+            free(records); free(ctx); free(str_sigs);
+            return ESP_FAIL;
         }
 
         /* Build the record */
@@ -1609,9 +2248,16 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         /* A legacy filename and a correctly-named one can describe the same
          * period.  Keep the first and skip the duplicate, so the same night
          * cannot appear twice in STR.edf. */
+        int day_number = as11_time_day_number(as11_day_label);
+        if (day_number <= 0 || day_number > INT16_MAX) {
+            ESP_LOGE(TAG, "STR.edf: %s has an invalid day; preserving export", nm);
+            free(spool_names); free(drift_index);
+            free(records); free(ctx); free(str_sigs);
+            return ESP_FAIL;
+        }
         bool dup = false;
         for (int k = 0; k < n_records; k++) {
-            if (records[k].period_start_as11 == period_start) { dup = true; break; }
+            if (records[k].values[0] == day_number) { dup = true; break; }
         }
         if (dup) {
             ESP_LOGD(TAG, "STR.edf: %s duplicates an already-parsed period "
@@ -1626,41 +2272,50 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         build_str_mask_events(ctx, rec->values, rec->mask_on_extra,
                               rec->mask_off_extra, period_start, record_drift_ms);
 
-        /* Resolve settings for this specific day:
-         * 1. Check SD_SUMMARIES_DIR/<day>.settings.json.
-         * 2. Check SD_STREAMS_DIR/<day>/ settings files (and backfill).
-         * 3. Fallback to settings_json passed in (current session). */
-        cJSON *day_settings = NULL;
-        char sum_settings_path[300];
-        snprintf(sum_settings_path, sizeof(sum_settings_path), "%s/%s.settings.json",
-                 SD_SUMMARIES_DIR, as11_day_label);
-        day_settings = edf_read_json_file(sum_settings_path);
-        if (!day_settings) {
-            char stream_day_dir[300];
-            snprintf(stream_day_dir, sizeof(stream_day_dir), "%s/%s",
-                     SD_STREAMS_DIR, as11_day_label);
-            DIR *sdd = opendir(stream_day_dir);
-            if (sdd) {
-                struct dirent *se;
-                while ((se = readdir(sdd)) != NULL) {
-                    size_t sel = strlen(se->d_name);
-                    if (sel > 14 && strcmp(se->d_name + sel - 14, "_settings.json") == 0) {
-                        char stream_set_path[600];
-                        snprintf(stream_set_path, sizeof(stream_set_path), "%s/%s",
-                                 stream_day_dir, se->d_name);
-                        day_settings = edf_read_json_file(stream_set_path);
-                        if (day_settings) {
-                            edf_write_json_file(sum_settings_path, day_settings);
-                            break;
-                        }
-                    }
-                }
-                closedir(sdd);
-            }
+        esp_err_t resolver_err = ESP_OK;
+        cJSON *day_settings = read_daily_settings_checked(
+            as11_day_label, family, serial, &resolver_err);
+        if (resolver_err == ESP_OK)
+            resolver_err = resolver_gate_daily_checked(
+                as11_day_label, family, serial, &day_settings, resolver_sessions);
+        if (resolver_err != ESP_OK) {
+            ESP_LOGE(TAG, "STR.edf: day %s settings/resolver check failed (err=%d); preserving export",
+                     as11_day_label, resolver_err);
+            cJSON_Delete(day_settings);
+            free(spool_names); free(drift_index);
+            free(records); free(ctx); free(str_sigs);
+            return resolver_err;
         }
-
-        const cJSON *settings_to_use = day_settings ? day_settings : settings_json;
-        build_str_data_values(ctx, rec->values, settings_to_use);
+        if (native_day_blocked(as11_day_label, family, serial, day_settings)) {
+            ESP_LOGE(TAG, "STR.edf: invalid or conflicting native settings for day %s", as11_day_label);
+            cJSON_Delete(day_settings);
+            free(spool_names); free(drift_index);
+            free(records); free(ctx); free(str_sigs);
+            return ESP_FAIL;
+        }
+        const cJSON *settings_to_use = day_settings;
+        if (!settings_to_use && family == SETTINGS_FAMILY_AS11 &&
+            strcmp(as11_day_label, current_day_label) == 0 &&
+            settings_provenance_is(settings_json, SETTINGS_SOURCE_LIVE,
+                                   as11_day_label, session_id) &&
+            live_day_unambiguous(as11_day_label, settings_json, serial, &resolver_err)) {
+            settings_to_use = settings_json;
+        }
+        if (resolver_err != ESP_OK) {
+            ESP_LOGE(TAG, "STR.edf: day %s live-settings gate failed (err=%d); preserving export",
+                     as11_day_label, resolver_err);
+            cJSON_Delete(day_settings);
+            free(spool_names); free(drift_index);
+            free(records); free(ctx); free(str_sigs);
+            return resolver_err;
+        }
+        build_str_data_values(ctx, rec->values,
+                              family == SETTINGS_FAMILY_AS10 ? NULL : settings_to_use);
+        if (family == SETTINGS_FAMILY_AS10)
+            omitted_settings += apply_as10_settings(rec->values, settings_to_use);
+        else if (settings_provenance_is(settings_to_use, SETTINGS_SOURCE_NATIVE_DAY,
+                                        as11_day_label, NULL))
+            omitted_settings += apply_as11_native_settings(rec->values, settings_to_use);
         if (day_settings) {
             cJSON_Delete(day_settings);
         }
@@ -1668,6 +2323,7 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         rec->period_start = period_start + record_drift_ms;
         rec->period_start_as11 = period_start;  /* raw AS11 for day labelling */
         n_records++;
+        if (n_records == STR_MAX_DAYS) older_spools = si;
 
         ESP_LOGD(TAG, "STR.edf: parsed %s (PeriodStart=%lld, drift=%lld, Duration=%d)",
                  nm, (long long)period_start, (long long)record_drift_ms,
@@ -1675,6 +2331,9 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
     }
     free(spool_names);
     free(drift_index);
+    if (older_spools)
+        ESP_LOGW(TAG, "STR.edf: selected %d distinct days; %d older spool file(s) "
+                 "not examined, evidence remains on the card", STR_MAX_DAYS, older_spools);
 
     /* Check whether the exported session's day is already covered by a spool
      * record; if not, synthesise one from session data.
@@ -1683,12 +2342,9 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
      * timezone difference between device and ESP can no longer make the day
      * look uncovered and force a synthesised record every single time
      * (issue #75). */
-    char current_day_label[16];
-    as11_time_noon_day(start_epoch_ms - clock_drift_ms, current_day_label,
-                       sizeof(current_day_label));
     ESP_LOGI(TAG, "STR.edf: current day label=%s (start_epoch_ms=%lld)",
              current_day_label, (long long)start_epoch_ms);
-    bool current_day_found = false;
+    bool current_day_found = native_only;
     for (int i = 0; i < n_records; i++) {
         char rec_day[16];
         as11_time_noon_day_for_period_start(records[i].period_start_as11,
@@ -1705,10 +2361,56 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
     if (!current_day_found && n_records < STR_MAX_DAYS + 1) {
         ESP_LOGI(TAG, "STR.edf: synthesizing current day record (day=%s)",
                  current_day_label);
-        build_current_day_record(&records[n_records], session_dir,
-                                 session_id,
-                                 start_epoch_ms, end_epoch_ms, clock_drift_ms,
-                                 settings_json);
+        esp_err_t resolver_err = ESP_OK;
+        cJSON *day_settings = read_daily_settings_checked(
+            current_day_label, family, serial, &resolver_err);
+        if (resolver_err == ESP_OK)
+            resolver_err = resolver_gate_daily_checked(
+                current_day_label, family, serial, &day_settings, resolver_sessions);
+        if (resolver_err != ESP_OK) {
+            ESP_LOGE(TAG, "STR.edf: current day %s settings/resolver check failed (err=%d); preserving export",
+                     current_day_label, resolver_err);
+            cJSON_Delete(day_settings);
+            free(records); free(ctx); free(str_sigs);
+            return resolver_err;
+        }
+        if (native_day_blocked(current_day_label, family, serial, day_settings)) {
+            ESP_LOGE(TAG, "STR.edf: invalid or conflicting native settings for day %s", current_day_label);
+            cJSON_Delete(day_settings);
+            free(records); free(ctx); free(str_sigs);
+            return ESP_FAIL;
+        }
+        const cJSON *current_settings = day_settings;
+        if (!current_settings && family == SETTINGS_FAMILY_AS11 &&
+            settings_provenance_is(settings_json, SETTINGS_SOURCE_LIVE,
+                                   current_day_label, session_id) &&
+            live_day_unambiguous(current_day_label, settings_json, serial, &resolver_err))
+            current_settings = settings_json;
+        if (resolver_err != ESP_OK) {
+            ESP_LOGE(TAG, "STR.edf: current day %s live-settings gate failed (err=%d); preserving export",
+                     current_day_label, resolver_err);
+            cJSON_Delete(day_settings);
+            free(records); free(ctx); free(str_sigs);
+            return resolver_err;
+        }
+        esp_err_t current_err = build_current_day_record(&records[n_records], session_dir,
+                                                         session_id, start_epoch_ms,
+                                                         end_epoch_ms, clock_drift_ms,
+                                                         family == SETTINGS_FAMILY_AS10
+                                                         ? NULL : current_settings);
+        if (current_err != ESP_OK) {
+            ESP_LOGE(TAG, "STR.edf: current day %s record build failed (err=%d); preserving export",
+                     current_day_label, current_err);
+            cJSON_Delete(day_settings);
+            free(records); free(ctx); free(str_sigs);
+            return current_err;
+        }
+        if (family == SETTINGS_FAMILY_AS10)
+            omitted_settings += apply_as10_settings(records[n_records].values, current_settings);
+        else if (settings_provenance_is(current_settings, SETTINGS_SOURCE_NATIVE_DAY,
+                                        current_day_label, NULL))
+            omitted_settings += apply_as11_native_settings(records[n_records].values, current_settings);
+        cJSON_Delete(day_settings);
         n_records++;
     }
 
@@ -1717,20 +2419,36 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         free(records); free(ctx); free(str_sigs);
         return ESP_FAIL;
     }
+    if (omitted_settings)
+        ESP_LOGW(TAG, "STR.edf: %d native settings samples cannot be represented; "
+                 "original evidence remains on the card", omitted_settings);
 
-    /* Sort records by period_start (chronological) */
+    /* Consumer dates follow the calendar index, not drift-corrected time. */
     for (int i = 0; i < n_records - 1; i++) {
         for (int j = i + 1; j < n_records; j++) {
-            if (records[j].period_start < records[i].period_start) {
+            if (records[j].values[0] < records[i].values[0]) {
                 str_day_record_t tmp = records[i];
                 records[i] = records[j];
                 records[j] = tmp;
             }
         }
     }
+    int first_day = records[0].values[0];
+    int last_day = records[n_records - 1].values[0];
+    int calendar_days = last_day - first_day + 1;
+    if (first_day <= 0 || calendar_days <= 0 || calendar_days > EDF_STR_MAX_RECORDS) {
+        ESP_LOGE(TAG, "STR.edf: calendar span is invalid or exceeds %d days; preserving existing export",
+                 EDF_STR_MAX_RECORDS);
+        free(records); free(ctx); free(str_sigs);
+        return ESP_FAIL;
+    }
 
     /* STR.edf signal definitions */
     memcpy(str_sigs, g_str_signals, STR_DATA_COUNT * sizeof(edf_signal_def_t));
+    if (family == SETTINGS_FAMILY_AS10) {
+        for (size_t i = 0; i < sizeof(g_as10_setting_fields) / sizeof(g_as10_setting_fields[0]); i++)
+            str_sigs[g_as10_setting_fields[i].str_index].label = g_as10_setting_fields[i].label;
+    }
 
     /* Create STR.edf at SDCARD root */
     char path[300];
@@ -1753,18 +2471,21 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
      * signal, so it is derived from the identical AS11 noon-day label rather
      * than re-deriving it from the timestamp with different rules. */
     const char *str_start_time = "12.00.00";
-    char first_day_label[16];
-    if (records[0].period_start_as11 > 0) {
-        as11_time_noon_day_for_period_start(records[0].period_start_as11,
-                                            first_day_label,
-                                            sizeof(first_day_label));
-    } else {
-        as11_time_noon_day(records[0].period_start, first_day_label,
-                           sizeof(first_day_label));
+    time_t first_epoch = (time_t)first_day * 86400;
+    struct tm first_date;
+    if (!gmtime_r(&first_epoch, &first_date)) {
+        edf_discard_atomic_file(edf, tmp_path);
+        free(records); free(ctx); free(str_sigs);
+        return ESP_FAIL;
     }
-    int fd_y = 0, fd_m = 0, fd_d = 0;
-    if (sscanf(first_day_label, "%4d%2d%2d", &fd_y, &fd_m, &fd_d) != 3) {
-        fd_y = 2000; fd_m = 1; fd_d = 1;
+    int fd_y = first_date.tm_year + 1900;
+    int fd_m = first_date.tm_mon + 1;
+    int fd_d = first_date.tm_mday;
+    if (fd_y < 1970 || fd_y > 9999 || fd_m < 1 || fd_m > 12 ||
+        fd_d < 1 || fd_d > 31) {
+        edf_discard_atomic_file(edf, tmp_path);
+        free(records); free(ctx); free(str_sigs);
+        return ESP_FAIL;
     }
 
     char str_date[32];
@@ -1792,12 +2513,12 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         }
         snprintf(fixed_recording_id, sizeof(fixed_recording_id),
                  "Startdate %02d-%.3s-%04d%.100s",
-                 fd_d, mon_names[(fd_m - 1) % 12], fd_y, tail);
+                 fd_d, mon_names[fd_m - 1], fd_y, tail);
     }
 
     int header_bytes = edf_write_header(edf, patient_id, fixed_recording_id,
                                         str_date, str_start_time,
-                                        n_records,
+                                        calendar_days,
                                         "86400.00",
                                         "EDF", str_sigs, STR_DATA_COUNT);
     if (header_bytes < 0) {
@@ -1809,17 +2530,28 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
 
     /* Write one data record per day.
      * Each record: 171 data int16 + 1 CRC int16 = 344 bytes. */
-    for (int r = 0; r < n_records; r++) {
+    int record_index = 0;
+    for (int r = 0; r < calendar_days; r++) {
+        str_day_record_t empty;
+        const str_day_record_t *record;
+        int day = first_day + r;
+        if (record_index < n_records && records[record_index].values[0] == day) {
+            record = &records[record_index++];
+        } else {
+            memset(&empty, 0xFF, sizeof(empty));
+            empty.values[0] = (int16_t)day;
+            record = &empty;
+        }
         int16_t rec_buf[171];
         int rec_pos = 0;
         for (int i = 0; i < STR_DATA_COUNT; i++) {
             int spr = g_str_signals[i].samples_per_record;
-            rec_buf[rec_pos++] = records[r].values[i];
+            rec_buf[rec_pos++] = record->values[i];
             for (int s = 1; s < spr; s++) {
                 if (i == 1 && s - 1 < 20)
-                    rec_buf[rec_pos++] = records[r].mask_on_extra[s - 1];
+                    rec_buf[rec_pos++] = record->mask_on_extra[s - 1];
                 else if (i == 2 && s - 1 < 20)
-                    rec_buf[rec_pos++] = records[r].mask_off_extra[s - 1];
+                    rec_buf[rec_pos++] = record->mask_off_extra[s - 1];
                 else
                     rec_buf[rec_pos++] = -1;
             }
@@ -1853,11 +2585,11 @@ esp_err_t edf_generate_str_edf(const char *sdcard_dir,
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "STR.edf generated: %s (%d records)", path, n_records);
+    ESP_LOGI(TAG, "STR.edf generated: %s (%d days, %d with summaries)",
+             path, calendar_days, n_records);
 
     free(records);
     free(ctx);
     free(str_sigs);
     return ESP_OK;
 }
-

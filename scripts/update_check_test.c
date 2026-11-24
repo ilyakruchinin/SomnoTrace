@@ -84,10 +84,37 @@ int main(void)
     /* ---- version compare -------------------------------------------------- */
     ok("same tag: no update", !upd_is_update("v3.2.1", "v3.2.1"));
     ok("newer tag: update", upd_is_update("v3.2.1", "v3.2.0"));
-    ok("older tag still flags (downgrade)", upd_is_update("v3.2.0", "v3.2.1"));
-    ok("dirty local differs", upd_is_update("v3.2.1", "v3.2.1+dirty"));
-    ok("dev suffix differs", upd_is_update("v3.2.1", "v3.2.1-dev+5"));
-    ok("untagged fork release differs", upd_is_update("3.2.1", "v3.2.1"));
+    ok("older tag is not an update", !upd_is_update("v3.2.0", "v3.2.1"));
+    ok("dirty same-version is not an update",
+       !upd_is_update("v3.2.1", "v3.2.1+dirty"));
+    ok("stable is newer than a dev prerelease",
+       upd_is_update("v3.2.1", "v3.2.1-dev+5"));
+    ok("optional v prefix is equivalent",
+       !upd_is_update("3.2.1", "v3.2.1"));
+    ok("beta5 is not offered stable v3.2.7",
+       !upd_is_update("v3.2.7", "v4.0.0-beta5"));
+    ok("newer beta is a newer release",
+       upd_is_update("v4.0.0-beta5", "v3.2.7"));
+    ok("stable is newer than rc",
+       upd_is_update("v3.2.1", "v3.2.1-rc.1"));
+    ok("rc is not newer than stable",
+       !upd_is_update("v3.2.1-rc.1", "v3.2.1"));
+    ok("rc.2 is newer than rc.1",
+       upd_is_update("v3.2.1-rc.2", "v3.2.1-rc.1"));
+    ok("numeric prerelease compares numerically",
+       upd_is_update("v3.2.1-10", "v3.2.1-2"));
+    ok("numeric is lower than alphanumeric",
+       upd_is_update("v3.2.1-alpha", "v3.2.1-2"));
+    ok("build metadata is ignored",
+       !upd_is_update("v3.2.1+build", "v3.2.1"));
+    ok("git-describe same core is not an update",
+       !upd_is_update("v3.2.1", "v3.2.1-5-gabc"));
+    ok("newer core is an update from git-describe",
+       upd_is_update("v3.2.2", "v3.2.1-5-gabc"));
+    ok("invalid tag never updates",
+       !upd_is_update("v3.2.1.0", "v3.2.1"));
+    ok("invalid local never updates",
+       !upd_is_update("v3.2.2", "v3.2.1-"));
     ok("empty tag never updates", !upd_is_update("", "v3.2.0"));
     ok("NULL tag never updates", !upd_is_update(NULL, "v3.2.0"));
 

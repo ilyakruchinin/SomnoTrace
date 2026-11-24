@@ -87,6 +87,10 @@ int       upload_stage_reconcile(upload_stage_ref_t *out, int max_out,
 int       upload_stage_status(const upload_stage_ref_t *ref, int backend_slot);
 void      upload_stage_mark(const upload_stage_ref_t *ref, int backend_slot,
                             upload_unit_status_t status, const char *remote_id);
+/* Same park rule as EDF groups (upload_park.h): a unit failed
+ * UPLOAD_MAX_GROUP_ATTEMPTS times is skipped by dispatch and excluded from
+ * pending until the parking goes stale. */
+bool      upload_stage_parked(const upload_stage_ref_t *ref, int backend_slot);
 int       upload_stage_pending(const upload_stage_ref_t *refs, int n_refs,
                                int backend_slot);
 int       upload_stage_cached_pending(int backend_slot);

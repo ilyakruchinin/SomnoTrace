@@ -44,8 +44,10 @@
  *   Device identification (Get RPC):
  *     → .somnotrace/sessions/streams/YYYYMMDD/<prefix>_ident.json
  *
- *   Current settings (Get RPC):
- *     → .somnotrace/sessions/streams/YYYYMMDD/<prefix>_settings.json
+ *   Current settings:
+ *     → streams/YYYYMMDD/<prefix>.live.settings.json (Get RPC)
+ *     → streams/YYYYMMDD/<prefix>.cached.settings.json (device fallback)
+ *   A live capture is also saved to summaries/YYYYMMDD.live.settings.json.
  *
  * post_therapy_collect() is blocking and should be called from a task
  * with adequate stack (8KB+).  It is invoked by stop_task after

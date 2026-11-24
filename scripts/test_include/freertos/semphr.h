@@ -28,6 +28,12 @@
  * the handle back into take/give, which are no-ops on the host. */
 typedef void *SemaphoreHandle_t;
 
+#ifdef SOMNO_ML_WORKER_TEST
+SemaphoreHandle_t xSemaphoreCreateMutex(void);
+void vSemaphoreDelete(SemaphoreHandle_t mutex);
+#else
 #define xSemaphoreCreateMutex()          ((SemaphoreHandle_t)0x1)
+#define vSemaphoreDelete(m)              ((void)(m))
+#endif
 #define xSemaphoreTake(m, ticks)         do { (void)(m); (void)(ticks); } while (0)
 #define xSemaphoreGive(m)                do { (void)(m); } while (0)

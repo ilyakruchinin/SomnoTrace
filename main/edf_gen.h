@@ -39,10 +39,14 @@
  *     <prefix>_events.snt                                 ← live events
  *     <prefix>_resp_events.bin                             ← TherapyEvents spool
  *     <prefix>_ident.json                                  ← device identity
- *     <prefix>_settings.json                               ← current settings
+ *     <prefix>.live.settings.json                          ← Get RPC snapshot
+ *     <prefix>.cached.settings.json                        ← cached fallback
+ *     <prefix>_settings.json                               ← legacy/imported snapshot
  *     <prefix>_session.json                                ← session metadata
  *   /somnotrace/.somnotrace/sessions/summaries/
  *     YYYYMMDD.spool                                       ← per-day Summary spool
+ *     YYYYMMDD.live.settings.json                          ← live day snapshot
+ *     YYYYMMDD.imported.settings.json                      ← imported STR settings
  *
  * Output goes to SDCARD/ (ResMed-compatible SD card image, OSCAR-ready):
  *   /somnotrace/SDCARD/
@@ -105,6 +109,11 @@ esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
  * SHARED exactly once. */
 #define EDF_GEN_PER_SESSION   (1u << 0)
 #define EDF_GEN_SHARED        (1u << 1)
+/* Rebuild the cumulative STR for a historical day without replacing the
+ * current Identification/CurrentSettings artifacts. */
+#define EDF_GEN_SHARED_HISTORICAL (1u << 2)
+/* Internal guard for rebuilds triggered by imported native STR evidence. */
+#define EDF_GEN_REQUIRE_NATIVE_ID (1u << 3)
 #define EDF_GEN_ALL           (EDF_GEN_PER_SESSION | EDF_GEN_SHARED)
 
 /* As edf_gen_generate(), but writes into out_root and honours the pass
@@ -128,12 +137,25 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
  * was fully rebuilt and published — the caller may then queue it for
  * upload. */
 esp_err_t edf_gen_rebuild_day(const char *day_folder);
+esp_err_t edf_gen_rebuild_day_for_native(const char *day_folder);
+
+/* Refresh the native STR without rebuilding DATALOG or changing current settings.
+ * Uses the latest session's existing timing fallback, or no session when absent. */
+esp_err_t edf_gen_rebuild_native_str(void);
 
 /* Boot check: was a day rebuild interrupted while publishing?
  *
  * Publication deletes the live day and moves the staged files into place, so
  * a reset in that window leaves the day incomplete.  Returns true and fills
- * out_day (8 chars + NUL) when such a day is found, consuming the marker so
- * the caller owns the retry.  Call once at boot, before anything reads the
+ * out_day (8 chars + NUL) when such a day is found. The marker remains until
+ * the rebuild succeeds. Call once at boot, before anything reads the
  * export tree. */
 bool edf_gen_take_interrupted_rebuild(char *out_day, size_t out_len);
+
+/* Release the publish sentinel when the day it names has been given up —
+ * either its source sessions are gone (nothing left to rebuild from) or the
+ * pending-export machinery has stopped retrying it.  A sentinel for a day
+ * that can never complete otherwise blocks every later day's publish, since
+ * only one recovery can be tracked at a time.  No-op unless the sentinel
+ * actually names this day. */
+void edf_gen_release_interrupted_rebuild(const char *day_folder);

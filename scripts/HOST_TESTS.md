@@ -26,8 +26,10 @@ that is wanted; nothing here depends on running there.
 | `scripts/test_include/` | one-file stand-ins for `esp_log.h`, `esp_err.h`, `esp_timer.h`, `esp_heap_caps.h`, `cJSON.h`, `esp_rom_crc.h`, `freertos/` |
 | `scripts/upload_ox_test.c` | oximetry upload-state store (`components/uploader/upload_ox.c`): >64 recordings, reboot persistence, fingerprint reset, deleted-recording eviction, legacy `oximetry.json` migration. Re-execs itself so a "reboot" really drops statics; needs real cJSON |
 | `scripts/edf_gen_test.c` | `#include`s the five `edf_*.c` modules — tests the real converter end to end (SNT files in, EDF bytes out) |
+| `scripts/dashboard_panel_test.js` | Exercises the dashboard's PLD parsing and missing/zero/loading states; requires Node.js. |
 | `scripts/as11_time_test.c` | AS11 epoch / noon-day arithmetic |
 | `scripts/as11_events_test.c` | AS11 event parser and lifecycle state machine (`main/as11_events.c`) |
+| `scripts/bridge_indicator_test.c` | Bridge LCD status: pairing, connection epochs, card Wi-Fi and stale status. |
 | `scripts/http_query_test.c` | Bounded HTTP query parsing (`main/http_query.c`): ESP_OK success handling, percent/plus decoding, key boundaries, truncation and NUL rejection. |
 | `scripts/somno_worker_test.c` | SomnoStage worker (`components/somno_ml/somno_ml_worker.c`): merged-fragment allocation lifecycle, active-AS11-source deferral, and worker stack budget. Needs real cJSON. |
 | `scripts/mqtt_live_contract_test.py` | Compiles the real LCD live-statistics and MQTT worker/discovery functions with virtual time and mocked hardware; verifies averages, freshness, unavailable states, discovery units, QoS, and independent 10s/60s deadlines. Needs real cJSON. |
@@ -134,4 +136,3 @@ Not part of CI.
 built on the host. A writer→reader round trip is the natural next test.
 `bsp_power.c`'s OCV curve and IR-drop compensation are pure functions but
 sit in a FreeRTOS/ADC/NVS file; they need a stub layer first.
-

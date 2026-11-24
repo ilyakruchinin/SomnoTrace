@@ -50,6 +50,7 @@
 #include <time.h>
 #include <errno.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -58,12 +59,19 @@
 #include "sd_storage.h"
 #include "snt_format.h"
 #include "as11_time.h"
+#include "settings_provenance.h"
+#include "source_store.h"
+#include "edf_as10_settings.h"
+#include "edf_data_dict.h"
+#include "import_spool_marker.h"
 
 #ifndef EDF_IMPORT_HOST
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
+#include "mbedtls/sha256.h"
 #include "psram_task.h"
+#include "esp_timer.h"
 #include "edf_gen.h"
 #include "somno_ml.h"
 #include "uploader.h"
@@ -78,21 +86,32 @@ static const char *TAG = "edf_import";
 static inline void *imp_malloc(size_t sz) { return malloc(sz); }
 static inline void *imp_calloc(size_t n, size_t sz) { return calloc(n, sz); }
 static inline void *imp_realloc(void *p, size_t sz) { return realloc(p, sz); }
+static inline void *imp_psram_malloc(size_t sz) { return malloc(sz); }
+static inline void *imp_psram_calloc(size_t n, size_t sz) { return calloc(n, sz); }
 #else
 static inline void *imp_malloc(size_t sz)
 {
     void *p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return p ? p : malloc(sz);
+    return p || sz > 4096 ? p : malloc(sz);
 }
 static inline void *imp_calloc(size_t n, size_t sz)
 {
+    if (n && sz > SIZE_MAX / n) return NULL;
     void *p = heap_caps_calloc(n, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return p ? p : calloc(n, sz);
+    return p || n * sz > 4096 ? p : calloc(n, sz);
 }
 static inline void *imp_realloc(void *p, size_t sz)
 {
     void *r = heap_caps_realloc(p, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return r ? r : realloc(p, sz);
+    return r || sz > 4096 ? r : realloc(p, sz);
+}
+static inline void *imp_psram_malloc(size_t sz)
+{
+    return heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+static inline void *imp_psram_calloc(size_t n, size_t sz)
+{
+    return heap_caps_calloc(n, sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 #endif
 
@@ -100,11 +119,18 @@ static inline void *imp_realloc(void *p, size_t sz)
 #define IMP_MAX_SIGS        140   /* STR has 134 (133 + Crc16) */
 #define IMP_MAX_FILES       192   /* per day group */
 #define IMP_MAX_SESSIONS    24    /* per day group */
-#define IMP_MAX_STR_REC     370   /* STR covers ~a year of days */
+#define IMP_MAX_STR_REC     EDF_STR_MAX_RECORDS
+#define IMP_MAX_SKIPPED_GROUPS 64
+#define IMP_MAX_RECORD_BYTES (1024 * 1024)
 #define IMP_MATCH_MS        60000 /* EVE↔wave cluster max TherapyStart→MaskOn gap */
 #define IMP_CLUSTER_MS      2000  /* same-cluster timestamp tolerance */
 #define IMP_SESS_DUP_MS     45000 /* existing-session duplicate window */
+#define IMP_UNCERTAIN_MS    (24LL * 60 * 60 * 1000) /* defer unproven same-day pair */
 #define IMP_LINE_MAX        470   /* keep event JSON lines < consumer buffers */
+#define IMP_NATIVE_DIRTY    SD_SUMMARIES_DIR "/native-str.needs_rebuild"
+/* An incomplete source untouched for this long is a stalled transfer, not
+ * a slow one — same staging, different report. */
+#define IMP_STALL_S         3600
 
 /* SomnoBridge drift sidecar */
 #define IMP_DRIFT_FILE      "_bridge_drift.json"
@@ -176,11 +202,41 @@ static void imp_epoch_to_local_iso(int64_t epoch_ms, char *out, size_t out_len)
     strftime(out, out_len, "%Y-%m-%dT%H:%M:%S", &tm);
 }
 
-/* FATFS f_rename returns FR_EXIST if dst exists — unlink dst first. */
+/* FATFS cannot rename over an existing file. Keep the previous file until
+ * the replacement succeeds, and leave the backup available after a crash. */
+static int imp_recover_replace(const char *dst, char *backup, size_t backup_len)
+{
+    int n = snprintf(backup, backup_len, "%s.replace-backup", dst);
+    if (n < 0 || (size_t)n >= backup_len) { errno = ENAMETOOLONG; return -1; }
+    struct stat st;
+    if (stat(backup, &st) != 0) return errno == ENOENT ? 0 : -1;
+    if (!S_ISREG(st.st_mode)) { errno = EINVAL; return -1; }
+    if (stat(dst, &st) == 0) {
+        if (!S_ISREG(st.st_mode)) { errno = EINVAL; return -1; }
+        if (unlink(dst) != 0) return -1;
+    } else if (errno != ENOENT) return -1;
+    return rename(backup, dst);
+}
+
 static int imp_rename_replace(const char *src, const char *dst)
 {
-    unlink(dst);
-    return rename(src, dst);
+    char backup[700];
+    if (imp_recover_replace(dst, backup, sizeof(backup)) != 0) return -1;
+    if (rename(src, dst) == 0) return 0;
+    if (errno != EEXIST) return -1;
+    if (rename(dst, backup) != 0) return -1;
+    if (rename(src, dst) != 0) {
+        int saved = errno;
+        if (rename(backup, dst) != 0)
+            ESP_LOGE(TAG, "import: previous file retained at %s", backup);
+        errno = saved;
+        return -1;
+    }
+    if (unlink(backup) != 0) {
+        ESP_LOGE(TAG, "import: previous file retained at %s; retry required", backup);
+        return -1;
+    }
+    return 0;
 }
 
 /* Parse a filename session prefix "YYYYMMDD_HHMMSS" at *p (needs the first
@@ -210,8 +266,7 @@ static esp_err_t imp_flush_close(FILE *f, const char *path)
         fclose(f);
         return ESP_FAIL;
     }
-    fclose(f);
-    return ESP_OK;
+    return fclose(f) == 0 ? ESP_OK : ESP_FAIL;
 }
 
 /* ── EDF file model ─────────────────────────────────────────────────── */
@@ -230,6 +285,7 @@ typedef struct {
 typedef struct {
     char      path[300];
     int64_t   ts_dev_ms;      /* header startdate+starttime → device epoch ms */
+    int       header_day;     /* civil day number from the EDF header */
     int64_t   n_records;      /* clamped to whole records actually on disk */
     int64_t   n_declared;     /* n_records as written in the header */
     double    rdur_s;
@@ -238,6 +294,7 @@ typedef struct {
     imp_sig_t sigs[IMP_MAX_SIGS];
     long      data_off;       /* header_bytes */
     long      rec_stride;     /* bytes per data record incl. Crc16 */
+    bool      incomplete;     /* declared records or trailing record are torn */
     bool      is_ann;         /* "EDF+D"/"EDF+C" */
     char      rec_id[81];     /* recording_id (carries SRN=/MID=/VID=) */
 } imp_edf_t;
@@ -320,8 +377,12 @@ static esp_err_t imp_edf_open(imp_edf_t *e, const char *path)
             sscanf(stime, "%2d.%2d.%2d", &hh, &mi, &ss) == 3) {
             int year = (yy >= 85) ? 1900 + yy : 2000 + yy;
             e->ts_dev_ms = imp_civil_to_dev_ms(year, mm, dd, hh, mi, ss);
+            char label[16];
+            snprintf(label, sizeof(label), "%04d%02d%02d", year, mm, dd);
+            e->header_day = as11_time_day_number(label);
         } else {
             e->ts_dev_ms = -1;
+            e->header_day = -1;
         }
     }
 
@@ -353,6 +414,12 @@ static esp_err_t imp_edf_open(imp_edf_t *e, const char *path)
         sg->dmax = (int)strtol(dmx, NULL, 10);
         sg->spr  = (int)strtol(spr, NULL, 10);
         sg->is_crc   = (strcmp(sg->label, "Crc16") == 0);
+        if (sg->spr <= 0 || sg->spr > (IMP_MAX_RECORD_BYTES - e->rec_stride) / 2 ||
+            (sg->is_crc && sg->spr != 1)) {
+            free(blk);
+            fclose(f);
+            return ESP_ERR_INVALID_SIZE;
+        }
         if (sg->is_crc) e->crc_sig = i;
         sg->is_annot = (strcmp(sg->label, "EDF Annotations") == 0);
         sg->rec_off  = e->rec_stride;
@@ -366,6 +433,8 @@ static esp_err_t imp_edf_open(imp_edf_t *e, const char *path)
     /* Clamp record count to whole records physically present (torn tail). */
     long avail = (long)st.st_size - e->data_off;
     int64_t have = avail / e->rec_stride;
+    e->incomplete = avail < 0 || avail % e->rec_stride != 0 ||
+                    (e->n_declared > 0 && e->n_declared > have);
     if (e->n_declared <= 0 || e->n_declared > have)
         e->n_records = have;
     else
@@ -539,10 +608,15 @@ static esp_err_t snt_w_flush(snt_w_t *w)
 {
     if (!w->f) return ESP_OK;
     w->hdr.sample_count = w->written;
-    if (fseek(w->f, 0, SEEK_SET) == 0)
-        fwrite(&w->hdr, 1, sizeof(w->hdr), w->f);
-    fseek(w->f, 0, SEEK_END);
-    return imp_flush_close(w->f, w->tmp_path) == ESP_OK ? (w->f = NULL, ESP_OK) : ESP_FAIL;
+    FILE *f = w->f;
+    w->f = NULL;
+    if (fseek(f, 0, SEEK_SET) != 0 ||
+        fwrite(&w->hdr, 1, sizeof(w->hdr), f) != sizeof(w->hdr) ||
+        fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    return imp_flush_close(f, w->tmp_path);
 }
 
 static void snt_w_abort(snt_w_t *w)
@@ -864,7 +938,7 @@ static int tal_events(const uint8_t *p, const uint8_t *end, double rec_onset_s,
                 if (L->n >= L->cap) {
                     int ncap = L->cap ? L->cap * 2 : 32;
                     imp_ev_t *t = imp_realloc(L->ev, (size_t)ncap * sizeof(imp_ev_t));
-                    if (!t) return added;
+                    if (!t) return -1;
                     L->ev = t; L->cap = ncap;
                 }
                 imp_ev_t *e = &L->ev[L->n];
@@ -928,16 +1002,21 @@ static esp_err_t collect_tal(const char *path, imp_ev_list_t *L, bool csl)
     for (int64_t r = 0; r < e->n_records; r++) {
         if (!imp_edf_read_rec(e, f, r, rec)) {
             ESP_LOGW(TAG, "import: %s torn at record %lld", path, (long long)r);
+            ret = ESP_FAIL;
             break;
         }
         if (!imp_edf_rec_crc_ok(e, rec)) {
-            ESP_LOGW(TAG, "import: %s record %lld CRC fail — annotations skipped",
+            ESP_LOGW(TAG, "import: %s record %lld CRC fail — source kept",
                      path, (long long)r);
-            continue;   /* never parse garbage into phantom events */
+            ret = ESP_ERR_INVALID_CRC;
+            break;
         }
         const uint8_t *blk = rec + e->sigs[ai].rec_off;
-        tal_events(blk, blk + e->sigs[ai].spr * 2,
-                   (double)r * e->rdur_s, L, csl);
+        if (tal_events(blk, blk + e->sigs[ai].spr * 2,
+                       (double)r * e->rdur_s, L, csl) < 0) {
+            ret = ESP_ERR_NO_MEM;
+            break;
+        }
     }
 out:
     free(rec);
@@ -948,54 +1027,176 @@ out:
 
 /* End of the last annotation (onset + duration) relative to the file's own
  * start, in ms; 0 when the file has none or can't be read. */
-static int64_t imp_ann_span_ms(const char *path, bool csl)
+static esp_err_t imp_ann_span_ms(const char *path, bool csl, int64_t *out_end)
 {
     imp_ev_list_t L = {0};
     int64_t end = 0;
-    if (collect_tal(path, &L, csl) == ESP_OK)
+    esp_err_t err = collect_tal(path, &L, csl);
+    if (err == ESP_OK)
         for (int i = 0; i < L.n; i++) {
             int64_t t = L.ev[i].onset_ms + L.ev[i].dur_ms;
             if (t > end) end = t;
         }
     free(L.ev);
-    return end;
+    if (err == ESP_OK) *out_end = end;
+    return err;
 }
 
 /* Emit one EventNotification JSON line per event (each well under the
- * 512/640-byte consumer line buffers). */
-static int emit_event_line(FILE *f, const char *data_id, const char *event,
-                           int64_t dev_ms, int dur_s, int backdate_s)
+ * 512/640-byte consumer line buffers).  fmt_event_line is the single
+ * source for the line format so in-memory renders stay byte-identical
+ * to file output. */
+static int fmt_event_line(char *line, size_t cap, const char *data_id,
+                          const char *event, int64_t dev_ms, int dur_s,
+                          int backdate_s)
 {
     char iso[32];
     imp_dev_to_iso(dev_ms, iso, sizeof(iso));
-    char line[512];
     int n;
     if (backdate_s > 0)
-        n = snprintf(line, sizeof(line),
+        n = snprintf(line, cap,
             "{\"method\":\"EventNotification\",\"params\":{\"dataId\":\"%s\","
             "\"events\":[{\"event\":\"%s\",\"reportTime\":\"%s\","
             "\"backdateSeconds\":%d}]}}\n",
             data_id, event, iso, backdate_s);
     else if (dur_s > 0)
-        n = snprintf(line, sizeof(line),
+        n = snprintf(line, cap,
             "{\"method\":\"EventNotification\",\"params\":{\"dataId\":\"%s\","
             "\"events\":[{\"event\":\"%s\",\"reportTime\":\"%s\","
             "\"durationSeconds\":%d}]}}\n",
             data_id, event, iso, dur_s);
     else
-        n = snprintf(line, sizeof(line),
+        n = snprintf(line, cap,
             "{\"method\":\"EventNotification\",\"params\":{\"dataId\":\"%s\","
             "\"events\":[{\"event\":\"%s\",\"reportTime\":\"%s\"}]}}\n",
             data_id, event, iso);
-    if (n <= 0 || n >= (int)sizeof(line)) return -1;
+    return (n > 0 && n < (int)cap) ? n : -1;
+}
+
+static int emit_event_line(FILE *f, const char *data_id, const char *event,
+                           int64_t dev_ms, int dur_s, int backdate_s)
+{
+    char line[512];
+    int n = fmt_event_line(line, sizeof(line), data_id, event, dev_ms,
+                           dur_s, backdate_s);
+    if (n <= 0) return -1;
     if ((int)fwrite(line, 1, (size_t)n, f) != n) return -1;
     return n;
 }
 
-/* Build <id>_events.snt for a session.
- * t_eve_dev = annotation-cluster start (TherapyStart), -1 when absent.
- * t_wav_dev = waveform-cluster start (MaskOn / _ZLE), -1 when absent.
- * Session start = t_eve when present else t_wav; end = end_dev_ms. */
+/* Emit sink: the events render below produces identical output whether it
+ * lands in the staged file (commit path) or an in-memory line set (the
+ * legacy-manifest coverage check in augment_session). */
+typedef int (*imp_emit_fn)(void *ctx, const char *data_id,
+                           const char *event, int64_t dev_ms, int dur_s,
+                           int backdate_s);
+
+static int emit_to_file(void *ctx, const char *data_id, const char *event,
+                        int64_t dev_ms, int dur_s, int backdate_s)
+{
+    return emit_event_line((FILE *)ctx, data_id, event, dev_ms, dur_s,
+                           backdate_s);
+}
+
+typedef struct {
+    char **v;      /* each entry is a malloc'd NUL-free line incl '\n' */
+    int     n, cap;
+} imp_line_set_t;
+
+static int emit_to_set(void *ctx, const char *data_id, const char *event,
+                       int64_t dev_ms, int dur_s, int backdate_s)
+{
+    imp_line_set_t *S = (imp_line_set_t *)ctx;
+    char line[512];
+    int n = fmt_event_line(line, sizeof(line), data_id, event, dev_ms,
+                           dur_s, backdate_s);
+    if (n <= 0) return -1;
+    if (S->n >= S->cap) {
+        int ncap = S->cap ? S->cap * 2 : 64;
+        char **t = imp_realloc(S->v, (size_t)ncap * sizeof(char *));
+        if (!t) return -1;
+        S->v = t; S->cap = ncap;
+    }
+    char *dup = imp_malloc((size_t)n + 1);
+    if (!dup) return -1;
+    memcpy(dup, line, (size_t)n + 1);
+    S->v[S->n++] = dup;
+    return n;
+}
+
+static void line_set_free(imp_line_set_t *S)
+{
+    for (int i = 0; i < S->n; i++) free(S->v[i]);
+    free(S->v);
+    S->v = NULL; S->n = S->cap = 0;
+}
+
+/* The full events.snt render: synthetic Therapy/Mask window (device
+ * domain) then respiratory (EVE) + CSR (CSL) annotations, byte-identical
+ * via emit.  t_eve_dev = annotation-cluster start (TherapyStart), -1
+ * when absent; t_wav_dev = waveform-cluster start (MaskOn/_ZLE), -1 when
+ * absent; session start = t_eve when present else t_wav.
+ * reportTime is written in the device clock domain so edf_annotations'
+ * (as11 + drift - session) inversion lands exactly on the source onset. */
+static esp_err_t events_render(const imp_file_t *eve_f,
+                               const imp_file_t *csl_f,
+                               int64_t t_eve_dev, int64_t t_wav_dev,
+                               int64_t end_dev_ms,
+                               imp_emit_fn emit, void *ctx,
+                               uint32_t *out_events)
+{
+    esp_err_t ret = ESP_OK;
+    uint32_t n_ev = 0;
+
+    int64_t sess_start = (t_eve_dev >= 0) ? t_eve_dev : t_wav_dev;
+
+    /* UsageEvents: synthetic Therapy/Mask window in the device domain.
+     * collect_session_mask_pairs() prefers MaskOn/MaskOff; TherapyStart/
+     * TherapyStop are the fallback and mirror what the AS11 emits. */
+    if (sess_start >= 0 &&
+        emit(ctx, "UsageEvents-TherapyStatusEvents", "TherapyStart",
+             sess_start, 0, 0) < 0) ret = ESP_FAIL;
+    if (ret == ESP_OK && t_wav_dev >= 0 &&
+        emit(ctx, "UsageEvents-TherapyStatusEvents", "MaskOn",
+             t_wav_dev, 0, 0) < 0) ret = ESP_FAIL;
+    if (ret == ESP_OK && t_wav_dev >= 0 && end_dev_ms > t_wav_dev &&
+        emit(ctx, "UsageEvents-TherapyStatusEvents", "MaskOff",
+             end_dev_ms, 0, 0) < 0) ret = ESP_FAIL;
+    if (ret == ESP_OK && end_dev_ms > sess_start &&
+        emit(ctx, "UsageEvents-TherapyStatusEvents", "TherapyStop",
+             end_dev_ms, 0, 0) < 0) ret = ESP_FAIL;
+
+    for (int pass = 0; pass < 2 && ret == ESP_OK; pass++) {
+        const imp_file_t *src = pass ? csl_f : eve_f;
+        if (!src) continue;
+        bool csl = (pass == 1);
+        imp_ev_list_t L = {0};
+        esp_err_t cr = collect_tal(src->path, &L, csl);
+        if (cr != ESP_OK) {
+            ESP_LOGW(TAG, "import: %s annotations unreadable (%s) — source kept",
+                     src->path, esp_err_to_name(cr));
+            ret = cr;
+        }
+        if (cr == ESP_OK && L.n > 0) {
+            qsort(L.ev, L.n, sizeof(imp_ev_t), imp_event_cmp);
+            for (int i = 0; i < L.n && ret == ESP_OK; i++) {
+                const char *name = imp_event_name(L.ev[i].label, csl);
+                if (!name) continue;
+                if (emit(ctx, "TherapyEvents-RespiratoryEvents",
+                         name, src->ts_dev_ms + L.ev[i].onset_ms,
+                         (int)(L.ev[i].dur_ms / 1000), 0) < 0)
+                    ret = ESP_FAIL;
+                else
+                    n_ev++;
+            }
+        }
+        free(L.ev);
+    }
+    if (ret == ESP_OK) *out_events = n_ev;
+    return ret;
+}
+
+/* Build <id>_events.snt for a session. */
 static esp_err_t write_events_snt(const char *dir, const char *id,
                                   const imp_file_t *eve_f, const imp_file_t *csl_f,
                                   int64_t t_eve_dev, int64_t t_wav_dev,
@@ -1006,47 +1207,47 @@ static esp_err_t write_events_snt(const char *dir, const char *id,
     snprintf(tmp, sizeof(tmp), "%s.part", path);
     FILE *f = fopen(tmp, "w");
     if (!f) return ESP_FAIL;
+    esp_err_t ret = events_render(eve_f, csl_f, t_eve_dev, t_wav_dev,
+                                  end_dev_ms, emit_to_file, f, out_events);
+    if (ret == ESP_OK) ret = imp_flush_close(f, tmp);
+    else fclose(f);
+    if (ret != ESP_OK) { unlink(tmp); return ret; }
+    /* Leave the .part staged — publish_parts() renames it with the rest of
+     * the session output. */
+    return ESP_OK;
+}
+
+/* Collect the TherapyEvents lines the offered annotation files would
+ * emit — the part of events.snt that EVE/CSL actually own.  The
+ * synthetic UsageEvents block is session-anchored, not source-anchored,
+ * so it is intentionally excluded here: an annotation-only re-offer
+ * cannot reproduce wave-derived MaskOn/MaskOff times and must not be
+ * judged on them. */
+static esp_err_t collect_ann_lines(const imp_file_t *eve_f,
+                                   const imp_file_t *csl_f,
+                                   imp_line_set_t *S, uint32_t *out_events)
+{
     esp_err_t ret = ESP_OK;
     uint32_t n_ev = 0;
-
-    int64_t sess_start = (t_eve_dev >= 0) ? t_eve_dev : t_wav_dev;
-
-    /* UsageEvents: synthetic Therapy/Mask window in the device domain.
-     * collect_session_mask_pairs() prefers MaskOn/MaskOff; TherapyStart/
-     * TherapyStop are the fallback and mirror what the AS11 emits. */
-    if (sess_start >= 0 &&
-        emit_event_line(f, "UsageEvents-TherapyStatusEvents", "TherapyStart",
-                        sess_start, 0, 0) < 0) ret = ESP_FAIL;
-    if (ret == ESP_OK && t_wav_dev >= 0 &&
-        emit_event_line(f, "UsageEvents-TherapyStatusEvents", "MaskOn",
-                        t_wav_dev, 0, 0) < 0) ret = ESP_FAIL;
-    if (ret == ESP_OK && t_wav_dev >= 0 && end_dev_ms > t_wav_dev &&
-        emit_event_line(f, "UsageEvents-TherapyStatusEvents", "MaskOff",
-                        end_dev_ms, 0, 0) < 0) ret = ESP_FAIL;
-    if (ret == ESP_OK && end_dev_ms > sess_start &&
-        emit_event_line(f, "UsageEvents-TherapyStatusEvents", "TherapyStop",
-                        end_dev_ms, 0, 0) < 0) ret = ESP_FAIL;
-
-    /* Respiratory (EVE) + CSR (CSL) annotations.  reportTime is written in
-     * the device clock domain so edf_annotations' (as11 + drift - session)
-     * inversion lands exactly on the source onset. */
     for (int pass = 0; pass < 2 && ret == ESP_OK; pass++) {
         const imp_file_t *src = pass ? csl_f : eve_f;
         if (!src) continue;
         bool csl = (pass == 1);
         imp_ev_list_t L = {0};
         esp_err_t cr = collect_tal(src->path, &L, csl);
-        if (cr != ESP_OK)
-            ESP_LOGW(TAG, "import: %s annotations unreadable (%s) — events skipped",
+        if (cr != ESP_OK) {
+            ESP_LOGW(TAG, "import: %s annotations unreadable (%s)",
                      src->path, esp_err_to_name(cr));
-        if (cr == ESP_OK && L.n > 0) {
+            ret = ESP_FAIL;
+        }
+        if (ret == ESP_OK && L.n > 0) {
             qsort(L.ev, L.n, sizeof(imp_ev_t), imp_event_cmp);
             for (int i = 0; i < L.n && ret == ESP_OK; i++) {
                 const char *name = imp_event_name(L.ev[i].label, csl);
                 if (!name) continue;
-                if (emit_event_line(f, "TherapyEvents-RespiratoryEvents",
-                                    name, src->ts_dev_ms + L.ev[i].onset_ms,
-                                    (int)(L.ev[i].dur_ms / 1000), 0) < 0)
+                if (emit_to_set(S, "TherapyEvents-RespiratoryEvents",
+                                name, src->ts_dev_ms + L.ev[i].onset_ms,
+                                (int)(L.ev[i].dur_ms / 1000), 0) < 0)
                     ret = ESP_FAIL;
                 else
                     n_ev++;
@@ -1054,14 +1255,8 @@ static esp_err_t write_events_snt(const char *dir, const char *id,
         }
         free(L.ev);
     }
-
-    if (ret == ESP_OK) ret = imp_flush_close(f, tmp);
-    else fclose(f);
-    if (ret != ESP_OK) { unlink(tmp); return ret; }
-    /* Leave the .part staged — publish_parts() renames it with the rest of
-     * the session output. */
-    *out_events = n_ev;
-    return ESP_OK;
+    if (ret == ESP_OK) *out_events = n_ev;
+    return ret;
 }
 
 /* ── Identification / settings resolution ───────────────────────────── */
@@ -1161,6 +1356,53 @@ static cJSON *read_json_file(const char *path)
     cJSON *j = cJSON_Parse(buf);
     free(buf);
     return j;
+}
+
+/* Native day snapshots are durable evidence: reject short reads, embedded
+ * NULs and trailing junk instead of accepting a valid JSON prefix. */
+static cJSON *read_native_day_json(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz <= 0 || sz > 256 * 1024 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    char *buf = imp_malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    bool ok = rd == (size_t)sz && !ferror(f);
+    if (fclose(f) != 0) ok = false;
+    buf[sz] = '\0';
+    cJSON *j = ok && !memchr(buf, '\0', (size_t)sz)
+               ? cJSON_ParseWithLengthOpts(buf, (size_t)sz + 1, NULL, true) : NULL;
+    free(buf);
+    return j;
+}
+
+/* A parse failure can also be an allocation or I/O failure. Only quarantine
+ * bytes which cannot be JSON regardless of parser memory availability. */
+static bool json_file_provably_corrupt(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    unsigned char buf[256];
+    size_t n;
+    bool nonspace = false, invalid = false;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            unsigned char ch = buf[i];
+            if (ch < 0x20 && ch != '\t' && ch != '\r' && ch != '\n')
+                invalid = true;
+            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n')
+                nonspace = true;
+        }
+    }
+    bool complete = !ferror(f);
+    if (fclose(f) != 0) complete = false;
+    return complete && (invalid || !nonspace);
 }
 
 static esp_err_t write_json_atomic(const char *path, const cJSON *j)
@@ -1423,30 +1665,171 @@ struct edf_import_ctx {
     char    src_family[8];  /* "AS10"/"AS11" for provenance */
     char    src_serial[40];
     bool    root_done;
+    bool    root_retained;
     bool    cleaned;
     bool    sweep_done;
+    struct { char day[9]; unsigned char kind; } skipped[IMP_MAX_SKIPPED_GROUPS];
+    int     n_skipped;
+    bool    skip_full;
     int     quiesce_s;      /* defer units modified within this window; 0 = off */
+    char    future_unit[320];
+    uint64_t future_signature;
+    int64_t future_seen_us;
+    bool    future_observed;
     imp_edf_t *scratch;     /* reusable header buffer */
 };
 
-/* STR Mode digital → ActiveTherapyProfile name (inverse of MODE_MAP). */
-static const char *mode_to_profile(int dig, bool as10)
+/* Convert a source signal's physical unit to the canonical unit in our STR
+ * header. Unknown units remain absent rather than being guessed. */
+static bool as10_unit_factor(as10_setting_unit_t kind, const char *unit, double *factor)
 {
-    /* AS11 MODE_MAP = {3,1,2,4,10,16,8,6,7,5,9}: profile index → dig. */
-    static const struct { int dig; const char *name; } T[] = {
-        {3, "CpapProfile"}, {1, "AutoSetProfile"}, {2, "AutoSetForHerProfile"},
-        {4, "SpontProfile"}, {10, "STProfile"}, {16, "TimedProfile"},
-        {8, "VAutoProfile"}, {6, "ASVProfile"}, {7, "ASVAutoProfile"},
-        {5, "iVAPSProfile"}, {9, "PACProfile"},
-    };
-    (void)as10;   /* AS10 mode codes are label-matched the same way */
-    for (size_t i = 0; i < sizeof(T) / sizeof(T[0]); i++)
-        if (T[i].dig == dig) return T[i].name;
-    return NULL;
+    *factor = 1.0;
+    switch (kind) {
+    case AS10_UNIT_ENUM:
+        return !unit[0] || !strcmp(unit, "1");
+    case AS10_UNIT_PRESSURE:
+        return !strcasecmp(unit, "cmH2O") || !strcasecmp(unit, "cmH20");
+    case AS10_UNIT_SECONDS:
+    case AS10_UNIT_MILLISECONDS:
+        if (!strcasecmp(unit, "s") || !strcasecmp(unit, "sec") ||
+            !strcasecmp(unit, "seconds")) {
+            if (kind == AS10_UNIT_MILLISECONDS) *factor = 1000.0;
+            return true;
+        }
+        if (!strcasecmp(unit, "ms") || !strcasecmp(unit, "msec")) {
+            if (kind == AS10_UNIT_SECONDS) *factor = 0.001;
+            return true;
+        }
+        return false;
+    case AS10_UNIT_MINUTES:
+        return !strcasecmp(unit, "min") || !strcasecmp(unit, "min.") ||
+               !strcasecmp(unit, "minutes");
+    case AS10_UNIT_CELSIUS:
+        return !strcasecmp(unit, "C") || !strcasecmp(unit, "degC") ||
+               !strcasecmp(unit, "Celsius");
+    }
+    return false;
 }
 
+/* Preserve physical values from the AS10 card's own EDF header and labels.
+ * The exporter maps these into a family-specific header without interpreting
+ * the raw device enum values. */
+static cJSON *as10_str_settings(const imp_edf_t *e, const uint8_t *rec, int *unsupported)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *fields = root ? cJSON_AddObjectToObject(root, "_as10_edf_settings") : NULL;
+    if (!fields) { cJSON_Delete(root); return NULL; }
+    for (size_t i = 0; i < sizeof(g_as10_setting_fields) / sizeof(g_as10_setting_fields[0]); i++) {
+        const as10_setting_field_t *field = &g_as10_setting_fields[i];
+        const imp_sig_t *sig = NULL;
+        for (int k = 0; k < e->n_sigs; k++) {
+            if (strcmp(e->sigs[k].label, field->label) == 0) {
+                sig = &e->sigs[k];
+                break;
+            }
+        }
+        if (!sig) continue;
+        int16_t dig = str_dig_at(rec, sig, 0);
+        double factor;
+        if (dig == -1 || dig == INT16_MIN) continue;
+        if (sig->spr != 1 || sig->dmax <= sig->dmin ||
+            !isfinite(sig->pmin) || !isfinite(sig->pmax) || sig->pmax <= sig->pmin ||
+            dig < sig->dmin || dig > sig->dmax ||
+            !as10_unit_factor(field->unit, sig->unit, &factor)) {
+            (*unsupported)++;
+            continue;
+        }
+        double physical = (sig->pmin + (dig - sig->dmin) *
+                           (sig->pmax - sig->pmin) / (sig->dmax - sig->dmin)) * factor;
+        if (!isfinite(physical)) { (*unsupported)++; continue; }
+        if (!cJSON_AddNumberToObject(fields, field->label, physical)) {
+            cJSON_Delete(root);
+            return NULL;
+        }
+    }
+    return root;
+}
+
+/* Preserve AS11 native settings in the destination signals' physical units.
+ * This avoids assuming the source card uses our digital ranges. */
+static cJSON *as11_str_settings(const imp_edf_t *e, const uint8_t *rec,
+                                 int *unsupported)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *fields = root ? cJSON_AddObjectToObject(root, "_as11_edf_settings") : NULL;
+    if (!fields) { cJSON_Delete(root); return NULL; }
+    for (int i = 5; i <= 75; i++) {
+        const edf_signal_def_t *target = &g_str_signals[i];
+        int si = imp_sig_find(e, target->label);
+        if (si < 0) continue;
+        const imp_sig_t *sig = &e->sigs[si];
+        int16_t dig = str_dig_at(rec, sig, 0);
+        if (dig == -1 || dig == INT16_MIN) continue;
+        double factor = 1.0;
+        bool unit_ok;
+        if (!strcmp(target->unit, "cmH2O"))
+            unit_ok = as10_unit_factor(AS10_UNIT_PRESSURE, sig->unit, &factor);
+        else if (!strcmp(target->unit, "seconds"))
+            unit_ok = as10_unit_factor(AS10_UNIT_SECONDS, sig->unit, &factor);
+        else if (!strcmp(target->unit, "msec"))
+            unit_ok = as10_unit_factor(AS10_UNIT_MILLISECONDS, sig->unit, &factor);
+        else if (!strcmp(target->unit, "min."))
+            unit_ok = as10_unit_factor(AS10_UNIT_MINUTES, sig->unit, &factor);
+        else if (!strcmp(target->unit, "Celsius"))
+            unit_ok = as10_unit_factor(AS10_UNIT_CELSIUS, sig->unit, &factor);
+        else if (!target->unit[0])
+            unit_ok = as10_unit_factor(AS10_UNIT_ENUM, sig->unit, &factor);
+        else
+            unit_ok = !strcasecmp(target->unit, sig->unit);
+        if (sig->spr != 1 || sig->dmax <= sig->dmin ||
+            !isfinite(sig->pmin) || !isfinite(sig->pmax) || sig->pmax <= sig->pmin ||
+            dig < sig->dmin || dig > sig->dmax || !unit_ok) {
+            (*unsupported)++;
+            continue;
+        }
+        double value = (sig->pmin + (dig - sig->dmin) *
+                        (sig->pmax - sig->pmin) / (sig->dmax - sig->dmin)) * factor;
+        if (!isfinite(value)) { (*unsupported)++; continue; }
+        if (!cJSON_AddNumberToObject(fields, target->label, value)) {
+            cJSON_Delete(root);
+            return NULL;
+        }
+    }
+    return root;
+}
+
+static void warn_unsupported_setting_labels(const imp_edf_t *e, bool as10)
+{
+    int count = 0;
+    char examples[112] = "";
+    for (int i = 0; i < e->n_sigs; i++) {
+        const char *label = e->sigs[i].label;
+        if (strncmp(label, "S.", 2)) continue;
+        bool known = false;
+        if (as10) {
+            for (size_t j = 0; j < sizeof(g_as10_setting_fields) / sizeof(g_as10_setting_fields[0]); j++)
+                if (!strcmp(label, g_as10_setting_fields[j].label)) { known = true; break; }
+        } else {
+            for (int j = 5; j <= 75; j++)
+                if (!strcmp(label, g_str_signals[j].label)) { known = true; break; }
+        }
+        if (known) continue;
+        if (count < 3) {
+            size_t used = strlen(examples);
+            snprintf(examples + used, sizeof(examples) - used, "%s%s", count ? ", " : "", label);
+        }
+        count++;
+    }
+    if (count)
+        ESP_LOGW(TAG, "import: %d unsupported STR settings label(s), e.g. %s; original retained",
+                 count, examples);
+}
+
+static esp_err_t mark_native_dirty(void);
+
 /* Write summaries/<day>.spool (atomic) for one decoded STR day. */
-static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite, bool *wrote)
+static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite,
+                                     bool as10, bool *wrote)
 {
     if (wrote) *wrote = false;
     /* Date is days since epoch → noon-day label = that civil date */
@@ -1459,9 +1842,31 @@ static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite, bool *w
     char spool_path[330];
     snprintf(spool_path, sizeof(spool_path), "%s/%s.spool",
              SD_SUMMARIES_DIR, label);
+    char backup[700];
+    if (imp_recover_replace(spool_path, backup, sizeof(backup)) != 0)
+        return ESP_FAIL;
+    bool native_overlay = false;
+    bool str_refresh = false;
     if (!overwrite) {
         struct stat st;
-        if (stat(spool_path, &st) == 0) return ESP_OK;   /* live/imported wins */
+        if (stat(spool_path, &st) == 0) {
+            if (!import_spool_is_synthetic(spool_path)) {
+                /* A non-synthetic spool is either live (post_therapy —
+                 * live always wins) or an earlier native STR import,
+                 * which a refreshed STR record may legitimately update
+                 * in place: the AS11 rewrites the day's record as
+                 * sessions complete.  STR-sourced spools carry a marker;
+                 * for AS10 sources no live pull exists at all, so a
+                 * non-synthetic spool can only be ours. */
+                if (!import_spool_is_native_str(spool_path) && !as10)
+                    return ESP_OK;
+                str_refresh = true;
+            } else {
+                snprintf(spool_path, sizeof(spool_path), "%s/%s.native.spool",
+                         SD_SUMMARIES_DIR, label);
+                native_overlay = true;
+            }
+        } else if (errno != ENOENT) return ESP_FAIL;
     }
 
     /* PeriodStart = local noon of the label, in the device domain */
@@ -1469,7 +1874,32 @@ static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite, bool *w
     if (noon_ms <= 0) noon_ms = d->day_number * 86400000LL + 43200000LL;
     pbuf_t b = {0};
     encode_spool_day(&b, d, noon_ms, noon_ms + 86400000LL);
+    pbuf_put(&b, (const uint8_t *)IMPORT_SPOOL_NATSTR_MARKER,
+             IMPORT_SPOOL_NATSTR_MARKER_LEN);
     esp_err_t ret = b.ovf ? ESP_ERR_NO_MEM : ESP_OK;
+    if (ret == ESP_OK && (native_overlay || str_refresh)) {
+        FILE *old = fopen(spool_path, "rb");
+        if (old) {
+            bool same = true;
+            unsigned char chunk[512];
+            size_t pos = 0;
+            while (pos < b.len) {
+                size_t n = b.len - pos < sizeof(chunk) ? b.len - pos : sizeof(chunk);
+                if (fread(chunk, 1, n, old) != n || memcmp(chunk, b.buf + pos, n)) {
+                    same = false;
+                    break;
+                }
+                pos += n;
+            }
+            if (same && fgetc(old) == EOF && !ferror(old)) {
+                fclose(old);
+                free(b.buf);
+                return ESP_OK;
+            }
+            fclose(old);
+        } else if (errno != ENOENT) ret = ESP_FAIL;
+        if (ret == ESP_OK && mark_native_dirty() != ESP_OK) ret = ESP_FAIL;
+    }
     if (ret == ESP_OK) {
         mkdir(SD_SESSIONS_DIR, 0775);
         mkdir(SD_SUMMARIES_DIR, 0775);
@@ -1490,335 +1920,513 @@ static esp_err_t write_spool_for_day(const str_day_t *d, bool overwrite, bool *w
     return ret;
 }
 
-/* cJSON convenience helpers: get-or-create a child object, and
- * set-or-replace a scalar member (STR overlay may rewrite existing
- * CurrentSettings fields with that record's values). */
-static cJSON *jget_or_add_obj(cJSON *o, const char *k)
+typedef enum {
+    STR_IMPORT_OK,
+    STR_IMPORT_PARTIAL,   /* some days ambiguous; valid days imported, source kept */
+    STR_IMPORT_RETAIN,
+    STR_IMPORT_RETRY,
+} str_import_result_t;
+
+/* Keep the original accessible even after the staging file is consumed. */
+static esp_err_t retain_native_str(const char *path)
 {
-    cJSON *v = cJSON_GetObjectItem(o, k);
-    if (cJSON_IsObject(v)) return v;
-    cJSON *n = cJSON_CreateObject();
-    if (n) cJSON_AddItemToObject(o, k, n);
-    return n;
+    mkdir(SD_SESSIONS_DIR, 0775);
+    if (!source_store_lock()) return ESP_FAIL;
+    esp_err_t err = source_store_init(NULL);
+    if (err != ESP_OK) goto done;
+    source_store_put_result_t put;
+    err = source_store_put_path("native_str_import", path, &put);
+    if (err != ESP_OK) goto done;
+    cJSON *observation = cJSON_CreateObject();
+    if (!observation) { err = ESP_ERR_NO_MEM; goto done; }
+    err = source_store_observe(put.id, "native-str", "native_str_import", observation);
+    cJSON_Delete(observation);
+done:
+    source_store_unlock();
+    return err;
 }
 
-static void jset_num(cJSON *o, const char *k, double v)
+static void mark_root_processed(const char *path, const char *id)
 {
-    if (cJSON_GetObjectItem(o, k))
-        cJSON_ReplaceItemInObject(o, k, cJSON_CreateNumber(v));
-    else
-        cJSON_AddNumberToObject(o, k, v);
-}
-
-static void jset_str(cJSON *o, const char *k, const char *v)
-{
-    if (cJSON_GetObjectItem(o, k))
-        cJSON_ReplaceItemInObject(o, k, cJSON_CreateString(v));
-    else
-        cJSON_AddStringToObject(o, k, v);
-}
-
-/* STR "S.*" signal → SettingProfiles field, the exact inverse of
- * build_str_data_values() in edf_summary.c (spec/0002 §4.3.4).
- * div: numeric scale — JSON value = dig / div.
- * enums: NULL → numeric field; else raw index → JSON string.
- * off11: AS11 stores raw+off11 (1 for most enums, 2 for S.Mask);
- *        AS10 carries the raw 0-indexed enum directly. */
-static const char *const EN_ON_OFF[]      = { "Off", "On", NULL };
-static const char *const EN_ON_OFF_AUTO[] = { "Off", "On", "Auto", NULL };
-static const char *const EN_EPR_TYPE[]    = { "RampOnly", "FullTime", NULL };
-static const char *const EN_PATVIEW[]     = { "Advanced", "Basic", NULL };
-static const char *const EN_YESNO[]       = { "No", "Yes", NULL };
-static const char *const EN_MASK[] =
-    { "Pillows", "FullFace", "Nasal", "Pediatric", NULL };
-static const char *const EN_TUBE[] =
-    { "SlimLine", "Standard", "15mmNonHeated", "19mmNonHeated", NULL };
-static const char *const EN_CLIMATE[]     = { "Auto", "Manual", NULL };
-
-typedef struct {
-    const char *label;
-    bool        feature;        /* false → TherapyProfiles, true → FeatureProfiles */
-    const char *profile;
-    const char *field;
-    int16_t     div;
-    const char *const *enums;
-    int8_t      off11;
-    bool        clamp;          /* out-of-range raw clamps to last enum (sparse maps) */
-} str_set_map_t;
-
-static const str_set_map_t STR_SETTINGS[] = {
-    /* [6-13] CPAP / AutoSet / AFH pressures (cmH2O × 50) */
-    { "S.C.StartPress",   false, "CpapProfile",          "StartPressure",   50, NULL, 0, false },
-    { "S.C.Press",        false, "CpapProfile",          "SetPressure",     50, NULL, 0, false },
-    { "S.A.StartPress",   false, "AutoSetProfile",       "StartPressure",   50, NULL, 0, false },
-    { "S.A.MaxPress",     false, "AutoSetProfile",       "MaxPressure",     50, NULL, 0, false },
-    { "S.A.MinPress",     false, "AutoSetProfile",       "MinPressure",     50, NULL, 0, false },
-    { "S.AFH.StartPress", false, "AutoSetForHerProfile", "StartPressure",   50, NULL, 0, false },
-    { "S.AFH.MaxPress",   false, "AutoSetForHerProfile", "MaxPressure",     50, NULL, 0, false },
-    { "S.AFH.MinPress",   false, "AutoSetForHerProfile", "MinPressure",     50, NULL, 0, false },
-    /* [14-21] VAuto */
-    { "S.VA.StartPress",  false, "VAutoProfile", "StartPressure",          50, NULL, 0, false },
-    { "S.VA.MaxIPAP",     false, "VAutoProfile", "MaxInspiratoryPressure", 50, NULL, 0, false },
-    { "S.VA.MinEPAP",     false, "VAutoProfile", "MinExpiratoryPressure",  50, NULL, 0, false },
-    { "S.VA.PS",          false, "VAutoProfile", "SetPressureSupport",     50, NULL, 0, false },
-    { "S.VA.TiMax",       false, "VAutoProfile", "SetMaxInspiratoryTime",  50, NULL, 0, false },
-    { "S.VA.TiMin",       false, "VAutoProfile", "SetMinInspiratoryTime",  50, NULL, 0, false },
-    { "S.VA.Trigger",     false, "VAutoProfile", "TriggerSensitivity",      1, NULL, 1, false },
-    { "S.VA.Cycle",       false, "VAutoProfile", "CycleSensitivity",        1, NULL, 1, false },
-    /* [22-32] Spont (S) */
-    { "S.S.StartPress",   false, "SpontProfile", "StartPressure",             50, NULL, 0, false },
-    { "S.S.IPAP",         false, "SpontProfile", "TargetInspiratoryPressure",50, NULL, 0, false },
-    { "S.S.EPAP",         false, "SpontProfile", "TargetExpiratoryPressure", 50, NULL, 0, false },
-    { "S.S.EasyBreathe",  false, "SpontProfile", "EasyBreatheEnable",          1, EN_ON_OFF, 1, false },
-    { "S.S.RespRateEn",   false, "SpontProfile", "RespiratoryRateEnable",      1, EN_ON_OFF, 1, true },
-    { "S.S.TiMax",        false, "SpontProfile", "SetMaxInspiratoryTime",     50, NULL, 0, false },
-    { "S.S.TiMin",        false, "SpontProfile", "SetMinInspiratoryTime",     50, NULL, 0, false },
-    { "S.S.RiseEnable",   false, "SpontProfile", "RiseTimeEnable",             1, EN_ON_OFF, 1, false },
-    { "S.S.RiseTime",     false, "SpontProfile", "RiseTime",                   1, NULL, 0, false },
-    { "S.S.Trigger",      false, "SpontProfile", "TriggerSensitivity",         1, NULL, 1, false },
-    { "S.S.Cycle",        false, "SpontProfile", "CycleSensitivity",           1, NULL, 1, false },
-    /* [33-42] ST */
-    { "S.ST.StartPress",  false, "STProfile", "StartPressure",             50, NULL, 0, false },
-    { "S.ST.IPAP",        false, "STProfile", "TargetInspiratoryPressure", 50, NULL, 0, false },
-    { "S.ST.EPAP",        false, "STProfile", "TargetExpiratoryPressure",  50, NULL, 0, false },
-    { "S.ST.RespRate",    false, "STProfile", "SetRespiratoryRate",         5, NULL, 0, false },
-    { "S.ST.TiMax",       false, "STProfile", "SetMaxInspiratoryTime",     50, NULL, 0, false },
-    { "S.ST.TiMin",       false, "STProfile", "SetMinInspiratoryTime",     50, NULL, 0, false },
-    { "S.ST.RiseEnable",  false, "STProfile", "RiseTimeEnable",             1, EN_ON_OFF, 1, false },
-    { "S.ST.RiseTime",    false, "STProfile", "RiseTime",                   1, NULL, 0, false },
-    { "S.ST.Trigger",     false, "STProfile", "TriggerSensitivity",         1, NULL, 1, false },
-    { "S.ST.Cycle",       false, "STProfile", "CycleSensitivity",           1, NULL, 1, false },
-    /* [43-49] Timed (T) */
-    { "S.T.StartPress",   false, "TimedProfile", "StartPressure",             50, NULL, 0, false },
-    { "S.T.IPAP",         false, "TimedProfile", "TargetInspiratoryPressure", 50, NULL, 0, false },
-    { "S.T.EPAP",         false, "TimedProfile", "TargetExpiratoryPressure",  50, NULL, 0, false },
-    { "S.T.RespRate",     false, "TimedProfile", "SetRespiratoryRate",         5, NULL, 0, false },
-    { "S.T.Ti",           false, "TimedProfile", "SetInspiratoryTime",        50, NULL, 0, false },
-    { "S.T.RiseEnable",   false, "TimedProfile", "RiseTimeEnable",             1, EN_ON_OFF, 1, false },
-    { "S.T.RiseTime",     false, "TimedProfile", "RiseTime",                   1, NULL, 0, false },
-    /* [50-58] ASV / ASVAuto */
-    { "S.AV.StartPress",  false, "ASVProfile", "StartPressure",             50, NULL, 0, false },
-    { "S.AV.EPAP",        false, "ASVProfile", "TargetExpiratoryPressure",  50, NULL, 0, false },
-    { "S.AV.MaxPS",       false, "ASVProfile", "MaxPressureSupport",        50, NULL, 0, false },
-    { "S.AV.MinPS",       false, "ASVProfile", "MinPressureSupport",        50, NULL, 0, false },
-    { "S.AA.StartPress",  false, "ASVAutoProfile", "StartPressure",           50, NULL, 0, false },
-    { "S.AA.MaxEPAP",     false, "ASVAutoProfile", "MaxExpiratoryPressure",   50, NULL, 0, false },
-    { "S.AA.MinEPAP",     false, "ASVAutoProfile", "MinExpiratoryPressure",   50, NULL, 0, false },
-    { "S.AA.MaxPS",       false, "ASVAutoProfile", "MaxPressureSupport",      50, NULL, 0, false },
-    { "S.AA.MinPS",       false, "ASVAutoProfile", "MinPressureSupport",      50, NULL, 0, false },
-    /* [59-75] Comfort / ramp / EPR / smart / circuit / climate features */
-    { "S.AS.Comfort",     true, "ComfortFeature",        "AutoSetComfort",          1, EN_ON_OFF,      1, false },
-    { "S.RampEnable",     true, "AutoRampFeature",       "RampEnable",              1, EN_ON_OFF_AUTO, 1, false },
-    { "S.RampTime",       true, "AutoRampFeature",       "RampTime",                1, NULL,           0, false },
-    { "S.EPR.ClinEnable", true, "EprFeature",            "EprEnablePatientAccess",  1, EN_ON_OFF,      1, false },
-    { "S.EPR.EPREnable",  true, "EprFeature",            "EprEnable",               1, EN_ON_OFF,      1, false },
-    { "S.EPR.Level",      true, "EprFeature",            "EprPressure",            50, NULL,           0, false },
-    { "S.EPR.EPRType",    true, "EprFeature",            "EprType",                 1, EN_EPR_TYPE,    1, false },
-    { "S.SmartStart",     true, "SmartStartStopFeature", "SmartStart",              1, EN_ON_OFF,      1, false },
-    { "S.PtAccess",       true, "PatientViewFeature",    "PatientView",             1, EN_PATVIEW,     1, false },
-    { "S.ABFilter",       true, "CircuitFeature",        "AntiBacterialFilter",     1, EN_YESNO,       1, false },
-    { "S.Mask",           true, "CircuitFeature",        "MaskType",                1, EN_MASK,        2, false },
-    { "S.Tube",           true, "CircuitFeature",        "TubeType",                1, EN_TUBE,        1, false },
-    { "S.ClimateControl", true, "ClimateFeature",        "ClimateControl",          1, EN_CLIMATE,     1, false },
-    { "S.HumEnable",      true, "ClimateFeature",        "HumidifierSettingEnable", 1, EN_ON_OFF,      1, false },
-    { "S.HumLevel",       true, "ClimateFeature",        "HumidifierLevel",         1, NULL,           0, false },
-    { "S.TempEnable",     true, "ClimateFeature",        "HeatedTubeSettingEnable", 1, EN_ON_OFF_AUTO, 1, false },
-    { "S.Temp",           true, "ClimateFeature",        "HeatedTubeTemperature",  10, NULL,           0, false },
-};
-
-/* Overlay one STR record's S.* settings channels onto a SettingProfiles
- * tree (inverse of build_str_data_values).  Only channels the record
- * actually carries are written; absent channels keep whatever the tree
- * already had (e.g. the card's CurrentSettings).  Returns the number of
- * S.* fields applied — 0 means the tree gained no settings content. */
-static int overlay_str_settings(cJSON *root, const imp_edf_t *e,
-                                const uint8_t *rec, int mode_dig, bool as10)
-{
-    cJSON *sp = jget_or_add_obj(root, "SettingProfiles");
-    if (!sp) return 0;
-    int applied = 0;
-    const char *prof = mode_to_profile(mode_dig, as10);
-    if (prof) {
-        cJSON *ap = jget_or_add_obj(sp, "ActiveProfiles");
-        if (ap) { jset_str(ap, "TherapyProfile", prof); applied++; }
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    if (!source_store_lock()) return;
+    source_store_put_result_t put;
+    cJSON *observation = NULL;
+    esp_err_t err = source_store_init(NULL);
+    if (err == ESP_OK) err = source_store_put_path("processed_root", path, &put);
+    if (err == ESP_OK) {
+        observation = cJSON_CreateObject();
+        err = observation ? source_store_observe(put.id, id, "processed_root", observation)
+                          : ESP_ERR_NO_MEM;
     }
-    cJSON *tp = NULL, *fp = NULL;
-    for (size_t i = 0; i < sizeof(STR_SETTINGS) / sizeof(STR_SETTINGS[0]); i++) {
-        const str_set_map_t *mp = &STR_SETTINGS[i];
-        int si = imp_sig_find(e, mp->label);
-        if (si < 0) continue;
-        int16_t dig = str_dig_at(rec, &e->sigs[si], 0);
-        if (dig == -1 || dig == INT16_MIN) continue;
-        cJSON *po;
-        if (mp->feature) {
-            if (!fp) fp = jget_or_add_obj(sp, "FeatureProfiles");
-            po = fp ? jget_or_add_obj(fp, mp->profile) : NULL;
-        } else {
-            if (!tp) tp = jget_or_add_obj(sp, "TherapyProfiles");
-            po = tp ? jget_or_add_obj(tp, mp->profile) : NULL;
+    cJSON_Delete(observation);
+    source_store_unlock();
+    if (err != ESP_OK) ESP_LOGW(TAG, "import: cannot record processed root source (error %d)", (int)err);
+}
+
+/* Record that a staged root file passed through the importer — distinct
+ * from mark_root_processed's "consumed" marker.  The file stays in place
+ * for re-resolution, but the sync layer may supersede it with fresher
+ * content instead of deferring on unproven staged input forever. */
+static void mark_root_evaluated(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    if (!source_store_lock()) return;
+    source_store_put_result_t put;
+    esp_err_t err = source_store_init(NULL);
+    if (err == ESP_OK) err = source_store_put_path("native_str_import", path, &put);
+    cJSON *observation = err == ESP_OK ? cJSON_CreateObject() : NULL;
+    if (err == ESP_OK)
+        err = observation ? source_store_observe(put.id, "root-evaluated",
+                                                 "native_str_import", observation)
+                          : ESP_ERR_NO_MEM;
+    cJSON_Delete(observation);
+    source_store_unlock();
+    if (err != ESP_OK) ESP_LOGW(TAG, "import: cannot record evaluated root source (error %d)", (int)err);
+}
+
+static bool quarantine_source(const char *path);
+
+static esp_err_t save_native_identity(const edf_import_ctx_t *ctx)
+{
+    const char *path = SD_SUMMARIES_DIR "/native.ident.json";
+    const cJSON *serial = cJSON_GetObjectItemCaseSensitive(ctx->ident, "SerialNumber");
+    int family = settings_provenance_family(ctx->ident);
+    if (!cJSON_IsString(serial) || !serial->valuestring || !serial->valuestring[0] ||
+        strcmp(serial->valuestring, ctx->src_serial) ||
+        family == SETTINGS_FAMILY_UNKNOWN ||
+        strcmp(settings_provenance_family_name(family), ctx->src_family))
+        return ESP_ERR_INVALID_STATE;
+
+    char backup[700];
+    if (imp_recover_replace(path, backup, sizeof(backup)) != 0) return ESP_FAIL;
+    struct stat st;
+    cJSON *old = read_json_file(path);
+    if (!old && (stat(path, &st) == 0 || errno != ENOENT)) return ESP_FAIL;
+    if (old) {
+        const cJSON *old_serial = cJSON_GetObjectItemCaseSensitive(old, "SerialNumber");
+        const cJSON *source = cJSON_GetObjectItemCaseSensitive(old, "_somnotrace_native_source");
+        bool same = cJSON_IsString(source) && source->valuestring &&
+                    !strcmp(source->valuestring, "native_str") &&
+                    cJSON_IsString(old_serial) && old_serial->valuestring &&
+                    !strcmp(old_serial->valuestring, serial->valuestring) &&
+                    settings_provenance_family(old) == family;
+        cJSON_Delete(old);
+        if (!same) return ESP_ERR_INVALID_STATE;
+        return ESP_OK;
+    }
+    cJSON *root = cJSON_Duplicate(ctx->ident, true);
+    if (!root || !cJSON_AddStringToObject(root, "_somnotrace_native_source", "native_str")) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    mkdir(SD_SESSIONS_DIR, 0775);
+    mkdir(SD_SUMMARIES_DIR, 0775);
+    esp_err_t err = write_json_atomic(path, root);
+    cJSON_Delete(root);
+    return err;
+}
+
+/* Retain complete native mask intervals as evidence for associating widely
+ * separated DATALOG anchors. These remain in the source clock domain. */
+static esp_err_t save_native_mask_intervals(const imp_edf_t *e, const uint8_t *rec,
+                                            const edf_import_ctx_t *ctx,
+                                            const char *day)
+{
+    char path[340];
+    snprintf(path, sizeof(path), "%s/%s.native.mask-intervals.json",
+             SD_SUMMARIES_DIR, day);
+    char backup[700];
+    if (imp_recover_replace(path, backup, sizeof(backup)) != 0) return ESP_FAIL;
+    struct stat st;
+    int present = stat(path, &st);
+    if (present != 0 && errno != ENOENT) return ESP_FAIL;
+    cJSON *old = present == 0 ? read_native_day_json(path) : NULL;
+    bool corrupt = present == 0 && !old && S_ISREG(st.st_mode) &&
+                   json_file_provably_corrupt(path);
+    if (present == 0 && !old && !corrupt) return ESP_FAIL;
+    if (old) {
+        const cJSON *serial = cJSON_GetObjectItemCaseSensitive(old, "serial");
+        const cJSON *family = cJSON_GetObjectItemCaseSensitive(old, "family");
+        if (!cJSON_IsString(serial) || !serial->valuestring ||
+            !cJSON_IsString(family) || !family->valuestring ||
+            strcmp(serial->valuestring, ctx->src_serial) ||
+            strcmp(family->valuestring, ctx->src_family)) {
+            cJSON_Delete(old);
+            return ESP_ERR_INVALID_STATE;
         }
-        if (!po) continue;
-        if (mp->enums) {
-            int raw = as10 ? (int)dig : (int)dig - mp->off11;
-            if (raw < 0) continue;
-            int last = 0;
-            while (mp->enums[last]) last++;
-            last--;
-            if (raw > last) {
-                if (!mp->clamp) continue;
-                raw = last;
+    }
+    cJSON *out = cJSON_CreateObject();
+    if (!out || !cJSON_AddStringToObject(out, "day", day) ||
+        !cJSON_AddStringToObject(out, "serial", ctx->src_serial) ||
+        !cJSON_AddStringToObject(out, "family", ctx->src_family)) {
+        cJSON_Delete(old);
+        cJSON_Delete(out);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON *pairs = cJSON_AddArrayToObject(out, "pairs");
+    if (!pairs) { cJSON_Delete(old); cJSON_Delete(out); return ESP_ERR_NO_MEM; }
+    int on_sig = imp_sig_find(e, "MaskOn"), off_sig = imp_sig_find(e, "MaskOff");
+    bool complete = on_sig >= 0 && off_sig >= 0 &&
+                    e->sigs[on_sig].spr == e->sigs[off_sig].spr &&
+                    e->sigs[on_sig].spr <= 20;
+    int last_off = -1, count = 0;
+    if (complete) {
+        for (int k = 0; k < e->sigs[on_sig].spr; k++) {
+            int on = str_dig_at(rec, &e->sigs[on_sig], k);
+            int off = str_dig_at(rec, &e->sigs[off_sig], k);
+            bool on_missing = on == -1 || on == INT16_MIN;
+            bool off_missing = off == -1 || off == INT16_MIN;
+            if (on_missing && off_missing) continue;
+            if (on_missing || off_missing || on < 0 || off < on ||
+                off > 1440 || on < last_off) {
+                complete = false;
+                break;
             }
-            jset_str(po, mp->field, mp->enums[raw]);
-        } else if (mp->off11) {
-            /* Numeric enum index (Trigger/Cycle sensitivity, 0..6). */
-            int raw = as10 ? (int)dig : (int)dig - mp->off11;
-            if (raw < 0 || raw > 6) continue;
-            jset_num(po, mp->field, raw);
-        } else {
-            jset_num(po, mp->field, (double)dig / (double)mp->div);
+            if (on == off) continue;
+            int values[] = {on, off};
+            cJSON *pair = cJSON_CreateIntArray(values, 2);
+            if (!pair || !cJSON_AddItemToArray(pairs, pair)) {
+                cJSON_Delete(pair);
+                cJSON_Delete(old);
+                cJSON_Delete(out);
+                return ESP_ERR_NO_MEM;
+            }
+            last_off = off;
+            count++;
         }
-        applied++;
     }
-    return applied;
+    complete = complete && count > 0;
+    if (!complete && !old && !corrupt) {
+        cJSON_Delete(out);
+        return ESP_OK;
+    }
+    if (!cJSON_AddBoolToObject(out, "complete", complete)) {
+        cJSON_Delete(old);
+        cJSON_Delete(out);
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t ret = ESP_OK;
+    if (!old || !cJSON_Compare(old, out, true)) {
+        ret = !corrupt || quarantine_source(path)
+              ? write_json_atomic(path, out) : ESP_FAIL;
+        if (ret == ESP_OK) {
+            cJSON *saved = read_native_day_json(path);
+            if (!saved || !cJSON_Compare(saved, out, true)) ret = ESP_FAIL;
+            cJSON_Delete(saved);
+        }
+    }
+    cJSON_Delete(old);
+    cJSON_Delete(out);
+    return ret;
 }
 
-/* Import every record of an STR.edf into per-day spools + day settings.
- * summaries/<day>.settings.json = the card's CurrentSettings tree (when
- * present) overlaid with that record's S.* channels — never a stub that
- * shadows the real tree in edf_generate_str_edf's priority lookup.
- * With no CurrentSettings (AS10 cards), the newest record's S.*-only
- * reconstruction becomes ctx->settings so session sidecars still carry
- * a usable tree. */
-static int import_str_edf(const char *path, edf_import_ctx_t *ctx,
-                          edf_import_unit_t *u)
+/* Set before changing any day, so a reset cannot lose the rebuild request. */
+static esp_err_t mark_native_dirty(void)
 {
-    imp_edf_t *e = imp_malloc(sizeof(imp_edf_t));
-    if (!e) return 0;
-    if (imp_edf_open(e, path) != ESP_OK) { free(e); return 0; }
+    struct stat st;
+    if (stat(IMP_NATIVE_DIRTY, &st) == 0) return ESP_OK;
+    if (errno != ENOENT) return ESP_FAIL;
+    cJSON *marker = cJSON_CreateObject();
+    if (!marker) return ESP_ERR_NO_MEM;
+    esp_err_t err = write_json_atomic(IMP_NATIVE_DIRTY, marker);
+    cJSON_Delete(marker);
+    return err;
+}
+
+/* Treat each explicitly imported AS11 STR record as the source for that day.
+ * Absent fields remain unknown rather than inheriting CurrentSettings. */
+static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ctx,
+                                          edf_import_unit_t *u)
+{
+    imp_edf_t *e = imp_psram_malloc(sizeof(imp_edf_t));
+    if (!e) return STR_IMPORT_RETRY;
+    esp_err_t opened = imp_edf_open(e, path);
+    if (opened != ESP_OK) {
+        free(e);
+        return opened == ESP_ERR_NO_MEM || opened == ESP_ERR_NOT_FOUND || opened == ESP_FAIL
+               ? STR_IMPORT_RETRY : STR_IMPORT_RETAIN;
+    }
+    int date_sig = imp_sig_find(e, "Date");
+    if (e->incomplete || e->n_records > IMP_MAX_STR_REC ||
+        date_sig < 0 || e->sigs[date_sig].spr != 1 || e->header_day <= 0 ||
+        fabs(e->rdur_s - 86400.0) > 0.001 ||
+        (imp_sig_find(e, "Duration") < 0 && imp_sig_find(e, "Mode") < 0 &&
+         imp_sig_find(e, "MaskOn") < 0) ||
+        (e->n_declared < 0 && e->n_records == 0)) {
+        free(e);
+        return STR_IMPORT_RETAIN;
+    }
 
     /* Platform family: Identification.* wins when resolved; else the
      * STR's own recording_id carries SRN=/MID=/VID= (MID < 40 → AS10,
      * which also selects 0-indexed enum decoding for S.* channels). */
-    if (!ctx->src_family[0] || !ctx->ident) {
-        cJSON *rid = ident_from_rec_id(e->rec_id);
-        if (rid) {
-            const cJSON *mid = cJSON_GetObjectItem(rid, "PlatformIdentifier");
-            const cJSON *sn  = cJSON_GetObjectItem(rid, "SerialNumber");
-            if (!ctx->src_family[0] && mid && cJSON_IsNumber(mid))
-                snprintf(ctx->src_family, sizeof(ctx->src_family), "%s",
-                         mid->valueint >= 40 ? "AS11" : "AS10");
-            if (!ctx->src_serial[0] && sn && cJSON_IsString(sn))
-                snprintf(ctx->src_serial, sizeof(ctx->src_serial), "%s",
-                         sn->valuestring);
-            if (!ctx->ident) ctx->ident = rid;
-            else cJSON_Delete(rid);
+    cJSON *rid = ident_from_rec_id(e->rec_id);
+    if (rid) {
+        const cJSON *mid = cJSON_GetObjectItem(rid, "PlatformIdentifier");
+        const cJSON *sn = cJSON_GetObjectItem(rid, "SerialNumber");
+        const char *family = cJSON_IsNumber(mid)
+                             ? (mid->valueint >= 40 ? "AS11" : "AS10") : "";
+        if ((ctx->src_family[0] && family[0] && strcmp(ctx->src_family, family) != 0) ||
+            (ctx->src_serial[0] && cJSON_IsString(sn) && sn->valuestring &&
+             sn->valuestring[0] && strcmp(ctx->src_serial, sn->valuestring) != 0)) {
+            ESP_LOGE(TAG, "import: STR and identification refer to different machines");
+            cJSON_Delete(rid);
+            free(e);
+            return STR_IMPORT_RETAIN;
         }
+        if (!ctx->src_family[0] && family[0])
+            snprintf(ctx->src_family, sizeof(ctx->src_family), "%s", family);
+        if (!ctx->src_serial[0] && cJSON_IsString(sn) && sn->valuestring)
+            snprintf(ctx->src_serial, sizeof(ctx->src_serial), "%s", sn->valuestring);
+        if (!ctx->ident) ctx->ident = rid;
+        else cJSON_Delete(rid);
     }
     bool as10 = !strcmp(ctx->src_family, "AS10");
-
+    warn_unsupported_setting_labels(e, as10);
     FILE *f = fopen(path, "rb");
-    if (!f) { free(e); return 0; }
-    uint8_t *rec = imp_malloc((size_t)e->rec_stride);
-    str_day_t *d = imp_calloc(1, sizeof(*d));
-    if (!rec || !d) { free(rec); free(d); fclose(f); free(e); return 0; }
+    if (!f) { free(e); return STR_IMPORT_RETRY; }
+    uint8_t *rec = imp_psram_malloc((size_t)e->rec_stride);
+    str_day_t *d = imp_psram_calloc(1, sizeof(*d));
+    if (!rec || !d) { free(rec); free(d); fclose(f); free(e); return STR_IMPORT_RETRY; }
 
-    int written = 0;
-    cJSON *latest = NULL;   /* newest S.* reconstruction (no CurrentSettings) */
-    int64_t n = e->n_records;
-    if (n > IMP_MAX_STR_REC) n = IMP_MAX_STR_REC;
-    for (int64_t r = 0; r < n; r++) {
-        if (!imp_edf_read_rec(e, f, r, rec)) break;
-        if (!imp_edf_rec_crc_ok(e, rec)) continue;   /* corrupt day → skip */
+    int written = 0, settings_written = 0, conflicting_days = 0, unsupported = 0;
+    bool retry = false, retain = false, ambiguous_any = false, identity_saved = false;
+    for (int64_t r = 0; r < e->n_records; r++) {
+        if (!imp_edf_read_rec(e, f, r, rec)) { retry = true; break; }
+        if (!imp_edf_rec_crc_ok(e, rec)) { retain = true; continue; }
         decode_str_record(e, rec, d);
-        if (d->day_number <= 0) continue;
-        bool spool_new = false;
-        if (write_spool_for_day(d, false, &spool_new) != ESP_OK) continue;
-        /* Only a spool this pass created counts: re-importing a card whose
-         * days already exist must not look like new data (the worker would
-         * rebuild and re-offer the newest day for nothing). */
-        if (spool_new) written++;
-
+        if (d->day_number <= 0) { retain = true; continue; }
+        if (d->day_number != e->header_day + r) {
+            ESP_LOGW(TAG, "import: STR record %lld disagrees with its header date",
+                     (long long)r);
+            retain = true;
+            continue;
+        }
+        if (!identity_saved) {
+            esp_err_t identity = save_native_identity(ctx);
+            if (identity != ESP_OK) {
+                ESP_LOGW(TAG, "import: STR identity unknown or conflicting (error %d)", (int)identity);
+                if (identity == ESP_ERR_INVALID_STATE) retain = true;
+                else retry = true;
+                break;
+            }
+            identity_saved = true;
+        }
         int y, mo, dd;
         imp_civil_from_days(d->day_number, &y, &mo, &dd);
-        char spath[340];
-        snprintf(spath, sizeof(spath), "%s/%04d%02d%02d.settings.json",
-                 SD_SUMMARIES_DIR, y, mo, dd);
-        cJSON *root = ctx->settings ? cJSON_Duplicate(ctx->settings, true)
-                                    : cJSON_CreateObject();
-        if (!root) continue;
-        int applied = overlay_str_settings(root, e, rec, d->mode_dig, as10);
-        struct stat st;
-        /* Only write when the file carries real settings — an empty stub
-         * would shadow richer per-session settings.json files in the
-         * edf_summary.c priority chain. */
-        if ((ctx->settings || applied > 0) && stat(spath, &st) != 0) {
-            mkdir(SD_SESSIONS_DIR, 0775);
-            mkdir(SD_SUMMARIES_DIR, 0775);
-            write_json_atomic(spath, root);
+        char day[9], spath[340];
+        snprintf(day, sizeof(day), "%04d%02d%02d", y, mo, dd);
+        bool ambiguous = false;
+
+        if (ctx->src_serial[0] &&
+            (!strcmp(ctx->src_family, "AS11") || as10)) {
+            cJSON *native = as10 ? as10_str_settings(e, rec, &unsupported)
+                                 : as11_str_settings(e, rec, &unsupported);
+            snprintf(spath, sizeof(spath), "%s/%s.native.settings.json",
+                     SD_SUMMARIES_DIR, day);
+            char backup[700];
+            if (imp_recover_replace(spath, backup, sizeof(backup)) != 0) {
+                cJSON_Delete(native);
+                retry = true;
+                break;
+            }
+            cJSON *old = read_native_day_json(spath);
+            struct stat existing;
+            int stat_result = stat(spath, &existing);
+            bool unreadable = (stat_result == 0 && !old) ||
+                              (stat_result != 0 && errno != ENOENT);
+            bool corrupt = unreadable && stat_result == 0 &&
+                           S_ISREG(existing.st_mode) &&
+                           json_file_provably_corrupt(spath);
+            if (unreadable && !corrupt) {
+                ESP_LOGE(TAG, "import: cannot safely read existing daily settings");
+                retry = true;
+            } else if (!native) {
+                retry = true;
+            } else {
+                const char *old_serial = settings_provenance_serial(old);
+                if (old && (!settings_provenance_is(old, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) ||
+                            !old_serial || strcmp(old_serial, ctx->src_serial) != 0 ||
+                            !settings_provenance_is_family(old, as10 ? SETTINGS_FAMILY_AS10 : SETTINGS_FAMILY_AS11))) {
+                    ESP_LOGE(TAG, "import: daily settings belong to another or unknown machine");
+                    ambiguous_any = ambiguous = true;
+                } else if (!settings_provenance_set(native, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) ||
+                           !settings_provenance_set_serial(native, ctx->src_serial) ||
+                           !settings_provenance_set_family(native, as10 ? SETTINGS_FAMILY_AS10 : SETTINGS_FAMILY_AS11)) {
+                    retry = true;
+                } else if (!old || !cJSON_Compare(old, native, true)) {
+                    mkdir(SD_SESSIONS_DIR, 0775);
+                    mkdir(SD_SUMMARIES_DIR, 0775);
+                    if (mark_native_dirty() == ESP_OK &&
+                        (!corrupt || quarantine_source(spath)) &&
+                        write_json_atomic(spath, native) == ESP_OK) {
+                        cJSON *written = read_native_day_json(spath);
+                        if (written && cJSON_Compare(written, native, true))
+                            settings_written++;
+                        else
+                            retry = true;
+                        cJSON_Delete(written);
+                    } else retry = true;
+                    if (corrupt && !retry)
+                        ESP_LOGW(TAG, "import: recovered corrupt native settings for %s; original quarantined", day);
+                }
+            }
+            cJSON_Delete(old);
+            cJSON_Delete(native);
         }
-        if (!ctx->settings) { cJSON_Delete(latest); latest = root; }
-        else cJSON_Delete(root);
+        if (!retry && settings_provenance_day_conflicts(
+                day, ctx->src_serial, as10 ? SETTINGS_FAMILY_AS10 : SETTINGS_FAMILY_AS11)) {
+            conflicting_days++;
+            ambiguous_any = ambiguous = true;
+        }
+        if (!retry && !ambiguous) {
+            esp_err_t masks = save_native_mask_intervals(e, rec, ctx, day);
+            if (masks == ESP_ERR_INVALID_STATE) {
+                conflicting_days++;
+                ambiguous_any = ambiguous = true;
+            } else if (masks != ESP_OK) {
+                retry = true;
+            }
+        }
+        if (!retry && !ambiguous) {
+            bool spool_new = false;
+            char spool_path[330];
+            struct stat spool_st;
+            snprintf(spool_path, sizeof(spool_path), "%s/%s.spool", SD_SUMMARIES_DIR, day);
+            int spool_status = stat(spool_path, &spool_st);
+            if ((spool_status != 0 && (errno != ENOENT || mark_native_dirty() != ESP_OK)) ||
+                write_spool_for_day(d, false, as10, &spool_new) != ESP_OK) retry = true;
+            else if (spool_new) written++;
+        }
+        if (retry) break;
     }
-    if (latest) ctx->settings = latest;
     free(d);
     free(rec);
     fclose(f);
     free(e);
     u->spools_written += written;
-    return written;
+    u->settings_written += settings_written;
+    /* The STR is re-evaluated hourly while retained — only warn when the
+     * conflicting-day count actually changes. */
+    static int s_last_conflicting_days = -1;
+    if (conflicting_days != s_last_conflicting_days) {
+        s_last_conflicting_days = conflicting_days;
+        if (conflicting_days)
+            ESP_LOGW(TAG, "import: %d day(s) have conflicting or unreadable session identity",
+                     conflicting_days);
+    }
+    if (unsupported)
+        ESP_LOGW(TAG, "import: %d native settings samples have unsupported units or ranges; "
+                 "the original STR is retained", unsupported);
+    /* A single ambiguous day must not discard the whole source or the
+     * root identity needed by independent days (WP3). */
+    return retry ? STR_IMPORT_RETRY : retain ? STR_IMPORT_RETAIN :
+           ambiguous_any ? STR_IMPORT_PARTIAL : STR_IMPORT_OK;
 }
 
 /* Refresh device_metadata.json when the root pass resolved ident or
  * settings — mirrors save_device_metadata_snapshot's {"serial","ident",
  * "settings"} merge semantics (old settings carry over only for the same
  * machine serial). */
-static void write_device_metadata(const edf_import_ctx_t *ctx)
+typedef enum {
+    METADATA_SAVED,
+    METADATA_RETAIN,
+    METADATA_RETRY,
+} metadata_result_t;
+
+static metadata_result_t write_device_metadata(const edf_import_ctx_t *ctx)
 {
-    if (!ctx->ident && !ctx->settings) return;
+    /* Settings without a source identity must not be paired with the cache. */
+    if (!ctx->ident || !ctx->src_serial[0] ||
+        settings_provenance_family(ctx->ident) == SETTINGS_FAMILY_UNKNOWN)
+        return METADATA_RETAIN;
+    char backup[700];
+    if (imp_recover_replace(SD_DEVICE_METADATA_PATH, backup, sizeof(backup)) != 0)
+        return METADATA_RETRY;
     cJSON *existing = read_json_file(SD_DEVICE_METADATA_PATH);
+    struct stat st;
+    int status = stat(SD_DEVICE_METADATA_PATH, &st);
+    if ((!existing && status == 0) || (status != 0 && errno != ENOENT) ||
+        (existing && !cJSON_IsObject(existing))) {
+        cJSON_Delete(existing);
+        return METADATA_RETRY;
+    }
     const cJSON *old_ident = existing ? cJSON_GetObjectItem(existing, "ident") : NULL;
     const cJSON *old_settings = existing ? cJSON_GetObjectItem(existing, "settings") : NULL;
     if (!cJSON_IsObject(old_ident)) old_ident = NULL;
     if (!cJSON_IsObject(old_settings)) old_settings = NULL;
 
-    const cJSON *use_ident = ctx->ident ? ctx->ident : old_ident;
-    if (!use_ident) { cJSON_Delete(existing); return; }
+    const cJSON *use_ident = ctx->ident;
     const cJSON *sn = cJSON_GetObjectItem(use_ident, "SerialNumber");
     const char *serial = (sn && cJSON_IsString(sn) && sn->valuestring)
                          ? sn->valuestring : "";
+    if (!serial[0] || strcmp(serial, ctx->src_serial) != 0) {
+        cJSON_Delete(existing);
+        return METADATA_RETAIN;
+    }
     const char *old_serial = "";
     if (old_ident) {
         const cJSON *os = cJSON_GetObjectItem(old_ident, "SerialNumber");
         if (os && cJSON_IsString(os) && os->valuestring)
             old_serial = os->valuestring;
     }
+    int old_family = settings_provenance_family(old_ident);
+    int new_family = settings_provenance_family(ctx->ident);
+    if (existing && (!old_ident || !old_serial[0] ||
+        strcmp(serial, old_serial) != 0 || old_family == SETTINGS_FAMILY_UNKNOWN ||
+        old_family != new_family)) {
+        ESP_LOGW(TAG, "import: preserving existing metadata for a different or unknown machine");
+        cJSON_Delete(existing);
+        return METADATA_RETAIN;
+    }
     const cJSON *use_settings = ctx->settings;
-    if (!use_settings && old_settings &&
-        (!ctx->ident || !strcmp(serial, old_serial)))
+    if (!use_settings && old_settings && !strcmp(serial, old_serial))
         use_settings = old_settings;
 
     cJSON *snap = cJSON_CreateObject();
-    if (snap) {
-        cJSON_AddStringToObject(snap, "serial", serial);
-        cJSON_AddItemToObject(snap, "ident",
-                              cJSON_Duplicate((cJSON *)use_ident, true));
-        if (use_settings)
-            cJSON_AddItemToObject(snap, "settings",
-                                  cJSON_Duplicate((cJSON *)use_settings, true));
-        mkdir(SD_SESSIONS_DIR, 0775);
-        write_json_atomic(SD_DEVICE_METADATA_PATH, snap);
-        cJSON_Delete(snap);
+    cJSON *ident_copy = cJSON_Duplicate(use_ident, true);
+    cJSON *settings_copy = use_settings ? cJSON_Duplicate(use_settings, true) : NULL;
+    bool ok = snap && ident_copy && (!use_settings || settings_copy) &&
+              cJSON_AddStringToObject(snap, "serial", serial);
+    if (ok && cJSON_AddItemToObject(snap, "ident", ident_copy)) {
+        ident_copy = NULL;
+    } else {
+        ok = false;
     }
+    if (ok && settings_copy) {
+        if (cJSON_AddItemToObject(snap, "settings", settings_copy)) settings_copy = NULL;
+        else ok = false;
+    }
+    cJSON_Delete(ident_copy);
+    cJSON_Delete(settings_copy);
+    mkdir(SD_SESSIONS_DIR, 0775);
+    esp_err_t result = ok ? write_json_atomic(SD_DEVICE_METADATA_PATH, snap) : ESP_ERR_NO_MEM;
+    cJSON_Delete(snap);
     cJSON_Delete(existing);
+    return result == ESP_OK ? METADATA_SAVED : METADATA_RETRY;
 }
 
 /* ── SomnoBridge drift sidecar (<day>/_bridge_drift.json) ───────────── */
 
 typedef struct {
     int64_t  drift_ms;          /* effective drift actually applied (0 when !usable) */
+    int64_t  half_ms;           /* accuracy bound of the chosen record, -1 absent */
     int64_t  measured_at_ms;    /* reference_at_ms from the sidecar, 0 when absent */
     bool     valid, usable;
+    /* Sidecar is a transport-failure placeholder: the bridge evidence is
+     * owed but not yet arrived — importing now would bake drift=0 into
+     * every session manifest. */
+    bool     pending_transport;
     char     source[48];     /* clock_drift_source / import provenance */
+    /* Source-device fixed zone: civil times inside the EDFs are the
+     * device's own local civil — when the bridge confirms a fixed-offset
+     * rule it wins over the ESP's own zone for device-domain parsing.
+     * INT32_MIN = no confirmed rule (ESP-local interpretation kept). */
+    int32_t  dev_tz_off_s;
+    char     dev_tz_rule[40];
     cJSON   *raw;            /* full sidecar JSON, embedded in the manifest */
 } imp_drift_t;
 
@@ -1842,15 +2450,130 @@ static bool json_bool(const cJSON *o, const char *key, bool dflt)
     return (v && cJSON_IsBool(v)) ? cJSON_IsTrue(v) : dflt;
 }
 
-/* Selection order per .ai/IMPORT-EDFs.md §4.2:
- *   1. source_of_truth           → measured, valid+usable
- *   2. best_available_offset     → valid+usable
- *   3. estimate (has_drift)      → valid=false, usable iff half_ms ≤ 5000
- *   4. none                      → drift 0, everything false
+/* A CPAP clock can plausibly be wrong by at most ~a timezone plus drift;
+ * |drift| beyond 24 h is an epoch-conversion bug, not a measurement. */
+#define IMP_DRIFT_MAX_MS     (24LL * 3600 * 1000)
+#define IMP_DRIFT_USABLE_HALF 5000
+
+/* schema-5 selection record (source_of_truth / best_available_offset):
+ * drift = clock_drift_ms or the midpoint of interval_ms;
+ * half = accuracy_half_ms (legacy half_ms accepted). */
+static bool drift_sel_parse(const cJSON *r, int64_t *drift, int64_t *half,
+                            int64_t *measured_at, const char **quality,
+                            const char **view)
+{
+    int64_t v;
+    if (!json_i64(r, "clock_drift_ms", &v)) {
+        const cJSON *iv = cJSON_GetObjectItem(r, "interval_ms");
+        const cJSON *lo = iv ? cJSON_GetArrayItem(iv, 0) : NULL;
+        const cJSON *hi = iv ? cJSON_GetArrayItem(iv, 1) : NULL;
+        if (!cJSON_IsNumber(lo) || !cJSON_IsNumber(hi)) return false;
+        v = ((int64_t)lo->valuedouble + (int64_t)hi->valuedouble) / 2;
+    }
+    int64_t h = -1;
+    if (!json_i64(r, "accuracy_half_ms", &h)) json_i64(r, "half_ms", &h);
+    int64_t at = 0;
+    if (!json_i64(r, "reference_at_ms", &at))
+        json_i64(r, "computed_at_ms", &at);
+    const cJSON *q = cJSON_GetObjectItem(r, "quality");
+    const cJSON *vw = cJSON_GetObjectItem(r, "selected_view");
+    if (!(vw && cJSON_IsString(vw)))
+        vw = cJSON_GetObjectItem(r, "origin");
+    *drift = v;
+    *half = h;
+    *measured_at = at;
+    *quality = (q && cJSON_IsString(q)) ? q->valuestring : NULL;
+    *view = (vw && cJSON_IsString(vw)) ? vw->valuestring : NULL;
+    return true;
+}
+
+static bool estimate_state_ok(const cJSON *est)
+{
+    const char *s = cJSON_GetStringValue(cJSON_GetObjectItem(est,
+                                                           "estimate_state"));
+    return s && (!strcmp(s, "provisional") || !strcmp(s, "validated"));
+}
+
+/* Inverse of imp_civil_from_days (public-domain algorithm). */
+static int64_t imp_days_from_civil(int y, int m, int d)
+{
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (int64_t)era * 146097 + (int)doe - 719468;
+}
+
+/* The ESP local-time UTC offset (s) at an epoch instant — computed without
+ * the non-portable tm_gmtoff, so the host test build sees the same math. */
+static int64_t imp_esp_off_at(int64_t epoch_ms)
+{
+    time_t t = (time_t)(epoch_ms / 1000);
+    struct tm lt;
+    if (!localtime_r(&t, &lt)) return 0;
+    int64_t naive = imp_days_from_civil(lt.tm_year + 1900, lt.tm_mon + 1,
+                                        lt.tm_mday) * 86400
+                  + (int64_t)lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec;
+    return naive - (int64_t)t;
+}
+
+/* Parse a fixed-offset zone rule ("UTC-10", "AEST-10", "UTC+5:30") into
+ * seconds EAST of UTC (local = utc + off).  POSIX sign is west-positive:
+ * "UTC-10" means UTC+10, i.e. +36000.  Returns false for non-fixed or
+ * unparseable rules (a DST tail means the rule isn't a fixed offset). */
+static bool imp_parse_tz_offset(const char *rule, int32_t *off_s)
+{
+    if (!rule || !off_s) return false;
+    const char *sign = NULL;
+    for (const char *p = rule; *p; p++)
+        if (*p == '+' || *p == '-') sign = p;
+    if (!sign) return false;
+    const char *q = sign + 1;
+    int parts[3] = {0, 0, 0};
+    int np = 0;
+    while (np < 3 && *q >= '0' && *q <= '9') {
+        char *end = NULL;
+        long v = strtol(q, &end, 10);
+        if (end == q) return false;
+        parts[np++] = (int)v;
+        q = (*end == ':') ? end + 1 : end;
+        if (*end != ':') break;
+    }
+    if (*q != '\0' && *q != ',') return false;
+    int64_t off = (int64_t)parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (off > 14 * 3600) return false;
+    *off_s = (int32_t)(*sign == '-' ? off : -off);
+    return true;
+}
+
+/* Total shift applied at a device-domain instant: the measured drift plus
+ * the zone delta between the source device's confirmed fixed rule and the
+ * ESP's own zone — source civil times are device-local, and mktime()
+ * reinterpreted them under the ESP zone, so the difference between the
+ * two interpretations is the correction. */
+static int64_t imp_shift_at(const imp_drift_t *d, int64_t t_dev_ms)
+{
+    int64_t s = d->drift_ms;
+    if (d->dev_tz_off_s != INT32_MIN)
+        s += (imp_esp_off_at(t_dev_ms) - (int64_t)d->dev_tz_off_s) * 1000;
+    return s;
+}
+
+/* Selection order (schema-5 shapes; legacy field names accepted):
+ *   1. source_of_truth            → fresh live qualified → valid+usable
+ *   2. best_available_offset      → current or previous-session selection
+ *   3. completed_session_fallback → eligible persisted record
+ *   4. estimate                   → valid=false, usable iff half ≤ 5000
+ *   5. none                       → drift 0, everything false
+ * Every tier is bounded by |drift| ≤ 24 h — an epoch-conversion bug
+ * produces values orders of magnitude beyond a real clock offset.
  * The whole sidecar is kept verbatim under "somnobridge_drift". */
 static void parse_drift_sidecar(const char *path, imp_drift_t *d)
 {
     memset(d, 0, sizeof(*d));
+    d->dev_tz_off_s = INT32_MIN;
+    d->half_ms = -1;
     snprintf(d->source, sizeof(d->source), "file_import");
     if (!path || !path[0]) return;
 
@@ -1859,46 +2582,122 @@ static void parse_drift_sidecar(const char *path, imp_drift_t *d)
         ESP_LOGW(TAG, "import: %s unreadable — file_import drift", path);
         return;
     }
-    const char *const keys[] = {
-        "source_of_truth", "best_available_offset", "estimate"
-    };
-    const cJSON *rec = NULL;
-    int64_t drift = 0;
-    int tier = -1;
-    for (int i = 0; i < 3; i++) {
-        const cJSON *r = cJSON_GetObjectItem(d->raw, keys[i]);
-        if (!r || !cJSON_IsObject(r)) continue;
-        int64_t v;
-        if (!json_i64(r, "clock_drift_ms", &v)) continue;
-        if (i == 1 && !json_bool(r, "valid", true)) continue;
-        if (i == 2 && !json_bool(r, "has_drift", false)) continue;
-        rec = r; drift = v; tier = i;
-        break;
+
+    /* A pending placeholder is not evidence: "metadata_unavailable" is a
+     * settled bridge answer (drift 0 is honest); "transport_error" means
+     * the sync side still owes this day its real record — the caller
+     * defers the group instead of committing zero drift. */
+    if (json_bool(d->raw, "pending", false)) {
+        const char *reason = cJSON_GetStringValue(
+            cJSON_GetObjectItem(d->raw, "reason"));
+        if (reason && !strcmp(reason, "transport_error")) {
+            d->pending_transport = true;
+            snprintf(d->source, sizeof(d->source), "somnobridge_pending");
+            return;
+        }
     }
-    if (!rec) {
+
+    const cJSON *est = cJSON_GetObjectItem(d->raw, "estimate");
+    /* Device-zone rule applies independently of drift usability. */
+    const char *rule = cJSON_GetStringValue(cJSON_GetObjectItem(est,
+                                                              "timezone_rule"));
+    if (rule && json_bool(est, "timezone_confirmed", false) &&
+        imp_parse_tz_offset(rule, &d->dev_tz_off_s)) {
+        snprintf(d->dev_tz_rule, sizeof(d->dev_tz_rule), "%s", rule);
+    } else {
+        d->dev_tz_off_s = INT32_MIN;
+    }
+
+    const cJSON *sot  = cJSON_GetObjectItem(d->raw, "source_of_truth");
+    const cJSON *best = cJSON_GetObjectItem(d->raw, "best_available_offset");
+    const cJSON *fb   = cJSON_GetObjectItem(d->raw,
+                                          "completed_session_fallback");
+
+    int64_t drift = 0, half = -1, at = 0, v = 0, h = -1;
+    const char *src = NULL, *q = NULL, *view = NULL;
+    bool valid = false, usable = false;
+
+    if (cJSON_IsObject(sot) &&
+        drift_sel_parse(sot, &v, &h, &at, &q, &view) &&
+        (!q || strcmp(q, "none"))) {
+        if (llabs(v) <= IMP_DRIFT_MAX_MS) {
+            drift = v; half = h;
+            valid = true; usable = (h < 0 || h <= IMP_DRIFT_USABLE_HALF);
+            src = (q && q[0]) ? q : "sot";
+        } else {
+            ESP_LOGW(TAG, "import: %s sot drift %lld ms implausible",
+                     path, (long long)v);
+        }
+    }
+    if (!src && cJSON_IsObject(best) && json_bool(best, "valid", true) &&
+        drift_sel_parse(best, &v, &h, &at, &q, &view) &&
+        (!q || strcmp(q, "none"))) {
+        if (llabs(v) <= IMP_DRIFT_MAX_MS) {
+            drift = v; half = h;
+            valid = true; usable = (h < 0 || h <= IMP_DRIFT_USABLE_HALF);
+            src = (view && !strcmp(view, "previous_session_fallback"))
+                ? "fallback"
+                : (view && !strcmp(view, "current_session_estimate"))
+                ? "current" : (q && q[0]) ? q : "best";
+        } else {
+            ESP_LOGW(TAG, "import: %s best drift %lld ms implausible",
+                     path, (long long)v);
+        }
+    }
+    if (!src && cJSON_IsObject(fb) &&
+        json_bool(fb, "fallback_eligible", false)) {
+        const cJSON *rec = cJSON_GetObjectItem(fb, "record");
+        if (cJSON_IsObject(rec) && json_i64(rec, "clock_drift_ms", &v)) {
+            if (llabs(v) <= IMP_DRIFT_MAX_MS) {
+                if (!json_i64(fb, "adjusted_half_ms", &h))
+                    json_i64(rec, "accuracy_half_ms", &h);
+                if (!json_i64(rec, "reference_at_ms", &at))
+                    json_i64(rec, "computed_at_ms", &at);
+                drift = v; half = h;
+                valid = true;
+                usable = (h < 0 || h <= IMP_DRIFT_USABLE_HALF);
+                src = "fallback";
+            } else {
+                ESP_LOGW(TAG, "import: %s fallback drift %lld ms implausible",
+                         path, (long long)v);
+            }
+        }
+    }
+    if (!src && cJSON_IsObject(est) &&
+        (json_bool(est, "has_drift", false) || estimate_state_ok(est)) &&
+        json_i64(est, "clock_drift_ms", &v)) {
+        if (llabs(v) <= IMP_DRIFT_MAX_MS) {
+            if (!json_i64(est, "accuracy_half_ms", &h))
+                json_i64(est, "half_ms", &h);
+            if (!json_i64(est, "reference_at_ms", &at))
+                json_i64(est, "computed_at_ms", &at);
+            drift = v; half = h;
+            valid = false;
+            usable = (h >= 0 && h <= IMP_DRIFT_USABLE_HALF);
+            src = "estimate";
+        } else {
+            ESP_LOGW(TAG, "import: %s estimate drift %lld ms implausible",
+                     path, (long long)v);
+        }
+    }
+
+    if (!src) {
         snprintf(d->source, sizeof(d->source), "somnobridge_none");
         return;
     }
-    d->valid    = (tier < 2);
-    int64_t half = 0;
-    bool have_half = json_i64(rec, "half_ms", &half) ||
-                     json_i64(rec, "accuracy_half_ms", &half);
-    d->usable   = (tier < 2) ? true : (have_half && half <= 5000);
+    d->valid  = valid;
+    d->usable = usable;
+    d->half_ms = half;
+    d->measured_at_ms = at;
     /* Only a usable drift may shift session timestamps (spec §4.2).  The
-     * raw estimate stays inside somnobridge_drift for diagnostics. */
+     * raw record stays inside somnobridge_drift for diagnostics. */
     d->drift_ms = d->usable ? drift : 0;
-    if (!json_i64(rec, "reference_at_ms", &d->measured_at_ms))
-        json_i64(rec, "computed_at_ms", &d->measured_at_ms);
-    const cJSON *q = cJSON_GetObjectItem(rec, "quality");
-    if (!(q && cJSON_IsString(q) && q->valuestring))
-        q = cJSON_GetObjectItem(rec, "origin");
-    snprintf(d->source, sizeof(d->source), "somnobridge_%s",
-             (q && cJSON_IsString(q) && q->valuestring) ? q->valuestring
-             : (tier == 0 ? "sot" : tier == 1 ? "provisional" : "estimate"));
+    snprintf(d->source, sizeof(d->source), "somnobridge_%s", src);
     ESP_LOGI(TAG, "import: %s drift=%lld ms, applied=%lld ms "
-             "(%s, valid=%d usable=%d)",
+             "(%s, valid=%d usable=%d, half=%lld, tz=%s)",
              path, (long long)drift, (long long)d->drift_ms,
-             d->source, (int)d->valid, (int)d->usable);
+             d->source, (int)d->valid, (int)d->usable, (long long)half,
+             d->dev_tz_off_s != INT32_MIN ? d->dev_tz_rule : "esp");
 }
 
 /* ── Session clustering ─────────────────────────────────────────────── */
@@ -1921,105 +2720,79 @@ static int file_ts_cmp(const void *a, const void *b)
 static bool is_wave(imp_kind_t k) { return k == K_BRP || k == K_PLD || k == K_SA2; }
 static bool is_ann(imp_kind_t k) { return k == K_EVE || k == K_CSL; }
 
-/* Cluster a day's files into sessions.  `files` is sorted in place — the
- * returned cluster members point INTO it, so it must outlive `out`.
- * Wave files (BRP/PLD/SA2) sharing a timestamp ±2 s form a wave cluster;
- * annotation files (EVE/CSL) likewise form ann clusters.  Each ann cluster
- * pairs with the earliest wave cluster starting 0..60 s after it (MaskOn
- * follows TherapyStart); leftovers stand alone. */
+/* Collect same-stem candidates without assigning annotation ownership.
+ * `files` is sorted in place and must outlive the returned clusters. */
 static int cluster_files(imp_file_t *files, int n_files,
                          imp_cluster_t *out, int max_out)
 {
-    int n = n_files > IMP_MAX_FILES ? IMP_MAX_FILES : n_files;
-    qsort(files, n, sizeof(imp_file_t), file_ts_cmp);
-
+    if (n_files > IMP_MAX_FILES) return -1;
+    qsort(files, n_files, sizeof(imp_file_t), file_ts_cmp);
     int n_out = 0;
-    /* 1:1 pairing by walking the sorted list: an ann file maps to the next
-     * wave file within the match window; all wave files at one timestamp
-     * share the wave anchor, all ann files at one timestamp share the ann
-     * anchor. */
-    typedef struct { int64_t ts; int idx; } grp_t;
-    /* Zero-fill so cppcheck's uninitvar can see the initialized-prefix
-     * invariant: reads are bounded by nw/na but the arrays are written
-     * conditionally under `nw < IMP_MAX_SESSIONS` guards. */
-    grp_t waves[IMP_MAX_SESSIONS] = {0}, anns[IMP_MAX_SESSIONS] = {0};
-    int nw = 0, na = 0;
-
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n_files; i++) {
         const imp_file_t *f = &files[i];
-        if (is_wave(f->kind)) {
-            if (nw == 0 || f->ts_dev_ms - waves[nw - 1].ts > IMP_CLUSTER_MS)
-                { if (nw < IMP_MAX_SESSIONS) waves[nw] = (grp_t){ f->ts_dev_ms, i }, nw++; }
-        } else if (is_ann(f->kind)) {
-            if (na == 0 || f->ts_dev_ms - anns[na - 1].ts > IMP_CLUSTER_MS)
-                { if (na < IMP_MAX_SESSIONS) anns[na] = (grp_t){ f->ts_dev_ms, i }, na++; }
+        if (!is_wave(f->kind) && !is_ann(f->kind)) continue;
+        int c = 0;
+        for (; c < n_out; c++) {
+            int64_t anchor = is_wave(f->kind) ? out[c].wav_ts : out[c].eve_ts;
+            if (anchor == f->ts_dev_ms) break;
         }
-    }
-
-    /* Match ann clusters to wave clusters.  An unmatched ann cluster still
-     * yields a session (mask-off run); unmatched wave clusters too. */
-    int wi = 0;
-    for (int ai = 0; ai < na && n_out < max_out; ai++) {
-        int64_t eve_ts = anns[ai].ts;
-        /* Wave clusters starting before this ann anchor (beyond tolerance)
-         * belong to an earlier therapy — skip them. */
-        while (wi < nw && waves[wi].ts < eve_ts - IMP_CLUSTER_MS)
-            wi++;
-        int match = -1;
-        if (wi < nw) {
-            int64_t delta = waves[wi].ts - eve_ts;
-            if (delta >= -IMP_CLUSTER_MS && delta <= IMP_MATCH_MS)
-                match = wi++;
+        if (c == n_out) {
+            if (n_out >= max_out) return -1;
+            memset(&out[n_out], 0, sizeof(out[n_out]));
+            out[n_out].wav_ts = is_wave(f->kind) ? f->ts_dev_ms : -1;
+            out[n_out].eve_ts = is_ann(f->kind) ? f->ts_dev_ms : -1;
+            n_out++;
         }
-        imp_cluster_t *c = &out[n_out];
-        memset(c, 0, sizeof(*c));
-        c->eve_ts = eve_ts;
-        c->wav_ts = (match >= 0) ? waves[match].ts : -1;
-        n_out++;
-    }
-    for (; wi < nw && n_out < max_out; wi++) {
-        imp_cluster_t *c = &out[n_out];
-        memset(c, 0, sizeof(*c));
-        c->eve_ts = -1;
-        c->wav_ts = waves[wi].ts;
-        n_out++;
-    }
-
-    /* Fill file slots per cluster. */
-    for (int i = 0; i < n; i++) {
-        const imp_file_t *f = &files[i];
-        for (int c = 0; c < n_out; c++) {
-            imp_cluster_t *cl = &out[c];
-            int64_t anchor = is_wave(f->kind) ? cl->wav_ts : cl->eve_ts;
-            if (anchor < 0 ||
-                llabs(f->ts_dev_ms - anchor) > IMP_CLUSTER_MS) continue;
-            switch (f->kind) {
-                case K_BRP: if (!cl->brp) cl->brp = f; break;
-                case K_PLD: if (!cl->pld) cl->pld = f; break;
-                case K_SA2: if (!cl->sa2) cl->sa2 = f; break;
-                case K_EVE: if (!cl->eve) cl->eve = f; break;
-                case K_CSL: if (!cl->csl) cl->csl = f; break;
-                default: break;
-            }
-            break;
+        const imp_file_t **slot = NULL;
+        switch (f->kind) {
+        case K_BRP: slot = &out[c].brp; break;
+        case K_PLD: slot = &out[c].pld; break;
+        case K_SA2: slot = &out[c].sa2; break;
+        case K_EVE: slot = &out[c].eve; break;
+        case K_CSL: slot = &out[c].csl; break;
+        default: break;
         }
+        /* SA2/SAD aliases or duplicate kinds must not silently disappear. */
+        if (!slot || *slot) return -1;
+        *slot = f;
     }
     return n_out;
 }
 
 /* ── Commit protocol ────────────────────────────────────────────────── */
 
-/* Marker written before any .part is staged: presence of
- * <id>_session.json.importing means "import in flight".  Orphan cleanup at
- * scan start removes it plus every <id>* file when no finished manifest
- * exists. */
+/* The versioned marker claims a new cohort, not an older session's files. */
+#define IMP_V2_MARKER "SomnoTrace import grouping v2\n"
 static esp_err_t write_import_marker(const char *dir, const char *id)
 {
     char p[448];
     snprintf(p, sizeof(p), "%s/%s_session.json.importing", dir, id);
-    FILE *f = fopen(p, "w");
-    if (!f) return ESP_FAIL;
+    int fd = open(p, O_WRONLY | O_CREAT | O_EXCL, 0664);
+    if (fd < 0) return ESP_FAIL;
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        unlink(p);
+        return ESP_FAIL;
+    }
+    if (fputs(IMP_V2_MARKER, f) < 0) {
+        fclose(f);
+        unlink(p);
+        return ESP_FAIL;
+    }
     return imp_flush_close(f, p);
+}
+
+static bool is_v2_import_marker(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char text[sizeof(IMP_V2_MARKER)];
+    size_t n = fread(text, 1, sizeof(text), f);
+    bool valid = n == sizeof(IMP_V2_MARKER) - 1 &&
+                 !memcmp(text, IMP_V2_MARKER, n) && !ferror(f);
+    fclose(f);
+    return valid;
 }
 
 static void delete_import_marker(const char *dir, const char *id)
@@ -2056,9 +2829,8 @@ static esp_err_t publish_parts(const char *dir, const char *id)
     return ret;
 }
 
-/* Boot/scan cleanup: drop incomplete imports (marker present, manifest
- * absent) and every stale *.part under streams/.  Public: main.c runs it
- * before session_writer_recover() so recovery never sees import residue. */
+/* Boot/scan cleanup owns only explicit v2 import markers and their artifacts.
+ * Legacy, malformed and unrelated .part files are not ours to remove. */
 void edf_import_cleanup_residue(void)
 {
     DIR *days = opendir(SD_STREAMS_DIR);
@@ -2079,28 +2851,27 @@ void edf_import_cleanup_residue(void)
         while ((fe = readdir(dd)) != NULL) {
             const char *nm = fe->d_name;
             size_t nl = strlen(nm);
-            /* stale .part → importer residue, delete */
-            if (nl > 5 && strcmp(nm + nl - 5, ".part") == 0) {
-                char p[600];
-                snprintf(p, sizeof(p), "%s/%s", dpath, nm);
-                unlink(p);
-                continue;
-            }
             const char *mfx = "_session.json.importing";
             size_t ml = strlen(mfx);
             if (nl <= ml || strcmp(nm + nl - ml, mfx) != 0) continue;
-            /* marker present: keep it only if the finished manifest is missing */
-            char id[40], mp[600];
+            char id[40], mp[600], marker[600];
             size_t idl = nl - ml;
             if (idl >= sizeof(id)) continue;
             memcpy(id, nm, idl); id[idl] = '\0';
+            snprintf(marker, sizeof(marker), "%s/%s", dpath, nm);
+            if (!is_v2_import_marker(marker)) continue;
             snprintf(mp, sizeof(mp), "%s/%s_session.json", dpath, id);
             struct stat st;
             if (stat(mp, &st) == 0) {
-                /* committed manifest exists → just drop the marker */
-                snprintf(mp, sizeof(mp), "%s/%s", dpath, nm);
-                unlink(mp);
-            } else if (n_dead < 24) {
+                cJSON *m = read_json_file(mp);
+                const cJSON *version = cJSON_GetObjectItemCaseSensitive(m, "import_grouping_version");
+                const cJSON *state = cJSON_GetObjectItemCaseSensitive(m, "state");
+                if (cJSON_IsNumber(version) && version->valuedouble == 2.0 &&
+                    cJSON_IsString(state) && state->valuestring &&
+                    !strcmp(state->valuestring, "completed"))
+                    unlink(marker);
+                cJSON_Delete(m);
+            } else if (errno == ENOENT && n_dead < 24) {
                 memcpy(dead[n_dead++], id, idl + 1);
             }
         }
@@ -2138,14 +2909,552 @@ typedef struct {
     const char          *import_src;   /* "file_import" | "somnobridge" */
     const char          *src_family;   /* "AS10" | "AS11" | "" */
     const char          *src_serial;
+    bool                 src_identity_verified;
+    bool                 retain_raw;  /* cross-stem association retains source evidence */
+    bool                 frozen;      /* matched a pre-cohort/future manifest */
+    char                 src_hash[5][65]; /* source-byte fingerprints */
+    uint64_t             src_size[5];
+    uint8_t              src_record_count[5][8];
     char                 day[9];       /* streams noon-day label */
     char                 id[40];
+    /* Bitmask over the cluster's source slots {brp,pld,sa2,eve,csl}
+     * marking which sources the commit/augment path consumed (merged or
+     * verified duplicate).  Sources whose bit is clear must NOT be
+     * deleted — their coverage could not be verified. */
+    uint8_t              src_consumed;
     uint32_t             n_flow, n_press, n_mm, n_sa2, n_pld, n_events;
 } imp_work_t;
 
-/* Duplicate/collision resolution: returns a free session id in out_id, or
- * ESP_ERR_INVALID_STATE when the session at this start time already exists
- * (caller then treats it as "already imported" and only deletes sources). */
+static const char *const imp_source_keys[] = { "brp", "pld", "sa2", "eve", "csl" };
+
+static const imp_file_t *cluster_source(const imp_cluster_t *cl, int i)
+{
+    const imp_file_t *files[] = { cl->brp, cl->pld, cl->sa2, cl->eve, cl->csl };
+    return files[i];
+}
+
+/* Hash an EDF or a prefix without loading it into RAM. For a growing EDF,
+ * substitute the original record-count field before comparing its prefix.
+ * The host hash is deterministic test identity only; firmware uses SHA-256. */
+static esp_err_t hash_source(const char *path, uint64_t limit,
+                             const uint8_t *old_count, char hex[65],
+                             uint64_t *size_out, uint8_t *count_out)
+{
+    uint8_t *buf = imp_psram_malloc(8192);
+    if (!buf) return ESP_ERR_NO_MEM;
+    FILE *f = fopen(path, "rb");
+    if (!f) { free(buf); return ESP_FAIL; }
+    esp_err_t ret = ESP_OK;
+    struct stat before, after;
+    if (fstat(fileno(f), &before) != 0 || !S_ISREG(before.st_mode) ||
+        before.st_size < 256 || (limit && limit > (uint64_t)before.st_size)) {
+        fclose(f);
+        free(buf);
+        return ESP_FAIL;
+    }
+    uint64_t target = limit ? limit : (uint64_t)before.st_size;
+    if (target < 256) { fclose(f); free(buf); return ESP_FAIL; }
+    uint8_t digest[32];
+#ifdef EDF_IMPORT_HOST
+    uint64_t lanes[4];
+    for (int lane = 0; lane < 4; lane++)
+        lanes[lane] = 0xcbf29ce484222325ULL +
+                      (uint64_t)lane * 0x9e3779b97f4a7c15ULL;
+#else
+    mbedtls_sha256_context hash;
+    mbedtls_sha256_init(&hash);
+    if (mbedtls_sha256_starts(&hash, 0) != 0) ret = ESP_FAIL;
+#endif
+    uint64_t pos = 0;
+    while (ret == ESP_OK && pos < target) {
+        size_t want = target - pos < 8192 ? (size_t)(target - pos) : 8192;
+        size_t n = fread(buf, 1, want, f);
+        if (n != want) { ret = ESP_FAIL; break; }
+        if (pos == 0) {
+            if (count_out) memcpy(count_out, buf + 236, 8);
+            if (old_count) memcpy(buf + 236, old_count, 8);
+        }
+#ifdef EDF_IMPORT_HOST
+        for (size_t b = 0; b < n; b++)
+            for (int lane = 0; lane < 4; lane++) {
+                lanes[lane] ^= buf[b];
+                lanes[lane] *= 0x100000001b3ULL;
+            }
+#else
+        if (mbedtls_sha256_update(&hash, buf, n) != 0) ret = ESP_FAIL;
+#endif
+        pos += n;
+    }
+    if (ferror(f) || fstat(fileno(f), &after) != 0 ||
+        before.st_size != after.st_size || before.st_mtime != after.st_mtime)
+        ret = ESP_FAIL;
+#ifdef EDF_IMPORT_HOST
+    for (int lane = 0; lane < 4; lane++)
+        for (int b = 0; b < 8; b++)
+            digest[lane * 8 + b] = (uint8_t)(lanes[lane] >> (8 * b));
+#else
+    if (ret == ESP_OK && mbedtls_sha256_finish(&hash, digest) != 0)
+        ret = ESP_FAIL;
+    mbedtls_sha256_free(&hash);
+#endif
+    if (fclose(f) != 0) ret = ESP_FAIL;
+    free(buf);
+    if (ret == ESP_OK) {
+        static const char chars[] = "0123456789abcdef";
+        for (int b = 0; b < 32; b++) {
+            hex[2 * b] = chars[digest[b] >> 4];
+            hex[2 * b + 1] = chars[digest[b] & 15];
+        }
+        hex[64] = '\0';
+        if (size_out) *size_out = (uint64_t)before.st_size;
+    }
+    return ret;
+}
+
+static esp_err_t hash_cluster_sources(imp_work_t *w, bool verify)
+{
+    for (int i = 0; i < 5; i++) {
+        const imp_file_t *src = cluster_source(w->cl, i);
+        if (!src) continue;
+        char hash[65];
+        uint64_t size;
+        uint8_t count[8];
+        esp_err_t err = hash_source(src->path, 0, NULL, hash, &size, count);
+        if (err != ESP_OK) return err;
+        if (verify && (strcmp(hash, w->src_hash[i]) || size != w->src_size[i]))
+            return ESP_FAIL;
+        if (!verify) {
+            memcpy(w->src_hash[i], hash, sizeof(hash));
+            w->src_size[i] = size;
+            memcpy(w->src_record_count[i], count, sizeof(count));
+        }
+    }
+    return ESP_OK;
+}
+
+static bool source_hash_metadata(const cJSON *entry, const char **hash,
+                                 uint64_t *size, uint8_t count[8])
+{
+    const cJSON *h = cJSON_GetObjectItemCaseSensitive(entry, "hash");
+    const cJSON *s = cJSON_GetObjectItemCaseSensitive(entry, "size");
+    const cJSON *r = cJSON_GetObjectItemCaseSensitive(entry, "records");
+    if (!cJSON_IsString(h) || !h->valuestring || strlen(h->valuestring) != 64 ||
+        !cJSON_IsNumber(s) || s->valuedouble < 256 ||
+        s->valuedouble > 9007199254740991.0 || floor(s->valuedouble) != s->valuedouble ||
+        !cJSON_IsString(r) || !r->valuestring || strlen(r->valuestring) != 16)
+        return false;
+    for (int i = 0; i < 8; i++) {
+        char a = r->valuestring[2 * i], b = r->valuestring[2 * i + 1];
+        int x = a >= '0' && a <= '9' ? a - '0' :
+                a >= 'a' && a <= 'f' ? a - 'a' + 10 : -1;
+        int y = b >= '0' && b <= '9' ? b - '0' :
+                b >= 'a' && b <= 'f' ? b - 'a' + 10 : -1;
+        if (x < 0 || y < 0) return false;
+        count[i] = (uint8_t)((x << 4) | y);
+    }
+    *hash = h->valuestring;
+    *size = (uint64_t)s->valuedouble;
+    return true;
+}
+
+/* Only manifests created with these source anchors participate in the new
+ * reconciliation path. Older imports and live recordings are not migrated. */
+static bool manifest_record_sources(cJSON *manifest, const imp_cluster_t *cl,
+                                    uint8_t consumed, const imp_work_t *w)
+{
+    cJSON *sources = cJSON_GetObjectItem(manifest, "import_sources");
+    if (!sources) sources = cJSON_AddObjectToObject(manifest, "import_sources");
+    if (!cJSON_IsObject(sources)) return false;
+    cJSON *hashes = cJSON_GetObjectItemCaseSensitive(manifest, "import_sha256");
+    if (w->src_identity_verified && !hashes)
+        hashes = cJSON_AddObjectToObject(manifest, "import_sha256");
+    if (w->src_identity_verified && !cJSON_IsObject(hashes)) return false;
+    for (int i = 0; i < 5; i++) {
+        const imp_file_t *file = cluster_source(cl, i);
+        if (!file || !(consumed & (1u << i))) continue;
+        cJSON *old = cJSON_GetObjectItemCaseSensitive(sources, imp_source_keys[i]);
+        if (old) {
+            if (!cJSON_IsString(old) || !old->valuestring ||
+                strcmp(old->valuestring, file->prefix)) return false;
+        } else if (!cJSON_AddStringToObject(sources, imp_source_keys[i], file->prefix)) {
+            return false;
+        }
+        if (w->src_identity_verified) {
+            if (!w->src_hash[i][0] || w->src_size[i] > 9007199254740991ULL)
+                return false;
+            char count_hex[17];
+            static const char chars[] = "0123456789abcdef";
+            for (int b = 0; b < 8; b++) {
+                count_hex[2 * b] = chars[w->src_record_count[i][b] >> 4];
+                count_hex[2 * b + 1] = chars[w->src_record_count[i][b] & 15];
+            }
+            count_hex[16] = '\0';
+            cJSON *next = cJSON_CreateObject();
+            if (!next ||
+                !cJSON_AddStringToObject(next, "hash", w->src_hash[i]) ||
+                !cJSON_AddNumberToObject(next, "size", (double)w->src_size[i]) ||
+                !cJSON_AddStringToObject(next, "records", count_hex)) {
+                cJSON_Delete(next);
+                return false;
+            }
+            cJSON *prev = cJSON_GetObjectItemCaseSensitive(hashes, imp_source_keys[i]);
+            if (prev) {
+                if (!cJSON_ReplaceItemInObjectCaseSensitive(hashes,
+                                                           imp_source_keys[i], next)) {
+                    cJSON_Delete(next);
+                    return false;
+                }
+            } else if (!cJSON_AddItemToObject(hashes, imp_source_keys[i], next)) {
+                cJSON_Delete(next);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static int64_t source_anchor(const cJSON *sources, int first, int last)
+{
+    int64_t anchor = -1;
+    for (int i = first; i < last; i++) {
+        const cJSON *v = cJSON_GetObjectItemCaseSensitive(sources, imp_source_keys[i]);
+        int64_t t = cJSON_IsString(v) && v->valuestring
+                  ? imp_parse_prefix_ms(v->valuestring) : -1;
+        if (t >= 0 && (anchor < 0 || t < anchor)) anchor = t;
+    }
+    return anchor;
+}
+
+/* Without machine identity, a possible match is grounds to defer, never to
+ * augment. A different source of the same kind proves it is not an exact
+ * duplicate, but cannot override an exact match in another offered kind. */
+static bool unattested_source_may_match(const cJSON *sources, const imp_cluster_t *cl)
+{
+    bool exact = false, different = false;
+    for (int i = 0; i < 5; i++) {
+        const imp_file_t *f = cluster_source(cl, i);
+        const cJSON *v = cJSON_GetObjectItemCaseSensitive(sources, imp_source_keys[i]);
+        if (!f || !v) continue;
+        if (cJSON_IsString(v) && v->valuestring && !strcmp(v->valuestring, f->prefix))
+            exact = true;
+        else
+            different = true;
+    }
+    if (exact) return true;
+    if (different) return false;
+    int64_t wave = source_anchor(sources, 0, 3);
+    int64_t ann = source_anchor(sources, 3, 5);
+    if (wave >= 0 && cl->wav_ts >= 0 &&
+        llabs(wave - cl->wav_ts) <= IMP_CLUSTER_MS) return true;
+    if (ann >= 0 && cl->eve_ts >= 0 &&
+        llabs(ann - cl->eve_ts) <= IMP_CLUSTER_MS) return true;
+    if (ann >= 0 && wave < 0 && cl->wav_ts >= 0 &&
+        cl->wav_ts - ann >= -IMP_CLUSTER_MS &&
+        cl->wav_ts - ann <= IMP_UNCERTAIN_MS) return true;
+    if (ann < 0 && wave >= 0 && cl->eve_ts >= 0 &&
+        wave - cl->eve_ts >= -IMP_CLUSTER_MS &&
+        wave - cl->eve_ts <= IMP_UNCERTAIN_MS) return true;
+    return false;
+}
+
+/* Returns 1 for the same native mask interval, 0 for different intervals,
+ * or -1 when the STR cannot decide. Endpoints are used only for matching. */
+static int native_mask_relation(const imp_work_t *w, int64_t ann, int64_t wave)
+{
+    if (ann < 0 || wave < ann || !w->day[0]) return -1;
+    char path[340];
+    snprintf(path, sizeof(path), "%s/%s.native.mask-intervals.json",
+             SD_SUMMARIES_DIR, w->day);
+    cJSON *m = read_native_day_json(path);
+    const cJSON *serial = cJSON_GetObjectItemCaseSensitive(m, "serial");
+    const cJSON *family = cJSON_GetObjectItemCaseSensitive(m, "family");
+    const cJSON *day = cJSON_GetObjectItemCaseSensitive(m, "day");
+    const cJSON *pairs = cJSON_GetObjectItemCaseSensitive(m, "pairs");
+    bool valid = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "complete")) &&
+                 cJSON_IsString(serial) && serial->valuestring &&
+                 cJSON_IsString(family) && family->valuestring &&
+                 cJSON_IsString(day) && day->valuestring &&
+                 !strcmp(serial->valuestring, w->src_serial) &&
+                 !strcmp(family->valuestring, w->src_family) &&
+                 !strcmp(day->valuestring, w->day) && cJSON_IsArray(pairs) &&
+                 cJSON_GetArraySize(pairs) > 0 && cJSON_GetArraySize(pairs) <= 20;
+    int64_t noon = as11_time_local_noon_epoch(w->day) * 1000;
+    int last_off = -1, index = 0, ann_index = -1, wave_index = -1;
+    const cJSON *pair;
+    cJSON_ArrayForEach(pair, pairs) {
+        const cJSON *on_j = cJSON_GetArrayItem(pair, 0);
+        const cJSON *off_j = cJSON_GetArrayItem(pair, 1);
+        if (!valid || !cJSON_IsArray(pair) || cJSON_GetArraySize(pair) != 2 ||
+            !cJSON_IsNumber(on_j) || !cJSON_IsNumber(off_j) ||
+            on_j->valuedouble != on_j->valueint ||
+            off_j->valuedouble != off_j->valueint ||
+            on_j->valueint < 0 || on_j->valueint < last_off ||
+            off_j->valueint <= on_j->valueint || off_j->valueint > 1440) {
+            valid = false;
+            break;
+        }
+        int on = on_j->valueint, off = off_j->valueint;
+        int64_t on_ms = noon + (int64_t)on * 60000;
+        int64_t off_ms = noon + (int64_t)off * 60000;
+        if (ann >= on_ms && ann < on_ms + 60000) ann_index = index;
+        if (wave >= on_ms && wave < off_ms) wave_index = index;
+        last_off = off;
+        index++;
+    }
+    cJSON_Delete(m);
+    if (!valid || noon <= 0 || ann_index < 0 || wave_index < 0) return -1;
+    return ann_index == wave_index ? 1 : 0;
+}
+
+typedef enum {
+    IMP_ASSOC_INDEPENDENT = 0,
+    IMP_ASSOC_SAME_SOURCE,
+    IMP_ASSOC_NATIVE_INTERVAL,
+    IMP_ASSOC_HEURISTIC,
+    IMP_ASSOC_DEFER_UNKNOWN,
+    IMP_ASSOC_DEFER_CONFLICT
+} imp_assoc_t;
+
+/* A nearby timestamp is a reason to consider a claim, never positive proof. */
+static imp_assoc_t association_policy(bool same_machine, bool same_stem,
+                                      int mask_relation, bool competing)
+{
+    if (competing || (same_stem && mask_relation == 0))
+        return IMP_ASSOC_DEFER_CONFLICT;
+    if (mask_relation == 0) return IMP_ASSOC_INDEPENDENT;
+    if (!same_machine) return IMP_ASSOC_DEFER_UNKNOWN;
+    if (same_stem) return IMP_ASSOC_SAME_SOURCE;
+    if (mask_relation == 1) return IMP_ASSOC_NATIVE_INTERVAL;
+    return IMP_ASSOC_DEFER_UNKNOWN;
+}
+
+/* Old/live manifests have no import anchors. Compare their recorded device
+ * time window when possible; unknown or malformed timing cannot disprove a
+ * match, so it must not authorize a second publication. */
+static bool frozen_manifest_may_match(const cJSON *m, const imp_cluster_t *cl,
+                                      int64_t incoming_end_dev)
+{
+    const cJSON *start = cJSON_GetObjectItemCaseSensitive(m, "start_epoch_ms");
+    const cJSON *end = cJSON_GetObjectItemCaseSensitive(m, "end_epoch_ms");
+    const cJSON *drift = cJSON_GetObjectItemCaseSensitive(m, "clock_drift_ms");
+    if (!cJSON_IsNumber(start) || !cJSON_IsNumber(end) || !cJSON_IsNumber(drift) ||
+        !isfinite(start->valuedouble) || !isfinite(end->valuedouble) ||
+        !isfinite(drift->valuedouble) ||
+        floor(start->valuedouble) != start->valuedouble ||
+        floor(end->valuedouble) != end->valuedouble ||
+        floor(drift->valuedouble) != drift->valuedouble ||
+        start->valuedouble <= 0 || end->valuedouble < start->valuedouble ||
+        end->valuedouble > 253402300799999.0 ||
+        fabs(drift->valuedouble) > IMP_DRIFT_MAX_MS)
+        return true;
+    /* clock_drift_ms is the complete applied shift, including any zone delta. */
+    int64_t shift = (int64_t)drift->valuedouble;
+    int64_t old_start = (int64_t)start->valuedouble - shift;
+    int64_t old_end = (int64_t)end->valuedouble - shift;
+    int64_t incoming_start = cl->eve_ts >= 0 ? cl->eve_ts : cl->wav_ts;
+    if (cl->wav_ts >= 0 && cl->wav_ts < incoming_start) incoming_start = cl->wav_ts;
+    if (incoming_start < 0 || incoming_end_dev < incoming_start) return true;
+    bool usable = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "clock_drift_valid")) ||
+                  cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "clock_drift_usable"));
+    int64_t uncertainty = usable ? IMP_CLUSTER_MS : IMP_DRIFT_MAX_MS;
+    return incoming_start <= old_end + uncertainty &&
+           incoming_end_dev >= old_start - uncertainty;
+}
+
+/* Match only a verified machine and unambiguous source anchors. The raw
+ * source clock, not the current drift estimate, identifies a session. */
+static esp_err_t find_import_match(const char *dir, imp_work_t *w,
+                                   const imp_cluster_t *cl,
+                                   int64_t incoming_end_dev,
+                                   char *out_id, size_t out_len)
+{
+    bool incoming_verified = w->src_identity_verified && w->src_serial && w->src_family;
+    DIR *d = opendir(dir);
+    if (!d) return ESP_FAIL;
+    int matches = 0;
+    bool conflict = false;
+    struct dirent *ent;
+    const char *suffix = "_session.json";
+    const size_t suffix_len = strlen(suffix);
+    for (;;) {
+        errno = 0;
+        ent = readdir(d);
+        if (!ent) {
+            if (errno != 0) { closedir(d); return ESP_FAIL; }
+            break;
+        }
+        size_t n = strlen(ent->d_name);
+        if (n <= suffix_len || strcmp(ent->d_name + n - suffix_len, suffix))
+            continue;
+        size_t id_len = n - suffix_len;
+        if (id_len >= out_len) { closedir(d); return ESP_ERR_INVALID_SIZE; }
+        char path[600];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        cJSON *m = read_json_file(path);
+        if (!cJSON_IsObject(m)) { cJSON_Delete(m); closedir(d); return ESP_FAIL; }
+        const cJSON *sources = cJSON_GetObjectItemCaseSensitive(m, "import_sources");
+        const cJSON *serial = cJSON_GetObjectItemCaseSensitive(m, "source_serial");
+        const cJSON *family = cJSON_GetObjectItemCaseSensitive(m, "source_device_family");
+        const cJSON *verified = cJSON_GetObjectItemCaseSensitive(m, "source_identity_verified");
+        bool previous_verified = cJSON_IsTrue(verified) &&
+                                 cJSON_IsString(serial) && serial->valuestring &&
+                                 cJSON_IsString(family) && family->valuestring;
+        if (!cJSON_IsObject(sources) || cJSON_GetArraySize(sources) == 0) {
+            if (frozen_manifest_may_match(m, cl, incoming_end_dev)) {
+                conflict = true;
+                w->frozen = true;
+            }
+            cJSON_Delete(m);
+            continue;
+        }
+        if (!incoming_verified || !previous_verified) {
+            if (unattested_source_may_match(sources, cl)) conflict = true;
+            cJSON_Delete(m);
+            continue;
+        }
+        if (strcmp(serial->valuestring, w->src_serial) ||
+            strcmp(family->valuestring, w->src_family)) {
+            cJSON_Delete(m);
+            continue;
+        }
+        bool exact = false, different = false, same_stem = false;
+        for (int i = 0; i < 5; i++) {
+            const imp_file_t *f = cluster_source(cl, i);
+            const cJSON *v = cJSON_GetObjectItemCaseSensitive(sources, imp_source_keys[i]);
+            if (!f) continue;
+            if (v) {
+                if (cJSON_IsString(v) && v->valuestring &&
+                    !strcmp(v->valuestring, f->prefix))
+                    exact = true;
+                else
+                    different = true;
+            }
+            for (int k = 0; k < 5; k++) {
+                const cJSON *old = cJSON_GetObjectItemCaseSensitive(sources, imp_source_keys[k]);
+                if (cJSON_IsString(old) && old->valuestring &&
+                    !strcmp(old->valuestring, f->prefix))
+                    same_stem = true;
+            }
+        }
+        int64_t old_wave = source_anchor(sources, 0, 3);
+        int64_t old_ann = source_anchor(sources, 3, 5);
+        int mask_pair = old_ann >= 0 && cl->wav_ts >= 0
+                        ? native_mask_relation(w, old_ann, cl->wav_ts) : -1;
+        int mask_reverse = old_wave >= 0 && cl->eve_ts >= 0
+                           ? native_mask_relation(w, cl->eve_ts, old_wave) : -1;
+        int mask = (mask_pair == 0 || mask_reverse == 0) ? 0 :
+                   (mask_pair == 1 || mask_reverse == 1) ? 1 : -1;
+        bool near = (old_wave >= 0 && cl->wav_ts >= 0 &&
+                     llabs(old_wave - cl->wav_ts) <= IMP_CLUSTER_MS) ||
+                    (old_ann >= 0 && cl->eve_ts >= 0 &&
+                     llabs(old_ann - cl->eve_ts) <= IMP_CLUSTER_MS) ||
+                    (old_ann >= 0 && cl->wav_ts >= 0 &&
+                     llabs(old_ann - cl->wav_ts) <= IMP_MATCH_MS) ||
+                    (old_wave >= 0 && cl->eve_ts >= 0 &&
+                     llabs(old_wave - cl->eve_ts) <= IMP_MATCH_MS);
+        int64_t prior_end = 0, prior_shift = 0;
+        if (old_ann >= 0 && old_wave < 0 && cl->wav_ts >= old_ann &&
+            (cl->wav_ts - old_ann <= IMP_UNCERTAIN_MS ||
+             (json_i64(m, "end_epoch_ms", &prior_end) &&
+              json_i64(m, "clock_drift_ms", &prior_shift) &&
+              cl->wav_ts <= prior_end - prior_shift)))
+            near = true;
+        if (old_wave >= 0 && old_ann < 0 && cl->eve_ts >= 0 &&
+            (llabs(old_wave - cl->eve_ts) <= IMP_UNCERTAIN_MS ||
+             incoming_end_dev >= old_wave))
+            near = true;
+        if (different && !exact && !same_stem) {
+            /* Not the same cohort — but a stored annotation-only session
+             * may still contest a wave grafted onto another annotation.
+             * Mirror the wave-alone rule so a bundled source cannot bypass
+             * a pending claim: a proven shared mask interval contests
+             * outright, STR silence contests inside the unproven window,
+             * and a proven different interval exonerates. */
+            if (old_ann >= 0 && old_wave < 0 && cl->wav_ts >= old_ann &&
+                (mask_pair == 1 ||
+                 (mask_pair != 0 &&
+                  (cl->wav_ts - old_ann <= IMP_UNCERTAIN_MS ||
+                   (json_i64(m, "end_epoch_ms", &prior_end) &&
+                    json_i64(m, "clock_drift_ms", &prior_shift) &&
+                    cl->wav_ts <= prior_end - prior_shift)))))
+                conflict = true;
+            cJSON_Delete(m);
+            continue;
+        }
+        imp_assoc_t decision = association_policy(true, same_stem, mask,
+                                                   exact && different);
+        if (decision == IMP_ASSOC_DEFER_CONFLICT ||
+            (decision == IMP_ASSOC_DEFER_UNKNOWN && near)) {
+            conflict = true;
+        } else if (decision == IMP_ASSOC_SAME_SOURCE ||
+                   decision == IMP_ASSOC_NATIVE_INTERVAL) {
+            matches++;
+            if (matches == 1) {
+                memcpy(out_id, ent->d_name, id_len);
+                out_id[id_len] = '\0';
+            }
+        }
+        cJSON_Delete(m);
+    }
+    closedir(d);
+    if (conflict || matches > 1) return ESP_ERR_NOT_SUPPORTED;
+    return matches == 1 ? ESP_ERR_INVALID_STATE : ESP_OK;
+}
+
+/* A session already stored across a noon boundary cannot safely be moved
+ * between day folders here. Retain a possible late complement for review
+ * rather than silently creating a second session in the adjacent folder. */
+static esp_err_t guard_adjacent_noon(imp_work_t *w, const imp_cluster_t *cl,
+                                     int64_t end_dev)
+{
+    int day_number = as11_time_day_number(w->day);
+    if (day_number < 0) return ESP_FAIL;
+    for (int sign = -1; sign <= 1; sign += 2) {
+        char day[9], dir[300], id[40];
+        int year, month, day_of_month;
+        imp_civil_from_days((int64_t)day_number + sign, &year, &month, &day_of_month);
+        if (year < 0 || year > 9999 || month < 1 || month > 12 ||
+            day_of_month < 1 || day_of_month > 31) return ESP_FAIL;
+        snprintf(day, sizeof(day), "%04d%02d%02d", year, month, day_of_month);
+        snprintf(dir, sizeof(dir), "%s/%s", SD_STREAMS_DIR, day);
+        struct stat st;
+        if (stat(dir, &st) != 0) {
+            if (errno == ENOENT) continue;
+            return ESP_FAIL;
+        }
+        if (!S_ISDIR(st.st_mode)) return ESP_FAIL;
+        esp_err_t match = find_import_match(dir, w, cl, end_dev, id, sizeof(id));
+        if (match == ESP_ERR_INVALID_STATE || match == ESP_ERR_NOT_SUPPORTED) {
+            ESP_LOGW(TAG, "import: possible cross-noon match; sources kept");
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+        if (match != ESP_OK) return match;
+    }
+    return ESP_OK;
+}
+
+/* An absent manifest does not prove an id is unused: a live or historical
+ * session can still have raw files or an unfamiliar recovery marker. */
+static int session_id_has_artifacts(const char *dir, const char *id)
+{
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    int found = 0;
+    size_t len = strlen(id);
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *name = ent->d_name;
+        if (strncmp(name, id, len) == 0 && name[len] == '_' &&
+            !(name[len + 1] >= '0' && name[len + 1] <= '9')) {
+            found = 1;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+/* Find a free id without changing an existing live or legacy session. */
 static esp_err_t pick_session_id(const char *dir, int64_t start_ntp,
                                  char *out_id, size_t out_len)
 {
@@ -2159,18 +3468,24 @@ static esp_err_t pick_session_id(const char *dir, int64_t start_ntp,
         snprintf(mp, sizeof(mp), "%s/%s_session.json", dir, id);
         struct stat st;
         if (stat(mp, &st) != 0) {
+            if (errno != ENOENT) return ESP_FAIL;
+            int artifacts = session_id_has_artifacts(dir, id);
+            if (artifacts < 0) return ESP_FAIL;
+            if (artifacts) return ESP_ERR_NOT_SUPPORTED;
             snprintf(out_id, out_len, "%s", id);
             return ESP_OK;
         }
-        /* Existing manifest → duplicate check by start_epoch_ms */
+        /* Do not rewrite a live or legacy session without source evidence. */
         cJSON *mj = read_json_file(mp);
         int64_t stt = 0;
-        if (mj) {
-            json_i64(mj, "start_epoch_ms", &stt);
+        if (!mj || !json_i64(mj, "start_epoch_ms", &stt)) {
             cJSON_Delete(mj);
+            return ESP_ERR_NOT_SUPPORTED;
         }
-        if (stt && llabs(stt - start_ntp) <= (int64_t)IMP_SESS_DUP_MS)
-            return ESP_ERR_INVALID_STATE;
+        cJSON_Delete(mj);
+        if (stt && llabs(stt - start_ntp) <= (int64_t)IMP_SESS_DUP_MS) {
+            return ESP_ERR_NOT_SUPPORTED;
+        }
         /* different session sharing the same second → next suffix */
     }
     return ESP_ERR_INVALID_SIZE;
@@ -2271,16 +3586,495 @@ static void manifest_enforce_cap(cJSON *r)
         cJSON_AddBoolToObject(r, "somnobridge_drift_truncated", true);
 }
 
+static bool manifest_fits_reader_limit(const cJSON *manifest)
+{
+    char *text = cJSON_PrintUnformatted(manifest);
+    bool fits = text && strlen(text) + 1 <= IMP_MANIFEST_MAX;
+    free(text);
+    return fits;
+}
+
+/* Growing provenance can push a formerly embedded drift document over the
+ * reader limit. Preserve the original before dropping the embed. */
+static esp_err_t preserve_overflowing_drift(const char *dir, const char *id,
+                                           cJSON *manifest)
+{
+    cJSON *drift = cJSON_GetObjectItemCaseSensitive(manifest, "somnobridge_drift");
+    if (manifest_fits_reader_limit(manifest) || !cJSON_IsObject(drift) ||
+        cJSON_GetObjectItemCaseSensitive(manifest, "somnobridge_drift_file") ||
+        cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(manifest, "somnobridge_drift_truncated")))
+        return ESP_OK;
+    char path[448], name[64];
+    snprintf(name, sizeof(name), "%s_bridge_drift.json", id);
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        cJSON *existing = read_native_day_json(path);
+        bool same = existing && cJSON_Compare(existing, drift, true);
+        cJSON_Delete(existing);
+        if (!same) return ESP_FAIL;
+    } else if (errno != ENOENT || write_json_atomic(path, drift) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (!cJSON_AddStringToObject(manifest, "somnobridge_drift_file", name))
+        return ESP_FAIL;
+    return ESP_OK;
+}
+
+static uint32_t manifest_u32(const cJSON *m, const char *key)
+{
+    const cJSON *j = cJSON_GetObjectItem((cJSON *)m, key);
+    return (cJSON_IsNumber(j) && j->valuedouble > 0)
+               ? (uint32_t)j->valuedouble : 0;
+}
+
+static bool manifest_has_kind(const cJSON *kinds, const char *k)
+{
+    const cJSON *it;
+    cJSON_ArrayForEach(it, kinds)
+        if (cJSON_IsString(it) && it->valuestring &&
+            !strcmp(it->valuestring, k))
+            return true;
+    return false;
+}
+
+static void manifest_add_kind(cJSON *mj, const char *k)
+{
+    cJSON *kinds = cJSON_GetObjectItem(mj, "src_kinds");
+    if (!cJSON_IsArray(kinds)) kinds = cJSON_AddArrayToObject(mj, "src_kinds");
+    if (!kinds || manifest_has_kind(kinds, k)) return;
+    cJSON_AddItemToArray(kinds, cJSON_CreateString(k));
+}
+
+static void manifest_set_num(cJSON *mj, const char *key, double v)
+{
+    cJSON *j = cJSON_GetObjectItem(mj, key);
+    if (cJSON_IsNumber(j)) cJSON_SetNumberValue(j, v);
+    else cJSON_AddNumberToObject(mj, key, v);
+}
+
+/* Compare converted samples rather than trusting a filename or sample count.
+ * Both the old and new file must be complete and the shorter must be an
+ * exact prefix. The result is 1 for growth, 2 for a shorter covered input,
+ * 0 for equality, and -1 for conflict. */
+static int staged_stream_relation(const char *dir, const char *id, const char *suffix)
+{
+    char path[448], part[456];
+    snprintf(path, sizeof(path), "%s/%s_%s.snt", dir, id, suffix);
+    snprintf(part, sizeof(part), "%s.part", path);
+    FILE *old = fopen(path, "rb"), *next = fopen(part, "rb");
+    if (!old || !next) {
+        if (old) fclose(old);
+        if (next) fclose(next);
+        return -1;
+    }
+    snt_header_t a, b;
+    int result = -1;
+    if (snt_read_header(old, &a) || snt_read_header(next, &b)) goto done;
+    uint32_t old_count = a.sample_count, new_count = b.sample_count;
+    a.sample_count = b.sample_count = 0;
+    if (memcmp(&a, &b, sizeof(a)) || !a.n_channels || !a.sample_bytes)
+        goto done;
+    uint64_t frame = (uint64_t)a.n_channels * a.sample_bytes;
+    struct stat os, ns;
+    if (fstat(fileno(old), &os) || fstat(fileno(next), &ns) ||
+        os.st_size < 0 || ns.st_size < 0 ||
+        (uint64_t)os.st_size != sizeof(a) + frame * old_count ||
+        (uint64_t)ns.st_size != sizeof(b) + frame * new_count)
+        goto done;
+    uint64_t left = frame * (old_count < new_count ? old_count : new_count);
+    unsigned char x[512], y[512];
+    while (left) {
+        size_t n = left < sizeof(x) ? (size_t)left : sizeof(x);
+        if (fread(x, 1, n, old) != n || fread(y, 1, n, next) != n ||
+            memcmp(x, y, n)) goto done;
+        left -= n;
+    }
+    result = new_count > old_count ? 1 : (new_count < old_count ? 2 : 0);
+done:
+    fclose(old);
+    fclose(next);
+    return result;
+}
+
+static void remove_staged_stream(const char *dir, const char *id, const char *suffix)
+{
+    char path[456];
+    snprintf(path, sizeof(path), "%s/%s_%s.snt.part", dir, id, suffix);
+    unlink(path);
+}
+
+/* Keep previously imported respiratory events when only one annotation
+ * file arrives. Rebuild the synthetic usage window from the reconciled
+ * anchors, then append genuinely new event lines. */
+static esp_err_t stage_merged_events(const char *dir, const char *id,
+                                     const imp_cluster_t *cl,
+                                     int64_t eve_dev, int64_t wav_dev,
+                                     int64_t end_dev, bool *changed,
+                                     uint8_t *new_kinds)
+{
+    imp_line_set_t cand = {0};
+    *new_kinds = 0;
+    uint32_t n_events = 0;
+    if (collect_ann_lines(cl->eve, cl->csl, &cand, &n_events) != ESP_OK) {
+        line_set_free(&cand);
+        return ESP_FAIL;
+    }
+    bool *seen = imp_calloc(cand.n ? (size_t)cand.n : 1, sizeof(bool));
+    char path[448], part[456];
+    snprintf(path, sizeof(path), "%s/%s_events.snt", dir, id);
+    snprintf(part, sizeof(part), "%s.part", path);
+    FILE *old = fopen(path, "r");
+    FILE *out = old && seen ? fopen(part, "w") : NULL;
+    esp_err_t ret = ESP_FAIL;
+    if (!old || !out) goto done;
+    uint32_t ignored = 0;
+    if (events_render(NULL, NULL, eve_dev, wav_dev, end_dev,
+                      emit_to_file, out, &ignored) != ESP_OK) goto done;
+    char line[640];
+    while (fgets(line, sizeof(line), old)) {
+        if (!strchr(line, '\n')) goto done;
+        if (strstr(line, "\"dataId\":\"UsageEvents-TherapyStatusEvents\""))
+            continue;
+        if (fputs(line, out) < 0) goto done;
+        bool found = false;
+        for (int i = 0; i < cand.n; i++) {
+            if (!seen[i] && !strcmp(line, cand.v[i])) {
+                seen[i] = true;
+                found = true;
+                break;
+            }
+        }
+        bool respiratory = strstr(line, "\"dataId\":\"TherapyEvents-RespiratoryEvents\"") != NULL;
+        bool csl_event = strstr(line, "\"event\":\"CsrStart\"") ||
+                         strstr(line, "\"event\":\"CsrEnd\"");
+        if (respiratory && (csl_event ? cl->csl != NULL : cl->eve != NULL) &&
+            !found) {
+            ret = ESP_ERR_NOT_SUPPORTED;
+            goto done;
+        }
+    }
+    if (ferror(old)) goto done;
+    for (int i = 0; i < cand.n; i++) {
+        if (seen[i]) continue;
+        if (fputs(cand.v[i], out) < 0) goto done;
+        bool csl = strstr(cand.v[i], "\"event\":\"CsrStart\"") ||
+                   strstr(cand.v[i], "\"event\":\"CsrEnd\"");
+        *new_kinds |= (uint8_t)(1u << (csl ? 4 : 3));
+    }
+    if (imp_flush_close(out, part) != ESP_OK) {
+        out = NULL;
+        goto done;
+    }
+    out = NULL;
+    fclose(old);
+    old = fopen(path, "rb");
+    FILE *next = fopen(part, "rb");
+    if (!old || !next) {
+        if (next) fclose(next);
+        goto done;
+    }
+    *changed = false;
+    unsigned char a[512], b[512];
+    for (;;) {
+        size_t na = fread(a, 1, sizeof(a), old);
+        size_t nb = fread(b, 1, sizeof(b), next);
+        if (na != nb || memcmp(a, b, na)) { *changed = true; break; }
+        if (na < sizeof(a)) {
+            if (ferror(old) || ferror(next)) { fclose(next); goto done; }
+            break;
+        }
+    }
+    fclose(next);
+    if (!*changed) unlink(part);
+    ret = ESP_OK;
+done:
+    if (old) fclose(old);
+    if (out) fclose(out);
+    if (ret != ESP_OK) unlink(part);
+    free(seen);
+    line_set_free(&cand);
+    return ret;
+}
+
+/* Legacy/future cohorts are immutable. Only consume a byte-identical replay
+ * when its identity, complete fingerprint and published artifacts all exist. */
+static bool frozen_exact_duplicate(const char *dir, const char *id,
+                                   const cJSON *manifest, const imp_work_t *w,
+                                   const imp_cluster_t *cl, uint8_t *consumed)
+{
+    *consumed = 0;
+    if (!w->src_identity_verified) return false;
+    const cJSON *state = cJSON_GetObjectItemCaseSensitive(manifest, "state");
+    const cJSON *sources = cJSON_GetObjectItemCaseSensitive(manifest, "import_sources");
+    const cJSON *hashes = cJSON_GetObjectItemCaseSensitive(manifest, "import_sha256");
+    if (!cJSON_IsString(state) || !state->valuestring ||
+        strcmp(state->valuestring, "completed") || !cJSON_IsObject(sources) ||
+        !cJSON_IsObject(hashes)) return false;
+    char path[448];
+    struct stat st;
+    snprintf(path, sizeof(path), "%s/%s_session.json.importing", dir, id);
+    if (stat(path, &st) == 0 || errno != ENOENT) return false;
+    snprintf(path, sizeof(path), "%s/%s_augment.pending", dir, id);
+    if (stat(path, &st) == 0 || errno != ENOENT) return false;
+    static const char *const artifacts[] = {
+        "_flow.snt", "_pld.snt", "_sa2.snt", "_events.snt", "_events.snt"
+    };
+    uint8_t offered = 0;
+    for (int i = 0; i < 5; i++) {
+        const imp_file_t *file = cluster_source(cl, i);
+        if (!file) continue;
+        const cJSON *name = cJSON_GetObjectItemCaseSensitive(sources, imp_source_keys[i]);
+        const cJSON *entry = cJSON_GetObjectItemCaseSensitive(hashes, imp_source_keys[i]);
+        const char *hash;
+        uint64_t size;
+        uint8_t records[8];
+        if (!cJSON_IsString(name) || !name->valuestring ||
+            strcmp(name->valuestring, file->prefix) ||
+            !source_hash_metadata(entry, &hash, &size, records) ||
+            strcmp(hash, w->src_hash[i]) || size != w->src_size[i] ||
+            memcmp(records, w->src_record_count[i], sizeof(records)))
+            return false;
+        snprintf(path, sizeof(path), "%s/%s%s", dir, id, artifacts[i]);
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
+            return false;
+        offered |= (uint8_t)(1u << i);
+    }
+    *consumed = offered;
+    return offered != 0;
+}
+
+/* New imports carry source anchors, allowing updates to be checked against
+ * their own converted streams without touching older or live sessions. */
+static esp_err_t augment_sourced_session(const char *dir, const char *id,
+                                         imp_work_t *w, const imp_cluster_t *cl,
+                                         int64_t end_dev)
+{
+    char mp[448];
+    snprintf(mp, sizeof(mp), "%s/%s_session.json", dir, id);
+    cJSON *mj = read_json_file(mp);
+    cJSON *sources = cJSON_GetObjectItemCaseSensitive(mj, "import_sources");
+    if (!cJSON_IsObject(sources)) { cJSON_Delete(mj); return ESP_ERR_NOT_SUPPORTED; }
+    const cJSON *version = cJSON_GetObjectItemCaseSensitive(mj, "import_grouping_version");
+    if (!cJSON_IsNumber(version) || version->valuedouble != 2.0) {
+        bool duplicate = frozen_exact_duplicate(dir, id, mj, w, cl, &w->src_consumed);
+        if (!duplicate) w->frozen = true;
+        cJSON_Delete(mj);
+        return duplicate ? ESP_ERR_INVALID_STATE : ESP_ERR_NOT_SUPPORTED;
+    }
+    for (int i = 0; i < 5; i++) {
+        const imp_file_t *file = cluster_source(cl, i);
+        if (!file) continue;
+        bool same_stem = false;
+        for (int k = 0; k < 5; k++) {
+            const cJSON *old = cJSON_GetObjectItemCaseSensitive(sources, imp_source_keys[k]);
+            if (cJSON_IsString(old) && old->valuestring &&
+                !strcmp(old->valuestring, file->prefix)) same_stem = true;
+        }
+        if (!same_stem) w->retain_raw = true;
+    }
+
+    char pending_path[448];
+    snprintf(pending_path, sizeof(pending_path), "%s/%s_augment.pending", dir, id);
+    struct stat pending_stat;
+    bool pending = stat(pending_path, &pending_stat) == 0;
+    if ((pending && !S_ISREG(pending_stat.st_mode)) ||
+        (!pending && errno != ENOENT)) {
+        cJSON_Delete(mj);
+        return ESP_FAIL;
+    }
+    int64_t old_start = 0, old_end = 0, shift = 0, old_off = 0;
+    if (!json_i64(mj, "start_epoch_ms", &old_start) ||
+        !json_i64(mj, "end_epoch_ms", &old_end) ||
+        !json_i64(mj, "clock_drift_ms", &shift)) {
+        cJSON_Delete(mj);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    json_i64(mj, "waveform_offset_ms", &old_off);
+    int64_t old_wave = -1;
+    json_i64(mj, "import_wave_dev_ms", &old_wave);
+    int64_t old_ann = source_anchor(sources, 3, 5);
+    int64_t eve_dev = old_ann >= 0 ? old_ann : cl->eve_ts;
+    int64_t wav_dev = old_wave >= 0 ? old_wave : cl->wav_ts;
+    int64_t start_dev = eve_dev >= 0 ? eve_dev : wav_dev;
+    if (start_dev < 0) { cJSON_Delete(mj); return ESP_ERR_NOT_SUPPORTED; }
+    if (imp_shift_at(w->drift, start_dev) != shift)
+        ESP_LOGI(TAG, "import: %s retains its original clock correction for late files", id);
+    if (wav_dev < 0) wav_dev = start_dev;
+    int64_t wav_ntp = old_wave >= 0 ? old_start + old_off : wav_dev + shift;
+    int64_t start_ntp = start_dev + shift;
+    int64_t end_ntp = end_dev + shift;
+    if (end_ntp < old_end) { end_ntp = old_end; end_dev = old_end - shift; }
+    const uint32_t m_flow = manifest_u32(mj, "brp_samples");
+    const uint32_t m_press = manifest_u32(mj, "press_samples");
+    const uint32_t m_mm = manifest_u32(mj, "brp_mm_samples");
+    const uint32_t m_sa2 = manifest_u32(mj, "sa2_samples");
+    const uint32_t m_pld = manifest_u32(mj, "pld_samples");
+    uint32_t nf = 0, np = 0, nm = 0, ns = 0, nl = 0;
+    bool change_brp = false, change_sa2 = false, change_pld = false;
+    bool metadata_changed = false, events_changed = false;
+    uint8_t new_event_kinds = 0;
+    esp_err_t ret = ESP_FAIL;
+    uint8_t offered = 0;
+    for (int i = 0; i < 5; i++) {
+        if (!cluster_source(cl, i)) continue;
+        offered |= (uint8_t)(1u << i);
+        if (!cJSON_GetObjectItemCaseSensitive(sources, imp_source_keys[i]))
+            metadata_changed = true;
+    }
+
+    if (cl->brp) {
+        imp_edf_t *e = imp_malloc(sizeof(*e));
+        esp_err_t r = e ? imp_edf_open(e, cl->brp->path) : ESP_ERR_NO_MEM;
+        if (r == ESP_OK) r = conv_brp(e, dir, id, wav_ntp, &nf, &np, &nm);
+        free(e);
+        if (r != ESP_OK) goto done;
+        bool recorded = cJSON_GetObjectItemCaseSensitive(sources, "brp") != NULL;
+        int flow = recorded && m_flow ? staged_stream_relation(dir, id, "flow") : 1;
+        int mm = recorded && m_mm ? staged_stream_relation(dir, id, "flow_mm") : 1;
+        int press = recorded && m_press ? staged_stream_relation(dir, id, "press") : (np ? 1 : 0);
+        if (flow < 0 || mm < 0 || press < 0 ||
+            ((flow == 1 || mm == 1 || press == 1) &&
+             (flow == 2 || mm == 2 || press == 2)) ||
+            (pending && (flow == 2 || mm == 2 || press == 2))) goto conflict;
+        change_brp = pending || flow == 1 || mm == 1 || press == 1;
+        if (!change_brp) {
+            remove_staged_stream(dir, id, "flow");
+            remove_staged_stream(dir, id, "flow_mm");
+            remove_staged_stream(dir, id, "press");
+        }
+    }
+    if (cl->sa2) {
+        imp_edf_t *e = imp_malloc(sizeof(*e));
+        esp_err_t r = e ? imp_edf_open(e, cl->sa2->path) : ESP_ERR_NO_MEM;
+        if (r == ESP_OK) r = conv_sa2(e, dir, id, wav_ntp, &ns);
+        free(e);
+        if (r != ESP_OK) goto done;
+        bool recorded = cJSON_GetObjectItemCaseSensitive(sources, "sa2") != NULL;
+        int rel = recorded && m_sa2 ? staged_stream_relation(dir, id, "sa2") : 1;
+        if (rel < 0 || (pending && rel == 2)) goto conflict;
+        change_sa2 = pending || rel == 1;
+        if (!change_sa2) remove_staged_stream(dir, id, "sa2");
+    }
+    if (cl->pld) {
+        imp_edf_t *e = imp_malloc(sizeof(*e));
+        esp_err_t r = e ? imp_edf_open(e, cl->pld->path) : ESP_ERR_NO_MEM;
+        if (r == ESP_OK) r = conv_pld(e, dir, id, wav_ntp, &nl);
+        free(e);
+        if (r != ESP_OK) goto done;
+        bool recorded = cJSON_GetObjectItemCaseSensitive(sources, "pld") != NULL;
+        int rel = recorded && m_pld ? staged_stream_relation(dir, id, "pld") : 1;
+        if (rel < 0 || (pending && rel == 2)) goto conflict;
+        change_pld = pending || rel == 1;
+        if (!change_pld) remove_staged_stream(dir, id, "pld");
+    }
+    esp_err_t event_result = stage_merged_events(dir, id, cl, eve_dev, wav_dev,
+                                                 end_dev, &events_changed,
+                                                 &new_event_kinds);
+    if (event_result == ESP_ERR_NOT_SUPPORTED) goto conflict;
+    if (event_result != ESP_OK) goto done;
+    if (w->src_identity_verified) {
+        const cJSON *hashes = cJSON_GetObjectItemCaseSensitive(mj, "import_sha256");
+        bool represented[] = {change_brp, change_pld, change_sa2,
+                              (new_event_kinds & (1u << 3)) != 0,
+                              (new_event_kinds & (1u << 4)) != 0};
+        for (int i = 0; i < 5; i++) {
+            if (!(offered & (1u << i)) ||
+                !cJSON_GetObjectItemCaseSensitive(sources, imp_source_keys[i]))
+                continue;
+            const cJSON *old = cJSON_GetObjectItemCaseSensitive(hashes, imp_source_keys[i]);
+            const char *old_hash;
+            uint64_t old_size;
+            uint8_t old_count[8];
+            if (!source_hash_metadata(old, &old_hash, &old_size, old_count))
+                goto conflict;
+            if (strcmp(old_hash, w->src_hash[i])) {
+                if ((!represented[i] && !pending) || w->src_size[i] <= old_size)
+                    goto conflict;
+                char prefix_hash[65];
+                esp_err_t h = hash_source(cluster_source(cl, i)->path, old_size,
+                                          old_count, prefix_hash, NULL, NULL);
+                if (h != ESP_OK) goto done;
+                if (strcmp(prefix_hash, old_hash)) goto conflict;
+            }
+        }
+        if (hash_cluster_sources(w, true) != ESP_OK) goto done;
+    }
+    if (!manifest_record_sources(mj, cl, offered, w)) goto conflict;
+
+    bool changed = change_brp || change_sa2 || change_pld || metadata_changed ||
+                   events_changed || pending || start_ntp != old_start || end_ntp != old_end;
+    if (changed) {
+        if (change_brp) {
+            manifest_set_num(mj, "brp_samples", nf);
+            manifest_set_num(mj, "press_samples", np);
+            manifest_set_num(mj, "brp_mm_samples", nm);
+            manifest_add_kind(mj, "brp");
+        }
+        if (change_sa2) { manifest_set_num(mj, "sa2_samples", ns); manifest_add_kind(mj, "sa2"); }
+        if (change_pld) { manifest_set_num(mj, "pld_samples", nl); manifest_add_kind(mj, "pld"); }
+        if (cl->eve) manifest_add_kind(mj, "eve");
+        if (cl->csl) manifest_add_kind(mj, "csl");
+        if (old_wave < 0 && cl->wav_ts >= 0)
+            manifest_set_num(mj, "import_wave_dev_ms", (double)cl->wav_ts);
+        manifest_set_num(mj, "start_epoch_ms", (double)start_ntp);
+        manifest_set_num(mj, "end_epoch_ms", (double)end_ntp);
+        manifest_set_num(mj, "waveform_offset_ms", (double)(wav_ntp - start_ntp));
+        char iso[32];
+        imp_epoch_to_local_iso(start_ntp, iso, sizeof(iso));
+        cJSON_ReplaceItemInObject(mj, "start_iso", cJSON_CreateString(iso));
+        imp_epoch_to_local_iso(end_ntp, iso, sizeof(iso));
+        cJSON_ReplaceItemInObject(mj, "end_iso", cJSON_CreateString(iso));
+        if (preserve_overflowing_drift(dir, id, mj) != ESP_OK) goto done;
+        manifest_enforce_cap(mj);
+        if (!manifest_fits_reader_limit(mj)) goto done;
+        /* A manifest is published last. If power or a write fails after
+         * replacing any stream, a retry must republish the offered sources
+         * and refresh the manifest/export even when the bytes now match. */
+        if (!pending) {
+            FILE *mark = fopen(pending_path, "w");
+            if (!mark || imp_flush_close(mark, pending_path) != ESP_OK) goto done;
+        }
+        if (publish_parts(dir, id) != ESP_OK || write_json_atomic(mp, mj) != ESP_OK)
+            goto done;
+        if (unlink(pending_path) != 0 && errno != ENOENT) goto done;
+    }
+    w->src_consumed = offered;
+    ret = changed ? ESP_OK : ESP_ERR_INVALID_STATE;
+    goto done;
+
+conflict:
+    ESP_LOGW(TAG, "import: %s changed source conflicts with recorded samples; kept", id);
+    ret = ESP_ERR_NOT_SUPPORTED;
+done:
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        remove_staged_stream(dir, id, "flow");
+        remove_staged_stream(dir, id, "flow_mm");
+        remove_staged_stream(dir, id, "press");
+        remove_staged_stream(dir, id, "sa2");
+        remove_staged_stream(dir, id, "pld");
+        char ep[456];
+        snprintf(ep, sizeof(ep), "%s/%s_events.snt.part", dir, id);
+        unlink(ep);
+    }
+    cJSON_Delete(mj);
+    return ret;
+}
+
 static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
                                 const imp_drift_t *drift)
 {
-    /* Session anchors (device domain) */
+    /* Session anchors (device domain).  The applied shift is the measured
+     * drift plus, when the sidecar confirms a fixed zone for the source
+     * device, the delta to the ESP's own zone — evaluated per anchor so
+     * a session straddling an ESP DST boundary still lands exactly. */
     int64_t anchor_dev = (cl->eve_ts >= 0) ? cl->eve_ts : cl->wav_ts;
     int64_t wav_off_ms = (cl->eve_ts >= 0 && cl->wav_ts >= 0)
                          ? cl->wav_ts - cl->eve_ts : 0;
     int64_t wav_dev = (cl->wav_ts >= 0) ? cl->wav_ts : anchor_dev;
-    int64_t start_ntp = anchor_dev + drift->drift_ms;
-    int64_t wav_ntp   = wav_dev + drift->drift_ms;
+    const int64_t shift = imp_shift_at(drift, anchor_dev);
+    int64_t start_ntp = anchor_dev + shift;
+    int64_t wav_ntp   = wav_dev + imp_shift_at(drift, wav_dev);
     int64_t end_dev   = anchor_dev;
 
     /* Longest member file span ends the session */
@@ -2289,13 +4083,20 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
     for (int i = 0; i < 5; i++) {
         if (!memb[i]) continue;
         imp_edf_t *e = imp_malloc(sizeof(imp_edf_t));
-        if (e && imp_edf_open(e, memb[i]->path) == ESP_OK) {
+        if (!e) return ESP_ERR_NO_MEM;
+        esp_err_t opened = imp_edf_open(e, memb[i]->path);
+        if (opened == ESP_OK) {
             int64_t span = (int64_t)(e->rdur_s * 1000.0) * e->n_records;
             /* Annotation files declare 0 s records, so a mask-less session's
              * span is its last annotation's end instead.  With waveforms the
              * waveform files alone define the end. */
             if (ann_only && e->is_ann) {
-                int64_t a = imp_ann_span_ms(memb[i]->path, i == 4);
+                int64_t a = 0;
+                esp_err_t span_err = imp_ann_span_ms(memb[i]->path, i == 4, &a);
+                if (span_err != ESP_OK) {
+                    free(e);
+                    return span_err;
+                }
                 if (a > span) span = a;
             }
             int64_t fend = e->ts_dev_ms >= 0 ? e->ts_dev_ms + span
@@ -2303,13 +4104,14 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
             if (fend > end_dev) end_dev = fend;
         }
         free(e);
+        if (opened != ESP_OK) return opened;
     }
     /* A mask-less session still needs end > start: the day spool and
      * SessionModeEntries ignore zero-length windows, and the AS11 itself
      * records MaskOff = MaskOn for 0-duration sessions. */
     if (ann_only && end_dev <= anchor_dev)
         end_dev = anchor_dev + 1000;
-    int64_t end_ntp = end_dev + drift->drift_ms;
+    int64_t end_ntp = end_dev + imp_shift_at(drift, end_dev);
 
     /* Noon-day stream folder — raw device time, never drifted.  Create the
      * full parent chain defensively: a fresh card whose first content is an
@@ -2322,8 +4124,18 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
     mkdir(SD_STREAMS_DIR, 0775);
     mkdir(dir, 0775);
 
-    esp_err_t sel = pick_session_id(dir, start_ntp, w->id, sizeof(w->id));
-    if (sel != ESP_OK) return sel;   /* INVALID_STATE = already imported */
+    esp_err_t sel = guard_adjacent_noon(w, cl, end_dev);
+    if (sel != ESP_OK) return sel;
+    sel = find_import_match(dir, w, cl, end_dev, w->id, sizeof(w->id));
+    if (sel == ESP_ERR_INVALID_STATE) {
+        /* The session already exists — merge whatever this cluster can
+         * still offer instead of deleting a late-recovered file as a
+         * duplicate (augment returns INVALID_STATE for a true dup). */
+        return augment_sourced_session(dir, w->id, w, cl, end_dev);
+    }
+    if (sel != ESP_OK) return sel;
+    sel = pick_session_id(dir, start_ntp, w->id, sizeof(w->id));
+    if (sel != ESP_OK) return sel;
 
     ESP_LOGI(TAG, "import: session %s (day %s, wav+%lld ms, %s)",
              w->id, w->day, (long long)wav_off_ms, drift->source);
@@ -2396,23 +4208,23 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
             char p[400];
             snt_w_t t;
             snprintf(p, sizeof(p), "%s/%s%s", dir, w->id, T[i].sfx);
-            if (snt_w_open(&t, p, T[i].ch, T[i].hz, T[i].tier, wav_ntp) == ESP_OK)
-                snt_w_flush(&t);
+            if (snt_w_open(&t, p, T[i].ch, T[i].hz, T[i].tier, wav_ntp) != ESP_OK ||
+                snt_w_flush(&t) != ESP_OK) goto out;
         }
     }
     if (n_sa2 == 0) {
         char p[400];
         snt_w_t t;
         snprintf(p, sizeof(p), "%s/%s_sa2.snt", dir, w->id);
-        if (snt_w_open(&t, p, 2, 10, SNT_TIER_RAW, wav_ntp) == ESP_OK)
-            snt_w_flush(&t);
+        if (snt_w_open(&t, p, 2, 10, SNT_TIER_RAW, wav_ntp) != ESP_OK ||
+            snt_w_flush(&t) != ESP_OK) goto out;
     }
     if (!have_pld) {
         char p[400];
         snt_w_t t;
         snprintf(p, sizeof(p), "%s/%s_pld.snt", dir, w->id);
-        if (snt_w_open(&t, p, 12, 5, SNT_TIER_RAW, wav_ntp) == ESP_OK)
-            snt_w_flush(&t);
+        if (snt_w_open(&t, p, 12, 5, SNT_TIER_RAW, wav_ntp) != ESP_OK ||
+            snt_w_flush(&t) != ESP_OK) goto out;
     }
 
     /* ── Events → staged .part ── */
@@ -2432,10 +4244,28 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
         }
     }
 
-    /* ── Publish all staged parts, then the manifest (commit point) ── */
+    if (w->src_identity_verified && hash_cluster_sources(w, true) != ESP_OK)
+        goto out;
+    /* Publish sidecars before the manifest, so a committed session does not
+     * lose its source identity/settings if an auxiliary write fails. */
     if (publish_parts(dir, w->id) != ESP_OK) goto out;
+    if (w->ident) {
+        char p[448];
+        snprintf(p, sizeof(p), "%s/%s_ident.json", dir, w->id);
+        if (write_json_atomic(p, w->ident) != ESP_OK) goto out;
+    }
+    if (w->settings) {
+        char p[448];
+        snprintf(p, sizeof(p), "%s/%s_settings.json", dir, w->id);
+        if (write_json_atomic(p, w->settings) != ESP_OK) goto out;
+    }
+    /* The manifest remains the commit point for all published files. */
     {
         cJSON *r = cJSON_CreateObject();
+        if (!r || !cJSON_AddNumberToObject(r, "import_grouping_version", 2)) {
+            cJSON_Delete(r);
+            goto out;
+        }
         char iso[32];
         imp_epoch_to_local_iso(start_ntp, iso, sizeof(iso));
         cJSON_AddStringToObject(r, "id", w->id);
@@ -2453,16 +4283,50 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
         cJSON_AddNumberToObject(r, "press_samples", (double)n_press);
         cJSON_AddNumberToObject(r, "sa2_samples", (double)n_sa2);
         cJSON_AddNumberToObject(r, "pld_samples", (double)n_pld);
+        /* Which source kinds were offered at commit: the augment path
+         * relies on it to merge a late-recovered file without ever
+         * discarding verifiable content. */
+        cJSON *kinds = cJSON_AddArrayToObject(r, "src_kinds");
+        if (kinds) {
+            if (cl->brp) cJSON_AddItemToArray(kinds, cJSON_CreateString("brp"));
+            if (cl->pld) cJSON_AddItemToArray(kinds, cJSON_CreateString("pld"));
+            if (cl->sa2) cJSON_AddItemToArray(kinds, cJSON_CreateString("sa2"));
+            if (cl->eve) cJSON_AddItemToArray(kinds, cJSON_CreateString("eve"));
+            if (cl->csl) cJSON_AddItemToArray(kinds, cJSON_CreateString("csl"));
+        }
+        if (!manifest_record_sources(r, cl, 0x1f, w)) {
+            cJSON_Delete(r);
+            goto out;
+        }
+        if (cl->wav_ts >= 0)
+            cJSON_AddNumberToObject(r, "import_wave_dev_ms", (double)cl->wav_ts);
         cJSON_AddNumberToObject(r, "stream_notifications", 0);
         cJSON_AddNumberToObject(r, "gap_events", 0);
         cJSON_AddNumberToObject(r, "gap_missing", 0);
-        cJSON_AddNumberToObject(r, "clock_drift_ms", (double)drift->drift_ms);
+        /* The applied session shift: measured drift + device-zone delta
+         * at the session anchor.  Downstream readers reconstruct device
+         * time as start_epoch_ms - clock_drift_ms, so the total applied
+         * shift is what must be recorded here; the decomposition stays
+         * visible in device_tz_* and somnobridge_drift. */
+        cJSON_AddNumberToObject(r, "clock_drift_ms", (double)shift);
         cJSON_AddBoolToObject(r, "clock_drift_valid", drift->valid);
         cJSON_AddBoolToObject(r, "clock_drift_usable", drift->usable);
         cJSON_AddStringToObject(r, "clock_drift_source", drift->source);
         if (drift->measured_at_ms > 0)
             cJSON_AddNumberToObject(r, "clock_drift_measured_at_ms",
                                     (double)drift->measured_at_ms);
+        if (drift->half_ms >= 0)
+            cJSON_AddNumberToObject(r, "clock_drift_half_ms",
+                                    (double)drift->half_ms);
+        if (drift->dev_tz_off_s != INT32_MIN) {
+            cJSON_AddNumberToObject(r, "device_tz_offset_s",
+                                    (double)drift->dev_tz_off_s);
+            cJSON_AddNumberToObject(r, "device_tz_delta_ms",
+                                    (double)(shift - drift->drift_ms));
+            if (drift->dev_tz_rule[0])
+                cJSON_AddStringToObject(r, "device_tz_rule",
+                                        drift->dev_tz_rule);
+        }
         cJSON_AddStringToObject(r, "time_source",
                                 drift->valid ? "ntp" : "file_import");
         cJSON_AddStringToObject(r, "import_source", w->import_src);
@@ -2471,8 +4335,18 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
             cJSON_AddStringToObject(r, "source_device_family", w->src_family);
         if (w->src_serial && w->src_serial[0])
             cJSON_AddStringToObject(r, "source_serial", w->src_serial);
+        if (w->src_identity_verified)
+            cJSON_AddBoolToObject(r, "source_identity_verified", true);
         manifest_add_drift(r, drift, drift_big, w->id, drift_filed);
+        if (preserve_overflowing_drift(dir, w->id, r) != ESP_OK) {
+            cJSON_Delete(r);
+            goto out;
+        }
         manifest_enforce_cap(r);
+        if (!manifest_fits_reader_limit(r)) {
+            cJSON_Delete(r);
+            goto out;
+        }
         char mp[448];
         snprintf(mp, sizeof(mp), "%s/%s_session.json", dir, w->id);
         esp_err_t wr = write_json_atomic(mp, r);
@@ -2480,19 +4354,6 @@ static esp_err_t commit_session(imp_work_t *w, const imp_cluster_t *cl,
         if (wr != ESP_OK) goto out;
     }
     delete_import_marker(dir, w->id);
-
-    /* Auxiliary sidecars — written after the commit point (they are
-     * recoverable through the existing ident/settings fallback chain). */
-    if (w->ident) {
-        char p[448];
-        snprintf(p, sizeof(p), "%s/%s_ident.json", dir, w->id);
-        write_json_atomic(p, w->ident);
-    }
-    if (w->settings) {
-        char p[448];
-        snprintf(p, sizeof(p), "%s/%s_settings.json", dir, w->id);
-        write_json_atomic(p, w->settings);
-    }
 
     w->n_flow = n_flow; w->n_press = n_press; w->n_mm = n_mm;
     w->n_sa2 = n_sa2; w->n_pld = n_pld; w->n_events = n_ev;
@@ -2517,10 +4378,222 @@ typedef struct {
     char        key[9];             /* sort key — always an 8-char day label */
     bool        is_flat;            /* files lived directly under IMPORT/ */
     bool        has_part;           /* .part/.tmp present → still transferring */
+    bool        future_part;        /* future timestamp needs monotonic observation */
+    uint64_t    future_part_signature;
+    bool        capacity_exceeded;  /* all candidates must be visible together */
     char        drift_path[320];    /* _bridge_drift.json, "" when absent */
+    time_t      dir_mtime;          /* src_dir mtime at scan — pre-commit re-check */
     int         n_files;
     imp_file_t  files[IMP_MAX_FILES];
 } imp_group_t;
+
+static unsigned char group_kind(const imp_group_t *g)
+{
+    if (g->is_flat) return 2;
+    return strncmp(g->src_dir, IMP_DATALOG_DIR, strlen(IMP_DATALOG_DIR)) == 0 ? 1 : 0;
+}
+
+static bool group_skipped(const edf_import_ctx_t *ctx, const char *day, unsigned char kind)
+{
+    for (int i = 0; i < ctx->n_skipped; i++)
+        if (ctx->skipped[i].kind == kind && !strcmp(ctx->skipped[i].day, day))
+            return true;
+    return false;
+}
+
+static void skip_group(edf_import_ctx_t *ctx, const imp_group_t *g)
+{
+    unsigned char kind = group_kind(g);
+    if (group_skipped(ctx, g->key, kind)) return;
+    if (ctx->n_skipped == IMP_MAX_SKIPPED_GROUPS) {
+        ctx->skip_full = true;
+        return;
+    }
+    memcpy(ctx->skipped[ctx->n_skipped].day, g->key, sizeof(g->key));
+    ctx->skipped[ctx->n_skipped++].kind = kind;
+}
+
+/* ── Persistent no-change markers ─────────────────────────────────────
+ * A group whose evaluation leaves only staged/rejected sources gets a
+ * .import_state file recording a signature of the surviving file set and
+ * the evidence epoch it was evaluated under.  While neither changes the
+ * group is skipped entirely — staged sources keep waiting for evidence
+ * instead of being re-clustered and re-evaluated on every pass.
+ *
+ * The evidence epoch is a counter in IMPORT/.import_epoch bumped whenever
+ * an import unit commits durable progress (sessions imported, sources
+ * consumed, settings or spools written): association outcomes consult
+ * committed manifests and STR mask intervals across days, so any durable
+ * change invalidates every marker once — then groups go quiet again. */
+
+static uint32_t s_import_epoch;
+static bool     s_epoch_loaded;
+
+static uint32_t import_epoch(void)
+{
+    if (!s_epoch_loaded) {
+        s_epoch_loaded = true;
+        cJSON *j = read_json_file(IMP_IMPORT_DIR "/.import_epoch");
+        const cJSON *e = j ? cJSON_GetObjectItemCaseSensitive(j, "epoch") : NULL;
+        if (cJSON_IsNumber(e) && e->valuedouble > 0 &&
+            e->valuedouble < 4294967295.0)
+            s_import_epoch = (uint32_t)e->valuedouble;
+        cJSON_Delete(j);
+        if (!s_import_epoch) s_import_epoch = 1;
+    }
+    return s_import_epoch;
+}
+
+static void import_epoch_bump(void)
+{
+    s_import_epoch = import_epoch() + 1;
+    if (!s_import_epoch) s_import_epoch = 1;
+    FILE *f = fopen(IMP_IMPORT_DIR "/.import_epoch", "w");
+    if (f) {
+        fprintf(f, "{\"epoch\":%lu}", (unsigned long)s_import_epoch);
+        fclose(f);
+    }
+}
+
+/* Order-independent signature over a group's surviving sources: each
+ * present file contributes a hash of name|size|mtime, so renames,
+ * rewrites, arrivals and deletions all change the sum.  Sources deleted
+ * after a commit drop out on their own via the stat failure. */
+static uint64_t group_signature(const imp_group_t *g)
+{
+    uint64_t sig = 0;
+    for (int i = 0; i < g->n_files; i++) {
+        struct stat st;
+        if (stat(g->files[i].path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        const char *base = strrchr(g->files[i].path, '/');
+        base = base ? base + 1 : g->files[i].path;
+        char rec[360];
+        int n = snprintf(rec, sizeof(rec), "%s|%lld|%lld|%lld", base,
+                         (long long)st.st_size, (long long)st.st_mtime,
+                         (long long)st.st_ctime);
+        if (n <= 0) continue;
+        if (n >= (int)sizeof(rec)) n = (int)sizeof(rec) - 1;
+        uint64_t h = 1469598103934665603ULL;   /* FNV-1a 64 */
+        for (int j = 0; j < n; j++) {
+            h ^= (uint8_t)rec[j];
+            h *= 1099511628211ULL;
+        }
+        sig += h;
+    }
+    if (g->drift_path[0]) {
+        struct stat st;
+        if (stat(g->drift_path, &st) == 0 && S_ISREG(st.st_mode))
+            sig += 0x9e3779b97f4a7c15ULL ^ (uint64_t)st.st_size ^
+                   ((uint64_t)st.st_mtime << 20);
+    }
+    return sig;
+}
+
+static void group_state_path(const imp_group_t *g, char *out, size_t cap)
+{
+    /* Flat groups share IMPORT/ — give each noon-day key its own file. */
+    if (g->is_flat)
+        snprintf(out, cap, "%s/.import_state_%s", g->src_dir, g->key);
+    else
+        snprintf(out, cap, "%s/.import_state", g->src_dir);
+}
+
+typedef enum {
+    GROUP_STATE_NEW,        /* no marker, or files/evidence changed */
+    GROUP_STATE_CONFIRM,    /* same set seen once — evaluate once more */
+    GROUP_STATE_SKIP,       /* unchanged across a confirmed evaluation */
+} group_state_t;
+
+/* A marker only earns the skip after the same file set was already
+ * evaluated twice with the same outcome: augmentation is iterative —
+ * a second pass over an unchanged set can legally merge what the first
+ * staged (e.g. a corrected-prefix append).  One confirmation pass bounds
+ * the extra work while never freezing a mid-resolution state. */
+static group_state_t group_state_check(const imp_group_t *g, uint64_t sig,
+                                       int *seen_out, int *skipped_out)
+{
+    char path[340];
+    group_state_path(g, path, sizeof(path));
+    *seen_out = 0;
+    *skipped_out = 0;
+    cJSON *j = read_json_file(path);
+    if (!j) return GROUP_STATE_NEW;
+    const cJSON *s = cJSON_GetObjectItemCaseSensitive(j, "sig");
+    const cJSON *e = cJSON_GetObjectItemCaseSensitive(j, "epoch");
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(j, "seen");
+    const cJSON *k = cJSON_GetObjectItemCaseSensitive(j, "skipped");
+    const cJSON *mv = cJSON_GetObjectItemCaseSensitive(j, "v");
+    group_state_t st = GROUP_STATE_NEW;
+    /* v2: older markers predate consume-on-commit — surviving files must
+     * be re-evaluated once so already-committed sources are consumed. */
+    if (cJSON_IsNumber(mv) && mv->valuedouble == 2.0 &&
+        cJSON_IsString(s) && s->valuestring && cJSON_IsNumber(e) &&
+        cJSON_IsNumber(v) && v->valueint >= 0 &&
+        (uint64_t)e->valuedouble == (uint64_t)import_epoch() &&
+        strtoull(s->valuestring, NULL, 16) == sig) {
+        *seen_out = v->valueint;
+        if (cJSON_IsNumber(k) && k->valueint > 0)
+            *skipped_out = k->valueint;
+        st = v->valueint >= 2 ? GROUP_STATE_SKIP : GROUP_STATE_CONFIRM;
+    }
+    cJSON_Delete(j);
+    return st;
+}
+
+static void group_state_write(const imp_group_t *g, int seen, int skipped)
+{
+    char path[340];
+    group_state_path(g, path, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "{\"v\":2,\"sig\":\"%llx\",\"epoch\":%lu,\"seen\":%d,\"skipped\":%d}",
+            (unsigned long long)group_signature(g),
+            (unsigned long)import_epoch(), seen, skipped);
+    fclose(f);
+}
+
+/* Staged-outcome warnings repeat verbatim on every re-evaluation while
+ * neither the surviving file set nor the evidence epoch has changed —
+ * report them once per (signature, epoch) instead of once per pass.
+ * Entries live for the process lifetime, the same horizon as the log
+ * volume they exist to limit; a change in bytes, membership or evidence
+ * re-arms the warnings immediately. */
+#define IMP_WARN_MARK_MAX 8
+
+typedef struct {
+    char     key[9];
+    uint64_t sig;
+    uint32_t epoch;
+} imp_warn_mark_t;
+
+static imp_warn_mark_t s_warn_mark[IMP_WARN_MARK_MAX];
+static int s_warn_mark_n, s_warn_mark_next;
+
+static bool imp_staged_warn_fresh(const imp_group_t *g, uint64_t sig)
+{
+    uint32_t epoch = import_epoch();
+    for (int i = 0; i < s_warn_mark_n; i++) {
+        if (!strcmp(s_warn_mark[i].key, g->key)) {
+            bool fresh = s_warn_mark[i].sig != sig ||
+                         s_warn_mark[i].epoch != epoch;
+            s_warn_mark[i].sig = sig;
+            s_warn_mark[i].epoch = epoch;
+            return fresh;
+        }
+    }
+    int slot = s_warn_mark_n < IMP_WARN_MARK_MAX
+               ? s_warn_mark_n++ : s_warn_mark_next++ % IMP_WARN_MARK_MAX;
+    memcpy(s_warn_mark[slot].key, g->key, sizeof(s_warn_mark[0].key));
+    s_warn_mark[slot].sig = sig;
+    s_warn_mark[slot].epoch = epoch;
+    return true;
+}
+
+#define imp_staged_logw(fresh, ...)                                    \
+    do {                                                               \
+        if (fresh) ESP_LOGW(TAG, __VA_ARGS__);                         \
+        else       ESP_LOGI(TAG, __VA_ARGS__);                         \
+    } while (0)
 
 static bool name_is_dir8(const char *n)
 {
@@ -2530,8 +4603,11 @@ static bool name_is_dir8(const char *n)
     return true;
 }
 
+static bool imp_recent(const char *path, int quiesce_s);
+static bool imp_future_file(const char *path, uint64_t *signature);
+
 /* Scan one directory for session EDFs + a drift sidecar. */
-static void scan_group_dir(const char *dir, imp_group_t *g)
+static void scan_group_dir(const char *dir, imp_group_t *g, int quiesce_s)
 {
     DIR *d = opendir(dir);
     if (!d) return;
@@ -2542,7 +4618,14 @@ static void scan_group_dir(const char *dir, imp_group_t *g)
         if (nl > 5 &&
             (!strcasecmp(nm + nl - 5, ".part") ||
              !strcasecmp(nm + nl - 5, ".tmp"))) {
-            g->has_part = true;
+            char part_path[640];
+            int n = snprintf(part_path, sizeof(part_path), "%s/%s", dir, nm);
+            if (n > 0 && (size_t)n < sizeof(part_path) &&
+                imp_recent(part_path, quiesce_s))
+                g->has_part = true;
+            if (quiesce_s > 0 && n > 0 && (size_t)n < sizeof(part_path) &&
+                imp_future_file(part_path, &g->future_part_signature))
+                g->future_part = true;
             continue;
         }
         if (!strcmp(nm, IMP_DRIFT_FILE)) {
@@ -2551,8 +4634,10 @@ static void scan_group_dir(const char *dir, imp_group_t *g)
             continue;
         }
         imp_file_t f;
-        if (g->n_files < IMP_MAX_FILES && imp_classify(dir, nm, &f))
-            g->files[g->n_files++] = f;
+        if (imp_classify(dir, nm, &f)) {
+            if (g->n_files < IMP_MAX_FILES) g->files[g->n_files++] = f;
+            else g->capacity_exceeded = true;
+        }
     }
     closedir(d);
 }
@@ -2562,9 +4647,10 @@ static void scan_group_dir(const char *dir, imp_group_t *g)
  * Sources: IMPORT/DATALOG/<day>/, IMPORT/<day>/, and flat IMPORT .edf
  * files (grouped by their own noon-day label).  Root files are handled by
  * the root pass, not here.  Returns true when *g was filled. */
-static bool next_group(imp_group_t *g)
+static bool next_group(const edf_import_ctx_t *ctx, imp_group_t *g)
 {
     memset(g, 0, sizeof(*g));
+    if (ctx->skip_full) return false;
     bool have = false;
 
     /* ~65 KiB scratch group — heap (PSRAM on target), never the 14 KiB
@@ -2580,15 +4666,17 @@ static bool next_group(imp_group_t *g)
         struct dirent *ent;
         while ((ent = readdir(d)) != NULL) {
             if (!name_is_dir8(ent->d_name)) continue;
+            if (group_skipped(ctx, ent->d_name, b == 0 ? 1 : 0)) continue;
             memset(t, 0, sizeof(*t));
             snprintf(t->src_dir, sizeof(t->src_dir), "%s/%.*s",
                      bases[b], 8, ent->d_name);
             struct stat st;
             if (stat(t->src_dir, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            t->dir_mtime = st.st_mtime;
             memcpy(t->key, ent->d_name, 9);   /* name_is_dir8 ⇒ exactly 8 + NUL */
-            scan_group_dir(t->src_dir, t);
+            scan_group_dir(t->src_dir, t, ctx->quiesce_s);
             if (t->has_part) continue;          /* transfer in flight */
-            if (t->n_files == 0 && !t->drift_path[0]) {
+            if (t->n_files == 0) {
                 /* Nothing importable in here: an already-drained husk, or a
                  * folder holding only leftovers (AS10 *.crc before the
                  * sidecar fix, quarantined *.bad, a user's own files).
@@ -2615,6 +4703,8 @@ static bool next_group(imp_group_t *g)
         DIR *d = opendir(IMP_IMPORT_DIR);
         if (d) {
             bool blocked = false;
+            bool future_part = false;
+            uint64_t future_part_signature = 0;
             char flat_key[9] = "";
             struct dirent *ent;
             while ((ent = readdir(d)) != NULL) {
@@ -2622,12 +4712,22 @@ static bool next_group(imp_group_t *g)
                 size_t nl = strlen(nm);
                 if (nl > 5 &&
                     (!strcasecmp(nm + nl - 5, ".part") ||
-                     !strcasecmp(nm + nl - 5, ".tmp")))
-                    blocked = true;
+                     !strcasecmp(nm + nl - 5, ".tmp"))) {
+                    char part_path[640];
+                    int n = snprintf(part_path, sizeof(part_path), "%s/%s",
+                                     IMP_IMPORT_DIR, nm);
+                    if (n > 0 && (size_t)n < sizeof(part_path) &&
+                        imp_recent(part_path, ctx->quiesce_s))
+                        blocked = true;
+                    if (ctx->quiesce_s > 0 && n > 0 && (size_t)n < sizeof(part_path) &&
+                        imp_future_file(part_path, &future_part_signature))
+                        future_part = true;
+                }
                 imp_file_t f;
                 if (!imp_classify(IMP_IMPORT_DIR, nm, &f)) continue;
                 char nd[9];
                 as11_time_noon_day(f.ts_dev_ms, nd, sizeof(nd));
+                if (group_skipped(ctx, nd, 2)) continue;
                 if (!flat_key[0] || strcmp(nd, flat_key) < 0)
                     memcpy(flat_key, nd, sizeof(flat_key));   /* nd is 8 + NUL */
             }
@@ -2639,9 +4739,16 @@ static bool next_group(imp_group_t *g)
                 memset(g, 0, sizeof(*g));
                 have = true;
                 g->is_flat = true;
+                g->future_part = future_part;
+                g->future_part_signature = future_part_signature;
                 memcpy(g->key, flat_key, sizeof(g->key));
                 snprintf(g->src_dir, sizeof(g->src_dir), "%s",
                          IMP_IMPORT_DIR);
+                {
+                    struct stat dst0;
+                    if (stat(g->src_dir, &dst0) == 0)
+                        g->dir_mtime = dst0.st_mtime;
+                }
                 rewinddir(d);
                 while ((ent = readdir(d)) != NULL) {
                     imp_file_t f;
@@ -2649,9 +4756,10 @@ static bool next_group(imp_group_t *g)
                         continue;
                     char nd[9];
                     as11_time_noon_day(f.ts_dev_ms, nd, sizeof(nd));
-                    if (!strcmp(nd, flat_key) &&
-                        g->n_files < IMP_MAX_FILES)
-                        g->files[g->n_files++] = f;
+                    if (!strcmp(nd, flat_key)) {
+                        if (g->n_files < IMP_MAX_FILES) g->files[g->n_files++] = f;
+                        else g->capacity_exceeded = true;
+                    }
                 }
                 /* root-level drift sidecar, if present */
                 char dp[320];
@@ -2696,7 +4804,10 @@ static void resolve_ident(edf_import_ctx_t *ctx)
         ctx->ident = ident_from_ident_json(j);
         cJSON_Delete(j);
         if (ctx->ident) {
-            snprintf(ctx->src_family, sizeof(ctx->src_family), "AS11");
+            const cJSON *mid = cJSON_GetObjectItem(ctx->ident, "PlatformIdentifier");
+            if (cJSON_IsNumber(mid))
+                snprintf(ctx->src_family, sizeof(ctx->src_family), "%s",
+                         mid->valueint >= 40 ? "AS11" : "AS10");
             const cJSON *s = cJSON_GetObjectItem(ctx->ident, "SerialNumber");
             if (s && cJSON_IsString(s))
                 snprintf(ctx->src_serial, sizeof(ctx->src_serial),
@@ -2726,23 +4837,111 @@ static void resolve_settings(edf_import_ctx_t *ctx)
     cJSON_Delete(j);
 }
 
+static void retain_root_for_next_run(edf_import_ctx_t *ctx, edf_import_unit_t *u)
+{
+    cJSON_Delete(ctx->ident);
+    cJSON_Delete(ctx->settings);
+    ctx->ident = NULL;
+    ctx->settings = NULL;
+    ctx->src_family[0] = '\0';
+    ctx->src_serial[0] = '\0';
+    ctx->root_retained = true;
+    u->root_retained = true;
+}
+
 static esp_err_t process_root_pass(edf_import_ctx_t *ctx, edf_import_unit_t *u)
 {
     u->root_pass = true;
+    /* A failed root pass retains its files and may be retried on this ctx. */
+    cJSON_Delete(ctx->ident);
+    cJSON_Delete(ctx->settings);
+    ctx->ident = NULL;
+    ctx->settings = NULL;
+    ctx->src_family[0] = '\0';
+    ctx->src_serial[0] = '\0';
+    ctx->root_retained = false;
     resolve_ident(ctx);
     resolve_settings(ctx);
 
     struct stat st;
-    if (stat(IMP_IMPORT_DIR "/STR.edf", &st) == 0)
-        import_str_edf(IMP_IMPORT_DIR "/STR.edf", ctx, u);
+    bool have_ident_source = stat(IMP_IMPORT_DIR "/Identification.json", &st) == 0 ||
+                             stat(IMP_IMPORT_DIR "/Identification.tgt", &st) == 0;
+    bool have_settings_source = stat(IMP_IMPORT_DIR "/SETTINGS/CurrentSettings.json", &st) == 0;
+    bool ident_source_valid = ctx->ident && ctx->src_serial[0] &&
+                              settings_provenance_family(ctx->ident) != SETTINGS_FAMILY_UNKNOWN;
+    if (stat(IMP_IMPORT_DIR "/STR.edf", &st) == 0) {
+        esp_err_t stored = retain_native_str(IMP_IMPORT_DIR "/STR.edf");
+        if (stored != ESP_OK) {
+            ESP_LOGW(TAG, "import: source store unavailable (error %d); "
+                     "processing STR but retaining staged source", (int)stored);
+        }
+        str_import_result_t result = import_str_edf(IMP_IMPORT_DIR "/STR.edf", ctx, u);
+        if (result == STR_IMPORT_RETAIN || result == STR_IMPORT_RETRY) {
+            ESP_LOGW(TAG, "import: STR retained for retry");
+            retain_root_for_next_run(ctx, u);
+            return ESP_OK;
+        }
+        if (result == STR_IMPORT_PARTIAL || stored != ESP_OK) {
+            /* Valid days were written above.  Keep the source files and the
+             * resolved identity/settings in memory so the same ctx can still
+             * import independent day groups; never clear identity here. */
+            /* Retained STR is re-evaluated hourly — report once per
+             * outcome change, not once per pass. */
+            static int s_last_str_outcome[2] = { -1, -1 };
+            if (u->settings_written != s_last_str_outcome[0] ||
+                u->spools_written != s_last_str_outcome[1]) {
+                s_last_str_outcome[0] = u->settings_written;
+                s_last_str_outcome[1] = u->spools_written;
+                ESP_LOGW(TAG, "import: STR source retained (%d new settings, %d new spools)",
+                         u->settings_written, u->spools_written);
+            }
+            if (result == STR_IMPORT_PARTIAL) {
+                /* Ambiguous days stay resolvable: the staged STR keeps its
+                 * canonical name so a later pass can extract their intervals
+                 * once the conflict clears.  But the file was already
+                 * evaluated — marking it lets the sync layer supersede it
+                 * with a fresher bridge copy instead of deferring on staged
+                 * input forever (which would deadlock the channel that
+                 * carries the resolving evidence). */
+                mark_root_evaluated(IMP_IMPORT_DIR "/STR.edf");
+                mark_root_evaluated(IMP_IMPORT_DIR "/Identification.json");
+                mark_root_evaluated(IMP_IMPORT_DIR "/Identification.tgt");
+                mark_root_evaluated(IMP_IMPORT_DIR "/SETTINGS/CurrentSettings.json");
+            }
+            ctx->root_retained = true;
+            u->root_retained = true;
+            return ESP_OK;
+        }
+    }
+    const cJSON *root_serial = cJSON_GetObjectItemCaseSensitive(ctx->ident, "SerialNumber");
+    if ((have_ident_source && !ident_source_valid) ||
+        (have_settings_source &&
+        (!ctx->settings || !ctx->ident || !ctx->src_serial[0] ||
+         !cJSON_IsString(root_serial) || !root_serial->valuestring ||
+         strcmp(root_serial->valuestring, ctx->src_serial) != 0 ||
+         settings_provenance_family(ctx->ident) == SETTINGS_FAMILY_UNKNOWN))) {
+        ESP_LOGW(TAG, "import: settings source identity is unknown; retaining root files");
+        retain_root_for_next_run(ctx, u);
+        return ESP_OK;
+    }
 
     /* Resolved ident/settings become the device_metadata.json snapshot
      * so sessions lacking sidecars still export correctly. */
-    write_device_metadata(ctx);
+    metadata_result_t metadata = write_device_metadata(ctx);
+    if (metadata == METADATA_RETRY ||
+        (metadata == METADATA_RETAIN && (have_ident_source || have_settings_source))) {
+        ESP_LOGW(TAG, "import: root metadata not committed; retaining source files");
+        retain_root_for_next_run(ctx, u);
+        return ESP_OK;
+    }
 
     /* Consume the sources — after this point the resolved trees live in
      * ctx and per-session sidecars; EDF recording_id remains as a
      * fallback for days imported in later runs. */
+    mark_root_processed(IMP_IMPORT_DIR "/STR.edf", "str-v1");
+    mark_root_processed(IMP_IMPORT_DIR "/Identification.json", "ident-json-v1");
+    mark_root_processed(IMP_IMPORT_DIR "/Identification.tgt", "ident-tgt-v1");
+    mark_root_processed(IMP_IMPORT_DIR "/SETTINGS/CurrentSettings.json", "current-settings-v1");
     unlink(IMP_IMPORT_DIR "/STR.edf");
     unlink(IMP_IMPORT_DIR "/Identification.json");
     unlink(IMP_IMPORT_DIR "/Identification.tgt");
@@ -2778,8 +4977,17 @@ static esp_err_t synthesize_day_spool(const char *day, bool *out_wrote)
     if (out_wrote) *out_wrote = false;
     char spool_path[300];
     snprintf(spool_path, sizeof(spool_path), "%s/%s.spool", SD_SUMMARIES_DIR, day);
+    char backup[700];
+    if (imp_recover_replace(spool_path, backup, sizeof(backup)) != 0)
+        return ESP_FAIL;
     struct stat st;
-    if (stat(spool_path, &st) == 0) return ESP_OK;   /* live/STR coverage wins */
+    if (stat(spool_path, &st) == 0) {
+        if (!import_spool_is_synthetic(spool_path)) return ESP_OK;
+        snprintf(spool_path, sizeof(spool_path), "%s/%s.imported.spool",
+                 SD_SUMMARIES_DIR, day);
+        if (imp_recover_replace(spool_path, backup, sizeof(backup)) != 0)
+            return ESP_FAIL;
+    } else if (errno != ENOENT) return ESP_FAIL;
 
     char dir[300];
     snprintf(dir, sizeof(dir), "%s/%s", SD_STREAMS_DIR, day);
@@ -3008,6 +5216,7 @@ static esp_err_t synthesize_day_spool(const char *day, bool *out_wrote)
     if (noon_ms <= 0) noon_ms = 0;
     pbuf_t b = {0};
     encode_spool_day(&b, sd, noon_ms, noon_ms + 86400000LL);
+    pbuf_put(&b, (const uint8_t *)IMPORT_SPOOL_MARKER, IMPORT_SPOOL_MARKER_LEN);
     free(sd);
     esp_err_t ret = b.ovf ? ESP_ERR_NO_MEM : ESP_OK;
     if (ret == ESP_OK) {
@@ -3056,9 +5265,196 @@ static void delete_sidecar_crc(const char *edf_path)
 
 static void delete_source(const imp_file_t *f)
 {
-    delete_sidecar_crc(f->path);
-    if (unlink(f->path) == 0) return;
+    if (unlink(f->path) == 0) {
+        delete_sidecar_crc(f->path);
+        return;
+    }
     ESP_LOGW(TAG, "import: cannot delete %s: %s", f->path, strerror(errno));
+}
+
+/* Never overwrite an earlier rejected file: it may contain different data. */
+static bool quarantine_source(const char *path)
+{
+    char bad[340];
+    for (int i = 0; i < 1000; i++) {
+        int n = i ? snprintf(bad, sizeof(bad), "%s.bad.%d", path, i)
+                  : snprintf(bad, sizeof(bad), "%s.bad", path);
+        if (n < 0 || (size_t)n >= sizeof(bad)) return false;
+        struct stat st;
+        if (stat(bad, &st) == 0) continue;
+        if (errno != ENOENT) return false;
+        if (rename(path, bad) == 0) return true;
+        if (errno != EEXIST) return false;
+    }
+    return false;
+}
+
+static bool directory_has_session_edfs(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d) return true;
+    struct dirent *ent;
+    bool found = false;
+    while ((ent = readdir(d)) != NULL) {
+        imp_file_t file;
+        if (imp_classify(dir, ent->d_name, &file)) { found = true; break; }
+    }
+    closedir(d);
+    return found;
+}
+
+/* Only deterministic input defects are quarantined. Storage or allocation
+ * failures keep the original name for retry in a later scan. */
+static esp_err_t inspect_session_source(const imp_file_t *file)
+{
+    imp_edf_t *e = imp_malloc(sizeof(*e));
+    if (!e) return ESP_ERR_NO_MEM;
+    esp_err_t result = imp_edf_open(e, file->path);
+    if (result == ESP_OK && e->incomplete)
+        result = ESP_ERR_NOT_FINISHED; /* a still-growing or torn source
+                                        * remains staged — distinguishable
+                                        * from a true defect */
+    if (result == ESP_OK) {
+        bool usable = true;
+        if (file->kind == K_BRP) {
+            int flow = imp_sig_find(e, "Flow");
+            if (flow < 0) flow = imp_sig_find(e, "BlowFlow");
+            int press = imp_sig_find(e, "Press");
+            if (press < 0) press = imp_sig_find(e, "MaskPress");
+            usable = flow >= 0 && (press < 0 || e->sigs[press].spr >= e->sigs[flow].spr);
+        } else if (file->kind == K_PLD) {
+            usable = imp_sig_find(e, "MaskPress") >= 0 || imp_sig_find(e, "Press") >= 0;
+        } else if (file->kind == K_SA2) {
+            int pulse = imp_sig_find(e, "Pulse"), spo2 = imp_sig_find(e, "SpO2");
+            usable = (pulse >= 0 || spo2 >= 0) &&
+                     (pulse < 0 || spo2 < 0 || e->sigs[spo2].spr >= e->sigs[pulse].spr);
+        } else if (file->kind == K_EVE || file->kind == K_CSL) {
+            usable = false;
+            for (int i = 0; i < e->n_sigs; i++)
+                if (e->sigs[i].is_annot || e->sigs[i].spr > 1) { usable = true; break; }
+        }
+        if (!usable) result = ESP_ERR_INVALID_SIZE;
+    }
+    free(e);
+    return result;
+}
+
+/* A root Identification file alone does not prove which machine produced
+ * every EDF in a session. Require agreement across the recording headers. */
+static cJSON *cluster_verified_ident(const imp_cluster_t *cl)
+{
+    const imp_file_t *files[] = { cl->brp, cl->pld, cl->sa2, cl->eve, cl->csl };
+    cJSON *first = NULL;
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        if (!files[i]) continue;
+        imp_edf_t *e = imp_malloc(sizeof(*e));
+        cJSON *ident = NULL;
+        if (e && imp_edf_open(e, files[i]->path) == ESP_OK &&
+            e->ts_dev_ms == files[i]->ts_dev_ms)
+            ident = ident_from_rec_id(e->rec_id);
+        free(e);
+        const cJSON *sn = cJSON_GetObjectItemCaseSensitive(ident, "SerialNumber");
+        const cJSON *old = cJSON_GetObjectItemCaseSensitive(first, "SerialNumber");
+        int family = settings_provenance_family(ident);
+        if (!cJSON_IsString(sn) || !sn->valuestring || !sn->valuestring[0] ||
+            family == SETTINGS_FAMILY_UNKNOWN ||
+            (first && (!cJSON_IsString(old) || strcmp(old->valuestring, sn->valuestring) ||
+                       settings_provenance_family(first) != family))) {
+            cJSON_Delete(ident);
+            cJSON_Delete(first);
+            return NULL;
+        }
+        if (!first) first = ident;
+        else cJSON_Delete(ident);
+    }
+    return first;
+}
+
+typedef struct {
+    uint8_t decision[IMP_MAX_SESSIONS][IMP_MAX_SESSIONS];
+    uint8_t claims[IMP_MAX_SESSIONS];
+    bool pending[IMP_MAX_SESSIONS];
+    bool merged[IMP_MAX_SESSIONS];
+    bool retain_raw[IMP_MAX_SESSIONS];
+} imp_associations_t;
+
+/* Compare the complete offered set before assigning anything. Conflicting
+ * candidate ownership keeps every involved source staged. */
+static void associate_clusters(imp_cluster_t *clusters, int n,
+                               imp_associations_t *a)
+{
+    for (int i = 0; i < n; i++) {
+        if (clusters[i].eve_ts < 0) continue;
+        for (int j = 0; j < n; j++) {
+            if (clusters[j].wav_ts < 0) continue;
+            imp_cluster_t combined = clusters[i];
+            combined.brp = clusters[j].brp;
+            combined.pld = clusters[j].pld;
+            combined.sa2 = clusters[j].sa2;
+            combined.wav_ts = clusters[j].wav_ts;
+            cJSON *ident = cluster_verified_ident(&combined);
+            int relation = -1;
+            if (ident) {
+                const cJSON *serial = cJSON_GetObjectItemCaseSensitive(ident, "SerialNumber");
+                imp_work_t w = {0};
+                w.src_serial = serial->valuestring;
+                w.src_family = settings_provenance_family_name(settings_provenance_family(ident));
+                as11_time_noon_day(combined.eve_ts, w.day, sizeof(w.day));
+                relation = native_mask_relation(&w, combined.eve_ts, combined.wav_ts);
+            }
+            bool same_stem = combined.eve_ts == combined.wav_ts;
+            /* MaskOn cannot precede TherapyStart, and whole-second stems
+             * cannot invert the order of two events on one clock: a wave
+             * stem before an annotation stem is provably a different
+             * session's wave — never a candidate. */
+            int64_t gap_ms = combined.wav_ts - combined.eve_ts;
+            bool candidate = (gap_ms >= 0 && gap_ms <= IMP_MATCH_MS) ||
+                             relation >= 0;
+            bool verified = ident != NULL;
+            imp_assoc_t decision = association_policy(verified, same_stem, relation, false);
+            cJSON_Delete(ident);
+            /* Verified machine and MaskOn inside the one-minute window after
+             * TherapyStart is the pairing the importer has always used.
+             * STR silence must not stall it: the day's STR snapshot is
+             * written only after the sessions it could prove, so relation -1
+             * is the normal state for a same-day bridge import. */
+            if (decision == IMP_ASSOC_DEFER_UNKNOWN && verified &&
+                gap_ms >= 0 && gap_ms <= IMP_MATCH_MS)
+                decision = IMP_ASSOC_HEURISTIC;
+            if (!candidate || decision == IMP_ASSOC_INDEPENDENT) continue;
+            a->decision[i][j] = (uint8_t)decision;
+            a->claims[i]++;
+            a->claims[j]++;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (clusters[i].eve_ts < 0) continue;
+        for (int j = 0; j < n; j++) {
+            imp_assoc_t decision = (imp_assoc_t)a->decision[i][j];
+            if (decision == IMP_ASSOC_INDEPENDENT) continue;
+            if (a->claims[i] != 1 || a->claims[j] != 1 ||
+                decision == IMP_ASSOC_DEFER_UNKNOWN ||
+                decision == IMP_ASSOC_DEFER_CONFLICT) {
+                a->pending[i] = a->pending[j] = true;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (clusters[i].eve_ts < 0 || a->pending[i]) continue;
+        for (int j = 0; j < n; j++) {
+            imp_assoc_t decision = (imp_assoc_t)a->decision[i][j];
+            if (a->pending[j] || (decision != IMP_ASSOC_SAME_SOURCE &&
+                                  decision != IMP_ASSOC_NATIVE_INTERVAL &&
+                                  decision != IMP_ASSOC_HEURISTIC)) continue;
+            clusters[i].brp = clusters[j].brp;
+            clusters[i].pld = clusters[j].pld;
+            clusters[i].sa2 = clusters[j].sa2;
+            clusters[i].wav_ts = clusters[j].wav_ts;
+            a->merged[j] = true;
+            a->retain_raw[i] = clusters[i].eve_ts != clusters[i].wav_ts;
+            break;
+        }
+    }
 }
 
 /* Process one day-group: cluster → convert → commit → delete sources.
@@ -3074,15 +5470,87 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
         return;
     }
     memcpy(u->day_label, g->key, sizeof(u->day_label));
+    uint64_t g_sig = group_signature(g);
+    const bool warn_staged = imp_staged_warn_fresh(g, g_sig);
+    if (g->capacity_exceeded) {
+        imp_staged_logw(warn_staged, "import: group exceeds source capacity; all sources kept");
+        skip_group(ctx, g);
+        u->sessions_failed++;
+        u->deferred_capacity++;
+        return;
+    }
+
+    /* A group already evaluated under the current evidence epoch whose
+     * surviving file set is unchanged has nothing new to decide — its
+     * staged sources stay put until files or evidence change.  One
+     * confirmation pass is always granted: identical input can still
+     * advance a staged resolution. */
+    int state_seen = 0, state_skipped = 0;
+    if (group_state_check(g, g_sig,
+                          &state_seen, &state_skipped) == GROUP_STATE_SKIP) {
+        skip_group(ctx, g);
+        u->sessions_skipped += state_skipped;
+        ESP_LOGI(TAG, "import: %s unchanged since last evaluation — skipped",
+                 g->src_dir);
+        return;
+    }
+    int failed_before = u->sessions_failed;
+    int skipped_before = u->sessions_skipped;
 
     imp_drift_t drift;
     parse_drift_sidecar(g->drift_path[0] ? g->drift_path : NULL, &drift);
+    if (drift.pending_transport) {
+        /* The sync pass is still retrying GET_DRIFT for this day — a
+         * zero-drift commit now would bake the transport failure into
+         * every session manifest.  Keep the group staged; a later pass
+         * lands the real sidecar (or a settled placeholder). */
+        imp_staged_logw(warn_staged,
+                        "import: %s drift record still in flight — deferred",
+                        g->src_dir);
+        if (drift.raw) cJSON_Delete(drift.raw);
+        u->deferred = true;
+        return;
+    }
     const char *import_src = g->drift_path[0] ? "somnobridge" : "file_import";
 
-    imp_cluster_t cl[IMP_MAX_SESSIONS];
+    imp_cluster_t *cl = imp_psram_calloc(IMP_MAX_SESSIONS, sizeof(*cl));
+    imp_associations_t *associations = imp_psram_calloc(1, sizeof(*associations));
+    if (!cl || !associations) {
+        free(cl);
+        free(associations);
+        if (drift.raw) cJSON_Delete(drift.raw);
+        skip_group(ctx, g);
+        u->sessions_failed++;
+        ESP_LOGW(TAG, "import: association scratch unavailable; sources kept");
+        return;
+    }
     int n_sess = cluster_files(g->files, g->n_files, cl, IMP_MAX_SESSIONS);
+    if (n_sess < 0) {
+        ESP_LOGW(TAG, "import: too many distinct mask sessions; sources kept");
+        skip_group(ctx, g);
+        if (drift.raw) cJSON_Delete(drift.raw);
+        free(associations);
+        free(cl);
+        u->sessions_failed++;
+        u->deferred_capacity++;
+        return;
+    }
+    associate_clusters(cl, n_sess, associations);
     ESP_LOGI(TAG, "import: %s → %d session cluster(s) from %d file(s)",
              g->src_dir, n_sess, g->n_files);
+
+    /* Entries may have landed between the directory scan and now — a stamp
+     * mismatch re-queues the unit rather than committing a subset. */
+    struct stat dst;
+    if (stat(g->src_dir, &dst) != 0 || dst.st_mtime != g->dir_mtime) {
+        ESP_LOGI(TAG, "import: %s changed during scan — re-queueing",
+                 g->src_dir);
+        if (drift.raw) cJSON_Delete(drift.raw);
+        free(associations);
+        free(cl);
+        u->deferred = true;
+        return;
+    }
 
     /* The streams noon-day of a committed session can differ from the
      * group's calendar-date key — sessions starting 00:00–11:59 belong to
@@ -3090,42 +5558,104 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
      * synthesis and the rebuild trigger cover them. */
     char days[2][9] = { {0}, {0} };
     int  n_days = 0;
+    bool source_retained = false;
 
     for (int i = 0; i < n_sess; i++) {
+        if (associations->merged[i]) continue;
+        if (associations->pending[i]) {
+            u->sessions_skipped++;
+            u->deferred_association++;
+            source_retained = true;
+            imp_staged_logw(warn_staged, "import: association unknown or conflicting; sources kept");
+            continue;
+        }
         imp_work_t w;
         memset(&w, 0, sizeof(w));
         w.cl = &cl[i];
         w.drift = &drift;
-        w.ident = ctx->ident;
-        w.settings = ctx->settings;
         w.import_src = import_src;
-        w.src_family = ctx->src_family;
-        w.src_serial = ctx->src_serial;
-
-        /* No root ident → fall back to the EDF recording_id (always
-         * present on ResMed files; keeps ident available for AS10 cards
-         * imported without Identification.tgt). */
-        cJSON *rec_ident = NULL;
-        if (!ctx->ident) {
-            const imp_file_t *any = cl[i].brp ? cl[i].brp :
-                cl[i].pld ? cl[i].pld : cl[i].sa2 ? cl[i].sa2 :
-                cl[i].eve ? cl[i].eve : cl[i].csl;
-            if (any) {
-                imp_edf_t *e = imp_malloc(sizeof(imp_edf_t));
-                if (e && imp_edf_open(e, any->path) == ESP_OK)
-                    rec_ident = ident_from_rec_id(e->rec_id);
-                free(e);
-                if (rec_ident) w.ident = rec_ident;
+        const imp_file_t *srcs[] = { cl[i].brp, cl[i].pld, cl[i].sa2,
+                                     cl[i].eve, cl[i].csl };
+        bool input_failed = false;
+        const imp_file_t *inflight = NULL;
+        for (int s = 0; s < 5; s++) {
+            if (!srcs[s]) continue;
+            esp_err_t check = inspect_session_source(srcs[s]);
+            if (check == ESP_OK) continue;
+            if (check == ESP_ERR_NOT_FINISHED) {
+                /* Still-growing or torn source — an upload in flight (or a
+                 * stalled one).  Staged and retried; not a defect. */
+                source_retained = true;
+                if (!inflight) inflight = srcs[s];
+                continue;
             }
+            input_failed = source_retained = true;
+            if ((check == ESP_ERR_INVALID_SIZE || check == ESP_ERR_INVALID_VERSION) &&
+                quarantine_source(srcs[s]->path)) u->files_rejected++;
+        }
+        if (inflight && !input_failed) {
+            /* An old mtime means the transfer died rather than paused. */
+            struct stat st;
+            bool stalled = stat(inflight->path, &st) == 0 &&
+                           time(NULL) - st.st_mtime > IMP_STALL_S;
+            (void)stalled;               /* host ESP_LOGW is a no-op */
+            u->sessions_skipped++;
+            u->deferred_inflight++;
+            imp_staged_logw(warn_staged,
+                            "import: %s — incomplete upload %s; source(s) kept",
+                            g->src_dir, stalled ? "stalled" : "still in flight");
+            continue;
+        }
+        if (input_failed) {
+            u->sessions_failed++;
+            continue;
+        }
+        cJSON *rec_ident = cluster_verified_ident(&cl[i]);
+        int source_count = 0;
+        for (int s = 0; s < 5; s++) if (srcs[s]) source_count++;
+        if (!rec_ident && source_count > 1) {
+            source_retained = true;
+            u->sessions_skipped++;
+            u->deferred_identity++;
+            imp_staged_logw(warn_staged, "import: source identity unknown or conflicting; sources kept");
+            continue;
+        }
+        if (rec_ident) {
+            const cJSON *sn = cJSON_GetObjectItemCaseSensitive(rec_ident, "SerialNumber");
+            int family = settings_provenance_family(rec_ident);
+            w.src_serial = sn->valuestring;
+            w.src_family = settings_provenance_family_name(family);
+            w.src_identity_verified = true;
+            const cJSON *root_sn = cJSON_GetObjectItemCaseSensitive(ctx->ident, "SerialNumber");
+            bool root_matches = ctx->ident && cJSON_IsString(root_sn) && root_sn->valuestring &&
+                                ctx->src_serial[0] && !strcmp(root_sn->valuestring, w.src_serial) &&
+                                !strcmp(ctx->src_serial, w.src_serial) &&
+                                settings_provenance_family(ctx->ident) == family;
+            w.ident = root_matches ? ctx->ident : rec_ident;
+            w.settings = root_matches ? ctx->settings : NULL;
+        } else {
+            /* Keep a display fallback, but never attest its machine identity. */
+            w.ident = ctx->ident;
+            w.retain_raw = true;
         }
 
+        if (w.src_identity_verified && hash_cluster_sources(&w, false) != ESP_OK) {
+            cJSON_Delete(rec_ident);
+            u->sessions_failed++;
+            source_retained = true;
+            ESP_LOGW(TAG, "import: cannot fingerprint source; files retained for retry");
+            continue;
+        }
         esp_err_t r = commit_session(&w, &cl[i], &drift);
         cJSON_Delete(rec_ident);
 
-        const imp_file_t *srcs[] = { cl[i].brp, cl[i].pld, cl[i].sa2,
-                                     cl[i].eve, cl[i].csl };
         if (r == ESP_OK) {
             u->sessions_imported++;
+            /* Committed content is durable: the manifest already records
+             * every offered kind (incl. cross-stem merges via
+             * manifest_record_sources), so the staged originals have done
+             * their job — consume them.  Only uncommitted sources
+             * (staged/failed) are ever left in IMPORT. */
             for (int s = 0; s < 5; s++)
                 if (srcs[s]) { delete_source(srcs[s]); u->files_consumed++; }
             if (w.day[0] &&
@@ -3142,30 +5672,48 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
                              w.day, g->src_dir);
                 }
             }
-        } else if (r == ESP_ERR_INVALID_STATE) {
-            /* Session already exists in the raw store → sources consumed */
+        } else if (r == ESP_ERR_INVALID_STATE || r == ESP_ERR_NOT_SUPPORTED) {
+            /* INVALID_STATE: true duplicate — every offered kind proved
+             * covered.  NOT_SUPPORTED: augment merged what it safely could
+             * and flagged the consumable sources in w.src_consumed; the
+             * rest stay in place — unverifiable, never deleted on a
+             * guess, retried on a later pass. */
             u->sessions_skipped++;
+            /* Sources flagged in src_consumed were provably merged or
+             * covered — delete them even under retain_raw: the flag guards
+             * the *unverifiable* remainder, not bytes already committed.
+             * Keeping them re-offered them on every pass forever. */
             for (int s = 0; s < 5; s++)
-                if (srcs[s]) { delete_source(srcs[s]); u->files_consumed++; }
+                if (srcs[s] && (w.src_consumed & (1u << s))) {
+                    delete_source(srcs[s]);
+                    u->files_consumed++;
+                }
+            if (associations->retain_raw[i] || w.retain_raw) source_retained = true;
+            if (r == ESP_ERR_NOT_SUPPORTED)
+                imp_staged_logw(warn_staged,
+                                "import: %s session %s — %ssource(s) kept "
+                                "for a later pass",
+                                g->src_dir, w.id,
+                                w.src_consumed ? "merged; remaining unverifiable "
+                                               : "unverifiable ");
+            if (r == ESP_ERR_NOT_SUPPORTED) {
+                if (w.frozen) u->deferred_frozen++;
+                else u->deferred_conflict++;
+                source_retained = true;
+            }
         } else {
             u->sessions_failed++;
-            /* Move unconvertible sources aside as *.bad — never deleted,
-             * but out of the scan path so a deterministic failure can't
-             * pin the inbox forever.  The user can rename them back to
-             * retry. */
-            for (int s = 0; s < 5; s++) {
-                if (!srcs[s]) continue;
-                char bad[340];
-                snprintf(bad, sizeof(bad), "%s.bad", srcs[s]->path);
-                /* imp_rename_replace unlinks a stale <name>.bad first —
-                 * without it a repeated failure wedges the source in
-                 * IMPORT/ on FATFS (rename-to-existing fails). */
-                if (imp_rename_replace(srcs[s]->path, bad) == 0) {
-                    delete_sidecar_crc(srcs[s]->path);
-                    u->files_rejected++;
-                }
-            }
+            source_retained = true;
+            imp_staged_logw(warn_staged, "import: session failed; source files retained for retry");
         }
+    }
+
+    if (u->deferred_association || u->deferred_identity || u->deferred_frozen ||
+        u->deferred_conflict || u->deferred_capacity || u->deferred_inflight) {
+        imp_staged_logw(warn_staged,
+                        "import: staged association=%d identity=%d frozen=%d conflict=%d capacity=%d inflight=%d",
+                        u->deferred_association, u->deferred_identity, u->deferred_frozen,
+                        u->deferred_conflict, u->deferred_capacity, u->deferred_inflight);
     }
 
     /* Orphan files in the group that never joined a cluster (unknown
@@ -3181,14 +5729,32 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
             /* A stray .edf that matched no cluster (e.g. >60 s TherapyStart
              * → MaskOn gap) — leave it for the user rather than guessing. */
             u->files_rejected++;
-            ESP_LOGW(TAG, "import: %s joined no session — left in place",
-                     g->files[i].path);
+            source_retained = true;
+            imp_staged_logw(warn_staged,
+                            "import: %s joined no session — left in place",
+                            g->files[i].path);
         }
     }
 
     /* The drift sidecar is consumed with the group (its contents live on
      * in each session's manifest). */
-    if (g->drift_path[0]) unlink(g->drift_path);
+    bool remaining = directory_has_session_edfs(g->src_dir);
+    if (source_retained && remaining) skip_group(ctx, g);
+    if (remaining && u->sessions_failed == failed_before && !g->future_part) {
+        /* Only staged/rejected/failed-clean sources remain: record the
+         * surviving set so the next pass can skip this group until files
+         * or evidence change.  Transient failures never get a marker —
+         * they must be retried. */
+        group_state_write(g, state_seen + 1,
+                          u->sessions_skipped - skipped_before);
+    } else if (!remaining) {
+        /* Fully drained — a stale marker must not pin this group. */
+        char sp[340];
+        group_state_path(g, sp, sizeof(sp));
+        unlink(sp);
+    }
+    if (g->drift_path[0] && !source_retained && !remaining)
+        unlink(g->drift_path);
 
     /* Report the streams days actually touched (the group key is the
      * source dir's calendar-date name, which can differ). */
@@ -3219,6 +5785,8 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
     rmdir(IMP_DATALOG_DIR);
 
     if (drift.raw) cJSON_Delete(drift.raw);
+    free(associations);
+    free(cl);
 }
 
 /* ── Public API ─────────────────────────────────────────────────────── */
@@ -3228,7 +5796,7 @@ static void process_group(edf_import_ctx_t *ctx, imp_group_t *g,
 #ifdef EDF_IMPORT_HOST
 #define IMP_QUIESCE_DEFAULT_S  0
 #else
-#define IMP_QUIESCE_DEFAULT_S  15
+#define IMP_QUIESCE_DEFAULT_S  30
 #endif
 
 edf_import_ctx_t *edf_import_ctx_create(void)
@@ -3257,7 +5825,7 @@ void edf_import_ctx_destroy(edf_import_ctx_t *ctx)
  * husks, *.bad quarantine, in-flight *.part and stray sidecars don't
  * count: pending() must go false once everything usable was consumed so
  * the worker actually stops rescheduling itself. */
-static bool dir_has_pending(const char *path, int depth)
+static bool dir_has_pending(const char *path, int depth, bool skip_root_str)
 {
     DIR *d = opendir(path);
     if (!d) return false;
@@ -3267,17 +5835,157 @@ static bool dir_has_pending(const char *path, int depth)
         const char *nm = ent->d_name;
         size_t nl = strlen(nm);
         if (nl >= 1 && nm[0] == '.') continue;
-        if (nl > 4 && !strcasecmp(nm + nl - 4, ".edf")) { any = true; break; }
+        if (nl > 4 && !strcasecmp(nm + nl - 4, ".edf")) {
+            if (skip_root_str && !strcasecmp(nm, "STR.edf")) continue;
+            any = true;
+            break;
+        }
         if (depth <= 0) continue;
         char full[400];
         snprintf(full, sizeof(full), "%s/%s", path, nm);
         struct stat st;
         if (stat(full, &st) == 0 && S_ISDIR(st.st_mode) &&
-            dir_has_pending(full, depth - 1)) { any = true; break; }
+            dir_has_pending(full, depth - 1, false)) { any = true; break; }
     }
     closedir(d);
     return any;
 }
+
+/* First .edf that can never join a group: imp_classify rejects it
+ * (unsupported name/kind).  Staged, retained and skipped sources all
+ * classify — they are tracked per-group, not here. */
+static bool first_stray_edf(const char *path, int depth, bool skip_root_str,
+                            char *out, size_t cap)
+{
+    DIR *d = opendir(path);
+    if (!d) return false;
+    bool found = false;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *nm = ent->d_name;
+        size_t nl = strlen(nm);
+        if (nl >= 1 && nm[0] == '.') continue;
+        char full[400];
+        snprintf(full, sizeof(full), "%s/%s", path, nm);
+        struct stat st;
+        if (depth > 0 && stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (first_stray_edf(full, depth - 1, false, out, cap)) {
+                found = true;
+                break;
+            }
+            continue;
+        }
+        if (nl > 4 && !strcasecmp(nm + nl - 4, ".edf")) {
+            if (skip_root_str && !strcasecmp(nm, "STR.edf")) continue;
+            imp_file_t f;
+            if (!imp_classify(path, nm, &f)) {
+                snprintf(out, cap, "%s", full);
+                found = true;
+                break;
+            }
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+/* True when at least one surviving group would actually be evaluated on
+ * this run — i.e. is not signature-skipped.  The root pass exists to give
+ * evaluating groups resolved ident/settings; when every pending group is
+ * already settled, re-running it only re-warns on unchanged state. */
+static bool groups_need_eval(void)
+{
+    /* ~65 KiB scratch group — heap (PSRAM on target), never the stack. */
+    imp_group_t *t = imp_calloc(1, sizeof(*t));
+    if (!t) return true;
+    const char *bases[] = { IMP_DATALOG_DIR, IMP_IMPORT_DIR };
+    for (int b = 0; b < 2; b++) {
+        DIR *d = opendir(bases[b]);
+        if (!d) continue;
+        struct dirent *ent;
+        bool need = false;
+        while ((ent = readdir(d)) != NULL) {
+            if (!name_is_dir8(ent->d_name)) continue;
+            memset(t, 0, sizeof(*t));
+            snprintf(t->src_dir, sizeof(t->src_dir), "%s/%.*s",
+                     bases[b], 8, ent->d_name);
+            memcpy(t->key, ent->d_name, 9);
+            scan_group_dir(t->src_dir, t, 0);
+            if (t->has_part) { need = true; break; }
+            if (t->n_files == 0) continue;
+            int seen, sk;
+            if (group_state_check(t, group_signature(t), &seen, &sk)
+                    != GROUP_STATE_SKIP) { need = true; break; }
+        }
+        closedir(d);
+        if (need) { free(t); return true; }
+    }
+    free(t);
+    /* Flat IMPORT .edf files form noon-day groups too — treat any present
+     * as needing eval: a manual drop plausibly wants root context. */
+    DIR *d = opendir(IMP_IMPORT_DIR);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            imp_file_t f;
+            if (imp_classify(IMP_IMPORT_DIR, ent->d_name, &f)) {
+                closedir(d);
+                return true;
+            }
+        }
+        closedir(d);
+    }
+    return false;
+}
+
+/* Retained root input is retried hourly, or sooner when observable inputs
+ * change. A same-size, same-mtime rewrite is detected by the hourly retry. */
+#define IMP_ROOT_RETRY_US (60LL * 60 * 1000000)
+static uint64_t s_root_retry_signature;
+static int64_t s_root_retry_until;
+
+static uint64_t root_retry_signature(void)
+{
+    static const char *const paths[] = {
+        IMP_IMPORT_DIR "/STR.edf",
+        IMP_IMPORT_DIR "/Identification.json",
+        IMP_IMPORT_DIR "/Identification.tgt",
+        IMP_IMPORT_DIR "/SETTINGS/CurrentSettings.json",
+        SD_STREAMS_DIR,
+        SD_SUMMARIES_DIR,
+    };
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        struct stat st;
+        bool exists = stat(paths[i], &st) == 0;
+        h = (h ^ (uint64_t)exists) * UINT64_C(1099511628211);
+        if (exists) {
+            h = (h ^ (uint64_t)st.st_size) * UINT64_C(1099511628211);
+            h = (h ^ (uint64_t)st.st_mtime) * UINT64_C(1099511628211);
+        }
+    }
+    return h;
+}
+
+static void root_retry_mark(int64_t now_us)
+{
+    s_root_retry_signature = root_retry_signature();
+    s_root_retry_until = now_us + IMP_ROOT_RETRY_US;
+}
+
+static bool root_retry_defer(int64_t now_us, bool groups_pending)
+{
+    return !groups_pending && s_root_retry_until > now_us &&
+           s_root_retry_signature == root_retry_signature();
+}
+
+#ifdef EDF_IMPORT_HOST
+void edf_import_test_mark_root_retry(int64_t now_us) { root_retry_mark(now_us); }
+bool edf_import_test_defer_root_retry(int64_t now_us, bool groups_pending)
+{
+    return root_retry_defer(now_us, groups_pending);
+}
+#endif
 
 /* Deferred spool synthesis flags (<day>.needs_spool in summaries/) are
  * import work too — keep the worker alive until the sweep clears them. */
@@ -3300,36 +6008,12 @@ static bool needs_spool_pending(void)
 
 bool edf_import_pending(void)
 {
+    struct stat st;
+    if (stat(IMP_NATIVE_DIRTY, &st) == 0) return true;
     if (root_files_pending()) return true;
-    if (dir_has_pending(IMP_IMPORT_DIR, 2)) return true;
+    if (dir_has_pending(IMP_IMPORT_DIR, 2, false)) return true;
     return needs_spool_pending();
 }
-
-#ifndef EDF_IMPORT_HOST
-/* Newest streams day "YYYYMMDD" (for the STR-only root-pass rebuild —
- * regenerating any day also refreshes the cumulative STR.edf + root
- * artifacts, since edf_generate_str_edf scans every summaries spool). */
-static bool find_newest_streams_day(char *out, size_t len)
-{
-    DIR *d = opendir(SD_STREAMS_DIR);
-    if (!d) return false;
-    char best[9] = "";
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        const char *nm = ent->d_name;
-        if (strlen(nm) != 8 || strcmp(nm, best) <= 0) continue;
-        char p[300];
-        snprintf(p, sizeof(p), "%s/%s", SD_STREAMS_DIR, nm);
-        struct stat st;
-        if (stat(p, &st) == 0 && S_ISDIR(st.st_mode))
-            memcpy(best, nm, 9);
-    }
-    closedir(d);
-    if (!best[0]) return false;
-    snprintf(out, len, "%s", best);
-    return true;
-}
-#endif /* EDF_IMPORT_HOST */
 
 /* Final sweep: days the run imported but whose spool synthesis never
  * landed (e.g. interrupted mid-unit) are flagged <day>.needs_spool in
@@ -3360,9 +6044,8 @@ static void final_needs_spool_sweep(void)
  * file's directory entry (size/mtime) on close/sync, so stat() alone cannot
  * prove an FTP upload is finished — the worker additionally holds off while
  * the FTP server is receiving (see edf_import_task); this check covers the
- * tail after the last close and any other writer.  A file dated in the
- * future (clock not yet set, or a PC with a fast clock) says nothing about
- * recency and never defers. */
+ * tail after the last close and any other writer.  Future-dated files are
+ * observed separately with a monotonic quiet window. */
 static bool imp_recent(const char *path, int quiesce_s)
 {
     if (quiesce_s <= 0) return false;
@@ -3373,7 +6056,58 @@ static bool imp_recent(const char *path, int quiesce_s)
     return (now - st.st_mtime) < quiesce_s;
 }
 
-static bool root_files_recent(int quiesce_s)
+/* Order-independent signature: readdir ordering is not stable on FAT. */
+static bool imp_future_file(const char *path, uint64_t *signature)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_mtime <= time(NULL) + 2) return false;
+    uint64_t h = UINT64_C(14695981039346656037);
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++)
+        h = (h ^ *p) * UINT64_C(1099511628211);
+    h = (h ^ (uint64_t)st.st_size) * UINT64_C(1099511628211);
+    h = (h ^ (uint64_t)st.st_mtime) * UINT64_C(1099511628211);
+    *signature ^= h;
+    return true;
+}
+
+#ifdef EDF_IMPORT_HOST
+static int64_t s_test_monotonic_us = -1;
+void edf_import_test_set_monotonic_us(int64_t value) { s_test_monotonic_us = value; }
+#endif
+
+static int64_t imp_monotonic_us(void)
+{
+#ifdef EDF_IMPORT_HOST
+    if (s_test_monotonic_us >= 0) return s_test_monotonic_us;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    return (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+#else
+    return esp_timer_get_time();
+#endif
+}
+
+static bool imp_future_deferred(edf_import_ctx_t *ctx, const char *unit,
+                                bool future, uint64_t signature)
+{
+    if (ctx->quiesce_s <= 0 || !future) {
+        ctx->future_observed = false;
+        return false;
+    }
+    int64_t now = imp_monotonic_us();
+    if (now < 0) return true;
+    if (!ctx->future_observed || strcmp(ctx->future_unit, unit) ||
+        ctx->future_signature != signature || now < ctx->future_seen_us) {
+        snprintf(ctx->future_unit, sizeof(ctx->future_unit), "%s", unit);
+        ctx->future_signature = signature;
+        ctx->future_seen_us = now;
+        ctx->future_observed = true;
+        return true;
+    }
+    return now - ctx->future_seen_us < (int64_t)ctx->quiesce_s * 1000000;
+}
+
+static bool root_files_recent(edf_import_ctx_t *ctx)
 {
     static const char *const paths[] = {
         IMP_IMPORT_DIR "/STR.edf",
@@ -3381,17 +6115,37 @@ static bool root_files_recent(int quiesce_s)
         IMP_IMPORT_DIR "/Identification.tgt",
         IMP_IMPORT_DIR "/SETTINGS/CurrentSettings.json",
     };
-    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++)
-        if (imp_recent(paths[i], quiesce_s)) return true;
-    return false;
+    bool future = false;
+    uint64_t signature = 0;
+    /* Any root-level arrival — including names outside the list below and
+     * new subdirs — bumps IMPORT/'s own stamp: more evidence may follow. */
+    if (imp_recent(IMP_IMPORT_DIR, ctx->quiesce_s)) return true;
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        if (imp_recent(paths[i], ctx->quiesce_s)) return true;
+        if (ctx->quiesce_s > 0 && imp_future_file(paths[i], &signature)) future = true;
+    }
+    return imp_future_deferred(ctx, "root", future, signature);
 }
 
-static bool group_recent(const imp_group_t *g, int quiesce_s)
+static bool group_recent(edf_import_ctx_t *ctx, const imp_group_t *g)
 {
-    if (g->drift_path[0] && imp_recent(g->drift_path, quiesce_s)) return true;
-    for (int i = 0; i < g->n_files; i++)
-        if (imp_recent(g->files[i].path, quiesce_s)) return true;
-    return false;
+    bool future = g->future_part;
+    uint64_t signature = g->future_part_signature;
+    /* Creating a file bumps the parent dir's mtime before the entry is ever
+     * scanned — the dir check is the 'siblings may still be arriving'
+     * signal for every writer, not just in-progress file contents. */
+    if (imp_recent(g->src_dir, ctx->quiesce_s)) return true;
+    if (g->drift_path[0]) {
+        if (imp_recent(g->drift_path, ctx->quiesce_s)) return true;
+        if (ctx->quiesce_s > 0 && imp_future_file(g->drift_path, &signature)) future = true;
+    }
+    for (int i = 0; i < g->n_files; i++) {
+        if (imp_recent(g->files[i].path, ctx->quiesce_s)) return true;
+        if (ctx->quiesce_s > 0 && imp_future_file(g->files[i].path, &signature)) future = true;
+    }
+    char unit[320];
+    snprintf(unit, sizeof(unit), "%s/%s", g->src_dir, g->key);
+    return imp_future_deferred(ctx, unit, future, signature);
 }
 
 esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
@@ -3408,7 +6162,7 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
         if (root_files_pending()) {
             /* Root files come first — sessions use the resolved ident and
              * settings — so a root copy still in flight holds everything. */
-            if (root_files_recent(ctx->quiesce_s)) {
+            if (root_files_recent(ctx)) {
                 ESP_LOGI(TAG, "import: root files modified within %d s — deferred",
                          ctx->quiesce_s);
                 out->root_pass = true;
@@ -3416,7 +6170,10 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
                 return ESP_OK;
             }
             ctx->root_done = true;
-            return process_root_pass(ctx, out);
+            esp_err_t rr = process_root_pass(ctx, out);
+            if (out->settings_written || out->spools_written)
+                import_epoch_bump();
+            return rr;
         }
         ctx->root_done = true;
         /* fall through — no root files, look for day groups */
@@ -3424,8 +6181,8 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
 
     imp_group_t *g = imp_calloc(1, sizeof(imp_group_t));
     if (!g) return ESP_ERR_NO_MEM;
-    bool have = next_group(g);
-    if (have && group_recent(g, ctx->quiesce_s)) {
+    bool have = next_group(ctx, g);
+    if (have && group_recent(ctx, g)) {
         ESP_LOGI(TAG, "import: %s modified within %d s — deferred",
                  g->src_dir, ctx->quiesce_s);
         out->deferred = true;
@@ -3435,6 +6192,10 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
     if (have) {
         process_group(ctx, g, out);
         free(g);
+        /* Deleting sources is durable evidence change — unlike re-merging
+         * retained files, it can never feed back into marker writes. */
+        if (out->files_consumed)
+            import_epoch_bump();
         /* A group deferred for in-flight transfers is not an error —
          * report the unit so the worker knows work remains pending. */
         return ESP_OK;
@@ -3445,13 +6206,15 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
         ctx->sweep_done = true;
         final_needs_spool_sweep();
     }
-    /* EDFs are visible to the cheap pending check but no group could be
-     * built from them — say so rather than reporting a clean empty inbox
-     * (that silence is what made #338 hard to diagnose). */
-    if (dir_has_pending(IMP_IMPORT_DIR, 2))
-        ESP_LOGW(TAG, "import: EDFs remain in %s but no importable day group "
-                 "was found (unsupported names or a folder with no session?)",
-                 IMP_IMPORT_DIR);
+    /* Staged and signature-skipped sources classify fine and are already
+     * reported per day — the leftover worth warning about is an EDF no
+     * group could ever be built from (the #338 case: unsupported names).
+     * Find the first one so the message stays actionable. */
+    char stray[400];
+    if (first_stray_edf(IMP_IMPORT_DIR, 2, ctx->root_retained,
+                        stray, sizeof(stray)))
+        ESP_LOGW(TAG, "import: %s matches no session group — left in place",
+                 stray);
     return ESP_ERR_NOT_FOUND;
 }
 
@@ -3459,7 +6222,7 @@ esp_err_t edf_import_process_next(edf_import_ctx_t *ctx, edf_import_unit_t *out)
 
 #ifndef EDF_IMPORT_HOST
 
-#define IMP_WORKER_STACK   (20 * 1024)   /* PSRAM — cJSON_Parse recursion + inlined converters */
+#define IMP_WORKER_STACK   (24 * 1024)   /* PSRAM — cJSON_Parse recursion + inlined converters */
 #define IMP_WORKER_PRIO    4
 #define IMP_SETTLE_MS      15000   /* let SD + FTP quieten before scanning */
 #define IMP_DEFER_POLL_MS  3000    /* re-check cadence while a copy is in flight */
@@ -3476,7 +6239,9 @@ static void edf_import_task(void *arg)
     bool any_imported = false;
     int idle = 0;
     int defer_ms = 0;
+    bool root_deferred = false;
     if (ctx) {
+        psram_work_begin("import-start", IMP_WORKER_STACK);
         for (;;) {
             if (!sd_storage_is_ready() || sd_storage_recording_active()) break;
 
@@ -3513,8 +6278,19 @@ static void edf_import_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(30000));
                 continue;
             }
+            if (!ctx->root_done && root_retry_defer(
+                    esp_timer_get_time(), groups_need_eval())) {
+                ctx->root_done = true;
+                ctx->root_retained = true;
+                root_deferred = true;
+            }
             edf_import_unit_t u;
+            psram_work_phase("import-unit", IMP_WORKER_STACK);
             esp_err_t r = edf_import_process_next(ctx, &u);
+            if (r == ESP_OK && u.root_pass && !u.deferred) {
+                if (u.root_retained) root_retry_mark(esp_timer_get_time());
+                else s_root_retry_until = 0;
+            }
             sd_storage_lease_release(SD_LEASE_EXPORT);
 
             if (r == ESP_OK && u.deferred) {
@@ -3529,9 +6305,27 @@ static void edf_import_task(void *arg)
             }
             defer_ms = 0;
             if (r == ESP_ERR_NOT_FOUND) {
+                struct stat dirty;
+                if (stat(IMP_NATIVE_DIRTY, &dirty) == 0) {
+                    if (root_deferred) break;
+                    esp_err_t rebuilt = edf_gen_rebuild_native_str();
+                    if (rebuilt == ESP_OK) {
+                        if (unlink(IMP_NATIVE_DIRTY) != 0 && errno != ENOENT)
+                            ESP_LOGW(TAG, "import: cannot clear native STR rebuild marker");
+                        uploader_request_scan();
+                    } else {
+                        ESP_LOGW(TAG, "import: native STR rebuild pending (error %d)", (int)rebuilt);
+                    }
+                    break;
+                }
+                if (ctx->root_retained) break;
                 if (++idle >= 3) break;
                 vTaskDelay(pdMS_TO_TICKS(10000));
                 continue;
+            }
+            if (r != ESP_OK) {
+                ESP_LOGE(TAG, "import: unit failed; retaining source files until retry");
+                break;
             }
             idle = 0;
             if (u.root_pass)
@@ -3549,22 +6343,22 @@ static void edf_import_task(void *arg)
              * nudged when the rebuild actually published. */
             if (u.day_label[0] && u.sessions_imported > 0) {
                 any_imported = true;
-                if (edf_gen_rebuild_day(u.day_label) == ESP_OK)
+                psram_work_phase("import-rebuild", IMP_WORKER_STACK);
+                struct stat native_dirty;
+                bool native_pending = stat(IMP_NATIVE_DIRTY, &native_dirty) == 0;
+                esp_err_t rebuilt = native_pending ? edf_gen_rebuild_day_for_native(u.day_label)
+                                                   : edf_gen_rebuild_day(u.day_label);
+                if (rebuilt == ESP_OK)
                     uploader_on_export_complete(u.day_label);
-                if (u.day2_label[0] &&
-                    edf_gen_rebuild_day(u.day2_label) == ESP_OK)
-                    uploader_on_export_complete(u.day2_label);
-            } else if (u.root_pass && u.spools_written > 0) {
-                /* STR-only import: one rebuild refreshes the cumulative
-                 * STR.edf + Identification/SETTINGS artifacts (the STR
-                 * pass scans every summaries spool). */
-                char day[9];
-                if (find_newest_streams_day(day, sizeof(day)) &&
-                    edf_gen_rebuild_day(day) == ESP_OK)
-                    uploader_on_export_complete(day);
+                if (u.day2_label[0]) {
+                    rebuilt = native_pending ? edf_gen_rebuild_day_for_native(u.day2_label)
+                                             : edf_gen_rebuild_day(u.day2_label);
+                    if (rebuilt == ESP_OK) uploader_on_export_complete(u.day2_label);
+                }
             }
             vTaskDelay(pdMS_TO_TICKS(200));   /* yield between units */
         }
+        psram_work_end("import-done", IMP_WORKER_STACK);
         edf_import_ctx_destroy(ctx);
     }
 
@@ -3572,10 +6366,18 @@ static void edf_import_task(void *arg)
      * the reconcile pass is a no-op for days already scored. */
     if (any_imported) somno_ml_reconcile();
 
-    ESP_LOGI(TAG, "import: inbox drained (worker stack: %u of %u bytes never used)",
-             (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)IMP_WORKER_STACK);
+    ESP_LOGI(TAG, "import: worker finished (stack: %u of %u bytes never used)",
+             (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)),
+             (unsigned)IMP_WORKER_STACK);
     s_worker_running = false;
     vTaskDelete(NULL);
+}
+
+void edf_import_kick_now(void)
+{
+    esp_err_t err = edf_import_start_worker();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+        ESP_LOGW(TAG, "import kick: %s", esp_err_to_name(err));
 }
 
 esp_err_t edf_import_start_worker(void)
@@ -3593,5 +6395,3 @@ esp_err_t edf_import_start_worker(void)
 }
 
 #endif /* EDF_IMPORT_HOST */
-
-

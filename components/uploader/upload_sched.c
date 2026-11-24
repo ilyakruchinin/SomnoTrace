@@ -240,7 +240,7 @@ static bool run_backend(backend_rt_t *r, int max_days,
      * which is the order the index already keeps. */
     /* static: only the scheduler task ever runs this, and 366 entries have no
      * business on the stack alongside the backends' own buffers. */
-    static uint32_t days[UPLOAD_MAX_DAYS_CAP];
+    static EXT_RAM_BSS_ATTR uint32_t days[UPLOAD_MAX_DAYS_CAP];
     int n_days = 0;
     int n_units = 0;
     int n_index = upload_index_day_count();
@@ -507,6 +507,7 @@ static bool run_backend(backend_rt_t *r, int max_days,
         bool ox_day_any = false;
         for (int oi = 0; oi < n_ox && fails < FAILS_BEFORE_SWITCH; oi++) {
             if (upload_ox_status(&ox_refs[oi], r->slot) == UG_OK) continue;
+            if (upload_ox_parked(&ox_refs[oi], r->slot)) continue;   /* see UPLOAD_MAX_GROUP_ATTEMPTS */
             if (strcmp(ox_day, ox_refs[oi].day) != 0) {
                 if (ox_day_any && (be->ox_day_end || be->day_end)) {
                     res = be->ox_day_end ? be->ox_day_end(ox_day, true) :
@@ -575,6 +576,7 @@ static bool run_backend(backend_rt_t *r, int max_days,
         for (int i = 0; i < n_st && fails < FAILS_BEFORE_SWITCH; i++) {
             if (!upload_stage_ref_has_fmt(&st_refs[i], be->stage_fmt)) continue;
             if (upload_stage_status(&st_refs[i], r->slot) == UG_OK) continue;
+            if (upload_stage_parked(&st_refs[i], r->slot)) continue;   /* see UPLOAD_MAX_GROUP_ATTEMPTS */
             if (strcmp(st_day, st_refs[i].day) != 0) {
                 if (st_day_any && be->stage_day_end) {
                     res = be->stage_day_end(st_day, true);
@@ -660,7 +662,8 @@ static bool run_backend(backend_rt_t *r, int max_days,
     } else {
         cooldown_reset(r);
         set_be_state(r, SB_IDLE);
-        ESP_LOGI(TAG, "%s: up to date%s", be->id,
+        ESP_LOGI(TAG, "%s: up to date%s%s", be->id,
+                 deferred_busy ? " (some work deferred)" : "",
                  bundle_committed && !any_ok ? " (root files)" : "");
     }
     return true;

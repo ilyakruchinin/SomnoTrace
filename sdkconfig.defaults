@@ -41,12 +41,19 @@ CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=16
 CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=16
 CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10
 # CONFIG_BT_CTRL_DTM_ENABLE is not set
-# CONFIG_BT_CTRL_BLE_SECURITY_ENABLE is not set
+CONFIG_BT_CTRL_BLE_SECURITY_ENABLE=y
 CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=4
-CONFIG_BT_NIMBLE_MAX_BONDS=1
+# Bond store: SomnoBridge bonds persist; NimBLE's capacity check counts
+# *active SMP procedures* on top of stored bonds, so a single stored bond
+# plus one live proc already trips a limit of 2 and pairing fails locally
+# with BLE_HS_ENOTSUP before the peer is contacted.  Keep headroom.
+CONFIG_BT_NIMBLE_MAX_BONDS=4
 CONFIG_BT_NIMBLE_MAX_CCCDS=4
 # NimBLE host stack: central GAP discovery and GATT notify event headroom.
-CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=6144
+# NimBLE host task runs the LESC P-256 SMP crypto; 6144
+# overflowed it (controller then spun on CPU0). The
+# SomnoBridge firmware pairs reliably with 12288.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=12288
 # Keep CONFIG_BT_CTRL_BLE_MASTER at the IDF default (required for central).
 # CONFIG_BT_CTRL_BLE_SECURITY_ENABLE / DTM are unused and stay off above.
 
@@ -165,7 +172,16 @@ CONFIG_BT_NIMBLE_PINNED_TO_CORE=1
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=32
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_SIZE=256
 CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=32
-# CONFIG_BT_NIMBLE_SECURITY_ENABLE is not set
+# NimBLE security (SMP) is REQUIRED for SomnoBridge pairing: with it
+# disabled, ble_gap_security_initiate() is a stub returning
+# BLE_HS_ENOTSUP (8) and pairing can never start.  LE Secure Connections
+# + bonding + NVS persistence match what the bridge expects (§5.2).
+# A clean build (build-dist.sh --clean deletes sdkconfig) takes these
+# from here — without them the release image cannot pair at all.
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=y
+CONFIG_BT_NIMBLE_SM_LEGACY=y
+CONFIG_BT_NIMBLE_SM_SC=y
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
 # CONFIG_BT_NIMBLE_DEBUG is not set
 # CONFIG_BT_NIMBLE_LOG_LEVEL_DEBUG is not set
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
@@ -239,12 +255,15 @@ CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=6
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=6
-CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE=4
-CONFIG_LWIP_MAX_SOCKETS=32
-CONFIG_LWIP_MAX_ACTIVE_TCP=28
+CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE=16
+CONFIG_LWIP_MAX_SOCKETS=40
+CONFIG_LWIP_MAX_ACTIVE_TCP=56
 CONFIG_LWIP_MAX_LISTENING_TCP=8
 CONFIG_LWIP_MAX_UDP_PCBS=8
 CONFIG_LWIP_MAX_RAW_PCBS=4
+# mDNS task stack + allocations live in PSRAM (no flash access, small latency cost)
+CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
+CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y
 # TCP send buffer: larger buffer lets send() return quickly by copying data
 # into lwIP's buffer, while actual TX happens asynchronously between BLE
 # coexistence slots.  Default is ~5760 (4*MSS); 32KB allows a full 16KB

@@ -25,6 +25,8 @@
 #include "upload_ox.h"
 #include "somno_ml.h"
 #include "web_auth.h"
+#include "httpd_defer.h"
+#include "session_graph.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,7 +59,7 @@ static esp_err_t json_send(httpd_req_t *req, char *json)
     return e;
 }
 
-static esp_err_t oximetry_recordings_handler(httpd_req_t *req)
+static esp_err_t oximetry_recordings_impl(httpd_req_t *req)
 {
     char date_str[16];
     if (query(req, "date", date_str, sizeof(date_str)) && strlen(date_str) == 8) {
@@ -72,7 +74,13 @@ static esp_err_t oximetry_recordings_handler(httpd_req_t *req)
     return json_send(req, oximetry_canonical_list_json());
 }
 
-static esp_err_t oximetry_days_handler(httpd_req_t *req)
+/* Canonical listing scans the SD — deferred off the httpd task. */
+static esp_err_t oximetry_recordings_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, oximetry_recordings_impl);
+}
+
+static esp_err_t oximetry_days_impl(httpd_req_t *req)
 {
     (void)req;
     cJSON *arr = NULL;
@@ -84,7 +92,12 @@ static esp_err_t oximetry_days_handler(httpd_req_t *req)
     return json_send(req, strdup("[]"));
 }
 
-static esp_err_t oximetry_recording_handler(httpd_req_t *req)
+static esp_err_t oximetry_days_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, oximetry_days_impl);
+}
+
+static esp_err_t oximetry_recording_impl(httpd_req_t *req)
 {
     char id[OXIMETRY_CANONICAL_MAX_COMPONENT];
     if (!query(req, "id", id, sizeof(id))) {
@@ -94,16 +107,26 @@ static esp_err_t oximetry_recording_handler(httpd_req_t *req)
     return json_send(req, oximetry_canonical_manifest_json(id));
 }
 
+static esp_err_t oximetry_recording_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, oximetry_recording_impl);
+}
+
 static esp_err_t oximetry_uploads_handler(httpd_req_t *req)
 {
     (void)req;
     return json_send(req, upload_ox_status_json());
 }
 
-static esp_err_t oximetry_diagnostics_handler(httpd_req_t *req)
+static esp_err_t oximetry_diagnostics_impl(httpd_req_t *req)
 {
     (void)req;
     return json_send(req, ox_store_conversion_diagnostics_json());
+}
+
+static esp_err_t oximetry_diagnostics_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, oximetry_diagnostics_impl);
 }
 
 static esp_err_t oximetry_file_handler(httpd_req_t *req)
@@ -162,28 +185,12 @@ static esp_err_t oximetry_file_handler(httpd_req_t *req)
         httpd_resp_set_hdr(req, "Content-Length", len);
         fclose(f); return httpd_resp_send(req, NULL, 0);
     }
-    if (fseek(f, start, SEEK_SET) != 0) { fclose(f); return ESP_FAIL; }
-    long remaining = end - start + 1;
-    uint8_t *buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
-    if (!buf) buf = malloc(4096);
-    if (!buf) {
-        fclose(f);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-    esp_err_t e = ESP_OK;
-    while (remaining > 0) {
-        size_t want = remaining > 4096 ? 4096 : (size_t)remaining;
-        size_t n = fread(buf, 1, want, f);
-        if (n == 0) break;
-        remaining -= (long)n;
-        e = httpd_resp_send_chunk(req, (const char *)buf, n);
-        if (e != ESP_OK) break;
-    }
-    if (e == ESP_OK) e = httpd_resp_send_chunk(req, NULL, 0);
-    free(buf);
+    /* Stream via the shared download worker — a long oximetry track would
+     * otherwise occupy the single httpd task for the whole transfer. */
     fclose(f);
-    if (e != ESP_OK) ESP_LOGW(TAG, "track send failed: %s", esp_err_to_name(e));
+    httpd_resp_set_hdr(req, "Connection", "close");
+    esp_err_t e = session_graph_enqueue_file(req, path, start, end - start + 1);
+    if (e != ESP_OK) ESP_LOGW(TAG, "track enqueue failed: %s", esp_err_to_name(e));
     return e;
 }
 

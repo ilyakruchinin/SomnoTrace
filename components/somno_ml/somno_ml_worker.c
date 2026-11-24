@@ -38,6 +38,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -52,6 +53,10 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+
+/* Optional application diagnostics; the scoring component also builds alone. */
+extern void psram_work_begin(const char *phase, uint32_t stack_bytes) __attribute__((weak));
+extern void psram_work_end(const char *phase, uint32_t stack_bytes) __attribute__((weak));
 
 static const char *TAG = "somno_ml";
 
@@ -104,7 +109,7 @@ typedef struct {
     int      tries;
 } pending_sst_t;
 
-static pending_sst_t   s_pending[PENDING_CAP];
+static EXT_RAM_BSS_ATTR pending_sst_t s_pending[PENDING_CAP];
 static SemaphoreHandle_t s_pending_mux;
 static int64_t s_next_recon_ms = -1;
 static int64_t s_next_full_ms  = -1;
@@ -446,22 +451,48 @@ static bool export_stage_csv(const char *sst_path,
 static int write_sst(const char *path, const somno_sst_header_t *hdr,
                      const uint8_t *stages, const uint8_t *conf)
 {
-    char tmp[300];
+    char tmp[300], backup[300];
     if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
         return -1;
+    if (snprintf(backup, sizeof(backup), "%s.bak", path) >= (int)sizeof(backup))
+        return -1;
+    struct stat st;
+    if (stat(backup, &st) == 0) {
+        struct stat current;
+        if (stat(path, &current) == 0 || errno != ENOENT ||
+            rename(backup, path) != 0)
+            return -1;
+    } else if (errno != ENOENT) {
+        return -1;
+    }
     FILE *f = fopen(tmp, "wb");
     if (!f) return -1;
     int ok = fwrite(hdr, 1, sizeof(*hdr), f) == sizeof(*hdr) &&
-             fwrite(stages, 1, hdr->n_epochs, f) == hdr->n_epochs &&
-             fwrite(conf, 1, hdr->n_epochs, f) == hdr->n_epochs;
-    fflush(f);
-    fclose(f);
+             (hdr->n_epochs == 0 ||
+              (stages && conf &&
+               fwrite(stages, 1, hdr->n_epochs, f) == hdr->n_epochs &&
+               fwrite(conf, 1, hdr->n_epochs, f) == hdr->n_epochs));
+    if (ok && fflush(f) != 0) ok = false;
+    if (ok && fsync(fileno(f)) != 0) ok = false;
+    if (fclose(f) != 0) ok = false;
     if (!ok) { unlink(tmp); return -1; }
     /* FatFs f_rename fails with FR_EXIST when the destination already
-     * exists — remove it first (rescoring replaces stale/partial .sst). */
+     * exists. Keep the previous output until the replacement is published. */
     if (rename(tmp, path) != 0) {
-        unlink(path);
-        if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
+        if (errno != EEXIST || rename(path, backup) != 0) {
+            unlink(tmp);
+            return -1;
+        }
+        if (rename(tmp, path) != 0) {
+            if (rename(backup, path) != 0)
+                ESP_LOGE(TAG, "previous SST retained at %s", backup);
+            unlink(tmp);
+            return -1;
+        }
+        if (unlink(backup) != 0) {
+            ESP_LOGW(TAG, "previous SST retained at %s", backup);
+            return -1;
+        }
     }
     /* A final hypnogram also emits its consumer Zeo CSV into the stages
      * export tree.  Stubs carry no displayable hypnogram, so INSUFFICIENT
@@ -510,10 +541,11 @@ static bool score_sample(score_ctx_t *ctx, double spo2, double pr, double motion
     if (!somno_feat_push(ctx->fe, spo2, pr, motion, sv, pv, mv, ctx->feats))
         return true;
     if (ctx->n_epochs >= ctx->cap_epochs) {
+        if (ctx->cap_epochs > UINT32_MAX / 2) return false;
         uint32_t nc = ctx->cap_epochs ? ctx->cap_epochs * 2 : 512;
+        if ((uint64_t)nc * 4 * sizeof(double) > SIZE_MAX) return false;
         double *nb = heap_caps_realloc(ctx->fused, nc * 4 * sizeof(double),
                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!nb) nb = realloc(ctx->fused, nc * 4 * sizeof(double));
         if (!nb) return false;
         ctx->fused = nb;
         ctx->cap_epochs = nc;
@@ -555,8 +587,8 @@ static int finish_and_write(score_ctx_t *ctx, const char *sst_path,
     strlcpy((char *)hdr.model_semver, somno_ml_model_semver(),
             sizeof(hdr.model_semver));
 
-    uint8_t *stages = malloc(n ? n : 1);
-    uint8_t *conf = malloc(n ? n : 1);
+    uint8_t *stages = heap_caps_malloc(n ? n : 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *conf = heap_caps_malloc(n ? n : 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!stages || !conf) { free(stages); free(conf); return -1; }
 
     if (ctx->valid_epochs < MIN_VALID_EPOCHS) {
@@ -584,7 +616,6 @@ static int finish_and_write(score_ctx_t *ctx, const char *sst_path,
 
     double *post = heap_caps_malloc(n * 4 * sizeof(double),
                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!post) post = malloc(n * 4 * sizeof(double));
     if (!post) { free(stages); free(conf); return -1; }
     if (somno_ml_decode_night(m, ctx->fused, (int)n, stages, post) != 0) {
         free(stages);
@@ -683,10 +714,9 @@ static int decode_ctx(score_ctx_t *ctx, uint8_t **stages_out,
 {
     const somno_model_t *m = somno_ml_get_model();
     uint32_t n = ctx->n_epochs;
-    uint8_t *stages = malloc(n ? n : 1);
+    uint8_t *stages = heap_caps_malloc(n ? n : 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     double *post = heap_caps_malloc(n * 4 * sizeof(double),
                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!post) post = malloc(n * 4 * sizeof(double));
     if (!stages || !post) { free(stages); free(post); return -1; }
     if (somno_ml_decode_night(m, ctx->fused, (int)n, stages, post) != 0) {
         free(stages);
@@ -720,8 +750,8 @@ static int write_member_sst(const char *sst_path, uint8_t source_type,
     strlcpy((char *)hdr.model_semver, somno_ml_model_semver(),
             sizeof(hdr.model_semver));
 
-    uint8_t *conf = malloc(n ? n : 1);
-    uint8_t *sl = malloc(n ? n : 1);
+    uint8_t *conf = heap_caps_malloc(n ? n : 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *sl = heap_caps_malloc(n ? n : 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!conf || !sl) { free(conf); free(sl); return -1; }
     for (uint32_t i = 0; i < n; i++) {
         sl[i] = insufficient ? 0xFF : stages[lo + i];
@@ -761,11 +791,15 @@ static int score_vitals(const char *vitals_path, const char *sst_path,
     ctx.cap_epochs = m.sample_count / (uint32_t)lrint(30.0 / m.dt) + 2;
     ctx.fused = heap_caps_malloc(ctx.cap_epochs * 4 * sizeof(double),
                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!ctx.fused) ctx.fused = malloc(ctx.cap_epochs * 4 * sizeof(double));
     if (!ctx.fused) { somno_feat_destroy(ctx.fe); fclose(f); return -1; }
 
-    vitals_feed(&ctx, f, &m);
+    bool fed = vitals_feed(&ctx, f, &m);
     fclose(f);
+    if (!fed) {
+        somno_feat_destroy(ctx.fe);
+        free(ctx.fused);
+        return -1;
+    }
     /* Gen1 (0.25 Hz): epochs round to 8 samples = 32 s, matching the
      * reference's round(30/dt) grid. */
     uint32_t ep_sec = (uint32_t)lrint(m.dt * lrint(30.0 / m.dt));
@@ -860,6 +894,7 @@ static int score_ring_group(const ring_rec_t *grp, int nmem, const char *job_id)
     FILE *fs[MAX_FRAG_GROUP] = {0};
     score_ctx_t ctx = {0};
     int rc = -1;
+    bool allow_solo = true;
 
     for (int k = 0; k < nmem; k++) {
         char vitals[340];
@@ -878,20 +913,22 @@ static int score_ring_group(const ring_rec_t *grp, int nmem, const char *job_id)
     }
 
     ctx.fe = somno_feat_create(metas[0].dt, 1);
-    if (!ctx.fe) goto solo;
+    if (!ctx.fe) { allow_solo = false; goto solo; }
     ctx.cap_epochs = 2;
     for (int k = 0; k < nmem; k++)
         ctx.cap_epochs += metas[k].sample_count /
                           (uint32_t)lrint(30.0 / metas[k].dt) + 2;
     ctx.fused = heap_caps_malloc(ctx.cap_epochs * 4 * sizeof(double),
                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!ctx.fused) ctx.fused = malloc(ctx.cap_epochs * 4 * sizeof(double));
-    if (!ctx.fused) { somno_feat_destroy(ctx.fe); ctx.fe = NULL; goto solo; }
+    if (!ctx.fused) { allow_solo = false; goto done; }
 
     uint32_t bounds[MAX_FRAG_GROUP + 1];
     bounds[0] = 0;
     for (int k = 0; k < nmem; k++) {
-        vitals_feed(&ctx, fs[k], &metas[k]);
+        if (!vitals_feed(&ctx, fs[k], &metas[k])) {
+            allow_solo = false;
+            goto done;
+        }
         fclose(fs[k]);
         fs[k] = NULL;
         bounds[k + 1] = ctx.n_epochs;
@@ -934,7 +971,7 @@ static int score_ring_group(const ring_rec_t *grp, int nmem, const char *job_id)
             free(stages);
             free(post);
             rc = 0;
-        }
+        } else allow_solo = false;
     }
 
 done:
@@ -943,7 +980,7 @@ done:
 solo:
     for (int k = 0; k < nmem; k++)
         if (fs[k]) fclose(fs[k]);
-    if (rc != 0) {  /* merged path failed — score each member independently */
+    if (rc != 0 && allow_solo) {  /* incompatible fragments: score independently */
         for (int k = 0; k < nmem; k++) {
             char vitals[340], sst[340];
             if (ring_paths_dir(grp[k].dir, vitals, sizeof(vitals),
@@ -962,8 +999,7 @@ static int ring_fragment_group(const char *recording_id, ring_rec_t *grp,
 {
     ring_rec_t *all = heap_caps_malloc(MAX_RING_RECS * sizeof(ring_rec_t),
                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!all) all = malloc(MAX_RING_RECS * sizeof(ring_rec_t));
-    if (!all) return 0;
+    if (!all) return -1;
     int n = collect_ring_recs(all, MAX_RING_RECS);
     int self = -1;
     for (int i = 0; i < n; i++)
@@ -1020,11 +1056,11 @@ static int score_sa2(const char *sa2_path, const char *sst_path,
     ctx.cap_epochs = sample_count / (uint32_t)lrint(30.0 / dt) + 2;
     ctx.fused = heap_caps_malloc(ctx.cap_epochs * 4 * sizeof(double),
                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!ctx.fused) ctx.fused = malloc(ctx.cap_epochs * 4 * sizeof(double));
     if (!ctx.fused) { somno_feat_destroy(ctx.fe); fclose(f); return -1; }
 
     int16_t rec[2];
     uint32_t read_n = 0;
+    bool fed = true;
     while (fread(rec, sizeof(int16_t), 2, f) == 2) {
         read_n++;
         /* sa2 values are stored scaled x100; <=0 is invalid like the portal */
@@ -1032,10 +1068,17 @@ static int score_sa2(const char *sa2_path, const char *sst_path,
         int sv = rec[1] != missing && rec[1] > 0;
         double pr = pv ? rec[0] / 100.0 : NAN;
         double spo2 = sv ? rec[1] / 100.0 : NAN;
-        if (!score_sample(&ctx, spo2, pr, 0.0, sv, pv, 0))
+        if (!score_sample(&ctx, spo2, pr, 0.0, sv, pv, 0)) {
+            fed = false;
             break;
+        }
     }
     fclose(f);
+    if (!fed) {
+        somno_feat_destroy(ctx.fe);
+        free(ctx.fused);
+        return -1;
+    }
     uint32_t ep_sec = (uint32_t)lrint(dt * lrint(30.0 / dt));
     int rc = finish_and_write(&ctx, sst_path, SOMNO_SST_SOURCE_AS11,
                               start_ms, 0, ep_sec,
@@ -1071,13 +1114,19 @@ int somno_ml_score_file(const somno_ml_job_t *job)
          * recordings.  Score the whole group in one pass so the decoder and
          * the REM-latency gate see the full night, then write each member's
          * own .sst slice.  Other members' jobs become no-ops via sst_fresh. */
-        ring_rec_t grp[MAX_FRAG_GROUP];
+        ring_rec_t *grp = heap_caps_malloc(MAX_FRAG_GROUP * sizeof(*grp),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!grp) return -1;
         int nmem = ring_fragment_group(job->id, grp, MAX_FRAG_GROUP);
+        if (nmem < 0) { free(grp); return -1; }
         if (nmem > 1) {
             ESP_LOGI(TAG, "%s: fragment group of %d — merged scoring",
                      job->id, nmem);
-            return score_ring_group(grp, nmem, job->id);
+            rc = score_ring_group(grp, nmem, job->id);
+            free(grp);
+            return rc;
         }
+        free(grp);
     }
 
     ESP_LOGI(TAG, "%s: scoring %s", job->id, src);
@@ -1355,7 +1404,10 @@ static void worker_task(void *arg)
             if (s_recon_more) somno_ml_reconcile();
             continue;
         }
+        bool diagnostics = psram_work_begin && psram_work_end;
+        if (diagnostics) psram_work_begin("scoring", SOMNO_WORKER_STACK_BYTES);
         somno_ml_score_file(&job);
+        if (diagnostics) psram_work_end("scoring-done", SOMNO_WORKER_STACK_BYTES);
         live_clear();
         verify_pending();
         service_periodic();
@@ -1372,6 +1424,11 @@ void somno_ml_worker_start(void)
     if (!s_queue) return;
     s_live.stage = -1;
     s_pending_mux = xSemaphoreCreateMutex();
+    if (!s_pending_mux) {
+        vQueueDelete(s_queue);
+        s_queue = NULL;
+        return;
+    }
     int64_t now = now_ms();
     s_next_recon_ms = now + RECON_RECENT_MS;
     s_next_full_ms = now + RECON_FULL_MS;
@@ -1383,9 +1440,23 @@ void somno_ml_worker_start(void)
     s_tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!s_stack || !s_tcb) {
         ESP_LOGE(TAG, "worker stack alloc failed");
-        return;
+        goto fail;
     }
-    xTaskCreateStaticPinnedToCore(worker_task, "somno_ml", SOMNO_WORKER_STACK_BYTES, NULL,
-                                  tskIDLE_PRIORITY + 1, s_stack, s_tcb, 1);
+    if (!xTaskCreateStaticPinnedToCore(worker_task, "somno_ml", SOMNO_WORKER_STACK_BYTES, NULL,
+                                       tskIDLE_PRIORITY + 1, s_stack, s_tcb, 1)) {
+        ESP_LOGE(TAG, "worker task creation failed");
+        goto fail;
+    }
     ESP_LOGI(TAG, "worker started (PSRAM stack)");
+    return;
+
+fail:
+    free(s_stack);
+    free(s_tcb);
+    s_stack = NULL;
+    s_tcb = NULL;
+    vSemaphoreDelete(s_pending_mux);
+    s_pending_mux = NULL;
+    vQueueDelete(s_queue);
+    s_queue = NULL;
 }

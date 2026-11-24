@@ -118,13 +118,16 @@ int64_t edf_find_mask_off_time(const char *events_snt_path)
     return mask_off_ms;
 }
 
-int64_t edf_find_zle_edge_time(const char *events_snt_path, int want_value,
-                               int64_t clock_drift_ms)
+int edf_find_zle_windows(const char *events_snt_path, int64_t clock_drift_ms,
+                         edf_zle_window_t *out, int max_windows)
 {
-    FILE *f = fopen(events_snt_path, "r");
-    if (!f) return -1;
+    if (!events_snt_path || !out || max_windows <= 0) return 0;
 
-    int64_t zle_ms = -1;
+    FILE *f = fopen(events_snt_path, "r");
+    if (!f) return 0;
+
+    int count = 0;
+    bool open = false;
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         cJSON *msg = cJSON_Parse(line);
@@ -141,29 +144,35 @@ int64_t edf_find_zle_edge_time(const char *events_snt_path, int want_value,
                         cJSON *ev = cJSON_GetArrayItem(events, i);
                         if (!ev) continue;
                         cJSON *val = cJSON_GetObjectItem(ev, "value");
-                        if (val && cJSON_IsNumber(val) &&
-                            (int)val->valuedouble == want_value) {
-                            int64_t cand = -1;
-                            cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
-                            if (rt && cJSON_IsString(rt)) {
-                                int64_t as11_ms =
-                                    as11_time_parse_iso8601_ms(rt->valuestring);
-                                if (as11_ms > 0)
-                                    cand = as11_ms + clock_drift_ms;
+                        if (!val || !cJSON_IsNumber(val)) continue;
+                        int v = (int)val->valuedouble;
+                        if (v != 0 && v != 1) continue;
+
+                        int64_t cand = -1;
+                        cJSON *rt = cJSON_GetObjectItem(ev, "reportTime");
+                        if (rt && cJSON_IsString(rt)) {
+                            int64_t as11_ms =
+                                as11_time_parse_iso8601_ms(rt->valuestring);
+                            if (as11_ms > 0)
+                                cand = as11_ms + clock_drift_ms;
+                        }
+                        if (cand < 0) {
+                            cJSON *ntp = cJSON_GetObjectItem(ev, "ntpTimeMs");
+                            if (ntp && cJSON_IsNumber(ntp))
+                                cand = (int64_t)ntp->valuedouble;
+                        }
+                        if (cand <= 0) continue;
+
+                        if (v == 1) {
+                            if (!open && count < max_windows) {
+                                out[count].start_ms = cand;
+                                out[count].end_ms = 0;
+                                open = true;
                             }
-                            if (cand < 0) {
-                                cJSON *ntp = cJSON_GetObjectItem(ev, "ntpTimeMs");
-                                if (ntp && cJSON_IsNumber(ntp))
-                                    cand = (int64_t)ntp->valuedouble;
-                            }
-                            if (cand > 0) {
-                                zle_ms = cand;
-                                if (want_value == 1) {
-                                    cJSON_Delete(msg);
-                                    fclose(f);
-                                    return zle_ms;
-                                }
-                            }
+                        } else if (open && cand > out[count].start_ms) {
+                            out[count].end_ms = cand;
+                            count++;
+                            open = false;
                         }
                     }
                 }
@@ -172,7 +181,12 @@ int64_t edf_find_zle_edge_time(const char *events_snt_path, int want_value,
         cJSON_Delete(msg);
     }
     fclose(f);
-    return zle_ms;
+
+    if (open && count < max_windows) {
+        out[count].end_ms = 0;
+        count++;
+    }
+    return count;
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -363,11 +377,8 @@ esp_err_t edf_convert_snt_to_edf(const char *snt_path, const char *edf_path,
     size_t record_bytes = record_data_samples * sizeof(int16_t);
     size_t raw_record_bytes = samples_per_record * snt_channels * sizeof(int16_t);
 
-    int16_t *raw = malloc(raw_record_bytes);
-    int16_t *record_buf = heap_caps_malloc(record_bytes, MALLOC_CAP_SPIRAM);
-    if (!record_buf) {
-        record_buf = malloc(record_bytes);
-    }
+    int16_t *raw = heap_caps_malloc(raw_record_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int16_t *record_buf = heap_caps_malloc(record_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!raw || !record_buf) {
         ESP_LOGE(TAG, "malloc record buffers failed");
         free(raw); free(record_buf); free(spr); free(sig);
@@ -390,15 +401,15 @@ esp_err_t edf_convert_snt_to_edf(const char *snt_path, const char *edf_path,
             if (snt2) {
                 int n_samp = (int)(avail / (snt_channels * sizeof(int16_t)));
                 size_t ch_bytes = (size_t)n_samp * sizeof(int16_t);
-                int16_t *flow_buf = malloc(ch_bytes);
-                int16_t *press_buf = malloc(ch_bytes);
+                int16_t *flow_buf = heap_caps_malloc(ch_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                int16_t *press_buf = heap_caps_malloc(ch_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
                 if (!flow_buf || !press_buf) {
                     ESP_LOGW(TAG, "v2 interleave malloc failed at record %d", rec);
                     free(flow_buf); free(press_buf);
                     free(raw); free(record_buf); free(spr); free(sig);
                     edf_discard_atomic_file(edf, tmp_path);
                     fclose(snt); fclose(snt2);
-                    return ESP_FAIL;
+                    return ESP_ERR_NO_MEM;
                 }
                 if (fread(flow_buf, 1, ch_bytes, snt) != ch_bytes ||
                     fread(press_buf, 1, ch_bytes, snt2) != ch_bytes) {
@@ -444,7 +455,7 @@ esp_err_t edf_convert_snt_to_edf(const char *snt_path, const char *edf_path,
                     double phys = stored / 100.0;
                     double dig = dmin + (phys - pmin) * k;
                     int idig = (int)(dig < 0 ? dig - 0.5 : dig + 0.5);
-                    if (!passthrough) {
+                    if (!passthrough || sig[ch].clamp_valid) {
                         idig = clamp_i16(idig, sig[ch].dig_min, sig[ch].dig_max);
                     } else {
                         idig = clamp_i16(idig, INT16_MIN, INT16_MAX);

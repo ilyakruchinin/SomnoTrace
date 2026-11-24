@@ -553,7 +553,7 @@ static int bat_calc_ocv(int mv, bool charging)
  * If out_spread_mv is non-NULL, writes the trimmed voltage spread in mV. */
 static int bat_sample_burst(int *out_spread_mv)
 {
-    static int samples[BAT_BURST_SAMPLES];
+    static EXT_RAM_BSS_ATTR int samples[BAT_BURST_SAMPLES];
     int n = 0;
 
     for (int i = 0; i < BAT_BURST_SAMPLES; i++) {

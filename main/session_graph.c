@@ -28,6 +28,8 @@
 #include "cJSON.h"
 #include "sd_storage.h"
 #include "edf_gen.h"
+#include "somno_ml.h"
+#include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -40,6 +42,8 @@
 #include "freertos/queue.h"
 #include "psram_task.h"
 #include "http_query.h"
+#include "httpd_defer.h"
+#include "session_graph.h"
 
 static const char *TAG = "session_graph";
 
@@ -60,27 +64,13 @@ typedef struct __attribute__((packed)) {
 #define SNT_HDR_SIZE sizeof(snt_hdr_t)   /* 28 bytes (packed) */
 #define GRAPH_MAX_POINTS 50000  /* upper bound for ?points=all */
 
-/* ── Physical-unit scaling factors ────────────────────────────────────
- * Raw .snt files store int16 digital values.  These scale factors convert
- * digital values to physical units matching the EDF signal definitions in
- * edf_gen.c.  The graph API emits pre-scaled physical values so the
- * frontend can display them directly without additional conversion.
- *
- * Formula: phys = (dig - dig_min) * (phys_max - phys_min)
- *                                  / (dig_max - dig_min)  + phys_min
- * For all channels below dig_min=0 simplifies to: phys = dig * scale.
- * Flow is the exception: dig_min=-1000, phys_min=-2.0.
- */
-
-/* BRP: Flow.40ms  — phys [-2.0, 3.0] dig [-1000, 1500] → 0.002 L/s per digit
- *      Press.40ms — phys [0.0, 40.0]  dig [0, 2000]     → 0.02 cmH2O per digit */
-#define BRP_FLOW_SCALE   0.002f    /* L/s per digit */
-#define BRP_FLOW_OFFSET  (-2.0f)   /* phys_min */
-#define BRP_FLOW_DIG_MIN (-1000)   /* dig_min */
-#define BRP_PRESS_SCALE  0.02f     /* cmH2O per digit */
-
-/* PLD ch3: Leak — phys [0.0, 2.0] dig [0, 100] → 0.02 L/s per digit */
-#define PLD_LEAK_SCALE   0.02f     /* L/s per digit */
+/* ── Physical-unit scaling ────────────────────────────────────────────
+ * Raw .snt files store int16 digital values scaled ×100 from the physical
+ * unit (hundredths of L/s for flow and leak, hundredths of cmH2O for
+ * pressure).  The graph API emits pre-scaled physical values — L/min for
+ * flow and leak (dig × 0.6), cmH2O for pressure (dig × 0.01) — so the
+ * frontend can display them directly; see brp_flow_phys()/brp_press_phys()/
+ * pld_leak_phys() below. */
 
 /* URL-decode a query parameter value.  Returns decoded length or -1 on overflow. */
 static int graph_url_decode(char *dst, const char *src, int max_len)
@@ -193,6 +183,7 @@ typedef struct {
     int64_t end_epoch_ms;
     int64_t clock_drift_ms;
     bool clock_drift_valid;
+    const char *stage_status;
     uint32_t brp_samples;
     uint32_t brp_mm_samples;
     uint32_t pld_samples;
@@ -221,7 +212,7 @@ static long file_size_stat(const char *path)
     return 0;
 }
 
-esp_err_t sessions_list_handler(httpd_req_t *req)
+static esp_err_t sessions_list_impl(httpd_req_t *req)
 {
     char date[16];
     if (!get_qparam(req, "date", date, sizeof(date))) {
@@ -247,8 +238,8 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
 
     /* Collect completed sessions into an array for sorting */
     int cap = 8, count = 0;
-    session_manifest_t *sessions = heap_caps_calloc(cap, sizeof(session_manifest_t), MALLOC_CAP_SPIRAM);
-    if (!sessions) sessions = calloc(cap, sizeof(session_manifest_t));
+    session_manifest_t *sessions = heap_caps_calloc(cap, sizeof(session_manifest_t),
+                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!sessions) { closedir(dd); httpd_resp_send_500(req); return ESP_FAIL; }
 
     struct dirent *fent;
@@ -329,7 +320,8 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
 
         if (count >= cap) {
             cap *= 2;
-            session_manifest_t *tmp = realloc(sessions, cap * sizeof(session_manifest_t));
+            session_manifest_t *tmp = heap_caps_realloc(sessions, cap * sizeof(session_manifest_t),
+                                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (!tmp) { cJSON_Delete(j); break; }
             sessions = tmp;
         }
@@ -370,6 +362,37 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
         }
 
         count++;
+        snprintf(fpath, sizeof(fpath), "%s/%s_stages.sst", day_dir, session_id);
+        struct stat stage_stat;
+        if (stat(fpath, &stage_stat) != 0) {
+            s->stage_status = errno == ENOENT ? "absent" : "error";
+        } else {
+            somno_sst_header_t hdr;
+            FILE *sf = fopen(fpath, "rb");
+            if (!sf) {
+                s->stage_status = errno == ENOENT ? "absent" : "error";
+            } else {
+                size_t got = fread(&hdr, 1, sizeof(hdr), sf);
+                bool read_error = ferror(sf);
+                fclose(sf);
+                if (read_error)
+                    s->stage_status = "error";
+                else if (got != sizeof(hdr) || hdr.magic != SOMNO_SST_MAGIC ||
+                    hdr.version != SOMNO_SST_VERSION ||
+                    hdr.source_type != SOMNO_SST_SOURCE_AS11 || hdr.decode_mode > 2 ||
+                    stage_stat.st_size < 0 ||
+                    (uint64_t)stage_stat.st_size < sizeof(hdr) + (uint64_t)hdr.n_epochs * 2)
+                    s->stage_status = "invalid";
+                else if (hdr.flags & SOMNO_SST_FLAG_INSUFFICIENT)
+                    s->stage_status = "insufficient";
+                else if (hdr.n_epochs == 0 || hdr.epoch_sec == 0 || hdr.epoch_sec > 3600)
+                    s->stage_status = "invalid";
+                else if (hdr.flags & SOMNO_SST_FLAG_PARTIAL)
+                    s->stage_status = "partial";
+                else
+                    s->stage_status = "ready";
+            }
+        }
     }
     closedir(dd);
 
@@ -398,22 +421,31 @@ esp_err_t sessions_list_handler(httpd_req_t *req)
             "\"start_epoch_ms\":%lld,\"end_epoch_ms\":%lld,"
             "\"clock_drift_ms\":%lld,\"clock_drift_valid\":%s,"
             "\"brp_samples\":%u,\"brp_mm_samples\":%u,\"pld_samples\":%u,\"sa2_samples\":%u,"
-            "\"brp_bytes\":%ld,\"brp_mm_bytes\":%ld,"
+            "\"brp_bytes\":%ld,\"brp_mm_bytes\":%ld,\"has_stages\":%s,\"stage_status\":\"%s\","
             "\"fmt\":%d,\"stream_notifications\":%u,\"gap_events\":%u,\"gap_missing\":%u}",
             s->id, s->state, s->partial ? "true" : "false",
             (long long)s->start_epoch_ms, (long long)s->end_epoch_ms,
             (long long)s->clock_drift_ms, s->clock_drift_valid ? "true" : "false",
             (unsigned)s->brp_samples, (unsigned)s->brp_mm_samples, (unsigned)s->pld_samples, (unsigned)s->sa2_samples,
             s->brp_bytes, s->brp_mm_bytes,
+            !strcmp(s->stage_status, "ready") ? "true" : "false", s->stage_status,
             s->fmt, (unsigned)s->stream_notifications, (unsigned)s->gap_events, (unsigned)s->gap_missing);
     }
 
     pos += snprintf(json + pos, json_cap - pos, "]");
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_send(req, json, pos);
     free(json);
     free(sessions);
     return ESP_OK;
+}
+
+/* Reads every *_session.json in the day dir + stats .snt files — seconds of
+ * SD I/O under import/upload churn, so it runs on the deferred worker. */
+esp_err_t sessions_list_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, sessions_list_impl);
 }
 
 static void resolve_day_dir(httpd_req_t *req, const char *session_id,
@@ -426,7 +458,7 @@ static int cmp_str(const void *a, const void *b)
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-esp_err_t days_list_handler(httpd_req_t *req)
+static esp_err_t days_list_impl(httpd_req_t *req)
 {
     DIR *dd = opendir(SD_STREAMS_DIR);
     if (!dd) {
@@ -497,8 +529,15 @@ esp_err_t days_list_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Opens ~140 day folders to count sessions — O(history) SD I/O that stalls
+ * the httpd task for seconds while the importer churns; deferred. */
+esp_err_t days_list_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, days_list_impl);
+}
+
 /* GET /api/summary?date=YYYYMMDD — per-day summary metrics from the spool. */
-esp_err_t summary_handler(httpd_req_t *req)
+static esp_err_t summary_impl(httpd_req_t *req)
 {
     char date[16];
     if (!get_qparam(req, "date", date, sizeof(date)) || strlen(date) != 8) {
@@ -519,10 +558,15 @@ esp_err_t summary_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+esp_err_t summary_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, summary_impl);
+}
+
 /* GET /api/session/settings?session=ID&date=YYYYMMDD — therapy mode + pressure
  * settings for the pressure panel (CPAP flat lines). Parses the session's
  * settings.json (SettingProfiles). */
-esp_err_t session_settings_handler(httpd_req_t *req)
+static esp_err_t session_settings_impl(httpd_req_t *req)
 {
     char session_id[32];
     if (!get_qparam(req, "session", session_id, sizeof(session_id))) {
@@ -533,8 +577,16 @@ esp_err_t session_settings_handler(httpd_req_t *req)
     resolve_day_dir(req, session_id, day_dir, sizeof(day_dir));
 
     char path[400];
-    snprintf(path, sizeof(path), "%s/%s_settings.json", day_dir, session_id);
+    snprintf(path, sizeof(path), "%s/%s.live.settings.json", day_dir, session_id);
     FILE *f = fopen(path, "r");
+    if (!f) {
+        snprintf(path, sizeof(path), "%s/%s.cached.settings.json", day_dir, session_id);
+        f = fopen(path, "r");
+    }
+    if (!f) {
+        snprintf(path, sizeof(path), "%s/%s_settings.json", day_dir, session_id);
+        f = fopen(path, "r");
+    }
     if (!f) {
         httpd_resp_set_type(req, "application/json");
         httpd_resp_set_status(req, "404 Not Found");
@@ -603,6 +655,11 @@ esp_err_t session_settings_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+esp_err_t session_settings_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, session_settings_impl);
+}
+
 /* Resolve the noon-day streams directory for a session.
  *
  * The session writer stores .snt files in a noon-day folder: sessions
@@ -645,7 +702,7 @@ static void resolve_day_dir(httpd_req_t *req, const char *session_id,
  *   → {"t":[...],"leak":[...]}
  * Flow zoom: brp.snt (L0, 25Hz, 2×int16/record)
  *   → {"t":[...],"flow":[...],"press":[...]}  */
-esp_err_t session_graph_handler(httpd_req_t *req)
+static esp_err_t session_graph_impl(httpd_req_t *req)
 {
     char session_id[32], channel[16], points_str[16];
     char start_ms_str[32], end_ms_str[32];
@@ -676,32 +733,45 @@ esp_err_t session_graph_handler(httpd_req_t *req)
     }
 
     /* Determine which .snt file to read.
-     * Flow overview prefers *_brp_mm.snt (L1 MinMax) and falls back to *_brp.snt (L0 raw).
-     * Flow zoom always uses *_brp.snt. Leak uses *_pld.snt. */
-    char file_path[400];
-    char alt_path[400];
-    bool have_alt = false;
+     * v2 keeps flow and pressure in separate single-channel files
+     * (_flow.snt / _flow_mm.snt / _press.snt); v1 multiplexes both into
+     * _brp.snt (2ch) and _brp_mm.snt (4ch).
+     * Flow overview prefers the L1 MinMax file and falls back to L0 raw;
+     * flow zoom always uses L0 raw.  Leak uses *_pld.snt. */
+    char file_path[400], cand2[400], cand3[400], cand4[400];
+    const char *cands[4] = { file_path, cand2, cand3, cand4 };
+    int n_cands = 0;
 
     if (strcmp(channel, "flow") == 0) {
         if (is_zoom) {
-            snprintf(file_path, sizeof(file_path), "%s/%s_brp.snt", day_dir, session_id);
+            snprintf(file_path, sizeof(file_path), "%s/%s_flow.snt", day_dir, session_id);
+            snprintf(cand2, sizeof(cand2), "%s/%s_brp.snt", day_dir, session_id);
+            n_cands = 2;
         } else {
-            snprintf(file_path, sizeof(file_path), "%s/%s_brp_mm.snt", day_dir, session_id);
-            snprintf(alt_path, sizeof(alt_path), "%s/%s_brp.snt", day_dir, session_id);
-            have_alt = true;
+            snprintf(file_path, sizeof(file_path), "%s/%s_flow_mm.snt", day_dir, session_id);
+            snprintf(cand2, sizeof(cand2), "%s/%s_flow.snt", day_dir, session_id);
+            snprintf(cand3, sizeof(cand3), "%s/%s_brp_mm.snt", day_dir, session_id);
+            snprintf(cand4, sizeof(cand4), "%s/%s_brp.snt", day_dir, session_id);
+            n_cands = 4;
         }
     } else if (strcmp(channel, "leak") == 0) {
         snprintf(file_path, sizeof(file_path), "%s/%s_pld.snt", day_dir, session_id);
+        n_cands = 1;
     } else {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown channel");
         return ESP_FAIL;
     }
 
-    FILE *f = fopen(file_path, "rb");
-    if (!f && have_alt) {
-        ESP_LOGI(TAG, "graph: falling back to L0 raw: %s", alt_path);
-        f = fopen(alt_path, "rb");
-        if (f) strlcpy(file_path, alt_path, sizeof(file_path));
+    FILE *f = NULL;
+    for (int i = 0; i < n_cands; i++) {
+        f = fopen(cands[i], "rb");
+        if (f) {
+            if (i > 0) {
+                ESP_LOGI(TAG, "graph: falling back to %s", cands[i]);
+                strlcpy(file_path, cands[i], sizeof(file_path));
+            }
+            break;
+        }
     }
     if (!f) {
         ESP_LOGW(TAG, "graph: file not found: %s", file_path);
@@ -727,6 +797,27 @@ esp_err_t session_graph_handler(httpd_req_t *req)
     int rec_bytes = n_ch * hdr.sample_bytes;
     int ms_per_rec = 10000 / hdr.sample_hz_x10;
     int16_t missing = snt_missing_for(hdr.version);
+
+    /* v2 sessions store pressure in a sibling _press.snt (L0, 1ch) while
+     * the opened file carries flow only (1ch L0 or 2ch MinMax). */
+    bool v2_split = strcmp(channel, "flow") == 0 &&
+                    ((hdr.tier == 0 && n_ch == 1) || (hdr.tier == 1 && n_ch == 2));
+    FILE *fp = NULL;
+    snt_hdr_t phdr;
+    memset(&phdr, 0, sizeof(phdr));
+    int press_ms_per_rec = 0;
+    if (v2_split) {
+        char ppath[400];
+        snprintf(ppath, sizeof(ppath), "%s/%s_press.snt", day_dir, session_id);
+        fp = fopen(ppath, "rb");
+        if (fp && (fread(&phdr, sizeof(phdr), 1, fp) != 1 ||
+                   phdr.magic != SNT_MAGIC)) {
+            fclose(fp);
+            fp = NULL;
+        }
+        if (fp && phdr.sample_hz_x10 > 0)
+            press_ms_per_rec = 10000 / phdr.sample_hz_x10;
+    }
 
     /* If the caller asked for every point, target the file's sample count
      * but cap it so we do not try to build a multi-megabyte JSON buffer. */
@@ -765,13 +856,32 @@ esp_err_t session_graph_handler(httpd_req_t *req)
     if (strcmp(channel, "flow") == 0) {
         if (emit_raw && n_samples > 0) {
             /* ── Flow raw window: emit un-decimated L0 samples ── */
-            int16_t *buf = heap_caps_malloc(n_samples * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-            if (!buf) { fclose(f); free(json); httpd_resp_send_500(req); return ESP_FAIL; }
+            int16_t *buf = heap_caps_malloc(n_samples * rec_bytes,
+                                          MALLOC_CAP_SPIRAM);
+            if (!buf) { if (fp) fclose(fp); fclose(f); free(json);
+                        httpd_resp_send_500(req); return ESP_FAIL; }
 
             long file_offset = SNT_HDR_SIZE + (long)start_sample * rec_bytes;
             fseek(f, file_offset, SEEK_SET);
-            size_t got = fread(buf, 2 * sizeof(int16_t), n_samples, f);
+            size_t got = fread(buf, rec_bytes, n_samples, f);
             n_samples = (uint32_t)got;
+
+            /* v2 pressure lives in the companion _press.snt on the same
+             * time base — map flow index i to its press sample by time. */
+            int16_t *pbuf = NULL;
+            size_t pgot = 0;
+            if (v2_split && fp && press_ms_per_rec > 0) {
+                pbuf = heap_caps_malloc(n_samples * sizeof(int16_t),
+                                        MALLOC_CAP_SPIRAM);
+                if (pbuf) {
+                    int64_t p_lo = (int64_t)start_sample * ms_per_rec /
+                                   press_ms_per_rec;
+                    if (p_lo > phdr.sample_count) p_lo = phdr.sample_count;
+                    fseek(fp, SNT_HDR_SIZE + (long)p_lo * sizeof(int16_t),
+                          SEEK_SET);
+                    pgot = fread(pbuf, sizeof(int16_t), n_samples, fp);
+                }
+            }
 
             pos += snprintf(json + pos, json_cap - pos, "{\"t\":[");
             for (uint32_t i = 0; i < n_samples; i++) {
@@ -782,14 +892,28 @@ esp_err_t session_graph_handler(httpd_req_t *req)
             pos += snprintf(json + pos, json_cap - pos, "],\"flow\":[");
             for (uint32_t i = 0; i < n_samples; i++) {
                 if (i > 0) pos += snprintf(json + pos, json_cap - pos, ",");
-                pos += snprintf(json + pos, json_cap - pos, "%.2f", brp_flow_phys(buf[i * 2], missing));
+                pos += snprintf(json + pos, json_cap - pos, "%.2f",
+                                brp_flow_phys(buf[i * n_ch], missing));
             }
             pos += snprintf(json + pos, json_cap - pos, "],\"press\":[");
-            for (uint32_t i = 0; i < n_samples; i++) {
-                if (i > 0) pos += snprintf(json + pos, json_cap - pos, ",");
-                pos += snprintf(json + pos, json_cap - pos, "%.2f", brp_press_phys(buf[i * 2 + 1], missing));
+            /* v2 without a readable _press.snt emits an empty array —
+             * fabricating zeros would draw a false flat line. */
+            if (!v2_split || pbuf) {
+                for (uint32_t i = 0; i < n_samples; i++) {
+                    if (i > 0) pos += snprintf(json + pos, json_cap - pos, ",");
+                    float v = 0.0f;
+                    if (pbuf && press_ms_per_rec > 0) {
+                        uint32_t pi = (uint32_t)((int64_t)i * ms_per_rec /
+                                                 press_ms_per_rec);
+                        if (pi < pgot) v = brp_press_phys(pbuf[pi], missing);
+                    } else if (!v2_split) {
+                        v = brp_press_phys(buf[i * n_ch + 1], missing);
+                    }
+                    pos += snprintf(json + pos, json_cap - pos, "%.2f", v);
+                }
             }
             pos += snprintf(json + pos, json_cap - pos, "]}");
+            free(pbuf);
             free(buf);
         } else {
             /* ── Flow decimated: L1 or L0 MinMax envelope over requested window ── */
@@ -800,25 +924,43 @@ esp_err_t session_graph_handler(httpd_req_t *req)
 
             float *flow = heap_caps_malloc(n_out * sizeof(float) * 2, MALLOC_CAP_SPIRAM);
         if (!flow) flow = malloc(n_out * sizeof(float) * 2);
-            if (!flow) { fclose(f); free(json); httpd_resp_send_500(req); return ESP_FAIL; }
+            if (!flow) { if (fp) fclose(fp); fclose(f); free(json);
+                         httpd_resp_send_500(req); return ESP_FAIL; }
             float *press = flow + n_out;
 
-            bool is_l1 = (hdr.tier == 1 && n_ch == 4);
+            bool is_l1 = hdr.tier == 1 && (n_ch == 4 || n_ch == 2);
             fseek(f, SNT_HDR_SIZE + (long)start_sample * rec_bytes, SEEK_SET);
+
+            /* v2 press companion: sequential cursor over each flow
+             * record's time span (records and output stay ordered). */
+            uint32_t p_next = 0;
+            if (v2_split && fp && press_ms_per_rec > 0) {
+                int64_t p_lo = (int64_t)start_sample * ms_per_rec /
+                               press_ms_per_rec;
+                if (p_lo > phdr.sample_count) p_lo = phdr.sample_count;
+                p_next = (uint32_t)p_lo;
+                fseek(fp, SNT_HDR_SIZE + (long)p_next * sizeof(int16_t),
+                      SEEK_SET);
+            }
 
             int out = 0; uint32_t ri = 0;
             while (ri < n_samples && out < n_out) {
                 float g_fmn = 1e9f, g_fmx = -1e9f;
                 float g_pmn = 1e9f, g_pmx = -1e9f;
                 for (int g = 0; g < group && ri < n_samples; g++) {
-                    if (is_l1) {
+                    if (is_l1 && n_ch == 4) {
                         int16_t rec[4];
                         if (fread(rec, sizeof(int16_t), 4, f) != 4) { ri = n_samples; break; }
                         if (rec[0] != missing) { float v = brp_flow_phys(rec[0], missing); if (v < g_fmn) g_fmn = v; }
                         if (rec[1] != missing) { float v = brp_flow_phys(rec[1], missing); if (v > g_fmx) g_fmx = v; }
                         if (rec[2] != missing) { float v = brp_press_phys(rec[2], missing); if (v < g_pmn) g_pmn = v; }
                         if (rec[3] != missing) { float v = brp_press_phys(rec[3], missing); if (v > g_pmx) g_pmx = v; }
-                    } else {
+                    } else if (is_l1 && n_ch == 2) {
+                        int16_t rec[2];
+                        if (fread(rec, sizeof(int16_t), 2, f) != 2) { ri = n_samples; break; }
+                        if (rec[0] != missing) { float v = brp_flow_phys(rec[0], missing); if (v < g_fmn) g_fmn = v; }
+                        if (rec[1] != missing) { float v = brp_flow_phys(rec[1], missing); if (v > g_fmx) g_fmx = v; }
+                    } else if (n_ch >= 2) {
                         int16_t rec[2];
                         if (fread(rec, sizeof(int16_t), 2, f) != 2) { ri = n_samples; break; }
                         if (rec[0] != missing) {
@@ -830,6 +972,36 @@ esp_err_t session_graph_handler(httpd_req_t *req)
                             float v = brp_press_phys(rec[1], missing);
                             if (v < g_pmn) g_pmn = v;
                             if (v > g_pmx) g_pmx = v;
+                        }
+                    } else {
+                        int16_t rec;
+                        if (fread(&rec, sizeof(int16_t), 1, f) != 1) { ri = n_samples; break; }
+                        if (rec != missing) {
+                            float v = brp_flow_phys(rec, missing);
+                            if (v < g_fmn) g_fmn = v;
+                            if (v > g_fmx) g_fmx = v;
+                        }
+                    }
+                    /* Pressure span covered by this flow record (v2 only —
+                     * v1 already decoded its pressure channel inline). */
+                    if (v2_split && fp && press_ms_per_rec > 0) {
+                        uint32_t p_lo = (uint32_t)(((int64_t)(start_sample + ri) *
+                                                    ms_per_rec) / press_ms_per_rec);
+                        uint32_t p_hi = (uint32_t)(((int64_t)(start_sample + ri + 1) *
+                                                    ms_per_rec) / press_ms_per_rec);
+                        if (p_hi > phdr.sample_count) p_hi = phdr.sample_count;
+                        int16_t pv;
+                        while (p_next < p_hi) {
+                            if (fread(&pv, sizeof(int16_t), 1, fp) != 1) {
+                                p_next = p_hi;
+                                break;
+                            }
+                            if (p_next >= p_lo && pv != missing) {
+                                float v = brp_press_phys(pv, missing);
+                                if (v < g_pmn) g_pmn = v;
+                                if (v > g_pmx) g_pmx = v;
+                            }
+                            p_next++;
                         }
                     }
                     ri++;
@@ -857,9 +1029,11 @@ esp_err_t session_graph_handler(httpd_req_t *req)
                 pos += snprintf(json + pos, json_cap - pos, "%.2f", flow[i]);
             }
             pos += snprintf(json + pos, json_cap - pos, "],\"press\":[");
-            for (int i = 0; i < out; i++) {
-                if (i > 0) pos += snprintf(json + pos, json_cap - pos, ",");
-                pos += snprintf(json + pos, json_cap - pos, "%.2f", press[i]);
+            if (!v2_split || fp) {
+                for (int i = 0; i < out; i++) {
+                    if (i > 0) pos += snprintf(json + pos, json_cap - pos, ",");
+                    pos += snprintf(json + pos, json_cap - pos, "%.2f", press[i]);
+                }
             }
             pos += snprintf(json + pos, json_cap - pos, "]}");
             free(flow);
@@ -933,6 +1107,7 @@ esp_err_t session_graph_handler(httpd_req_t *req)
         pos += snprintf(json + pos, json_cap - pos, "{\"error\":\"unsupported channel\"}");
     }
 
+    if (fp) fclose(fp);
     fclose(f);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, pos);
@@ -940,9 +1115,15 @@ esp_err_t session_graph_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Reads and decimates .snt channel data — SD-heavy; deferred. */
+esp_err_t session_graph_handler(httpd_req_t *req)
+{
+    return httpd_defer_dispatch(req, session_graph_impl);
+}
+
 typedef struct {
     httpd_req_t *req;
-    char file_path[400];
+    char file_path[512];    /* OXIMETRY_CANONICAL_MAX_PATH-sized */
     long range_start;
     long send_size;
 } session_file_async_t;
@@ -1052,7 +1233,7 @@ static void snt_download_worker(void *arg)
 /* Called before httpd starts. Creates the download queue and the single
  * persistent worker task on a PSRAM stack (the worker only reads SD and writes
  * to sockets — no flash writes — so an external-memory stack is safe under
- * CONFIG_SPI_FLASH_AUTO_SUSPEND). Falls back to an internal stack. */
+ * CONFIG_SPI_FLASH_AUTO_SUSPEND). No large internal-stack fallback. */
 void session_graph_init(void)
 {
     if (s_download_queue) return;
@@ -1061,22 +1242,16 @@ void session_graph_init(void)
         ESP_LOGE(TAG, "failed to create download queue");
         return;
     }
-    static StackType_t *stack = NULL;
-    static StaticTask_t *tcb = NULL;
-    stack = heap_caps_malloc(SNT_WORKER_STACK, MALLOC_CAP_SPIRAM);
-    tcb   = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
-    TaskHandle_t h = NULL;
-    if (stack && tcb) {
-        h = xTaskCreateStaticPinnedToCore(snt_download_worker, "snt_download",
-                                          SNT_WORKER_STACK, NULL, 4, stack, tcb,
-                                          tskNO_AFFINITY);
+    TaskHandle_t h = psram_task_create(snt_download_worker, "snt_download",
+                                      SNT_WORKER_STACK, NULL, 4,
+                                      tskNO_AFFINITY, NULL, NULL);
+    if (!h) {
+        ESP_LOGE(TAG, "failed to create snt_download PSRAM worker");
+        vQueueDelete(s_download_queue);
+        s_download_queue = NULL;
     } else {
-        ESP_LOGW(TAG, "snt worker PSRAM stack alloc failed, using internal stack");
-        free(stack); free(tcb); stack = NULL; tcb = NULL;
-        h = psram_task_create(snt_download_worker, "snt_download", SNT_WORKER_STACK, NULL, 4, tskNO_AFFINITY, NULL, NULL);
+        ESP_LOGI(TAG, "snt_download worker started (PSRAM stack)");
     }
-    if (!h) ESP_LOGE(TAG, "failed to create snt_download worker");
-    else ESP_LOGI(TAG, "snt_download worker started (PSRAM stack=%s)", stack ? "yes" : "no");
 }
 
 /* GET /api/session/file?session=ID&date=YYYYMMDD&type=brp|brp_mm|pld|sa2|events
@@ -1115,6 +1290,16 @@ esp_err_t session_file_handler(httpd_req_t *req)
 
     FILE *f = fopen(file_path, "rb");
     if (!f) {
+        if (strcmp(type, "stages") == 0 && errno == ENOENT) {
+            httpd_resp_set_status(req, "404 Not Found");
+            httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+            return httpd_resp_send(req, "stages not available", HTTPD_RESP_USE_STRLEN);
+        }
+        if (errno != ENOENT) {
+            ESP_LOGW(TAG, "session_file: cannot open %s: %s", file_path, strerror(errno));
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
         ESP_LOGW(TAG, "session_file: file not found: %s", file_path);
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "file not found");
         return ESP_FAIL;
@@ -1194,31 +1379,50 @@ esp_err_t session_file_handler(httpd_req_t *req)
      * next request. */
     httpd_resp_set_hdr(req, "Connection", "close");
 
+    fclose(f);
+    return session_graph_enqueue_file(req, file_path, range_start, send_size);
+}
+
+/* Shared with /download (net_provision.c): hands a whole-file (or range)
+ * chunked transfer to the snt_download worker so the httpd task is not
+ * blocked for the duration of a large SD read + TCP stream.
+ * Caller sets response headers first; this always answers the request —
+ * with the file body on success or a 503/500 on contention/failure. */
+esp_err_t session_graph_enqueue_file(httpd_req_t *req, const char *file_path,
+                                     long range_start, long send_size)
+{
+    if (!s_download_queue) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        httpd_resp_sendstr(req, "Download worker unavailable; retry later");
+        return ESP_OK;
+    }
+
     session_file_async_t *transfer = heap_caps_calloc(1, sizeof(*transfer), MALLOC_CAP_SPIRAM);
     if (!transfer) transfer = calloc(1, sizeof(*transfer));
     httpd_req_t *async_req = NULL;
     if (!transfer || httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
         free(transfer);
-        fclose(f);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
     transfer->req = async_req;
-    memcpy(transfer->file_path, file_path, sizeof(transfer->file_path));
+    strlcpy(transfer->file_path, file_path, sizeof(transfer->file_path));
     transfer->range_start = range_start;
     transfer->send_size = send_size;
-    fclose(f);
 
     /* Hand off to the persistent download worker. Ownership of `transfer` and
      * completion of the async handler pass to the worker. If the queue is full
-     * (too many pending downloads), reject and clean up here. */
-    if (!s_download_queue ||
-        xQueueSend(s_download_queue, &transfer, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "snt_download: queue unavailable/full, rejecting request");
+     * (too many pending downloads), answer 503 rather than dropping the
+     * socket into an unhandled void. */
+    if (xQueueSend(s_download_queue, &transfer, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "snt_download: queue full, rejecting request");
+        httpd_resp_set_status(async_req, "503 Service Unavailable");
+        httpd_resp_set_hdr(async_req, "Cache-Control", "no-store");
+        httpd_resp_sendstr(async_req, "Too many downloads; retry later");
         httpd_req_async_handler_complete(async_req);
         free(transfer);
-        return ESP_FAIL;
     }
     return ESP_OK;
 }

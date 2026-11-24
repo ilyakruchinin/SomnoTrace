@@ -25,6 +25,7 @@
 #include "bsp_i2c.h"
 #include "bsp_display.h"
 #include "device_settings.h"
+#include "psram_task.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -143,7 +144,9 @@ esp_err_t bsp_touch_init(void)
             gpio_isr_handler_add(BSP_PIN_TP_INT, touch_gpio_isr_handler, NULL);
             s_has_touch = true;
             ESP_LOGI(TAG, "CST816 touch controller detected on I2C 0x%02X", CST816_ADDR);
-            xTaskCreate(touch_worker_task, "bsp_touch", 3072, NULL, 5, &s_touch_task);
+            s_touch_task = psram_task_create(touch_worker_task, "bsp_touch",
+                                             3072, NULL, 5, tskNO_AFFINITY,
+                                             NULL, NULL);
         }
     } else {
         ESP_LOGW(TAG, "CST816 touch controller not detected (%s)", esp_err_to_name(probe_tp));

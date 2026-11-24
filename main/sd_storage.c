@@ -189,6 +189,16 @@ esp_err_t sd_storage_get_free(uint64_t *free_bytes, uint64_t *total_bytes)
     return ESP_OK;
 }
 
+esp_err_t sd_storage_diagnostics_allowed(bool *allowed)
+{
+    if (!allowed) return ESP_ERR_INVALID_ARG;
+    *allowed = false;
+    uint64_t free_bytes = 0;
+    esp_err_t ret = sd_storage_get_free(&free_bytes, NULL);
+    if (ret == ESP_OK) *allowed = free_bytes >= SD_RESERVE_BYTES;
+    return ret;
+}
+
 /* Reclaim derived (regenerable) output so raw capture can proceed.
  * Only SDCARD/ is eligible: it is fully rebuildable from
  * .somnotrace/sessions/, which is the source of truth. */

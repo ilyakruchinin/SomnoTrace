@@ -30,6 +30,7 @@
 #include <time.h>
 
 #include "bsp_display.h"
+#include "bridge_indicator.h"
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_heap_caps.h"
@@ -84,7 +85,8 @@ static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b);
 static void fb_clear(uint16_t color);
 static int fb_draw_string_aa(int x, int y, const font_info_t *font, const char *str, uint16_t color);
 static void fb_draw_wifi_indicator(int x, int y, bool connected);
-static void fb_draw_ble_indicator(int x, int y);
+static void fb_draw_ble_indicator(int x, int y, bool dim);
+static void fb_draw_bridge_card_indicator(bridge_indicator_view_t view);
 static void fb_draw_update_indicator(int x, int y);
 static void render_graph(void);
 static void render_info(void);
@@ -97,6 +99,7 @@ static esp_lcd_panel_io_handle_t s_io = NULL;
 static uint16_t *s_fb = NULL;
 static bool s_wifi_connected = false;
 static bool s_as11_paired = false;
+static bridge_indicator_t s_bridge_indicator;
 static bool s_update_available = false;
 static uint16_t s_rotation = 0;  /* current LCD rotation in degrees */
 static volatile bool s_rotation_pending = false;  /* set_rotation requested, deferred to render task */
@@ -972,6 +975,56 @@ void bsp_display_set_as11_paired(bool paired)
     if (s_display_task) xTaskNotifyGive(s_display_task);
 }
 
+void bsp_display_bridge_set_paired(bool paired)
+{
+    if (!s_state_mutex) {
+        bridge_indicator_set_paired(&s_bridge_indicator, paired);
+        return;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bridge_indicator_set_paired(&s_bridge_indicator, paired);
+    s_status_dirty = true;
+    xSemaphoreGive(s_state_mutex);
+    if (s_display_task) xTaskNotifyGive(s_display_task);
+}
+
+void bsp_display_bridge_set_connected(bool connected)
+{
+    if (!s_state_mutex) {
+        bridge_indicator_set_connected(&s_bridge_indicator, connected);
+        return;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bridge_indicator_set_connected(&s_bridge_indicator, connected);
+    s_status_dirty = true;
+    xSemaphoreGive(s_state_mutex);
+    if (s_display_task) xTaskNotifyGive(s_display_task);
+}
+
+uint32_t bsp_display_bridge_epoch(void)
+{
+    if (!s_state_mutex) return s_bridge_indicator.epoch;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    uint32_t epoch = s_bridge_indicator.epoch;
+    xSemaphoreGive(s_state_mutex);
+    return epoch;
+}
+
+void bsp_display_bridge_set_card_status(uint32_t epoch, bool valid, bool wifi)
+{
+    if (!s_state_mutex) {
+        bridge_indicator_set_status(&s_bridge_indicator, epoch, valid, wifi,
+                                    esp_timer_get_time());
+        return;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bridge_indicator_set_status(&s_bridge_indicator, epoch, valid, wifi,
+                                esp_timer_get_time());
+    s_status_dirty = true;
+    xSemaphoreGive(s_state_mutex);
+    if (s_display_task) xTaskNotifyGive(s_display_task);
+}
+
 void bsp_display_set_battery(int percent, bool charging, bool valid)
 {
     if (!s_state_mutex) return;
@@ -1503,7 +1556,7 @@ static void render_info(void)
 /* Draw Bluetooth paired icon (standard 1px-stroke Bluetooth rune).
  * Layout: 9×15px icon centered to the left of WiFi bars.
  * x,y is the top-left corner of the icon bounding box. */
-static void fb_draw_ble_indicator(int x, int y)
+static void fb_draw_ble_indicator(int x, int y, bool dim)
 {
     static const uint16_t bitmap[15] = {
         0x030, /* ...##.... */
@@ -1522,7 +1575,7 @@ static void fb_draw_ble_indicator(int x, int y)
         0x02C, /* ...#.##.. */
         0x030, /* ...##.... */
     };
-    uint16_t col = rgb565(80, 180, 255);
+    uint16_t col = dim ? rgb565(45, 70, 90) : rgb565(80, 180, 255);
 
     for (int r = 0; r < 15; r++) {
         uint16_t row = bitmap[r];
@@ -1535,6 +1588,60 @@ static void fb_draw_ble_indicator(int x, int y)
                     s_fb[py * LCD_H_RES + px] = col;
                 }
             }
+        }
+    }
+}
+
+/* SD card + status mark: 23x15 pixels in the spare header slot. The card
+ * refers to the bridge's Wi-Fi link, not SomnoTrace's own storage. */
+static void fb_draw_bridge_card_indicator(bridge_indicator_view_t view)
+{
+    static const uint16_t card[15] = {
+        0x1FF, 0x201, 0x4A9, 0x8A9, 0x8A9, 0x8A9, 0x801, 0x801,
+        0x801, 0x801, 0x801, 0x801, 0x801, 0x801, 0xFFF,
+    };
+    static const uint8_t check[15] = {
+        0, 0, 0, 0, 0, 0x01, 0x02, 0x04, 0x44, 0x28, 0x10, 0, 0, 0, 0,
+    };
+    static const uint8_t warning[15] = {
+        0, 0, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0, 0, 0x18, 0, 0,
+    };
+    static const uint8_t unknown[15] = {
+        0, 0, 0x3C, 0x22, 0x41, 0x01, 0x01, 0x06, 0x08, 0x08, 0, 0, 0x08, 0, 0,
+    };
+    static const uint8_t disconnected[15] = {
+        0, 0, 0, 0, 0x41, 0x22, 0x14, 0x08, 0x08, 0x14, 0x22, 0x41, 0, 0, 0,
+    };
+    const uint8_t *mark;
+    uint16_t col;
+    switch (view) {
+    case BRIDGE_INDICATOR_CARD_WIFI:
+        col = rgb565(80, 220, 100);
+        mark = check;
+        break;
+    case BRIDGE_INDICATOR_CARD_OFFLINE:
+        col = rgb565(255, 190, 30);
+        mark = warning;
+        break;
+    case BRIDGE_INDICATOR_UNKNOWN:
+        col = rgb565(145, 160, 175);
+        mark = unknown;
+        break;
+    case BRIDGE_INDICATOR_DISCONNECTED:
+        col = rgb565(75, 85, 95);
+        mark = disconnected;
+        break;
+    default:
+        return;
+    }
+    for (int row = 0; row < 15; row++) {
+        for (int bit = 0; bit < 12; bit++) {
+            if (card[row] & (1 << (11 - bit)))
+                fb_fill_rect(85 + bit, 11 + row, 1, 1, col);
+        }
+        for (int bit = 0; bit < 7; bit++) {
+            if (mark[row] & (1 << (6 - bit)))
+                fb_fill_rect(101 + bit, 11 + row, 1, 1, col);
         }
     }
 }
@@ -1651,6 +1758,8 @@ static void render_status(void)
     nlines = s_status_nlines;
     wifi = s_wifi_connected;
     bool as11_paired = s_as11_paired;
+    bridge_indicator_view_t bridge = bridge_indicator_view(&s_bridge_indicator,
+                                                            esp_timer_get_time());
     bool update_avail = s_update_available;
     int batt_pct = s_batt_percent;
     bool batt_chg = s_batt_charging;
@@ -1677,9 +1786,13 @@ static void render_status(void)
 
     fb_draw_wifi_indicator(218, 10, wifi);
 
-    /* AS11 BLE paired icon — Bluetooth rune to the left of WiFi bars */
+    /* AS11 and bridge share the BLE slot; never use the AS11 live-data
+     * flag to represent a bridge connection. */
     if (as11_paired) {
-        fb_draw_ble_indicator(199, 11);
+        fb_draw_ble_indicator(199, 11, false);
+    } else if (bridge != BRIDGE_INDICATOR_HIDDEN) {
+        fb_draw_ble_indicator(199, 11, bridge == BRIDGE_INDICATOR_DISCONNECTED);
+        fb_draw_bridge_card_indicator(bridge);
     }
 
     /* Firmware update badge — amber download arrow between clock and battery.

@@ -120,6 +120,7 @@ struct somno_feat {
 
     /* baseline ring: filtered spo2 + original validity, last base_n samples */
     double bval[BASE_CAP];
+    double baseline_scratch[BASE_CAP];
     uint8_t bok[BASE_CAP];
     int bhead, bcount;
 
@@ -543,7 +544,8 @@ int somno_feat_push(somno_feat_t *f, double spo2, double pr, double motion,
     for (int i = 0; i < SOMNO_ML_N_FEATURES; i++) feats[i] = NAN;
 
     /* 10-minute baseline p90 ending at this epoch's last sample */
-    double bbuf[BASE_CAP]; int bn = 0;
+    double *bbuf = f->baseline_scratch;
+    int bn = 0;
     for (int i = 0; i < f->bcount; i++) {
         int idx = (f->bhead + i) % f->base_n;
         double v = f->bval[idx];

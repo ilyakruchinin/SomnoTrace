@@ -43,7 +43,7 @@ static const char *TAG = "up_index";
 
 /* ── Module state ─────────────────────────────────────────────────── */
 
-static upload_day_t *s_days[UPLOAD_MAX_DAYS_CAP];
+static EXT_RAM_BSS_ATTR upload_day_t *s_days[UPLOAD_MAX_DAYS_CAP];
 static int s_n_days = 0;
 
 static char s_be_names[UPLOAD_MAX_BACKENDS][UPLOAD_BACKEND_ID_LEN];
@@ -502,7 +502,7 @@ esp_err_t upload_index_load(int max_days)
     if (max_days > UPLOAD_MAX_DAYS_CAP) max_days = UPLOAD_MAX_DAYS_CAP;
 
     /* Collect day numbers present on disk. */
-    static uint32_t found[UPLOAD_MAX_DAYS_CAP];
+    static EXT_RAM_BSS_ATTR uint32_t found[UPLOAD_MAX_DAYS_CAP];
     int n_found = 0;
 
     DIR *dir = opendir(UPLOAD_STATE_DIR);

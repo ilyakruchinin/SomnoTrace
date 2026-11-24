@@ -43,21 +43,49 @@
 /* v2.0.0 split the converter into five modules. All are #included so the tests still
  * reach the static helpers (spool_to_edf, build_str_data_values) they exercise. */
 /* Each module defines its own static TAG; rename per include so they coexist. */
+#include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+static int edf_test_rename(const char *from, const char *to);
+static bool test_fat_rename, test_fail_install, test_fail_restore;
+int host_heap_caps_realloc_fail;
+int host_heap_caps_malloc_fail;
+int host_heap_caps_calloc_fail;
+#define rename edf_test_rename
 #define TAG TAG_hdr
 #include "edf_header.c"       /* found via -I<main dir>, see run_host_tests.sh */
 #undef TAG
+#undef rename
 #define TAG TAG_wav
 #include "edf_waveform.c"
 #undef TAG
 #define TAG TAG_ann
 #include "edf_annotations.c"
 #undef TAG
+static bool test_summary_print_fail;
+static char *test_summary_print(const cJSON *item);
+#define cJSON_PrintUnformatted test_summary_print
 #define TAG TAG_sum
 #include "edf_summary.c"
 #undef TAG
+#undef cJSON_PrintUnformatted
 #define TAG TAG_gen
 #include "edf_gen.c"
 #undef TAG
+
+static char *test_summary_print(const cJSON *item)
+{
+    return test_summary_print_fail ? NULL : cJSON_PrintUnformatted(item);
+}
+
+static void *test_cjson_alloc_failure(size_t size)
+{
+    (void)size;
+    errno = ENOMEM;
+    return NULL;
+}
 
 #include <assert.h>
 #include <math.h>
@@ -68,6 +96,15 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+
+static int edf_test_rename(const char *from, const char *to)
+{
+    struct stat st;
+    if (test_fat_rename && stat(to, &st) == 0) { errno = EEXIST; return -1; }
+    if (test_fail_install && strstr(from, ".tmp")) { errno = EIO; return -1; }
+    if (test_fail_restore && strstr(from, ".replace-backup")) { errno = EIO; return -1; }
+    return rename(from, to);
+}
 
 /* ── link stubs for the storage arbitration edf_gen.c calls ─────────── */
 bool sd_storage_is_ready(void) { return true; }
@@ -175,9 +212,10 @@ static uint8_t *read_file(const char *path, size_t *len)
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    uint8_t *buf = malloc(n > 0 ? (size_t)n : 1);
+    uint8_t *buf = malloc((size_t)n + 1);
     assert(buf);
     if (n > 0 && fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); fclose(f); return NULL; }
+    buf[n] = '\0';
     fclose(f);
     *len = (size_t)n;
     return buf;
@@ -187,7 +225,7 @@ static uint8_t *read_file(const char *path, size_t *len)
 typedef struct {
     long hdr_bytes;
     int ndr, ns;
-    int spr[16];
+    int spr[160];
     long rec_bytes;
 } edf_t;
 
@@ -198,7 +236,7 @@ static bool edf_parse(const uint8_t *b, size_t len, edf_t *e)
     memcpy(t, b + 184, 8); t[8] = 0; e->hdr_bytes = atol(t);
     memcpy(t, b + 236, 8); t[8] = 0; e->ndr = atoi(t);
     memcpy(t, b + 252, 4); t[4] = 0; e->ns = atoi(t);
-    if (e->ns <= 0 || e->ns > 16) return false;
+    if (e->ns <= 0 || e->ns > 160) return false;
     if ((size_t)e->hdr_bytes != 256 + 256 * (size_t)e->ns) return false;
     e->rec_bytes = 0;
     for (int i = 0; i < e->ns; i++) {
@@ -1300,6 +1338,862 @@ static void test_str_pressure_settings_exact(void)
     cJSON_Delete(settings);
 }
 
+static void test_spont_settings_strings_and_numeric(void)
+{
+    const char *json =
+        "{\"SettingProfiles\":{\"TherapyProfiles\":{"
+        "\"VAutoProfile\":{"
+        "\"SetMaxInspiratoryTime\":\"PT2S\",\"SetMinInspiratoryTime\":\"PT0.3S\","
+        "\"TriggerSensitivity\":\"Medium\",\"CycleSensitivity\":\"High\""
+        "},"
+        "\"SpontProfile\":{"
+        "\"SetMaxInspiratoryTime\":\"PT1.2S\","
+        "\"SetMinInspiratoryTime\":\"PT0.4S\","
+        "\"RiseTimeEnable\":\"Min\","
+        "\"RiseTime\":\"PT0.25S\","
+        "\"TriggerSensitivity\":\"Low\",\"CycleSensitivity\":\"High\""
+        "},"
+        "\"STProfile\":{"
+        "\"SetMaxInspiratoryTime\":\"PT2.5S\",\"SetMinInspiratoryTime\":\"PT0.5S\","
+        "\"RiseTimeEnable\":\"Min\",\"RiseTime\":\"PT0.3S\","
+        "\"TriggerSensitivity\":\"VeryLow\",\"CycleSensitivity\":\"VeryHigh\""
+        "},"
+        "\"TimedProfile\":{"
+        "\"SetInspiratoryTime\":\"PT1.5S\",\"RiseTimeEnable\":\"On\",\"RiseTime\":\"PT0.4S\""
+        "}}}}";
+    cJSON *settings = cJSON_Parse(json);
+    CHECK(settings != NULL, "bilevel JSON did not parse");
+    if (!settings) return;
+    summary_ctx_t ctx = {0};
+    int16_t values[STR_DATA_COUNT];
+    memset(values, 0xFF, sizeof(values));
+    build_str_data_values(&ctx, values, settings);
+    CHECK(values[18] == 100 && values[19] == 15 && values[20] == 3 && values[21] == 4,
+          "VAuto string settings not mapped (%d,%d,%d,%d)",
+          values[18], values[19], values[20], values[21]);
+    CHECK(values[27] == 60 && values[28] == 20, "duration strings not scaled to Ti");
+    CHECK(values[29] == 1, "Spont RiseTimeEnable 'Min' should map to 1, got %d", values[29]);
+    CHECK(values[30] == 250, "rise-time string not converted to milliseconds");
+    CHECK(values[31] == 2 && values[32] == 4, "named sensitivities mapped incorrectly");
+    CHECK(values[37] == 125 && values[38] == 25 && values[39] == 1 && values[40] == 300 &&
+          values[41] == 1 && values[42] == 5,
+          "ST string settings not mapped (%d,%d,%d,%d,%d,%d)",
+          values[37], values[38], values[39], values[40], values[41], values[42]);
+    CHECK(values[47] == 75 && values[48] == 2 && values[49] == 400,
+          "Timed string settings not mapped (%d,%d,%d)",
+          values[47], values[48], values[49]);
+    cJSON_Delete(settings);
+
+    settings = cJSON_Parse(
+        "{\"SettingProfiles\":{\"TherapyProfiles\":{"
+        "\"VAutoProfile\":{"
+        "\"SetMaxInspiratoryTime\":2.0,\"SetMinInspiratoryTime\":0.3,"
+        "\"TriggerSensitivity\":2,\"CycleSensitivity\":3"
+        "},"
+        "\"SpontProfile\":{"
+        "\"SetMaxInspiratoryTime\":1.2,\"SetMinInspiratoryTime\":0.4,"
+        "\"RiseTime\":250,\"TriggerSensitivity\":1,\"CycleSensitivity\":3"
+        "}}}}");
+    CHECK(settings != NULL, "numeric bilevel JSON did not parse");
+    if (!settings) return;
+    memset(values, 0xFF, sizeof(values));
+    build_str_data_values(&ctx, values, settings);
+    CHECK(values[18] == 100 && values[19] == 15 && values[20] == 3 && values[21] == 4,
+          "numeric VAuto settings changed");
+    CHECK(values[27] == 60 && values[28] == 20 && values[30] == 250 &&
+          values[31] == 2 && values[32] == 4,
+          "imported numeric settings changed");
+    cJSON_Delete(settings);
+
+    const struct { const char *name; int expected; } names[] = {
+        {"VeryLow", 1}, {"Very Low", 1}, {"Low", 2}, {"Medium", 3},
+        {"Med", 3}, {"High", 4}, {"VeryHigh", 5}, {"Very High", 5},
+        {"unknown", -1}, {"", -1},
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        cJSON *v = cJSON_CreateString(names[i].name);
+        CHECK(sensitivity_to_edf(v) == names[i].expected,
+              "sensitivity %s", names[i].name);
+        cJSON_Delete(v);
+    }
+    const char *invalid[] = {
+        "", "P", "PT", "PT.S", "PT1.S", "PT-1S", "PT1e0S",
+        "PT1Sx", "PT4.01S", "PT999999999999999999999999999999999S",
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        cJSON *v = cJSON_CreateString(invalid[i]);
+        CHECK(duration_string_to_edf(v, 50.0, 200) == -1,
+              "accepted invalid Ti duration %s", invalid[i]);
+        cJSON_Delete(v);
+    }
+}
+
+static void test_pld_snore_missing_and_clamping(void)
+{
+    set_tz("UTC");
+    for (int version = 1; version <= 2; version++) {
+        char root[300], sd[400], out[400], path[600];
+        snprintf(root, sizeof(root), "%s/snore_v%d", g_root, version);
+        build_session(root, version, SA2_N, sd, sizeof(sd));
+        int16_t frames[PLD_N * 12] = {0};
+        frames[9] = version == 1 ? SNT_MISSING_V1 : SNT_MISSING_V2;
+        frames[12 + 9] = 0;
+        frames[24 + 9] = 100;
+        frames[36 + 9] = 2000;
+        frames[10] = version == 1 ? SNT_MISSING_V1 : SNT_MISSING_V2;
+        snprintf(path, sizeof(path), "%s/%s_pld.snt", sd, SID);
+        write_snt(path, (uint8_t)version, 12, 5, START_MS, PLD_N, frames, PLD_N);
+        CHECK(generate(root, sd, out, sizeof(out)) == ESP_OK, "generate PLD v%d", version);
+        snprintf(path, sizeof(path), "%s/DATALOG/20260301/%s_PLD.edf", out, SID);
+        size_t len = 0;
+        uint8_t *bytes = read_file(path, &len);
+        CHECK(bytes != NULL, "missing PLD v%d", version);
+        if (!bytes) continue;
+        edf_t edf;
+        if (edf_parse(bytes, len, &edf)) {
+            CHECK(edf_sample(bytes, &edf, 0, 7, 0) == -1, "missing snore v%d", version);
+            CHECK(edf_sample(bytes, &edf, 0, 7, 1) == 0, "zero snore v%d", version);
+            CHECK(edf_sample(bytes, &edf, 0, 7, 2) == 50, "measured snore v%d", version);
+            CHECK(edf_sample(bytes, &edf, 0, 7, 3) == 250, "snore clamp v%d", version);
+            CHECK(edf_sample(bytes, &edf, 0, 8, 0) == -1, "missing flow limit v%d", version);
+            check_edf_structure("PLD.edf", bytes, len, &edf);
+        } else {
+            CHECK(false, "invalid PLD EDF v%d", version);
+        }
+        free(bytes);
+    }
+}
+
+static void write_live_ident(const char *path, const char *day, const char *sid)
+{
+    cJSON *ident = cJSON_Parse("{\"SerialNumber\":\"fixture-machine\",\"PlatformIdentifier\":46}");
+    CHECK(ident && settings_provenance_set(ident, SETTINGS_SOURCE_LIVE_IDENT, day, sid),
+          "mark live identity");
+    if (ident) {
+        char *json = cJSON_PrintUnformatted(ident);
+        if (json) { write_text(path, json); free(json); }
+        cJSON_Delete(ident);
+    }
+}
+
+/* The host suite uses the fixed /somnotrace tree, so a previous run can
+ * leave a trusted daily snapshot behind.  Reset only this test's day. */
+static void reset_day_state(const char *day)
+{
+    char dir[400], path[600];
+    snprintf(dir, sizeof(dir), "%s/%s", SD_STREAMS_DIR, day);
+    rmtree(dir);
+    mk("%s", dir);
+    snprintf(path, sizeof(path), "%s/%s.settings.json", SD_SUMMARIES_DIR, day);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/%s.live.settings.json", SD_SUMMARIES_DIR, day);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/%s.imported.settings.json", SD_SUMMARIES_DIR, day);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/%s.native.settings.json", SD_SUMMARIES_DIR, day);
+    unlink(path);
+}
+
+static cJSON *read_daily_settings(const char *day, int family, const char *serial)
+{
+    esp_err_t err;
+    return read_daily_settings_checked(day, family, serial, &err);
+}
+
+static void test_daily_settings_provenance(void)
+{
+    const char *day = "20260301";
+    const char *sid = SID;
+    char dir[400], path[600];
+    mk("%s", SD_MOUNT_POINT);
+    mk("%s", SD_APP_DIR);
+    mk("%s", SD_SESSIONS_DIR);
+    mk("%s", SD_STREAMS_DIR);
+    mk("%s", SD_SUMMARIES_DIR);
+    reset_day_state(day);
+    snprintf(dir, sizeof(dir), "%s/%s", SD_STREAMS_DIR, day);
+
+    cJSON *settings = cJSON_Parse(
+        "{\"SettingProfiles\":{\"ActiveProfiles\":{\"TherapyProfile\":\"CpapProfile\"},"
+        "\"TherapyProfiles\":{\"CpapProfile\":{\"SetPressure\":8}}}}");
+    CHECK(settings != NULL, "settings JSON");
+    if (!settings) return;
+    snprintf(path, sizeof(path), "%s/%s.settings.json", SD_SUMMARIES_DIR, day);
+    char *json = cJSON_PrintUnformatted(settings);
+    write_text(path, json);
+    free(json);
+    cJSON *read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+    CHECK(read == NULL, "legacy day snapshot must remain unknown");
+    cJSON_Delete(read);
+
+    CHECK(settings_provenance_set(settings, SETTINGS_SOURCE_LIVE, day, sid), "mark live");
+    snprintf(path, sizeof(path), "%s/%s_session.json", dir, sid);
+    write_text(path, "{}");
+    snprintf(path, sizeof(path), "%s/%s_ident.json", dir, sid);
+    write_text(path, "{\"SerialNumber\":\"fixture-machine\"}");
+    snprintf(path, sizeof(path), "%s/%s.live.settings.json", dir, sid);
+    json = cJSON_PrintUnformatted(settings);
+    write_text(path, json);
+    snprintf(path, sizeof(path), "%s/%s.live.settings.json", SD_SUMMARIES_DIR, day);
+    write_text(path, json);
+    free(json);
+    read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+    CHECK(read == NULL, "unmarked or backfilled identity must not establish provenance");
+    cJSON_Delete(read);
+    snprintf(path, sizeof(path), "%s/%s_ident.json", dir, sid);
+    write_live_ident(path, day, sid);
+    read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+    CHECK(read != NULL, "matching live session accepted");
+    cJSON_Delete(read);
+    read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "different-machine");
+    CHECK(read == NULL, "another machine must not use live settings");
+    cJSON_Delete(read);
+    read = read_daily_settings(day, SETTINGS_FAMILY_UNKNOWN, "fixture-machine");
+    CHECK(read == NULL, "unknown machine family must not use live settings");
+    cJSON_Delete(read);
+    CHECK(!settings_provenance_is(settings, SETTINGS_SOURCE_LIVE, "20260228", sid),
+          "wrong day accepted");
+    CHECK(!settings_provenance_is(settings, SETTINGS_SOURCE_LIVE, day, "other"),
+          "borrowed session accepted");
+
+    snprintf(path, sizeof(path), "%s/other_session.json", dir);
+    write_text(path, "{}");
+    snprintf(path, sizeof(path), "%s/other_ident.json", dir);
+    write_live_ident(path, day, "other");
+    read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+    CHECK(read == NULL, "day with an unverified second session accepted");
+    cJSON_Delete(read);
+    cJSON *other = cJSON_Duplicate(settings, true);
+    CHECK(other && settings_provenance_set(other, SETTINGS_SOURCE_LIVE, day, "other"),
+          "mark second live session");
+    if (other) {
+        cJSON *profiles = cJSON_GetObjectItem(other, "SettingProfiles");
+        cJSON_AddStringToObject(profiles, "UnexportedMetadata", "changed");
+        snprintf(path, sizeof(path), "%s/other.live.settings.json", dir);
+        json = cJSON_PrintUnformatted(other);
+        write_text(path, json);
+        free(json);
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+        CHECK(read != NULL, "irrelevant metadata must not invalidate equal EDF settings");
+        cJSON_Delete(read);
+        cJSON *cpap = cJSON_GetObjectItem(cJSON_GetObjectItem(profiles, "TherapyProfiles"),
+                                          "CpapProfile");
+        cJSON_ReplaceItemInObject(cpap, "SetPressure", cJSON_CreateNumber(9));
+        json = cJSON_PrintUnformatted(other);
+        write_text(path, json);
+        free(json);
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+        CHECK(read == NULL, "different session settings must be unknown");
+        cJSON_Delete(read);
+        cJSON_Delete(other);
+    }
+
+    cJSON *native = cJSON_Duplicate(settings, true);
+    CHECK(native && settings_provenance_set(native, SETTINGS_SOURCE_IMPORTED_STR, day, NULL) &&
+          settings_provenance_set_serial(native, "fixture-machine") &&
+          settings_provenance_set_family(native, SETTINGS_FAMILY_AS11) &&
+          settings_provenance_record_sessions(native, day),
+          "mark native");
+    if (native) {
+        cJSON *unchecked = cJSON_Duplicate(native, true);
+        cJSON *unchecked_meta = cJSON_GetObjectItemCaseSensitive(unchecked, SETTINGS_PROVENANCE_KEY);
+        cJSON_DeleteItemFromObjectCaseSensitive(unchecked_meta, "local_sessions");
+        cJSON_DeleteItemFromObjectCaseSensitive(unchecked_meta, "coverage_verified");
+        cJSON_AddArrayToObject(unchecked_meta, "local_sessions");
+        CHECK(!settings_provenance_covers_sessions(unchecked, "20260227"),
+              "empty unverified coverage is not proof");
+        cJSON_DeleteItemFromObjectCaseSensitive(unchecked_meta, "local_sessions");
+        cJSON_AddBoolToObject(unchecked_meta, "coverage_verified", true);
+        CHECK(!settings_provenance_covers_sessions(unchecked, "20260227"),
+              "absent coverage is not proof");
+        cJSON_DeleteItemFromObjectCaseSensitive(unchecked_meta, "local_sessions");
+        cJSON_AddArrayToObject(unchecked_meta, "local_sessions");
+        CHECK(settings_provenance_covers_sessions(unchecked, "20260228"),
+              "empty recorded coverage covers an empty day");
+        CHECK(!settings_provenance_covers_sessions(unchecked, day),
+              "empty recorded coverage must not cover a later local session");
+        cJSON_Delete(unchecked);
+        snprintf(path, sizeof(path), "%s/%s.imported.settings.json", SD_SUMMARIES_DIR, day);
+        json = cJSON_PrintUnformatted(native);
+        write_text(path, json);
+        free(json);
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+        CHECK(read && settings_provenance_is(read, SETTINGS_SOURCE_IMPORTED_STR, day, NULL),
+              "native daily snapshot should take precedence");
+        cJSON_Delete(read);
+
+        snprintf(path, sizeof(path), "%s/imported_session.json", dir);
+        write_text(path, "{\"import_source\":\"file_import\",\"source_serial\":\"fixture-machine\","
+                         "\"source_device_family\":\"AS11\","
+                         "\"source_identity_verified\":true}");
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+        CHECK(read != NULL, "imported waveform session should not stale STR settings");
+        cJSON_Delete(read);
+        write_text(path, "{\"import_source\":\"file_import\",\"source_serial\":\"another-machine\","
+                         "\"source_device_family\":\"AS11\","
+                         "\"source_identity_verified\":true}");
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+        CHECK(read == NULL, "another machine must not use imported settings");
+        cJSON_Delete(read);
+        write_text(path, "{\"import_source\":\"file_import\",\"source_serial\":\"fixture-machine\","
+                         "\"source_device_family\":\"AS11\","
+                         "\"source_identity_verified\":true}");
+        snprintf(path, sizeof(path), "%s/later_session.json", dir);
+        write_text(path, "{}");
+        snprintf(path, sizeof(path), "%s/later_ident.json", dir);
+        write_live_ident(path, day, "later");
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+        CHECK(read == NULL, "new local session must stale the legacy imported snapshot");
+        cJSON_Delete(read);
+        CHECK(settings_provenance_record_sessions(native, day),
+              "refresh imported coverage after re-import");
+        snprintf(path, sizeof(path), "%s/%s.imported.settings.json", SD_SUMMARIES_DIR, day);
+        json = cJSON_PrintUnformatted(native);
+        write_text(path, json);
+        free(json);
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+        CHECK(read != NULL, "re-import covers the later session");
+        cJSON_Delete(read);
+        CHECK(cJSON_AddObjectToObject(native, "_as11_edf_settings") &&
+              settings_provenance_set(native, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) &&
+              settings_provenance_set_serial(native, "fixture-machine") &&
+              settings_provenance_set_family(native, SETTINGS_FAMILY_AS11),
+              "create independent native daily record");
+        snprintf(path, sizeof(path), "%s/%s.native.settings.json", SD_SUMMARIES_DIR, day);
+        json = cJSON_PrintUnformatted(native);
+        write_text(path, json);
+        free(json);
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+        CHECK(read && settings_provenance_is(read, SETTINGS_SOURCE_NATIVE_DAY, day, NULL),
+              "new native daily evidence takes precedence over v1");
+        cJSON_Delete(read);
+        write_text(path, "broken JSON");
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+        CHECK(!read && native_day_blocked(day, SETTINGS_FAMILY_AS11, "fixture-machine", read),
+              "corrupt native day does not fall back to old evidence");
+        cJSON_Delete(read);
+        /* A native record declaring another machine carries no authority
+         * here: it must be skipped, not gate this machine's resolution or
+         * block the day (mixed-machine noon-days are legitimate). */
+        CHECK(settings_provenance_set_serial(native, "other-machine"),
+              "relabel native record as foreign");
+        json = cJSON_PrintUnformatted(native);
+        write_text(path, json);
+        free(json);
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "fixture-machine");
+        CHECK(read && settings_provenance_is(read, SETTINGS_SOURCE_IMPORTED_STR, day, NULL),
+              "foreign native record defers to own imported settings");
+        CHECK(!native_day_blocked(day, SETTINGS_FAMILY_AS11, "fixture-machine", read),
+              "foreign native record does not block the day");
+        cJSON_Delete(read);
+        read = read_daily_settings(day, SETTINGS_FAMILY_AS11, "other-machine");
+        CHECK(read == NULL &&
+              native_day_blocked(day, SETTINGS_FAMILY_AS11, "other-machine", read),
+              "the record still gates its own machine when the day conflicts");
+        cJSON_Delete(read);
+        unlink(path);
+        cJSON_Delete(native);
+    }
+    cJSON_Delete(settings);
+}
+
+/* A session whose identity evidence cannot be read (e.g. an interrupted
+ * write leaves a torn _session.json/_ident.json behind) is unattributable.
+ * It must withhold that day's settings — the record still exports, minus
+ * the settings overlay — and must not abort the whole STR generation. */
+static void test_corrupt_session_evidence_withholds_day(void)
+{
+    const char *day = "20260303";
+    const char *sid = "20260303_221500";
+    char dir[400], path[600];
+    mk("%s", SD_MOUNT_POINT);
+    mk("%s", SD_APP_DIR);
+    mk("%s", SD_SESSIONS_DIR);
+    mk("%s", SD_STREAMS_DIR);
+    mk("%s", SD_SUMMARIES_DIR);
+    reset_day_state(day);
+    snprintf(dir, sizeof(dir), "%s/%s", SD_STREAMS_DIR, day);
+
+    snprintf(path, sizeof(path), "%s/%s_session.json", dir, sid);
+    write_text(path, "{}");
+    snprintf(path, sizeof(path), "%s/%s_ident.json", dir, sid);
+    write_live_ident(path, day, sid);
+    cJSON *native = cJSON_Parse("{\"_as11_edf_settings\":{\"S.C.Press\":8}}");
+    CHECK(native && settings_provenance_set(native, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) &&
+          settings_provenance_set_serial(native, "fixture-machine") &&
+          settings_provenance_set_family(native, SETTINGS_FAMILY_AS11),
+          "create same-machine native daily record");
+    if (!native) return;
+    char *json = cJSON_PrintUnformatted(native);
+    snprintf(path, sizeof(path), "%s/%s.native.settings.json", SD_SUMMARIES_DIR, day);
+    write_text(path, json);
+    free(json);
+
+    snprintf(path, sizeof(path), "%s/%s_2_session.json", dir, sid);
+    write_text(path, "{}");
+    snprintf(path, sizeof(path), "%s/%s_2_ident.json", dir, sid);
+    write_text(path, "broken JSON");
+    esp_err_t err = ESP_OK;
+    cJSON *read = read_daily_settings_checked(day, SETTINGS_FAMILY_AS11,
+                                              "fixture-machine", &err);
+    CHECK(read == NULL && err == ESP_OK,
+          "unreadable identity evidence withholds the day without erroring");
+    bool conflicts = false;
+    CHECK(settings_provenance_day_conflicts_checked(day, "fixture-machine",
+          SETTINGS_FAMILY_AS11, &conflicts, NULL) == ESP_OK && conflicts,
+          "unattributable session counts as a conflict");
+    CHECK(!native_day_blocked(day, SETTINGS_FAMILY_AS11, "fixture-machine", read),
+          "valid native claim withheld by conflict must not block the export");
+    cJSON_Delete(read);
+
+    snprintf(path, sizeof(path), "%s/%s_2_session.json", dir, sid);
+    write_text(path, "broken JSON");
+    CHECK(settings_provenance_day_conflicts_checked(day, "fixture-machine",
+          SETTINGS_FAMILY_AS11, &conflicts, NULL) == ESP_OK && conflicts,
+          "unreadable session manifest counts as a conflict");
+    bool match = true, bridge = true;
+    CHECK(settings_provenance_session_checked(day, "20260303_221500_2",
+          "fixture-machine", SETTINGS_FAMILY_AS11, &match, &bridge) == ESP_OK &&
+          !match && !bridge,
+          "unreadable session manifest resolves as unverified");
+    cJSON_Delete(native);
+    reset_day_state(day);
+}
+
+static void test_pb_varint(FILE *f, uint64_t value)
+{
+    while (value >= 0x80) {
+        fputc((int)((value & 0x7f) | 0x80), f);
+        value >>= 7;
+    }
+    fputc((int)value, f);
+}
+
+static void write_test_summary(const char *path, int64_t noon_ms)
+{
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL, "create synthetic spool");
+    if (!f) return;
+    const struct { int field; int64_t value; } vals[] = {
+        {SUM_F_PERIOD_START, noon_ms}, {SUM_F_PERIOD_END, noon_ms + 86400000},
+        {SUM_F_DURATION_MIN, 120}, {SUM_F_TUBE_CONNECTED, 1},
+        {SUM_F_HUM_CONNECTED, 2},
+    };
+    for (size_t i = 0; i < sizeof(vals) / sizeof(vals[0]); i++) {
+        test_pb_varint(f, (uint64_t)vals[i].field << 3);
+        test_pb_varint(f, (uint64_t)vals[i].value);
+    }
+    fclose(f);
+}
+
+static void test_imported_spool_selection(void)
+{
+    const char *day = "20991130";
+    char base[400], imported[400], native[400], chosen[400];
+    mk("%s", SD_MOUNT_POINT);
+    mk("%s", SD_APP_DIR);
+    mk("%s", SD_SESSIONS_DIR);
+    mk("%s", SD_SUMMARIES_DIR);
+    snprintf(base, sizeof(base), "%s/%s.spool", SD_SUMMARIES_DIR, day);
+    snprintf(imported, sizeof(imported), "%s/%s.imported.spool", SD_SUMMARIES_DIR, day);
+    snprintf(native, sizeof(native), "%s/%s.native.spool", SD_SUMMARIES_DIR, day);
+    struct stat st;
+    if (stat(base, &st) == 0 || stat(imported, &st) == 0 || stat(native, &st) == 0) {
+        CHECK(false, "spool fixture already exists; refusing to overwrite it");
+        return;
+    }
+    write_test_summary(base, 4105032000000LL);
+    FILE *f = fopen(base, "ab");
+    CHECK(f != NULL, "open synthetic spool marker");
+    if (!f) return;
+    CHECK(fwrite(IMPORT_SPOOL_MARKER, 1, IMPORT_SPOOL_MARKER_LEN, f) ==
+          IMPORT_SPOOL_MARKER_LEN, "append synthetic marker");
+    fclose(f);
+    CHECK(select_summary_spool(day, chosen, sizeof(chosen)) == ESP_OK &&
+          !strcmp(chosen, base), "synthetic base used when no refresh exists");
+    write_test_summary(imported, 4105032000000LL);
+    CHECK(select_summary_spool(day, chosen, sizeof(chosen)) == ESP_OK &&
+          !strcmp(chosen, imported), "refreshed imported summary is selected");
+    write_test_summary(native, 4105032000000LL);
+    CHECK(select_summary_spool(day, chosen, sizeof(chosen)) == ESP_OK &&
+          !strcmp(chosen, native), "native STR summary supersedes synthetic summary");
+    write_test_summary(base, 4105032000000LL);
+    CHECK(select_summary_spool(day, chosen, sizeof(chosen)) == ESP_OK &&
+          !strcmp(chosen, base), "live summary supersedes all imported overlays");
+    unlink(base);
+    unlink(imported);
+    unlink(native);
+}
+
+static void test_atomic_export_recovery(void)
+{
+    char path[400], tmp[440], backup[440];
+    snprintf(path, sizeof(path), "%s/atomic.edf", g_root);
+    snprintf(backup, sizeof(backup), "%s.replace-backup", path);
+    write_text(path, "old");
+    FILE *f = edf_open_atomic_file(path, tmp, sizeof(tmp));
+    CHECK(f != NULL, "open staged export");
+    if (!f) return;
+    fputs("new", f);
+    test_fat_rename = true;
+    test_fail_install = true;
+    CHECK(edf_finalize_atomic_file(f, tmp, path) != ESP_OK, "failed FAT install is reported");
+    size_t n = 0;
+    uint8_t *data = read_file(path, &n);
+    CHECK(data && n == 3 && !memcmp(data, "old", 3), "failed install restores old export");
+    CHECK(access(backup, F_OK) != 0, "restored export has no backup residue");
+    free(data);
+
+    f = edf_open_atomic_file(path, tmp, sizeof(tmp));
+    CHECK(f != NULL, "open staged export again");
+    if (!f) goto done;
+    fputs("new", f);
+    test_fail_restore = true;
+    CHECK(edf_finalize_atomic_file(f, tmp, path) != ESP_OK, "restore failure is reported");
+    CHECK(access(backup, F_OK) == 0, "restore failure preserves backup");
+    test_fail_install = test_fail_restore = false;
+    f = edf_open_atomic_file(path, tmp, sizeof(tmp));
+    CHECK(f != NULL, "restart recovers backup before writing");
+    if (f) edf_discard_atomic_file(f, tmp);
+    data = read_file(path, &n);
+    CHECK(data && n == 3 && !memcmp(data, "old", 3), "restart recovers old export");
+    free(data);
+
+    f = edf_open_atomic_file(path, tmp, sizeof(tmp));
+    CHECK(f != NULL, "open successful staged export");
+    if (!f) goto done;
+    fputs("new", f);
+    CHECK(edf_finalize_atomic_file(f, tmp, path) == ESP_OK, "FAT replacement succeeds");
+    data = read_file(path, &n);
+    CHECK(data && n == 3 && !memcmp(data, "new", 3), "replacement publishes new export");
+    free(data);
+    CHECK(access(backup, F_OK) != 0, "successful replacement clears backup");
+
+    write_text(backup, "old");
+    f = edf_open_atomic_file(path, tmp, sizeof(tmp));
+    CHECK(f != NULL, "restart rolls back interrupted replacement");
+    if (f) edf_discard_atomic_file(f, tmp);
+    data = read_file(path, &n);
+    CHECK(data && n == 3 && !memcmp(data, "old", 3), "previous export wins after restart");
+    free(data);
+    CHECK(access(backup, F_OK) != 0, "restart restores backup");
+
+    f = fopen("/dev/full", "w");
+    if (f) {
+        fputs("write failure", f);
+        CHECK(edf_finalize_atomic_file(f, tmp, path) != ESP_OK, "flush failure is reported");
+        data = read_file(path, &n);
+        CHECK(data && n == 3 && !memcmp(data, "old", 3), "flush failure preserves export");
+        free(data);
+    }
+done:
+    test_fat_rename = test_fail_install = test_fail_restore = false;
+}
+
+static void test_drift_index_allocation_failure(void)
+{
+    char dir[400], path[600];
+    snprintf(dir, sizeof(dir), "%s/20330517", SD_STREAMS_DIR);
+    mk("%s", dir);
+    snprintf(path, sizeof(path), "%s/20330517_220000_session.json", dir);
+    write_text(path, "{\"start_epoch_ms\":2000000000000,\"clock_drift_ms\":214000}");
+    session_drift_entry_t *entries = NULL;
+    int count = 0;
+    host_heap_caps_realloc_fail = 1;
+    CHECK(build_session_drift_index(&entries, &count) != ESP_OK &&
+          entries == NULL && count == 0,
+          "incomplete drift index is rejected on PSRAM exhaustion");
+    host_heap_caps_realloc_fail = 0;
+    CHECK(build_session_drift_index(&entries, &count) == ESP_OK && count > 0,
+          "drift index succeeds after allocation recovers");
+    free(entries);
+    unlink(path);
+    rmdir(dir);
+}
+
+static void test_rebuild_manifest_allocation_failure(void)
+{
+    const char *day = "20330518";
+    char dir[400], manifest[600], export_dir[500], artifact[600];
+    mk("%s", SD_STREAMS_DIR);
+    snprintf(dir, sizeof(dir), "%s/%s", SD_STREAMS_DIR, day);
+    mk("%s", dir);
+    snprintf(manifest, sizeof(manifest), "%s/20330518_220000_session.json", dir);
+    write_text(manifest, "{\"start_epoch_ms\":2000000000000,\"end_epoch_ms\":2000000060000}");
+    mk("%s", SD_SDCARD_DIR);
+    mk("%s", SD_SDCARD_DATALOG);
+    snprintf(export_dir, sizeof(export_dir), "%s/%s", SD_SDCARD_DATALOG, day);
+    mk("%s", export_dir);
+    snprintf(artifact, sizeof(artifact), "%s/previous.edf", export_dir);
+    write_text(artifact, "valid previous export");
+
+    host_heap_caps_malloc_fail = 1;
+    CHECK(edf_gen_rebuild_day(day) == ESP_ERR_NO_MEM,
+          "manifest allocation failure propagates");
+    host_heap_caps_malloc_fail = 0;
+    size_t len = 0;
+    uint8_t *bytes = read_file(artifact, &len);
+    CHECK(bytes && len == strlen("valid previous export") &&
+          !memcmp(bytes, "valid previous export", len),
+          "manifest allocation failure preserves previous day");
+    free(bytes);
+    unlink(artifact);
+    rmdir(export_dir);
+    unlink(manifest);
+    rmdir(dir);
+}
+
+static void test_spool_metric_bounds(void)
+{
+    summary_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    CHECK(ctx != NULL, "allocate summary context");
+    if (!ctx) return;
+    const uint8_t data[] = {0x78, 0x01}; /* metric subfield 15 is unsupported */
+    pb_field_t field = {.field = 12, .wire = 2, .data = data, .len = sizeof(data)};
+    ctx->metrics[13].val[6] = 12345;
+    summary_field_cb(&field, ctx);
+    CHECK(ctx->metrics[13].val[6] == 12345,
+          "unknown metric subfield does not overwrite the next metric");
+    free(ctx);
+}
+
+static void test_rebuild_sentinel_safety(void)
+{
+    mk("%s", SD_SDCARD_DIR);
+    if (access(REBUILD_SENTINEL, F_OK) == 0) {
+        CHECK(false, "unexpected pre-existing rebuild sentinel");
+        return;
+    }
+    CHECK(edf_gen_rebuild_day("20/60301") == ESP_ERR_INVALID_ARG,
+          "rebuild refuses a non-date path");
+    CHECK(rebuild_write_sentinel("20260301") == ESP_OK, "write recovery marker");
+    CHECK(rebuild_write_sentinel("20260302") != ESP_OK,
+          "another day's recovery marker cannot be overwritten");
+    size_t n = 0;
+    uint8_t *contents = read_file(REBUILD_SENTINEL, &n);
+    CHECK(contents && n == 9 && !memcmp(contents, "20260301\n", 9),
+          "existing recovery marker remains intact");
+    free(contents);
+    char interrupted[16];
+    CHECK(edf_gen_take_interrupted_rebuild(interrupted, sizeof(interrupted)) &&
+          !strcmp(interrupted, "20260301") && access(REBUILD_SENTINEL, F_OK) == 0,
+          "boot recovery leaves the marker until rebuild succeeds");
+    CHECK(rebuild_write_sentinel("20260301") == ESP_OK,
+          "the same interrupted day can be retried");
+    edf_gen_release_interrupted_rebuild("20260302");
+    CHECK(access(REBUILD_SENTINEL, F_OK) == 0,
+          "release ignores a sentinel naming a different day");
+    edf_gen_release_interrupted_rebuild("20260301");
+    CHECK(access(REBUILD_SENTINEL, F_OK) != 0,
+          "release drops the abandoned day's sentinel");
+    CHECK(rebuild_write_sentinel("20260303") == ESP_OK,
+          "another day's publish unblocks once the sentinel is released");
+    CHECK(unlink(REBUILD_SENTINEL) == 0, "remove test-owned marker");
+    char tmp[400];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", REBUILD_SENTINEL);
+    CHECK(mkdir(tmp, 0775) == 0, "create test marker-write blocker");
+    CHECK(rebuild_write_sentinel("20260301") != ESP_OK,
+          "marker write failure aborts publication");
+    CHECK(rmdir(tmp) == 0, "remove test marker-write blocker");
+}
+
+static void test_str_settings_history_end_to_end(void)
+{
+    set_tz("UTC");
+    const char *sid = "20260302_220000";
+    const char *day = "20260302";
+    const int64_t start = START_MS + 86400000LL;
+    char dir[400], path[600], out[400], current_spool[600];
+    reset_day_state(day);
+    reset_day_state("20260228");
+    snprintf(dir, sizeof(dir), "%s/%s", SD_STREAMS_DIR, day);
+    snprintf(out, sizeof(out), "%s/str_provenance", g_root);
+    mk("%s", out);
+
+    cJSON *settings = cJSON_Parse(
+        "{\"SettingProfiles\":{\"ActiveProfiles\":{\"TherapyProfile\":\"CpapProfile\"},"
+        "\"TherapyProfiles\":{\"CpapProfile\":{\"SetPressure\":8}}}}");
+    CHECK(settings && settings_provenance_set(settings, SETTINGS_SOURCE_LIVE, day, sid),
+          "create live settings");
+    if (!settings) return;
+    char *json = cJSON_PrintUnformatted(settings);
+    snprintf(path, sizeof(path), "%s/%s.live.settings.json", dir, sid);
+    write_text(path, json);
+    snprintf(path, sizeof(path), "%s/%s.live.settings.json", SD_SUMMARIES_DIR, day);
+    write_text(path, json);
+    free(json);
+    snprintf(path, sizeof(path), "%s/%s_session.json", dir, sid);
+    write_text(path, "{}");
+    snprintf(path, sizeof(path), "%s/%s_ident.json", dir, sid);
+    write_live_ident(path, day, sid);
+    snprintf(path, sizeof(path), "%s/20260228.settings.json", SD_SUMMARIES_DIR);
+    write_text(path, "{\"SettingProfiles\":{\"ActiveProfiles\":{\"TherapyProfile\":\"CpapProfile\"}}}");
+    snprintf(path, sizeof(path), "%s/20260228.spool", SD_SUMMARIES_DIR);
+    write_test_summary(path, START_MS - 34LL * 3600000);
+    snprintf(current_spool, sizeof(current_spool), "%s/%s.spool", SD_SUMMARIES_DIR, day);
+    write_test_summary(current_spool, start - 10LL * 3600000);
+    cJSON *ident = cJSON_Parse("{\"SerialNumber\":\"fixture-machine\",\"PlatformIdentifier\":46}");
+    CHECK(ident != NULL, "create exporting device identity");
+
+    for (int pass = 0; pass < 8; pass++) {
+        if (pass == 1) {
+            cJSON *native = cJSON_Duplicate(settings, true);
+            CHECK(native && settings_provenance_set(native, SETTINGS_SOURCE_IMPORTED_STR,
+                                                   "20260228", NULL) &&
+                  settings_provenance_set_serial(native, "fixture-machine") &&
+                  settings_provenance_set_family(native, SETTINGS_FAMILY_AS11) &&
+                  settings_provenance_record_sessions(native, "20260228"), "mark imported history");
+            if (native) {
+                snprintf(path, sizeof(path), "%s/20260228.imported.settings.json", SD_SUMMARIES_DIR);
+                json = cJSON_PrintUnformatted(native);
+                write_text(path, json);
+                free(json);
+                cJSON_Delete(native);
+            }
+        }
+        if (pass == 2) unlink(current_spool);  /* Exercise synthesized current day. */
+        cJSON *export_settings = settings;
+        cJSON *borrowed = NULL;
+        if (pass == 3) {
+            borrowed = cJSON_Duplicate(settings, true);
+            CHECK(borrowed && settings_provenance_set(borrowed, SETTINGS_SOURCE_CACHED, day, sid),
+                  "mark cached settings");
+            snprintf(path, sizeof(path), "%s/%s.live.settings.json", dir, sid);
+            json = cJSON_PrintUnformatted(borrowed);
+            write_text(path, json);
+            free(json);
+            export_settings = borrowed;
+        } else if (pass == 4) {
+            snprintf(path, sizeof(path), "%s/%s.live.settings.json", dir, sid);
+            unlink(path);
+            snprintf(path, sizeof(path), "%s/%s.live.settings.json", SD_SUMMARIES_DIR, day);
+            unlink(path);
+            borrowed = cJSON_Duplicate(settings, true);
+            CHECK(borrowed && settings_provenance_set(borrowed, SETTINGS_SOURCE_LIVE,
+                                                     day, "different_session"),
+                  "mark borrowed same-day settings");
+            export_settings = borrowed;
+        } else if (pass == 5) {
+            snprintf(path, sizeof(path), "%s/%s.live.settings.json", dir, sid);
+            json = cJSON_PrintUnformatted(settings);
+            write_text(path, json);
+            free(json);
+        } else if (pass == 6) {
+            snprintf(path, sizeof(path), "%s/%s_ident.json", dir, sid);
+            write_text(path, "{\"SerialNumber\":\"fixture-machine\",\"PlatformIdentifier\":46}");
+        } else if (pass == 7) {
+            snprintf(path, sizeof(path), "%s/%s_ident.json", dir, sid);
+            write_live_ident(path, "20260301", sid);
+        }
+        CHECK(edf_generate_str_edf(out, "X X X X", "Startdate 02-MAR-2026 X X X",
+              "02.03.26", export_settings, ident, dir, sid, start, start + 7200000, 0) == ESP_OK,
+              "generate STR pass %d", pass);
+        snprintf(path, sizeof(path), "%s/STR.edf", out);
+        size_t len = 0;
+        uint8_t *bytes = read_file(path, &len);
+        CHECK(bytes != NULL, "STR exists pass %d", pass);
+        if (!bytes) continue;
+        edf_t e;
+        CHECK(edf_parse(bytes, len, &e) && e.ndr == 3, "STR structure pass %d", pass);
+        if (edf_parse(bytes, len, &e) && e.ndr == 3) {
+            CHECK(edf_sample(bytes, &e, 0, 5, 0) == (pass > 0 && pass < 6 ? 3 : -1),
+                  "historical Mode pass %d", pass);
+            CHECK(edf_sample(bytes, &e, 0, 7, 0) == (pass > 0 && pass < 6 ? 400 : -1),
+                  "historical pressure pass %d", pass);
+            CHECK(edf_sample(bytes, &e, 0, 76, 0) == 1 &&
+                  edf_sample(bytes, &e, 0, 77, 0) == 2,
+                  "spool tube/humidifier lost pass %d", pass);
+            CHECK(edf_sample(bytes, &e, 1, 0, 0) ==
+                  as11_time_day_number("20260301") &&
+                  edf_sample(bytes, &e, 1, 3, 0) == -1 &&
+                  edf_sample(bytes, &e, 1, 4, 0) == -1 &&
+                  edf_sample(bytes, &e, 1, 5, 0) == -1,
+                  "calendar gap is an unknown record pass %d", pass);
+            CHECK(edf_sample(bytes, &e, 2, 0, 0) == as11_time_day_number(day) &&
+                  edf_sample(bytes, &e, 2, 5, 0) == (pass < 3 || pass == 5 ? 3 : -1) &&
+                  edf_sample(bytes, &e, 2, 7, 0) == (pass < 3 || pass == 5 ? 400 : -1),
+                  "current settings provenance pass %d", pass);
+            check_edf_structure("STR.edf", bytes, len, &e);
+            for (int r = 0; r < e.ndr; r++) {
+                const uint8_t *rec = bytes + e.hdr_bytes + r * e.rec_bytes;
+                CHECK(ccitt_false(rec, (size_t)e.rec_bytes - 2) ==
+                      (uint16_t)edf_sample(bytes, &e, r, e.ns - 1, 0),
+                      "STR record CRC pass %d record %d", pass, r);
+            }
+        }
+        free(bytes);
+        cJSON_Delete(borrowed);
+    }
+
+    /* A historical-day rebuild must refresh the cumulative STR without
+     * replacing the card's current identity/settings. */
+    snprintf(path, sizeof(path), "%s/%s_ident.json", dir, sid);
+    write_live_ident(path, day, sid);
+    char ident_out[500], cs_out[500];
+    snprintf(ident_out, sizeof(ident_out), "%s/Identification.json", out);
+    snprintf(cs_out, sizeof(cs_out), "%s/SETTINGS/CurrentSettings.json", out);
+    mk("%s/SETTINGS", out);
+    write_text(ident_out, "sentinel-ident");
+    write_text(cs_out, "sentinel-settings");
+    CHECK(edf_gen_generate_ex(out, dir, sid, start, start + 7200000, 0,
+                              EDF_GEN_SHARED_HISTORICAL) == ESP_OK,
+          "historical shared pass");
+    size_t ident_len = 0, cs_len = 0;
+    uint8_t *ident_bytes = read_file(ident_out, &ident_len);
+    uint8_t *cs_bytes = read_file(cs_out, &cs_len);
+    CHECK(ident_bytes && ident_len == strlen("sentinel-ident") &&
+          memcmp(ident_bytes, "sentinel-ident", ident_len) == 0,
+          "historical rebuild preserves current Identification.json");
+    CHECK(cs_bytes && cs_len == strlen("sentinel-settings") &&
+          memcmp(cs_bytes, "sentinel-settings", cs_len) == 0,
+          "historical rebuild preserves current CurrentSettings.json");
+    free(ident_bytes);
+    free(cs_bytes);
+
+    /* Exporting a provenance-marked live capture must not publish the
+     * internal marker in the device-compatible root artifacts. */
+    CHECK(edf_gen_generate_ex(out, dir, sid, start, start + 7200000, 0,
+                              EDF_GEN_SHARED) == ESP_OK,
+          "current shared pass");
+    ident_bytes = read_file(ident_out, &ident_len);
+    cs_bytes = read_file(cs_out, &cs_len);
+    cJSON *published_ident = ident_bytes ? cJSON_Parse((char *)ident_bytes) : NULL;
+    cJSON *published_settings = cs_bytes ? cJSON_Parse((char *)cs_bytes) : NULL;
+    CHECK(published_ident &&
+          cJSON_GetObjectItem(published_ident, SETTINGS_PROVENANCE_KEY) == NULL,
+          "Identification.json must not publish provenance");
+    CHECK(published_settings &&
+          cJSON_GetObjectItem(published_settings, SETTINGS_PROVENANCE_KEY) == NULL,
+          "CurrentSettings.json must not publish provenance");
+    cJSON_Delete(published_ident);
+    cJSON_Delete(published_settings);
+    free(ident_bytes);
+    free(cs_bytes);
+
+    /* Historical daily evidence must not replace CurrentSettings even when
+     * it is the only settings source available for the rebuild. */
+    snprintf(path, sizeof(path), "%s/%s.live.settings.json", dir, sid);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/%s_settings.json", dir, sid);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/%s.settings.json", SD_SUMMARIES_DIR, day);
+    char *legacy = cJSON_PrintUnformatted(settings);
+    write_text(path, legacy);
+    free(legacy);
+    write_text(cs_out, "sentinel-current");
+    CHECK(edf_gen_generate_ex(out, dir, sid, start, start + 7200000, 0,
+                              EDF_GEN_SHARED) == ESP_OK,
+          "legacy settings shared pass");
+    cs_bytes = read_file(cs_out, &cs_len);
+    CHECK(cs_bytes && cs_len == strlen("sentinel-current") &&
+          memcmp(cs_bytes, "sentinel-current", cs_len) == 0,
+          "historical settings must not replace CurrentSettings.json");
+    free(cs_bytes);
+
+    cJSON_Delete(ident);
+    cJSON_Delete(settings);
+}
+
 /* ── Identification.json / Identification.crc ────────────────────────────────
  * edf_generate_identification_files() was the largest untested function in the
  * exporter. The mutation harness picks it as edf_header.c's canary, empties its
@@ -1800,7 +2694,7 @@ static void test_wf_a_non_string_report_time_is_skipped(void)
     assert(edf_find_mask_off_time(p) == -1);
 }
 
-/* ---- edf_find_zle_edge_time --------------------------------------------------- */
+/* ---- edf_find_zle_windows ----------------------------------------------------- */
 
 static void test_wf_zle_only_reads_zle_records(void)
 {
@@ -1813,7 +2707,8 @@ static void test_wf_zle_only_reads_zle_records(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"OTHER\",\"events\":[{\"value\":1,"
         "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
-    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 0);
 }
 
 static void test_wf_zle_value_must_be_a_number(void)
@@ -1825,7 +2720,8 @@ static void test_wf_zle_value_must_be_a_number(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":\"1\","
         "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
-    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 0);
 }
 
 static void test_wf_zle_falls_back_to_ntp_when_report_time_is_unusable(void)
@@ -1837,7 +2733,9 @@ static void test_wf_zle_falls_back_to_ntp_when_report_time_is_unusable(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
         "\"reportTime\":7,\"ntpTimeMs\":1756000000000}]}}\n");
-    assert(edf_find_zle_edge_time(p, 1, 0) == 1756000000000LL);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 1);
+    assert(w[0].start_ms == 1756000000000LL);
 }
 
 static void test_wf_zle_clock_drift_is_added_to_the_as11_time(void)
@@ -1847,8 +2745,11 @@ static void test_wf_zle_clock_drift_is_added_to_the_as11_time(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
         "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
-    int64_t zero = edf_find_zle_edge_time(p, 1, 0);
-    int64_t plus = edf_find_zle_edge_time(p, 1, 4321);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 1);
+    int64_t zero = w[0].start_ms;
+    assert(edf_find_zle_windows(p, 4321, w, 2) == 1);
+    int64_t plus = w[0].start_ms;
     assert(zero > 0);
     assert(plus - zero == 4321);
 }
@@ -1907,7 +2808,8 @@ static void test_wf_zle_events_must_be_an_array(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":{\"x\":{\"value\":1,"
         "\"ntpTimeMs\":1756000000000}}}}\n");
-    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 0);
 }
 
 static void test_wf_zle_rejects_a_zero_ntp_time(void)
@@ -1919,7 +2821,8 @@ static void test_wf_zle_rejects_a_zero_ntp_time(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
         "\"ntpTimeMs\":0}]}}\n");
-    assert(edf_find_zle_edge_time(p, 1, 0) == -1);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 0);
 }
 
 static void test_wf_zle_an_epoch_report_time_is_not_a_time(void)
@@ -1935,7 +2838,9 @@ static void test_wf_zle_an_epoch_report_time_is_not_a_time(void)
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
         "\"reportTime\":\"1970-01-01T00:00:00.000\","
         "\"ntpTimeMs\":1756000000000}]}}\n");
-    assert(edf_find_zle_edge_time(p, 1, 60000) == 1756000000000LL);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 60000, w, 2) == 1);
+    assert(w[0].start_ms == 1756000000000LL);
 }
 
 static void test_wf_zle_a_drift_cancelled_time_is_not_a_time(void)
@@ -1953,7 +2858,9 @@ static void test_wf_zle_a_drift_cancelled_time_is_not_a_time(void)
     wf_write(p,
         "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,"
         "\"reportTime\":\"2026-09-01T22:00:00.000\"}]}}\n");
-    int64_t as11 = edf_find_zle_edge_time(p, 1, 0);
+    edf_zle_window_t w[2];
+    assert(edf_find_zle_windows(p, 0, w, 2) == 1);
+    int64_t as11 = w[0].start_ms;
     assert(as11 > 0);
 
     wf_path(q, sizeof(q), "wf_zle_cancel.jsonl");
@@ -1963,7 +2870,123 @@ static void test_wf_zle_a_drift_cancelled_time_is_not_a_time(void)
         "\"ntpTimeMs\":1756000000000}]}}\n");
     /* as11 + (-as11) == 0, which is not a time. The ntp value must NOT rescue it:
      * the AS11 path answered, and it answered zero. */
-    assert(edf_find_zle_edge_time(q, 1, -as11) == -1);
+    assert(edf_find_zle_windows(q, -as11, w, 2) == 0);
+}
+
+static void test_wf_zle_windows_state_machine(void)
+{
+    char p[400];
+    wf_path(p, sizeof(p), "wf_zle_wins.jsonl");
+    /* Leading stray 0, then (1000..2000) with duplicate 1 and duplicate 0,
+     * then an open final rising edge at 3000 (StandbyStarted race). */
+    wf_write(p,
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":0,\"ntpTimeMs\":500}]}}\n"
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,\"ntpTimeMs\":1000}]}}\n"
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,\"ntpTimeMs\":1200}]}}\n"
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":0,\"ntpTimeMs\":2000}]}}\n"
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":0,\"ntpTimeMs\":2100}]}}\n"
+        "{\"params\":{\"dataId\":\"_ZLE\",\"events\":[{\"value\":1,\"ntpTimeMs\":3000}]}}\n");
+    edf_zle_window_t w[4];
+    int n = edf_find_zle_windows(p, 0, w, 4);
+    CHECK(n == 2, "expected 2 windows, got %d", n);
+    if (n == 2) {
+        CHECK(w[0].start_ms == 1000 && w[0].end_ms == 2000,
+              "window 0 [%lld..%lld]", (long long)w[0].start_ms, (long long)w[0].end_ms);
+        CHECK(w[1].start_ms == 3000 && w[1].end_ms == 0,
+              "window 1 [%lld..%lld] should stay open", (long long)w[1].start_ms, (long long)w[1].end_ms);
+    }
+}
+
+static void test_zle_multi_window_splits_waveforms(void)
+{
+    set_tz("UTC");
+    char rootm[300], sdm[400], outm[400];
+    char root0[300], sd0[400], out0[400], p[600];
+    snprintf(rootm, sizeof(rootm), "%s/zle_multi", g_root);
+    snprintf(root0, sizeof(root0), "%s/zle_multi_ref", g_root);
+    /* 3-minute session (180 s): two >=60 s windows separated by a 20 s break.
+     * Window 1: +10 s → +75 s  (65 s → 1 complete 60 s record, starts 22:00:10)
+     * Gap:      +75 s → +95 s  (toilet break, excluded)
+     * Window 2: +95 s → +165 s (70 s → 1 complete 60 s record, starts 22:01:35) */
+    build_session(rootm, 2, SA2_N, sdm, sizeof(sdm));
+    build_session(root0, 2, SA2_N, sd0, sizeof(sd0));
+    static const int64_t zle_at[] = { 10000, 75000, 95000, 165000 };
+    static const int     zle_v[]  = {     1,     0,     1,      0 };
+    write_zle_sequence(sdm, zle_at, zle_v, 4);
+
+    CHECK(generate(rootm, sdm, outm, sizeof(outm)) == ESP_OK, "multi-window generate failed");
+    CHECK(generate(root0, sd0, out0, sizeof(out0)) == ESP_OK, "reference generate failed");
+
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/%s_BRP.edf", out0, SID);
+    size_t n0 = 0; uint8_t *b0 = read_file(p, &n0);
+    edf_t eu;
+    CHECK(b0 && edf_parse(b0, n0, &eu), "reference BRP missing");
+
+    /* Window 1 triplet */
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/20260301_220010_BRP.edf", outm);
+    size_t n1 = 0; uint8_t *b1 = read_file(p, &n1);
+    CHECK(b1 != NULL, "window 1 BRP missing (22:00:10)");
+    if (b1 && b0) {
+        edf_t e1;
+        CHECK(edf_parse(b1, n1, &e1) && e1.ndr == 1,
+              "window 1 should have 1 record, got %d", e1.ndr);
+        if (e1.ndr == 1) {
+            int j = 250; /* +10 s at 25 Hz */
+            CHECK(edf_sample(b1, &e1, 0, 0, 0) == edf_sample(b0, &eu, j / eu.spr[0], 0, j % eu.spr[0]),
+                  "window 1 first sample matches +10 s");
+        }
+    }
+    free(b1);
+
+    /* Window 2 triplet */
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/20260301_220135_BRP.edf", outm);
+    size_t n2 = 0; uint8_t *b2 = read_file(p, &n2);
+    CHECK(b2 != NULL, "window 2 BRP missing (22:01:35)");
+    if (b2 && b0) {
+        edf_t e2;
+        CHECK(edf_parse(b2, n2, &e2) && e2.ndr == 1,
+              "window 2 should have 1 record, got %d", e2.ndr);
+        if (e2.ndr == 1) {
+            int j = 2375; /* +95 s at 25 Hz */
+            CHECK(edf_sample(b2, &e2, 0, 0, 0) == edf_sample(b0, &eu, j / eu.spr[0], 0, j % eu.spr[0]),
+                  "window 2 first sample matches +95 s");
+        }
+    }
+    free(b2);
+
+    /* Only ONE EVE/CSL pair at TherapyStart (22:00:00) */
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/%s_EVE.edf", outm, SID);
+    CHECK(access(p, F_OK) == 0, "TherapyStart EVE.edf missing");
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/20260301_220135_EVE.edf", outm);
+    CHECK(access(p, F_OK) != 0, "second window must not emit a duplicate EVE.edf");
+
+    free(b0);
+}
+
+static void test_zle_open_final_window_not_truncated(void)
+{
+    set_tz("UTC");
+    char rooto[300], sdo[400], outo[400], p[600];
+    snprintf(rooto, sizeof(rooto), "%s/zle_open", g_root);
+    /* StandbyStarted race: final _ZLE=0 never written after second _ZLE=1.
+     * Window 2 (+95 s → EOF +180 s = 85 s) must produce 1 record, NOT be
+     * truncated back to Window 1's falling edge (+75 s). */
+    build_session(rooto, 2, SA2_N, sdo, sizeof(sdo));
+    static const int64_t zle_at[] = { 10000, 75000, 95000 };
+    static const int     zle_v[]  = {     1,     0,     1 };
+    write_zle_sequence(sdo, zle_at, zle_v, 3);
+
+    CHECK(generate(rooto, sdo, outo, sizeof(outo)) == ESP_OK, "open-final generate failed");
+
+    snprintf(p, sizeof(p), "%s/DATALOG/20260301/20260301_220135_BRP.edf", outo);
+    size_t n2 = 0; uint8_t *b2 = read_file(p, &n2);
+    CHECK(b2 != NULL, "open final window BRP missing (22:01:35)");
+    if (b2) {
+        edf_t e2;
+        CHECK(edf_parse(b2, n2, &e2) && e2.ndr == 1,
+              "open final window should keep 1 record through EOF, got %d", e2.ndr);
+    }
+    free(b2);
 }
 
 /* The dedup pass compares each event only against the previous KEPT one, so it
@@ -1997,6 +3020,102 @@ static void test_annotation_dedup_orders_and_keeps_distinct(void)
     CHECK(strcmp(ev[0].label, "CSR End") == 0, "label breaks the onset tie");
     CHECK(ev[2].onset_sec == 200 && ev[3].onset_sec == 300, "onsets ascend");
     CHECK(sort_and_dedup_events(ev, 0) == 0, "an empty list is handled");
+}
+
+static void test_resolver_gates_daily_settings(void)
+{
+    set_tz("UTC");
+    const char *day = "20260310";
+    char path[600];
+    resolver_session_t resolver_scratch[RESOLVER_MAX_SESSIONS];
+    reset_day_state(day);
+    cJSON *native = cJSON_Parse(
+        "{\"SettingProfiles\":{\"ActiveProfiles\":{\"TherapyProfile\":\"CpapProfile\"}}}");
+    CHECK(native && settings_provenance_set(native, SETTINGS_SOURCE_IMPORTED_STR, day, NULL) &&
+          settings_provenance_set_serial(native, "fixture-machine") &&
+          settings_provenance_set_family(native, SETTINGS_FAMILY_AS11) &&
+          settings_provenance_record_sessions(native, day), "gate: native record");
+    if (!native) return;
+    bool authorised = false;
+    snprintf(path, sizeof(path), "%s/%s/unverified_session.json", SD_STREAMS_DIR, day);
+    write_text(path, "{}");
+    CHECK(resolver_authorises_day_checked(day, SETTINGS_FAMILY_AS11, "fixture-machine",
+                                         native, resolver_scratch, &authorised) == ESP_OK &&
+          !authorised,
+          "gate: unverified local session withholds the native record");
+    unlink(path);
+    CHECK(resolver_authorises_day_checked(day, SETTINGS_FAMILY_AS11, "fixture-machine",
+                                         native, resolver_scratch, &authorised) == ESP_OK &&
+          authorised,
+          "gate: verified native record with no local sessions applies");
+    snprintf(path, sizeof(path), "%s/%s/bridge_session.json", SD_STREAMS_DIR, day);
+    write_text(path, "{\"import_source\":\"somnobridge\"}");
+    CHECK(resolver_authorises_day_checked(day, SETTINGS_FAMILY_AS11, "fixture-machine",
+                                         native, resolver_scratch, &authorised) == ESP_OK &&
+          authorised,
+          "gate: bridge import without identity is covered by the verified native record");
+    unlink(path);
+    CHECK(resolver_authorises_day_checked(day, SETTINGS_FAMILY_AS11, "other-machine",
+                                         native, resolver_scratch, &authorised) == ESP_OK &&
+          !authorised,
+          "gate: native record from another machine is withheld");
+    cJSON_Delete(native);
+    cJSON *none = NULL;
+    CHECK(resolver_gate_daily_checked(day, SETTINGS_FAMILY_AS11, "fixture-machine",
+                                      &none, resolver_scratch) == ESP_OK && !none,
+          "gate: no record stays unknown");
+
+    snprintf(path, sizeof(path), "%s/%s/oom_session.json", SD_STREAMS_DIR, day);
+    write_text(path, "{}");
+    snprintf(path, sizeof(path), "%s/%s/oom.live.settings.json", SD_STREAMS_DIR, day);
+    write_text(path, "{\"SettingProfiles\":{\"TherapyProfiles\":{}}}");
+    test_summary_print_fail = true;
+    CHECK(resolver_authorises_day_checked(day, SETTINGS_FAMILY_AS11, "fixture-machine",
+                                         NULL, resolver_scratch, &authorised) == ESP_ERR_NO_MEM,
+          "gate: settings digest allocation failure is an error, not unknown");
+    test_summary_print_fail = false;
+    cJSON_Hooks hooks = { .malloc_fn = test_cjson_alloc_failure, .free_fn = free };
+    cJSON_InitHooks(&hooks);
+    esp_err_t provenance_err = resolver_authorises_day_checked(
+        day, SETTINGS_FAMILY_AS11, "fixture-machine", NULL, resolver_scratch, &authorised);
+    cJSON_InitHooks(NULL);
+    CHECK(provenance_err == ESP_ERR_NO_MEM && !authorised,
+          "gate: unavailable manifest evidence is an error, not a conflict");
+
+    snprintf(path, sizeof(path), "%s/%s/oom_session.json", SD_STREAMS_DIR, day);
+    FILE *manifest_file = fopen(path, "wb");
+    CHECK(manifest_file != NULL, "gate: create large synthetic manifest");
+    if (manifest_file) {
+        fputs("{\"padding\":\"", manifest_file);
+        for (int i = 0; i < 5000; i++) fputc('m', manifest_file);
+        fputs("\"}", manifest_file);
+        fclose(manifest_file);
+        host_heap_caps_malloc_fail = 1;
+        provenance_err = resolver_authorises_day_checked(
+            day, SETTINGS_FAMILY_AS11, "fixture-machine", NULL, resolver_scratch, &authorised);
+        host_heap_caps_malloc_fail = 0;
+        CHECK(provenance_err == ESP_ERR_NO_MEM && !authorised,
+              "gate: large manifest cannot fall back to internal RAM");
+    }
+
+    snprintf(path, sizeof(path), "%s/%s.imported.settings.json", SD_SUMMARIES_DIR, day);
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL, "gate: create large synthetic daily settings");
+    if (f) {
+        fputs("{\"padding\":\"", f);
+        for (int i = 0; i < 5000; i++) fputc('x', f);
+        fputs("\"}", f);
+        fclose(f);
+        esp_err_t err = ESP_OK;
+        host_heap_caps_malloc_fail = 1;
+        cJSON *daily = read_daily_settings_checked(day, SETTINGS_FAMILY_AS11,
+                                                  "fixture-machine", &err);
+        host_heap_caps_malloc_fail = 0;
+        CHECK(!daily && err == ESP_ERR_NO_MEM,
+              "gate: settings-read allocation failure is not treated as absence");
+        cJSON_Delete(daily);
+        unlink(path);
+    }
 }
 
 int main(void)
@@ -2048,6 +3167,30 @@ int main(void)
     run("the session's AS11 offset beats the device timezone",
         test_as11_offset_beats_device_timezone, NULL);
     run("STR pressure settings are exact cmH2O x 50", test_str_pressure_settings_exact, NULL);
+    run("Spont settings accept device strings and imported numbers",
+        test_spont_settings_strings_and_numeric, NULL);
+    run("PLD snore preserves missing data, zero and range",
+        test_pld_snore_missing_and_clamping, NULL);
+    run("daily settings require provenance and unambiguous live sessions",
+        test_daily_settings_provenance, NULL);
+    run("STR settings history preserves unknowns and trusted snapshots",
+        test_str_settings_history_end_to_end, NULL);
+    run("atomic EDF publication preserves and recovers prior exports",
+        test_atomic_export_recovery, NULL);
+    run("live and native summaries take precedence over synthetic imports",
+        test_imported_spool_selection, NULL);
+    run("a partial drift index is rejected when PSRAM is exhausted",
+        test_drift_index_allocation_failure, NULL);
+    run("a rebuild preserves the day when manifest allocation fails",
+        test_rebuild_manifest_allocation_failure, NULL);
+    run("unexpected summary metric numbers stay in bounds",
+        test_spool_metric_bounds, NULL);
+    run("day rebuild markers protect interrupted publication",
+        test_rebuild_sentinel_safety, NULL);
+    run("the resolver gates daily settings fail-closed",
+        test_resolver_gates_daily_settings, NULL);
+    run("unreadable session evidence withholds but does not abort the day",
+        test_corrupt_session_evidence_withholds_day, NULL);
 
     run("crc32 matches the published CRC-32/ISO-HDLC check vector",
         test_crc32_matches_the_published_check_vector, NULL);
@@ -2090,6 +3233,12 @@ int main(void)
 
     run("_ZLE rejects an AS11 time cancelled by the drift",
         test_wf_zle_a_drift_cancelled_time_is_not_a_time, NULL);
+    run("_ZLE multi-window state machine",
+        test_wf_zle_windows_state_machine, NULL);
+    run("_ZLE multi-window splits BRP/PLD/SA2 on toilet breaks",
+        test_zle_multi_window_splits_waveforms, NULL);
+    run("_ZLE open final window is not truncated to prior falling edge",
+        test_zle_open_final_window_not_truncated, NULL);
 
     if (!getenv("KEEP_TEST_TREE")) rmtree(g_root);
     else printf("test tree kept at %s\n", g_root);
@@ -2098,4 +3247,3 @@ int main(void)
            n_pass, n_fail, n_xfail, n_xpass);
     return n_fail ? 1 : 0;
 }
-

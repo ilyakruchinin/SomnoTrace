@@ -22,11 +22,13 @@
  */
 
 #include "edf_gen.h"
+#include "settings_provenance.h"
 #include "edf_internal.h"
 #include "edf_header.h"
 #include "edf_waveform.h"
 #include "edf_annotations.h"
 #include "edf_summary.h"
+#include <strings.h>
 
 static const char *TAG = "edf_gen";
 
@@ -55,6 +57,181 @@ static void format_recording_id_from_ident(char *out, size_t out_len,
         }
     }
     as11_time_format_recording_id(out, out_len, epoch_ms, srn, mid, vid);
+}
+
+static bool ident_matches_native(const cJSON *ident)
+{
+    cJSON *native = edf_read_json_file(SD_SUMMARIES_DIR "/native.ident.json");
+    const cJSON *marker = cJSON_GetObjectItemCaseSensitive(native, "_somnotrace_native_source");
+    const cJSON *a = cJSON_GetObjectItemCaseSensitive(native, "SerialNumber");
+    const cJSON *b = cJSON_GetObjectItemCaseSensitive(ident, "SerialNumber");
+    int family = settings_provenance_family(native);
+    bool match = cJSON_IsString(marker) && marker->valuestring &&
+                 !strcmp(marker->valuestring, "native_str") &&
+                 cJSON_IsString(a) && a->valuestring && a->valuestring[0] &&
+                 cJSON_IsString(b) && b->valuestring &&
+                 !strcmp(a->valuestring, b->valuestring) &&
+                 family != SETTINGS_FAMILY_UNKNOWN &&
+                 settings_provenance_family(ident) == family;
+    cJSON_Delete(native);
+    return match;
+}
+
+static bool exported_datalog_exists(void)
+{
+    DIR *root = opendir(SD_SDCARD_DATALOG);
+    if (!root) return errno != ENOENT;
+    bool found = false;
+    struct dirent *day;
+    while ((day = readdir(root)) != NULL && !found) {
+        if (day->d_name[0] == '.') continue;
+        char path[400];
+        int n = snprintf(path, sizeof(path), "%s/%s", SD_SDCARD_DATALOG, day->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path)) { found = true; break; }
+        DIR *d = opendir(path);
+        if (!d) { found = true; break; }
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            size_t len = strlen(ent->d_name);
+            if (len > 4 && !strcasecmp(ent->d_name + len - 4, ".edf")) {
+                found = true;
+                break;
+            }
+        }
+        closedir(d);
+    }
+    closedir(root);
+    return found;
+}
+
+static bool exported_identity_compatible(const cJSON *native)
+{
+    const char *path = SD_SDCARD_DIR "/Identification.json";
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        if (errno != ENOENT) return false;
+        int str_stat = stat(SD_SDCARD_DIR "/STR.edf", &st);
+        int str_errno = errno;
+        if (str_stat != 0 && str_errno == ENOENT && !exported_datalog_exists())
+            return true;
+        /* Identification.json missing while STR/DATALOG exist is an
+         * interrupted-export state, not a foreign tree: regenerate it from
+         * native.ident.json and let the compare below verify the result.
+         * The veto stays for a file that exists but cannot match, and for
+         * a native identity too weak to publish from. */
+        const cJSON *serial = cJSON_GetObjectItemCaseSensitive(native, "SerialNumber");
+        if (!cJSON_IsString(serial) || !serial->valuestring ||
+            !serial->valuestring[0] ||
+            settings_provenance_family(native) == SETTINGS_FAMILY_UNKNOWN ||
+            edf_generate_identification_files(SD_SDCARD_DIR,
+                SD_SUMMARIES_DIR "/native.ident.json") != ESP_OK)
+            return false;
+        ESP_LOGI(TAG, "native STR: regenerated missing Identification.json");
+    }
+    cJSON *published = edf_read_json_file(path);
+    const cJSON *fg = cJSON_GetObjectItemCaseSensitive(published, "FlowGenerator");
+    const cJSON *profiles = cJSON_GetObjectItemCaseSensitive(fg, "IdentificationProfiles");
+    const cJSON *product = cJSON_GetObjectItemCaseSensitive(profiles, "Product");
+    const cJSON *software = cJSON_GetObjectItemCaseSensitive(profiles, "Software");
+    const cJSON *existing = cJSON_GetObjectItemCaseSensitive(product, "SerialNumber");
+    const cJSON *expected = cJSON_GetObjectItemCaseSensitive(native, "SerialNumber");
+    int family = settings_provenance_family(native);
+    bool match = cJSON_IsString(existing) && existing->valuestring &&
+                 cJSON_IsString(expected) && expected->valuestring &&
+                 !strcmp(existing->valuestring, expected->valuestring) &&
+                 family != SETTINGS_FAMILY_UNKNOWN &&
+                 settings_provenance_family(software) == family;
+    cJSON_Delete(published);
+    return match;
+}
+
+static esp_err_t ensure_identification_crc(void)
+{
+    const char *json_path = SD_SDCARD_DIR "/Identification.json";
+    const char *crc_path = SD_SDCARD_DIR "/Identification.crc";
+    FILE *f = fopen(json_path, "rb");
+    if (!f || fseek(f, 0, SEEK_END) != 0) { if (f) fclose(f); return ESP_FAIL; }
+    long size = ftell(f);
+    if (size <= 0 || size > 65536 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    uint8_t *data = heap_caps_malloc((size_t)size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!data) { fclose(f); return ESP_ERR_NO_MEM; }
+    bool read_ok = fread(data, 1, (size_t)size, f) == (size_t)size && !ferror(f);
+    fclose(f);
+    uint32_t crc = read_ok ? edf_crc32_ieee(data, (size_t)size) : 0;
+    free(data);
+    if (!read_ok) return ESP_FAIL;
+    uint8_t expected[4] = {crc & 0xff, (crc >> 8) & 0xff,
+                           (crc >> 16) & 0xff, (crc >> 24) & 0xff};
+    uint8_t actual[5];
+    f = fopen(crc_path, "rb");
+    if (f) {
+        size_t n = fread(actual, 1, sizeof(actual), f);
+        bool ok = !ferror(f) && n == sizeof(expected) &&
+                  !memcmp(actual, expected, sizeof(expected));
+        fclose(f);
+        if (ok) return ESP_OK;
+        ESP_LOGE(TAG, "native STR: Identification.crc is invalid; preserving existing export");
+        return ESP_FAIL;
+    }
+    if (errno != ENOENT) return ESP_FAIL;
+    ESP_LOGW(TAG, "native STR: repairing missing Identification.crc");
+    char tmp[380];
+    f = edf_open_atomic_file(crc_path, tmp, sizeof(tmp));
+    if (!f) return ESP_FAIL;
+    if (!edf_write_all(f, expected, sizeof(expected))) {
+        edf_discard_atomic_file(f, tmp);
+        return ESP_FAIL;
+    }
+    return edf_finalize_atomic_file(f, tmp, crc_path);
+}
+
+static esp_err_t rebuild_native_from_latest_session(bool *has_session);
+
+esp_err_t edf_gen_rebuild_native_str(void)
+{
+    if (!sd_storage_is_ready()) return ESP_ERR_INVALID_STATE;
+    if (!sd_storage_lease_acquire(SD_LEASE_EXPORT, 120000)) return ESP_ERR_TIMEOUT;
+    esp_err_t result = ESP_FAIL;
+    const char *native_path = SD_SUMMARIES_DIR "/native.ident.json";
+    cJSON *native = edf_read_json_file(native_path);
+    const cJSON *marker = cJSON_GetObjectItemCaseSensitive(native, "_somnotrace_native_source");
+    const cJSON *serial = cJSON_GetObjectItemCaseSensitive(native, "SerialNumber");
+    int family = settings_provenance_family(native);
+    if (!cJSON_IsString(marker) || !marker->valuestring ||
+        strcmp(marker->valuestring, "native_str") ||
+        !cJSON_IsString(serial) || !serial->valuestring || !serial->valuestring[0] ||
+        family == SETTINGS_FAMILY_UNKNOWN) goto done;
+
+    mkdir(SD_SDCARD_DIR, 0775);
+    mkdir(SD_SDCARD_DATALOG, 0775);
+    if (edf_recover_atomic_file(SD_SDCARD_DIR "/Identification.json") != ESP_OK ||
+        edf_recover_atomic_file(SD_SDCARD_DIR "/Identification.crc") != ESP_OK ||
+        edf_recover_atomic_file(SD_SDCARD_DIR "/STR.edf") != ESP_OK)
+        goto done;
+    if (!exported_identity_compatible(native)) {
+        ESP_LOGE(TAG, "native STR: existing export identity differs or is unavailable");
+        goto done;
+    }
+    struct stat st;
+    if (stat(SD_SDCARD_DIR "/Identification.json", &st) != 0) {
+        if (edf_generate_identification_files(SD_SDCARD_DIR, native_path) != ESP_OK)
+            goto done;
+    }
+    if (ensure_identification_crc() != ESP_OK) goto done;
+    bool has_session = false;
+    result = rebuild_native_from_latest_session(&has_session);
+    if (result != ESP_OK || has_session) goto done;
+    char recording_id[128];
+    format_recording_id_from_ident(recording_id, sizeof(recording_id), 0, native);
+    result = edf_generate_str_edf(SD_SDCARD_DIR, "X X X X 0000 0000", recording_id,
+                                  "", NULL, native, NULL, NULL, 0, 0, 0);
+done:
+    cJSON_Delete(native);
+    sd_storage_lease_release(SD_LEASE_EXPORT);
+    return result;
 }
 
 esp_err_t edf_gen_generate(const char *session_dir, const char *session_id,
@@ -308,6 +485,30 @@ read_pre_gate_info(const char *session_dir, const char *session_id,
     cJSON_Delete(mani);
 }
 
+typedef struct {
+    char root_datalog[200], root_settings[200];
+    char day_folder[16], day_dir[240], ts_prefix[32];
+    char streams_root[300], sessions_root[300], dir_day_label[16];
+    char self_ident_path[330], ident_path[420];
+    char self_settings_path[330], settings_path[420], events_snt_path[330];
+} edf_gen_paths_t;
+
+/* These aliases are scoped to this function. Each invocation owns its paths,
+ * keeping export scratch off nested worker stacks without global state. */
+#define root_datalog       (paths->root_datalog)
+#define root_settings      (paths->root_settings)
+#define day_folder         (paths->day_folder)
+#define day_dir            (paths->day_dir)
+#define ts_prefix          (paths->ts_prefix)
+#define streams_root       (paths->streams_root)
+#define sessions_root      (paths->sessions_root)
+#define dir_day_label      (paths->dir_day_label)
+#define self_ident_path    (paths->self_ident_path)
+#define ident_path         (paths->ident_path)
+#define self_settings_path (paths->self_settings_path)
+#define settings_path      (paths->settings_path)
+#define events_snt_path    (paths->events_snt_path)
+
 esp_err_t edf_gen_generate_ex(const char *out_root,
                               const char *session_dir, const char *session_id,
                               int64_t start_epoch_ms, int64_t end_epoch_ms,
@@ -335,6 +536,13 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         return ESP_ERR_INVALID_ARG;
     }
 
+    edf_gen_paths_t *paths = heap_caps_calloc(1, sizeof(*paths),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!paths) {
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return ESP_ERR_NO_MEM;
+    }
+
     ESP_LOGI(TAG, "=== EDF GENERATION START ===");
     ESP_LOGI(TAG, "session=%s id=%s drift=%lldms",
              session_dir, session_id, (long long)clock_drift_ms);
@@ -348,7 +556,6 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
      * This is the ResMed-compatible SD card image, fully derived from .somnotrace/sessions/ */
     /* Output paths are derived from out_root so a day rebuild can generate
      * into a staging tree and publish only on success. */
-    char root_datalog[200], root_settings[200];
     snprintf(root_datalog, sizeof(root_datalog), "%s/DATALOG", out_root);
     snprintf(root_settings, sizeof(root_settings), "%s/SETTINGS", out_root);
 
@@ -362,15 +569,12 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
 
     /* Create date subdirectory inside DATALOG (noon-based day using AS11 offset).
      * Layout: DATALOG/YYYYMMDD/YYYYMMDD_HHMMSS_TYPE.edf */
-    char day_folder[16];
     as11_time_noon_day(start_epoch_ms - clock_drift_ms, day_folder, sizeof(day_folder));
 
-    char day_dir[240];
     snprintf(day_dir, sizeof(day_dir), "%s/%s", root_datalog, day_folder);
     mkdir(day_dir, 0775);
 
     /* Session timestamp prefix for EVE/CSL EDF filenames (NTP TherapyStart). */
-    char ts_prefix[32];
     as11_time_format_session_prefix(start_epoch_ms, ts_prefix, sizeof(ts_prefix));
 
     /* ── Load post-therapy data from .somnotrace/sessions/streams/YYYYMMDD/ ──
@@ -385,16 +589,13 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
      *   3. The pre-stream device_metadata.json snapshot
      * When a fallback succeeds, <session_id>_ident.json is backfilled so
      * edf_generate_identification_files() and future rebuilds find it in place. */
-    char streams_root[300], sessions_root[300], dir_day_label[16];
     resolve_session_roots(session_dir, streams_root, sizeof(streams_root),
                           sessions_root, sizeof(sessions_root),
                           dir_day_label, sizeof(dir_day_label));
     const char *lookup_day = dir_day_label[0] ? dir_day_label : day_folder;
 
-    char self_ident_path[330];
     snprintf(self_ident_path, sizeof(self_ident_path), "%s/%s_ident.json",
              session_dir, session_id);
-    char ident_path[420];
     strlcpy(ident_path, self_ident_path, sizeof(ident_path));
 
     cJSON *ident = edf_read_json_file(ident_path);
@@ -412,8 +613,9 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         if (ident) {
             ESP_LOGW(TAG, "session %s has no ident.json — using %s from another day",
                      session_id, ident_path);
-            if (edf_write_json_file(self_ident_path, ident) == ESP_OK) {
-                strlcpy(ident_path, self_ident_path, sizeof(ident_path));
+            if (!(flags & EDF_GEN_REQUIRE_NATIVE_ID)) {
+                if (edf_write_json_file(self_ident_path, ident) == ESP_OK)
+                    strlcpy(ident_path, self_ident_path, sizeof(ident_path));
             }
         }
     }
@@ -422,31 +624,50 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         if (ident) {
             ESP_LOGW(TAG, "session %s has no ident.json — using device_metadata.json snapshot",
                      session_id);
-            if (edf_write_json_file(self_ident_path, ident) == ESP_OK) {
-                strlcpy(ident_path, self_ident_path, sizeof(ident_path));
+            if (!(flags & EDF_GEN_REQUIRE_NATIVE_ID)) {
+                if (edf_write_json_file(self_ident_path, ident) == ESP_OK)
+                    strlcpy(ident_path, self_ident_path, sizeof(ident_path));
             }
         }
     }
 
+    if ((flags & EDF_GEN_REQUIRE_NATIVE_ID) && !ident_matches_native(ident)) {
+        ESP_LOGE(TAG, "session %s identity does not match native STR", session_id);
+        cJSON_Delete(ident);
+        free(paths);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return ESP_ERR_INVALID_STATE;
+    }
     const char *ident_serial = ident_get_serial(ident);
 
-    /* Read settings.json for STR.edf settings fields and CurrentSettings.json.
+    /* Read settings.json for CurrentSettings.json. STR history independently
+     * checks the provenance and machine identity of each daily snapshot.
      *
      * Fallback hierarchy when <session_id>_settings.json is missing:
      *   1. Another session's _settings.json in the same day folder
      *   2. summaries/<day>.settings.json
      *   3. The closest day's _settings.json in streams/ (same SerialNumber)
      *   4. The pre-stream device_metadata.json snapshot (same SerialNumber) */
-    char self_settings_path[330];
     snprintf(self_settings_path, sizeof(self_settings_path), "%s/%s_settings.json",
              session_dir, session_id);
-    char settings_path[420];
-    strlcpy(settings_path, self_settings_path, sizeof(settings_path));
-
+    bool settings_historical = false;
+    snprintf(settings_path, sizeof(settings_path), "%s/%s.live.settings.json",
+             session_dir, session_id);
     cJSON *settings = edf_read_json_file(settings_path);
+    if (!settings) {
+        snprintf(settings_path, sizeof(settings_path), "%s/%s.cached.settings.json",
+                 session_dir, session_id);
+        settings = edf_read_json_file(settings_path);
+        settings_historical = settings != NULL;
+    }
+    if (!settings) {
+        strlcpy(settings_path, self_settings_path, sizeof(settings_path));
+        settings = edf_read_json_file(settings_path);
+    }
     if (!settings && day_metadata_fallback(session_dir, session_id, "_settings.json",
                                            settings_path, sizeof(settings_path))) {
         settings = edf_read_json_file(settings_path);
+        settings_historical = settings != NULL;
         if (settings) {
             ESP_LOGW(TAG, "session %s has no settings.json — using %s from the same day",
                      session_id, settings_path);
@@ -456,27 +677,54 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         snprintf(settings_path, sizeof(settings_path), "%s/summaries/%s.settings.json",
                  sessions_root, lookup_day);
         settings = edf_read_json_file(settings_path);
+        settings_historical = settings != NULL;
         if (settings) {
             ESP_LOGW(TAG, "session %s has no settings.json — using %s",
                      session_id, settings_path);
+        }
+    }
+    if (!settings && sessions_root[0] && ident) {
+        /* Bridge-imported sessions have no live snapshot; the native STR
+         * daily snapshot is their settings source.  Require the same
+         * serial/family and current-session coverage before using it. */
+        snprintf(settings_path, sizeof(settings_path),
+                 "%s/summaries/%s.imported.settings.json",
+                 sessions_root, lookup_day);
+        cJSON *imported = edf_read_json_file(settings_path);
+        int family = settings_provenance_family(ident);
+        const char *imported_serial = settings_provenance_serial(imported);
+        if (imported &&
+            settings_provenance_is(imported, SETTINGS_SOURCE_IMPORTED_STR,
+                                   lookup_day, NULL) &&
+            imported_serial && ident_serial &&
+            !strcmp(imported_serial, ident_serial) &&
+            family != SETTINGS_FAMILY_UNKNOWN &&
+            settings_provenance_is_family(imported, family) &&
+            settings_provenance_covers_sessions(imported, lookup_day)) {
+            settings = imported;
+            settings_historical = true;
+            ESP_LOGW(TAG, "session %s has no settings.json — using imported "
+                     "STR settings %s", session_id, settings_path);
+        } else {
+            cJSON_Delete(imported);
         }
     }
     if (!settings && cross_day_metadata_fallback(streams_root, lookup_day, "_settings.json",
                                                  ident_serial, settings_path,
                                                  sizeof(settings_path))) {
         settings = edf_read_json_file(settings_path);
+        settings_historical = settings != NULL;
         if (settings) {
             ESP_LOGW(TAG, "session %s has no settings.json — using %s from another day",
                      session_id, settings_path);
-            edf_write_json_file(self_settings_path, settings);
         }
     }
     if (!settings) {
         settings = device_snapshot_fallback(sessions_root, "settings", ident_serial);
+        settings_historical = settings != NULL;
         if (settings) {
             ESP_LOGW(TAG, "session %s has no settings.json — using device_metadata.json snapshot",
                      session_id);
-            edf_write_json_file(self_settings_path, settings);
         }
     }
     ESP_LOGI(TAG, "settings.json: path=%s %s", settings_path,
@@ -493,12 +741,12 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                  session_id);
         rmdir(day_dir);
         if (settings) cJSON_Delete(settings);
+        free(paths);
         sd_storage_lease_release(SD_LEASE_EXPORT);
         return ESP_FAIL;
     }
 
     /* Path to events.snt for EVE.edf / CSL.edf generation */
-    char events_snt_path[330];
     snprintf(events_snt_path, sizeof(events_snt_path), "%s/%s_events.snt", session_dir, session_id);
 
     /* ── Build EDF header timestamps ──
@@ -520,14 +768,22 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     as11_time_format_edf_datetime(edf_start_ms, start_date, sizeof(start_date),
                         start_time, sizeof(start_time));
 
-    /* BRP/PLD/SA2 start timestamp (NTP clock domain).
+    /* BRP/PLD/SA2 gating windows (NTP clock domain).
      * Prefer _ZLE (Zero Leak Estimate) ValueChange — the AS11's actual
      * data gating signal — over MaskOn.  Fall back to MaskOn if _ZLE
      * is not available (e.g. older sessions or subscription not accepted).
-     * Rationale: https://github.com/ilyakruchinin/SomnoTrace/issues/20#issuecomment-4975037843 */
-    int64_t maskon_start_ms = start_epoch_ms;
-    uint32_t brp_skip = 0, sa2_skip = 0, pld_skip = 0;
-    uint32_t brp_max = 0, sa2_max = 0, pld_max = 0;
+     * Rationale: https://github.com/ilyakruchinin/SomnoTrace/issues/20#issuecomment-4975037843
+     *
+     * When a user removes the mask mid-session without stopping therapy,
+     * the AS11 toggles _ZLE 1→0→1 and emits one BRP/PLD/SA2 triplet per
+     * (_ZLE=1 → _ZLE=0) window while keeping a single EVE/CSL pair. */
+    typedef struct {
+        int64_t  start_ms;
+        uint32_t brp_skip, sa2_skip, pld_skip;
+        uint32_t brp_max,  sa2_max,  pld_max;
+    } edf_wave_win_t;
+    edf_wave_win_t wave_wins[EDF_MAX_ZLE_WINDOWS];
+    int n_wave_wins = 0;
     /* True once a real data-gating signal (_ZLE rising or MaskOn) was found.
      * When false the AS11 never began delivering gated flow data. */
     bool therapy_gated = false;
@@ -546,114 +802,171 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         read_pre_gate_info(session_dir, session_id, &pg);
         bool pre_gated = pg.pre_gated;
         if (pre_gated) {
-            maskon_start_ms = start_epoch_ms + pg.wav_off;
-            if (maskon_start_ms >= end_epoch_ms)
-                maskon_start_ms = start_epoch_ms;
+            int64_t ws = start_epoch_ms + pg.wav_off;
+            if (ws >= end_epoch_ms)
+                ws = start_epoch_ms;
+            memset(&wave_wins[0], 0, sizeof(wave_wins[0]));
+            wave_wins[0].start_ms = ws;
+            n_wave_wins = 1;
             therapy_gated = true;
             emit_brp = pg.emit_brp;
             emit_sa2 = pg.emit_sa2;
             emit_pld = pg.emit_pld;
             ESP_LOGI(TAG, "pre_gated: maskon_start=%lld (offset %lld ms, "
                           "streams already gated — no skip)",
-                     (long long)maskon_start_ms, (long long)pg.wav_off);
+                     (long long)ws, (long long)pg.wav_off);
         }
 
         if (!pre_gated) {
-        int64_t zle_ntp = edf_find_zle_edge_time(events_snt_path, 1, clock_drift_ms);
-        if (zle_ntp > 0 && zle_ntp > start_epoch_ms && zle_ntp < end_epoch_ms) {
-            maskon_start_ms = zle_ntp;
-            therapy_gated = true;
-            int64_t skip_ms = zle_ntp - start_epoch_ms;
-            brp_skip = edf_ms_to_samples_25hz(skip_ms);
-            sa2_skip = edf_ms_to_samples_1hz(skip_ms);
-            pld_skip = edf_ms_to_samples_pld(skip_ms);
-            ESP_LOGI(TAG, "_ZLE: ntp=%lld skip_ms=%lld "
-                         "brp_skip=%u sa2_skip=%u pld_skip=%u",
-                     (long long)zle_ntp, (long long)skip_ms,
-                     (unsigned)brp_skip, (unsigned)sa2_skip,
-                     (unsigned)pld_skip);
-        } else {
-            if (zle_ntp > 0) {
-                ESP_LOGW(TAG, "_ZLE NTP time %lld out of session range "
-                             "[%lld, %lld], falling back to MaskOn",
-                         (long long)zle_ntp,
-                         (long long)start_epoch_ms,
-                         (long long)end_epoch_ms);
-            } else {
-                ESP_LOGI(TAG, "_ZLE not found in events.snt, using MaskOn");
-            }
-            /* Fall back to MaskOn */
-            int64_t maskon_as11 = edf_find_mask_on_time(events_snt_path);
-            if (maskon_as11 > 0) {
-                int64_t maskon_ntp = maskon_as11 + clock_drift_ms;
-                if (maskon_ntp > start_epoch_ms && maskon_ntp < end_epoch_ms) {
-                    maskon_start_ms = maskon_ntp;
-                    therapy_gated = true;
-                    int64_t skip_ms = maskon_ntp - start_epoch_ms;
-                    brp_skip = edf_ms_to_samples_25hz(skip_ms);
-                    sa2_skip = edf_ms_to_samples_1hz(skip_ms);
-                    pld_skip = edf_ms_to_samples_pld(skip_ms);
-                    ESP_LOGI(TAG, "MaskOn: as11=%lld ntp=%lld skip_ms=%lld "
-                                 "brp_skip=%u sa2_skip=%u pld_skip=%u",
-                             (long long)maskon_as11, (long long)maskon_ntp,
-                             (long long)skip_ms,
-                             (unsigned)brp_skip, (unsigned)sa2_skip,
-                             (unsigned)pld_skip);
-                } else {
-                    ESP_LOGW(TAG, "MaskOn NTP time %lld out of session range "
-                                 "[%lld, %lld], using TherapyStart",
-                             (long long)maskon_ntp,
+            edf_zle_window_t zle_wins[EDF_MAX_ZLE_WINDOWS];
+            int nz = edf_find_zle_windows(events_snt_path, clock_drift_ms,
+                                          zle_wins, EDF_MAX_ZLE_WINDOWS);
+            int64_t win_durs[EDF_MAX_ZLE_WINDOWS];
+            int64_t maskoff_ntp_cached = -1;
+            bool maskoff_checked = false;
+
+            for (int i = 0; i < nz; i++) {
+                int64_t ws = zle_wins[i].start_ms;
+                if (!(ws > start_epoch_ms && ws < end_epoch_ms)) {
+                    ESP_LOGW(TAG, "_ZLE[%d] NTP time %lld out of session range "
+                                 "[%lld, %lld], skipping",
+                             i, (long long)ws,
                              (long long)start_epoch_ms,
                              (long long)end_epoch_ms);
+                    continue;
+                }
+                int64_t we = zle_wins[i].end_ms;
+                const char *end_src = "_ZLE-falling";
+                if (we == 0) {
+                    if (!maskoff_checked) {
+                        int64_t moff_as11 = edf_find_mask_off_time(events_snt_path);
+                        if (moff_as11 > 0)
+                            maskoff_ntp_cached = moff_as11 + clock_drift_ms;
+                        maskoff_checked = true;
+                    }
+                    if (maskoff_ntp_cached > ws && maskoff_ntp_cached <= end_epoch_ms) {
+                        we = maskoff_ntp_cached;
+                        end_src = "MaskOff";
+                    }
+                }
+                (void)end_src;
+
+                edf_wave_win_t w;
+                memset(&w, 0, sizeof(w));
+                w.start_ms = ws;
+                int64_t skip_ms = ws - start_epoch_ms;
+                w.brp_skip = edf_ms_to_samples_25hz(skip_ms);
+                w.sa2_skip = edf_ms_to_samples_1hz(skip_ms);
+                w.pld_skip = edf_ms_to_samples_pld(skip_ms);
+                ESP_LOGI(TAG, "_ZLE[%d]: ntp=%lld skip_ms=%lld "
+                             "brp_skip=%u sa2_skip=%u pld_skip=%u",
+                         i, (long long)ws, (long long)skip_ms,
+                         (unsigned)w.brp_skip, (unsigned)w.sa2_skip,
+                         (unsigned)w.pld_skip);
+
+                int64_t eff_end = end_epoch_ms;
+                if (we > 0) {
+                    if (we > ws && we <= end_epoch_ms) {
+                        int64_t dur_ms = we - ws;
+                        eff_end = we;
+                        w.brp_max = edf_ms_to_samples_25hz(dur_ms);
+                        w.sa2_max = edf_ms_to_samples_1hz(dur_ms);
+                        w.pld_max = edf_ms_to_samples_pld(dur_ms);
+                        ESP_LOGI(TAG, "end[%d] (%s): ntp=%lld dur_ms=%lld "
+                                     "brp_max=%u sa2_max=%u pld_max=%u",
+                                 i, end_src, (long long)we, (long long)dur_ms,
+                                 (unsigned)w.brp_max, (unsigned)w.sa2_max,
+                                 (unsigned)w.pld_max);
+                    } else {
+                        ESP_LOGW(TAG, "end[%d] (%s) NTP time %lld out of range "
+                                     "(%lld, %lld], no end truncation",
+                                 i, end_src, (long long)we,
+                                 (long long)ws, (long long)end_epoch_ms);
+                    }
+                } else {
+                    ESP_LOGI(TAG, "_ZLE[%d]: open at EOF, no end truncation", i);
+                }
+
+                win_durs[n_wave_wins] = eff_end - ws;
+                wave_wins[n_wave_wins++] = w;
+            }
+
+            if (n_wave_wins > 0) {
+                therapy_gated = true;
+                if (n_wave_wins > 1) {
+                    int kept = 0;
+                    for (int i = 0; i < n_wave_wins; i++) {
+                        if (win_durs[i] >= 60000)
+                            wave_wins[kept++] = wave_wins[i];
+                    }
+                    if (kept > 0)
+                        n_wave_wins = kept;
+                    else
+                        n_wave_wins = 1;
                 }
             } else {
-                ESP_LOGI(TAG, "MaskOn not found in events.snt, using TherapyStart "
-                             "for BRP/PLD/SA2");
-            }
-        }
+                if (nz == 0)
+                    ESP_LOGI(TAG, "_ZLE not found in events.snt, using MaskOn");
+                /* Fall back to MaskOn / MaskOff */
+                edf_wave_win_t w;
+                memset(&w, 0, sizeof(w));
+                w.start_ms = start_epoch_ms;
 
-        /* BRP/PLD/SA2 end timestamp (for end truncation).
-         * AS11 EDF data spans exactly the _ZLE gating window, but .snt
-         * captures TherapyStart→TherapyStop, so the tail must be truncated.
-         *
-         * Prefer the _ZLE falling edge — the symmetric counterpart of the
-         * rising edge used for the start, in the same clock domain.  Fall back
-         * to the last MaskOff only when no falling edge is present.  MaskOff
-         * alone is unreliable: many sessions emit no MaskOff event at all
-         * (e.g. SmartStop), in which case end truncation silently never ran
-         * and the file simply ended wherever the .snt capture stopped. */
-        int64_t end_ntp = edf_find_zle_edge_time(events_snt_path, 0, clock_drift_ms);
-        const char *end_src = "_ZLE-falling";
-        (void)end_src;   /* host ESP_LOG* are no-ops — string is log-only */
-        if (end_ntp <= 0) {
-            int64_t maskoff_as11 = edf_find_mask_off_time(events_snt_path);
-            if (maskoff_as11 > 0) {
-                end_ntp = maskoff_as11 + clock_drift_ms;
-                end_src = "MaskOff";
+                int64_t maskon_as11 = edf_find_mask_on_time(events_snt_path);
+                if (maskon_as11 > 0) {
+                    int64_t maskon_ntp = maskon_as11 + clock_drift_ms;
+                    if (maskon_ntp > start_epoch_ms && maskon_ntp < end_epoch_ms) {
+                        w.start_ms = maskon_ntp;
+                        therapy_gated = true;
+                        int64_t skip_ms = maskon_ntp - start_epoch_ms;
+                        w.brp_skip = edf_ms_to_samples_25hz(skip_ms);
+                        w.sa2_skip = edf_ms_to_samples_1hz(skip_ms);
+                        w.pld_skip = edf_ms_to_samples_pld(skip_ms);
+                        ESP_LOGI(TAG, "MaskOn: as11=%lld ntp=%lld skip_ms=%lld "
+                                     "brp_skip=%u sa2_skip=%u pld_skip=%u",
+                                 (long long)maskon_as11, (long long)maskon_ntp,
+                                 (long long)skip_ms,
+                                 (unsigned)w.brp_skip, (unsigned)w.sa2_skip,
+                                 (unsigned)w.pld_skip);
+                    } else {
+                        ESP_LOGW(TAG, "MaskOn NTP time %lld out of session range "
+                                     "[%lld, %lld], using TherapyStart",
+                                 (long long)maskon_ntp,
+                                 (long long)start_epoch_ms,
+                                 (long long)end_epoch_ms);
+                    }
+                } else {
+                    ESP_LOGI(TAG, "MaskOn not found in events.snt, using TherapyStart "
+                                 "for BRP/PLD/SA2");
+                }
+
+                int64_t maskoff_as11 = edf_find_mask_off_time(events_snt_path);
+                if (maskoff_as11 > 0) {
+                    int64_t end_ntp = maskoff_as11 + clock_drift_ms;
+                    if (end_ntp > w.start_ms && end_ntp <= end_epoch_ms) {
+                        int64_t dur_ms = end_ntp - w.start_ms;
+                        w.brp_max = edf_ms_to_samples_25hz(dur_ms);
+                        w.sa2_max = edf_ms_to_samples_1hz(dur_ms);
+                        w.pld_max = edf_ms_to_samples_pld(dur_ms);
+                        ESP_LOGI(TAG, "end (MaskOff): ntp=%lld dur_ms=%lld "
+                                     "brp_max=%u sa2_max=%u pld_max=%u",
+                                 (long long)end_ntp, (long long)dur_ms,
+                                 (unsigned)w.brp_max, (unsigned)w.sa2_max,
+                                 (unsigned)w.pld_max);
+                    } else {
+                        ESP_LOGW(TAG, "end (MaskOff) NTP time %lld out of range "
+                                     "(%lld, %lld], no end truncation",
+                                 (long long)end_ntp,
+                                 (long long)w.start_ms,
+                                 (long long)end_epoch_ms);
+                    }
+                } else {
+                    ESP_LOGI(TAG, "no _ZLE falling edge or MaskOff in events.snt, "
+                                  "no end truncation");
+                }
+                wave_wins[0] = w;
+                n_wave_wins = 1;
             }
-        }
-        if (end_ntp > 0) {
-            if (end_ntp > maskon_start_ms && end_ntp <= end_epoch_ms) {
-                int64_t dur_ms = end_ntp - maskon_start_ms;
-                brp_max = edf_ms_to_samples_25hz(dur_ms);
-                sa2_max = edf_ms_to_samples_1hz(dur_ms);
-                pld_max = edf_ms_to_samples_pld(dur_ms);
-                ESP_LOGI(TAG, "end (%s): ntp=%lld dur_ms=%lld "
-                             "brp_max=%u sa2_max=%u pld_max=%u",
-                         end_src, (long long)end_ntp, (long long)dur_ms,
-                         (unsigned)brp_max, (unsigned)sa2_max,
-                         (unsigned)pld_max);
-            } else {
-                ESP_LOGW(TAG, "end (%s) NTP time %lld out of range "
-                             "(%lld, %lld], no end truncation",
-                         end_src, (long long)end_ntp,
-                         (long long)maskon_start_ms,
-                         (long long)end_epoch_ms);
-            }
-        } else {
-            ESP_LOGI(TAG, "no _ZLE falling edge or MaskOff in events.snt, "
-                          "no end truncation");
-        }
         }   /* !pre_gated */
     }
     /* ── Aborted session with no therapy: emit no per-session files ──
@@ -705,172 +1018,185 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
         }
     }
 
-    char maskon_date[16], maskon_time[16];
-    as11_time_format_edf_datetime(maskon_start_ms, maskon_date, sizeof(maskon_date),
-                        maskon_time, sizeof(maskon_time));
-    char maskon_ts_prefix[32];
-    as11_time_format_session_prefix(maskon_start_ms, maskon_ts_prefix,
-                      sizeof(maskon_ts_prefix));
-
-    /* Recording ID: TherapyStart for EVE/CSL, MaskOn for BRP/PLD/SA2. */
+    /* Recording ID: TherapyStart for EVE/CSL, MaskOn/_ZLE for BRP/PLD/SA2. */
     char recording_id[128];       /* TherapyStart-based (EVE/CSL) */
     format_recording_id_from_ident(recording_id, sizeof(recording_id),
                         edf_start_ms, ident);
-    char maskon_recording_id[128]; /* MaskOn-based (BRP/PLD/SA2) */
-    format_recording_id_from_ident(maskon_recording_id, sizeof(maskon_recording_id),
-                        maskon_start_ms, ident);
 
     /* Patient ID has CRC filled in by edf_write_header.
      * Initial value is the "X X X X" prefix with placeholder zeros. */
     char patient_id[81] = "X X X X 0000 0000";
 
     int errors = 0;
+    bool allocation_failed = false;
 
-    /* ── Generate BRP.edf (25 Hz breath waveform) ──
-     * v2 format: flow.snt + press.snt (separate 1-ch files).
-     * v1 (backwards compat): brp.snt (single 2-ch interleaved file).
-     * Try v2 first; if flow.snt doesn't exist, fall back to v1 brp.snt. */
-    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy && emit_brp) {
-        char snt_path[300], edf_path[350], press_path[300];
-        snprintf(snt_path, sizeof(snt_path), "%s/%s_flow.snt", session_dir, session_id);
-        snprintf(press_path, sizeof(press_path), "%s/%s_press.snt", session_dir, session_id);
-        snprintf(edf_path, sizeof(edf_path), "%s/%s_BRP.edf", day_dir, maskon_ts_prefix);
+    for (int wi = 0; wi < n_wave_wins && (flags & EDF_GEN_PER_SESSION) && !no_therapy; wi++) {
+        const edf_wave_win_t *w = &wave_wins[wi];
+        char maskon_date[16], maskon_time[16];
+        as11_time_format_edf_datetime(w->start_ms, maskon_date, sizeof(maskon_date),
+                            maskon_time, sizeof(maskon_time));
+        char maskon_ts_prefix[32];
+        as11_time_format_session_prefix(w->start_ms, maskon_ts_prefix,
+                          sizeof(maskon_ts_prefix));
+        char maskon_recording_id[128]; /* MaskOn-based (BRP/PLD/SA2) */
+        format_recording_id_from_ident(maskon_recording_id, sizeof(maskon_recording_id),
+                            w->start_ms, ident);
 
-        edf_signal_def_t brp_sigs[] = {
-            { .label = "Flow.40ms", .transducer = "",
-              .unit = "L/s", .phys_min = -2.0, .phys_max = 3.0,
-              .dig_min = -1000, .dig_max = 1500,
-              .prefilter = "", .samples_per_record = 1500 },
-            { .label = "Press.40ms", .transducer = "",
-              .unit = "cmH2O", .phys_min = 0.0, .phys_max = 40.0,
-              .dig_min = 0, .dig_max = 2000,
-              .prefilter = "", .samples_per_record = 1500 },
-        };
+        /* ── Generate BRP.edf (25 Hz breath waveform) ──
+         * v2 format: flow.snt + press.snt (separate 1-ch files).
+         * v1 (backwards compat): brp.snt (single 2-ch interleaved file).
+         * Try v2 first; if flow.snt doesn't exist, fall back to v1 brp.snt. */
+        if (emit_brp) {
+            char snt_path[300], edf_path[350], press_path[300];
+            snprintf(snt_path, sizeof(snt_path), "%s/%s_flow.snt", session_dir, session_id);
+            snprintf(press_path, sizeof(press_path), "%s/%s_press.snt", session_dir, session_id);
+            snprintf(edf_path, sizeof(edf_path), "%s/%s_BRP.edf", day_dir, maskon_ts_prefix);
 
-        /* Check if v2 flow.snt exists; if not, fall back to v1 brp.snt */
-        struct stat st_test;
-        const char *press_arg = press_path;
-        if (stat(snt_path, &st_test) != 0) {
-            /* v1 fallback: use brp.snt (2-ch interleaved, no second file) */
-            snprintf(snt_path, sizeof(snt_path), "%s/%s_brp.snt", session_dir, session_id);
-            press_arg = NULL;
+            static const edf_signal_def_t brp_sigs[] = {
+                { .label = "Flow.40ms", .transducer = "",
+                  .unit = "L/s", .phys_min = -2.0, .phys_max = 3.0,
+                  .dig_min = -1000, .dig_max = 1500,
+                  .prefilter = "", .samples_per_record = 1500 },
+                { .label = "Press.40ms", .transducer = "",
+                  .unit = "cmH2O", .phys_min = 0.0, .phys_max = 40.0,
+                  .dig_min = 0, .dig_max = 2000,
+                  .prefilter = "", .samples_per_record = 1500 },
+            };
+
+            /* Check if v2 flow.snt exists; if not, fall back to v1 brp.snt */
+            struct stat st_test;
+            const char *press_arg = press_path;
+            if (stat(snt_path, &st_test) != 0) {
+                /* v1 fallback: use brp.snt (2-ch interleaved, no second file) */
+                snprintf(snt_path, sizeof(snt_path), "%s/%s_brp.snt", session_dir, session_id);
+                press_arg = NULL;
+            }
+            esp_err_t err = edf_convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
+                                                   maskon_date, maskon_time, brp_sigs, 2, "60.00",
+                                                   NULL, w->brp_skip, w->brp_max, press_arg);
+            if (err != ESP_OK) {
+                allocation_failed |= err == ESP_ERR_NO_MEM;
+                errors++;
+            }
         }
-        if (edf_convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
-                               maskon_date, maskon_time, brp_sigs, 2, "60.00",
-                               NULL, brp_skip, brp_max, press_arg) != ESP_OK) {
-            errors++;
+
+        /* ── Generate SA2.edf (1 Hz SpO2/pulse) ── */
+        if (emit_sa2) {
+            char snt_path[300], edf_path[350];
+            snprintf(snt_path, sizeof(snt_path), "%s/%s_sa2.snt", session_dir, session_id);
+            snprintf(edf_path, sizeof(edf_path), "%s/%s_SA2.edf", day_dir, maskon_ts_prefix);
+
+            static const edf_signal_def_t sa2_sigs[] = {
+                { .label = "Pulse.1s", .transducer = "",
+                  .unit = "bpm", .phys_min = 0.0, .phys_max = 300.0,
+                  .dig_min = 0, .dig_max = 300,
+                  .prefilter = "", .samples_per_record = 60,
+                  .invalid_passthrough = true },
+                { .label = "SpO2.1s", .transducer = "",
+                  .unit = "%", .phys_min = 0.0, .phys_max = 100.0,
+                  .dig_min = 0, .dig_max = 100,
+                  .prefilter = "", .samples_per_record = 60,
+                  .invalid_passthrough = true },
+            };
+            esp_err_t err = edf_convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
+                                                   maskon_date, maskon_time, sa2_sigs, 2, "60.00",
+                                                   NULL, w->sa2_skip, w->sa2_max, NULL);
+            if (err != ESP_OK) {
+                allocation_failed |= err == ESP_ERR_NO_MEM;
+                errors++;
+            }
         }
-    }
 
-    /* ── Generate SA2.edf (1 Hz SpO2/pulse) ── */
-    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy && emit_sa2) {
-        char snt_path[300], edf_path[350];
-        snprintf(snt_path, sizeof(snt_path), "%s/%s_sa2.snt", session_dir, session_id);
-        snprintf(edf_path, sizeof(edf_path), "%s/%s_SA2.edf", day_dir, maskon_ts_prefix);
+        /* ── Generate PLD.edf (0.5 Hz per-breath stats) ──
+         *
+         * BLE quantisation note (2026-07-05 reverse-engineering):
+         * The AS11 sends PLD values via BLE at phys×100 (integer physical
+         * units).  Some channels have coarser BLE resolution than the AS11's
+         * internal SD-card EDF:
+         *   - RespRate: BLE sends integer bpm; AS11 internal EDF has 0.2 bpm
+         *     resolution (dig_max=450, phys_max=90).  ~20 % of samples differ
+         *     by ±0.2–1.0 bpm.
+         *   - MinVent: BLE sends 0.01 L/min; AS11 internal EDF has 0.125 L/min
+         *     resolution.  ~24 % of samples differ by ±0.02–0.12.
+         *   - MaskPress: during pressure ramp-up (first ~20 s) BLE and SD sample
+         *     at slightly different moments within the 2 s window, causing
+         *     ±0.02–0.16 cmH2O differences.  Converges to ≤0.04 once stable.
+         * Other channels (Press, EprPress, Leak, TidVol, Snore, FlowLim) match
+         * ≥94 % at offset=0.  These differences are a fundamental BLE data-path
+         * limitation and cannot be fixed by firmware changes.
+         * See spec/archive/edf-as11-comparison-20260629.md §3.6. */
+        if (emit_pld) {
+            char snt_path[300], edf_path[350];
+            snprintf(snt_path, sizeof(snt_path), "%s/%s_pld.snt", session_dir, session_id);
+            snprintf(edf_path, sizeof(edf_path), "%s/%s_PLD.edf", day_dir, maskon_ts_prefix);
 
-        edf_signal_def_t sa2_sigs[] = {
-            { .label = "Pulse.1s", .transducer = "",
-              .unit = "bpm", .phys_min = 0.0, .phys_max = 300.0,
-              .dig_min = 0, .dig_max = 300,
-              .prefilter = "", .samples_per_record = 60,
-              .invalid_passthrough = true },
-            { .label = "SpO2.1s", .transducer = "",
-              .unit = "%", .phys_min = 0.0, .phys_max = 100.0,
-              .dig_min = 0, .dig_max = 100,
-              .prefilter = "", .samples_per_record = 60,
-              .invalid_passthrough = true },
-        };
-        if (edf_convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
-                               maskon_date, maskon_time, sa2_sigs, 2, "60.00",
-                               NULL, sa2_skip, sa2_max, NULL) != ESP_OK) {
-            errors++;
-        }
-    }
-
-    /* ── Generate PLD.edf (0.5 Hz per-breath stats) ──
-     *
-     * BLE quantisation note (2026-07-05 reverse-engineering):
-     * The AS11 sends PLD values via BLE at phys×100 (integer physical
-     * units).  Some channels have coarser BLE resolution than the AS11's
-     * internal SD-card EDF:
-     *   - RespRate: BLE sends integer bpm; AS11 internal EDF has 0.2 bpm
-     *     resolution (dig_max=450, phys_max=90).  ~20 % of samples differ
-     *     by ±0.2–1.0 bpm.
-     *   - MinVent: BLE sends 0.01 L/min; AS11 internal EDF has 0.125 L/min
-     *     resolution.  ~24 % of samples differ by ±0.02–0.12.
-     *   - MaskPress: during pressure ramp-up (first ~20 s) BLE and SD sample
-     *     at slightly different moments within the 2 s window, causing
-     *     ±0.02–0.16 cmH2O differences.  Converges to ≤0.04 once stable.
-     * Other channels (Press, EprPress, Leak, TidVol, Snore, FlowLim) match
-     * ≥94 % at offset=0.  These differences are a fundamental BLE data-path
-     * limitation and cannot be fixed by firmware changes.
-     * See spec/archive/edf-as11-comparison-20260629.md §3.6. */
-    if ((flags & EDF_GEN_PER_SESSION) && !no_therapy && emit_pld) {
-        char snt_path[300], edf_path[350];
-        snprintf(snt_path, sizeof(snt_path), "%s/%s_pld.snt", session_dir, session_id);
-        snprintf(edf_path, sizeof(edf_path), "%s/%s_PLD.edf", day_dir, maskon_ts_prefix);
-
-        edf_signal_def_t pld_sigs[] = {
-            { .label = "MaskPress.2s", .transducer = "",
-              .unit = "cmH2O", .phys_min = 0.0, .phys_max = 40.0,
-              .dig_min = 0, .dig_max = 2000,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "Press.2s", .transducer = "",
-              .unit = "cmH2O", .phys_min = 0.0, .phys_max = 50.0,
-              .dig_min = 0, .dig_max = 2500,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "EprPress.2s", .transducer = "",
-              .unit = "cmH2O", .phys_min = 0.0, .phys_max = 30.0,
-              .dig_min = 0, .dig_max = 1500,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "Leak.2s", .transducer = "",
-              .unit = "L/s", .phys_min = 0.0, .phys_max = 2.0,
-              .dig_min = 0, .dig_max = 100,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "RespRate.2s", .transducer = "",
-              .unit = "bpm", .phys_min = 0.0, .phys_max = 90.0,
-              .dig_min = 0, .dig_max = 450,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "TidVol.2s", .transducer = "",
-              .unit = "L", .phys_min = 0.0, .phys_max = 4.0,
-              .dig_min = 0, .dig_max = 200,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "MinVent.2s", .transducer = "",
-              .unit = "L/min", .phys_min = 0.0, .phys_max = 30.0,
-              .dig_min = 0, .dig_max = 240,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "Snore.2s", .transducer = "",
-              .unit = "", .phys_min = 0.0, .phys_max = 5.0,
-              .dig_min = 0, .dig_max = 250,
-              .prefilter = "", .samples_per_record = 30 },
-            { .label = "FlowLim.2s", .transducer = "",
-              .unit = "", .phys_min = 0.0, .phys_max = 1.0,
-              .dig_min = 0, .dig_max = 100,
-              .prefilter = "", .samples_per_record = 30,
-              .invalid_passthrough = true },
-        };
-        /* PLD .snt has 12 channels but AS11 EDF (VID=3) only has 9.
-         * Channel order in .snt: 0=MaskPress, 1=Press, 2=EprPress, 3=Leak,
-         * 4=RespRate, 5=TidVol, 6=MinVent, 7=TgtVent, 8=IERatio,
-         * 9=Snore, 10=FlowLim, 11=Ti
-         * EDF drops TgtVent(7), IERatio(8), Ti(11). */
-        static const int pld_ch_map[] = {0, 1, 2, 3, 4, 5, 6, 9, 10};
-        if (edf_convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
-                               maskon_date, maskon_time, pld_sigs, 9, "60.00",
-                               pld_ch_map, pld_skip, pld_max, NULL) != ESP_OK) {
-            errors++;
+            static const edf_signal_def_t pld_sigs[] = {
+                { .label = "MaskPress.2s", .transducer = "",
+                  .unit = "cmH2O", .phys_min = 0.0, .phys_max = 40.0,
+                  .dig_min = 0, .dig_max = 2000,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "Press.2s", .transducer = "",
+                  .unit = "cmH2O", .phys_min = 0.0, .phys_max = 50.0,
+                  .dig_min = 0, .dig_max = 2500,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "EprPress.2s", .transducer = "",
+                  .unit = "cmH2O", .phys_min = 0.0, .phys_max = 30.0,
+                  .dig_min = 0, .dig_max = 1500,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "Leak.2s", .transducer = "",
+                  .unit = "L/s", .phys_min = 0.0, .phys_max = 2.0,
+                  .dig_min = 0, .dig_max = 100,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "RespRate.2s", .transducer = "",
+                  .unit = "bpm", .phys_min = 0.0, .phys_max = 90.0,
+                  .dig_min = 0, .dig_max = 450,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "TidVol.2s", .transducer = "",
+                  .unit = "L", .phys_min = 0.0, .phys_max = 4.0,
+                  .dig_min = 0, .dig_max = 200,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "MinVent.2s", .transducer = "",
+                  .unit = "L/min", .phys_min = 0.0, .phys_max = 30.0,
+                  .dig_min = 0, .dig_max = 240,
+                  .prefilter = "", .samples_per_record = 30 },
+                { .label = "Snore.2s", .transducer = "",
+                  .unit = "", .phys_min = 0.0, .phys_max = 5.0,
+                  .dig_min = 0, .dig_max = 250,
+                  .prefilter = "", .samples_per_record = 30,
+                  .invalid_passthrough = true, .clamp_valid = true },
+                { .label = "FlowLim.2s", .transducer = "",
+                  .unit = "", .phys_min = 0.0, .phys_max = 1.0,
+                  .dig_min = 0, .dig_max = 100,
+                  .prefilter = "", .samples_per_record = 30,
+                  .invalid_passthrough = true },
+            };
+            /* PLD .snt has 12 channels but AS11 EDF (VID=3) only has 9.
+             * Channel order in .snt: 0=MaskPress, 1=Press, 2=EprPress, 3=Leak,
+             * 4=RespRate, 5=TidVol, 6=MinVent, 7=TgtVent, 8=IERatio,
+             * 9=Snore, 10=FlowLim, 11=Ti
+             * EDF drops TgtVent(7), IERatio(8), Ti(11). */
+            static const int pld_ch_map[] = {0, 1, 2, 3, 4, 5, 6, 9, 10};
+            esp_err_t err = edf_convert_snt_to_edf(snt_path, edf_path, patient_id, maskon_recording_id,
+                                                   maskon_date, maskon_time, pld_sigs, 9, "60.00",
+                                                   pld_ch_map, w->pld_skip, w->pld_max, NULL);
+            if (err != ESP_OK) {
+                allocation_failed |= err == ESP_ERR_NO_MEM;
+                errors++;
+            }
         }
     }
 
     /* ── Generate STR.edf from per-day summary spool files ──
      * STR.edf goes in the SDCARD root (not inside DATALOG/) — it is a
      * multi-day cumulative file with one record per day. */
-    if ((flags & EDF_GEN_SHARED) &&
-        edf_generate_str_edf(out_root, patient_id, recording_id,
-                         "", settings,
-                         session_dir, session_id,
-                         start_epoch_ms, end_epoch_ms, clock_drift_ms) != ESP_OK) {
-        errors++;
+    if (flags & (EDF_GEN_SHARED | EDF_GEN_SHARED_HISTORICAL)) {
+        esp_err_t err = edf_generate_str_edf(out_root, patient_id, recording_id,
+                                              "", settings, ident, session_dir, session_id,
+                                              start_epoch_ms, end_epoch_ms, clock_drift_ms);
+        if (err != ESP_OK) {
+            allocation_failed |= err == ESP_ERR_NO_MEM;
+            errors++;
+        }
     }
 
     /* ── Check if session is long enough for EVE/CSL ──
@@ -892,10 +1218,11 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     if ((flags & EDF_GEN_PER_SESSION) && !no_therapy) {
         char eve_path[350];
         snprintf(eve_path, sizeof(eve_path), "%s/%s_EVE.edf", day_dir, ts_prefix);
-        if (edf_generate_eve_edf(eve_path, events_snt_path,
-                                 start_epoch_ms, clock_drift_ms,
-                                 patient_id, recording_id,
-                                 start_date, start_time) != ESP_OK) {
+        esp_err_t err = edf_generate_eve_edf(eve_path, events_snt_path,
+                                              start_epoch_ms, clock_drift_ms,
+                                              patient_id, recording_id, start_date, start_time);
+        if (err != ESP_OK) {
+            allocation_failed |= err == ESP_ERR_NO_MEM;
             errors++;
         }
 
@@ -905,10 +1232,11 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
          * "Recording starts" marker record. */
         char csl_path[350];
         snprintf(csl_path, sizeof(csl_path), "%s/%s_CSL.edf", day_dir, ts_prefix);
-        if (edf_generate_csl_edf(csl_path, events_snt_path,
-                                 start_epoch_ms, clock_drift_ms,
-                                 patient_id, recording_id,
-                                 start_date, start_time) != ESP_OK) {
+        err = edf_generate_csl_edf(csl_path, events_snt_path,
+                                   start_epoch_ms, clock_drift_ms,
+                                   patient_id, recording_id, start_date, start_time);
+        if (err != ESP_OK) {
+            allocation_failed |= err == ESP_ERR_NO_MEM;
             errors++;
         }
     }
@@ -922,11 +1250,41 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
     /* ── Copy settings to SDCARD/SETTINGS/CurrentSettings.json ──
      * The device returns {"SettingProfiles":{...}} but AS11 nests this under
      * a "FlowGenerator" wrapper: {"FlowGenerator":{"SettingProfiles":{...}}}.
-     * Use a reference wrapper so the original `settings` tree is freed once
-     * below (cJSON_AddItemReferenceToObject does not transfer ownership). */
-    if ((flags & EDF_GEN_SHARED) && settings) {
+     * Strip internal provenance before publishing the device-compatible JSON.
+     * Only a current raw card capture or this session's live capture may
+     * replace CurrentSettings; imported/legacy/borrowed daily evidence is
+     * historical and must not be advertised as the device's current state. */
+    bool publish_current = settings && !settings_historical;
+    if (publish_current) {
+        const cJSON *meta = cJSON_GetObjectItem(settings, SETTINGS_PROVENANCE_KEY);
+        if (cJSON_IsObject(meta)) {
+            char current_day[16];
+            as11_time_noon_day(start_epoch_ms - clock_drift_ms, current_day,
+                               sizeof(current_day));
+            publish_current = settings_provenance_is(settings, SETTINGS_SOURCE_LIVE,
+                                                     current_day, session_id);
+        }
+    }
+    if ((flags & EDF_GEN_SHARED) && settings && !publish_current)
+        ESP_LOGW(TAG, "not publishing borrowed/historical settings as CurrentSettings.json");
+    if ((flags & EDF_GEN_SHARED) && settings && publish_current) {
         cJSON *cs_root = cJSON_CreateObject();
-        cJSON_AddItemReferenceToObject(cs_root, "FlowGenerator", settings);
+        cJSON *cs_settings = cJSON_Duplicate(settings, true);
+        if (!cs_root || !cs_settings) {
+            cJSON_Delete(cs_root);
+            cJSON_Delete(cs_settings);
+            allocation_failed = true;
+            errors++;
+            goto after_current_settings;
+        }
+        cJSON_DeleteItemFromObjectCaseSensitive(cs_settings, SETTINGS_PROVENANCE_KEY);
+        if (!cJSON_AddItemToObject(cs_root, "FlowGenerator", cs_settings)) {
+            cJSON_Delete(cs_settings);
+            cJSON_Delete(cs_root);
+            allocation_failed = true;
+            errors++;
+            goto after_current_settings;
+        }
         char *settings_str = cJSON_PrintUnformatted(cs_root);
         cJSON_Delete(cs_root);
         if (settings_str) {
@@ -958,13 +1316,17 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                         /* Realloc to make room for 2 extra bytes */
                         size_t old_len = strlen(settings_str);
                         char *tmp = realloc(settings_str, old_len + 3);
-                        if (tmp) {
-                            settings_str = tmp;
-                            memmove(settings_str + insert_pos + 2,
-                                    settings_str + insert_pos, tail_len);
-                            settings_str[insert_pos] = '.';
-                            settings_str[insert_pos + 1] = '0';
+                        if (!tmp) {
+                            free(settings_str);
+                            allocation_failed = true;
+                            errors++;
+                            goto after_current_settings;
                         }
+                        settings_str = tmp;
+                        memmove(settings_str + insert_pos + 2,
+                                settings_str + insert_pos, tail_len);
+                        settings_str[insert_pos] = '.';
+                        settings_str[insert_pos + 1] = '0';
                         p = settings_str + insert_pos + 2;
                     } else {
                         p = scan;
@@ -1023,13 +1385,16 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                     errors++;
                 }
             } else {
-                unlink(cs_crc_path);
-                ESP_LOGW(TAG, "CurrentSettings.json write failed — removed stale %s", cs_crc_path);
+                ESP_LOGW(TAG, "CurrentSettings.json write failed — retaining previous files");
                 errors++;
             }
             free(settings_str);
+        } else {
+            allocation_failed = true;
+            errors++;
         }
     }
+after_current_settings:
 
     /* ── Cleanup ── */
     if (ident) cJSON_Delete(ident);
@@ -1038,9 +1403,24 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
 
     ESP_LOGI(TAG, "=== EDF GENERATION DONE (%d errors) ===", errors);
 
+    free(paths);
     sd_storage_lease_release(SD_LEASE_EXPORT);
-    return errors > 0 ? ESP_FAIL : ESP_OK;
+    return allocation_failed ? ESP_ERR_NO_MEM : errors > 0 ? ESP_FAIL : ESP_OK;
 }
+
+#undef root_datalog
+#undef root_settings
+#undef day_folder
+#undef day_dir
+#undef ts_prefix
+#undef streams_root
+#undef sessions_root
+#undef dir_day_label
+#undef self_ident_path
+#undef ident_path
+#undef self_settings_path
+#undef settings_path
+#undef events_snt_path
 
 /* ════════════════════════════════════════════════════════════════════
  *  Section 12: Transactional single-day rebuild
@@ -1074,6 +1454,33 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
  * automatic rebuild.  It is written outside the day folder because the day
  * folder itself is deleted during publication. */
 #define REBUILD_SENTINEL      SD_SDCARD_DIR "/.rebuilding"
+
+static esp_err_t rebuild_write_sentinel(const char *day)
+{
+    FILE *existing = fopen(REBUILD_SENTINEL, "r");
+    if (existing) {
+        char saved[16] = "";
+        bool same = fgets(saved, sizeof(saved), existing) &&
+                    !strncmp(saved, day, 8) &&
+                    (saved[8] == '\n' || saved[8] == '\0');
+        fclose(existing);
+        if (!same) {
+            ESP_LOGE(TAG, "rebuild: another interrupted day is pending recovery");
+            return ESP_ERR_INVALID_STATE;
+        }
+        return ESP_OK;
+    }
+    if (errno != ENOENT) return ESP_FAIL;
+    char tmp[380], text[16];
+    int len = snprintf(text, sizeof(text), "%s\n", day);
+    FILE *f = edf_open_atomic_file(REBUILD_SENTINEL, tmp, sizeof(tmp));
+    if (!f) return ESP_FAIL;
+    if (len < 0 || (size_t)len >= sizeof(text) || !edf_write_all(f, text, (size_t)len)) {
+        edf_discard_atomic_file(f, tmp);
+        return ESP_FAIL;
+    }
+    return edf_finalize_atomic_file(f, tmp, REBUILD_SENTINEL);
+}
 
 typedef struct {
     char    session_id[40];
@@ -1129,35 +1536,40 @@ static esp_err_t rebuild_move_dir(const char *src, const char *dst)
 }
 
 /* Read one session manifest into a rebuild descriptor. */
-static bool rebuild_read_manifest(const char *day_path, const char *fname,
-                                  rebuild_session_t *out)
+static esp_err_t rebuild_read_manifest(const char *day_path, const char *fname,
+                                       rebuild_session_t *out)
 {
     const char *suffix = "_session.json";
     size_t slen = strlen(suffix), flen = strlen(fname);
-    if (flen <= slen || strcmp(fname + flen - slen, suffix) != 0) return false;
+    if (flen <= slen || strcmp(fname + flen - slen, suffix) != 0) return ESP_ERR_NOT_FOUND;
 
     size_t prefix_len = flen - slen;
-    if (prefix_len == 0 || prefix_len >= sizeof(out->session_id)) return false;
+    if (prefix_len == 0 || prefix_len >= sizeof(out->session_id)) return ESP_ERR_INVALID_ARG;
 
     char json_path[656];
     snprintf(json_path, sizeof(json_path), "%s/%s", day_path, fname);
     FILE *f = fopen(json_path, "r");
-    if (!f) return false;
-    fseek(f, 0, SEEK_END);
+    if (!f) return ESP_FAIL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return ESP_FAIL; }
     long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > 16384) { fclose(f); return false; }
-    char *buf = malloc(size + 1);
-    if (!buf) { fclose(f); return false; }
+    if (size <= 0 || size > 16384 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return ESP_FAIL;
+    }
+    char *buf = heap_caps_malloc((size_t)size + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) { fclose(f); return ESP_ERR_NO_MEM; }
     size_t rd = fread(buf, 1, size, f);
     fclose(f);
+    if (rd != (size_t)size) { free(buf); return ESP_FAIL; }
     buf[rd] = '\0';
 
+    errno = 0;
     cJSON *j = cJSON_Parse(buf);
+    int parse_errno = errno;
     free(buf);
     if (!j) {
-        ESP_LOGW(TAG, "rebuild: %s is not valid JSON, skipping", fname);
-        return false;
+        ESP_LOGW(TAG, "rebuild: %s could not be parsed", fname);
+        return parse_errno == ENOMEM ? ESP_ERR_NO_MEM : ESP_FAIL;
     }
 
     bool ok = false;
@@ -1187,8 +1599,20 @@ static bool rebuild_read_manifest(const char *day_path, const char *fname,
             bool usable = ju ? cJSON_IsTrue(ju) : measured;
             (void)usable;   /* host ESP_LOG* are no-ops — value is log-only */
             if (!measured) {
-                ESP_LOGW(TAG, "rebuild: %s drift is an estimate (usable=%d)",
-                         out->session_id, (int)usable);
+                /* Bridge-imported sessions with no usable drift evidence
+                 * keep the warning; everywhere else (NTP-timed captures
+                 * where drift 0 is the expected value, or imports carrying
+                 * a usable estimate) it is informational, not a defect. */
+                cJSON *jsrc = cJSON_GetObjectItem(j, "clock_drift_source");
+                bool imported = cJSON_IsString(jsrc) && jsrc->valuestring &&
+                                !strncmp(jsrc->valuestring, "somnobridge", 11);
+                if (imported && !usable) {
+                    ESP_LOGW(TAG, "rebuild: %s drift is an estimate (usable=%d)",
+                             out->session_id, (int)usable);
+                } else {
+                    ESP_LOGI(TAG, "rebuild: %s drift is an estimate (usable=%d)",
+                             out->session_id, (int)usable);
+                }
             }
             ok = true;
         } else {
@@ -1197,12 +1621,130 @@ static bool rebuild_read_manifest(const char *day_path, const char *fname,
         }
     }
     cJSON_Delete(j);
-    return ok;
+    return ok ? ESP_OK : ESP_ERR_INVALID_ARG;
 }
 
-esp_err_t edf_gen_rebuild_day(const char *day_folder)
+/* The newest streams day is the one whose rebuild may refresh the current
+ * root artifacts.  If it cannot be determined, fail closed: generate only
+ * the cumulative STR and never overwrite current identity/settings from an
+ * older day. */
+static bool newest_streams_day(char out[9])
+{
+    DIR *d = opendir(SD_STREAMS_DIR);
+    if (!d) return false;
+    char best[9] = "";
+    struct dirent *ent;
+    bool failed = false;
+    for (;;) {
+        errno = 0;
+        ent = readdir(d);
+        if (!ent) { failed = errno != 0; break; }
+        const char *n = ent->d_name;
+        if (strlen(n) != 8) continue;
+        bool digits = true;
+        for (int i = 0; i < 8; i++)
+            if (n[i] < '0' || n[i] > '9') { digits = false; break; }
+        if (!digits) continue;
+        if (!best[0] || strcmp(n, best) > 0) memcpy(best, n, 9);
+    }
+    closedir(d);
+    if (failed || !best[0]) return false;
+    memcpy(out, best, 9);
+    return true;
+}
+
+/* Ignore empty streams directories when finding the latest real session.
+ * A present but unreadable manifest is not silently treated as no session. */
+static esp_err_t newest_manifest_day(char out[9])
+{
+    out[0] = '\0';
+    DIR *root = opendir(SD_STREAMS_DIR);
+    if (!root) return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    struct dirent *ent;
+    bool failed = false;
+    for (;;) {
+        errno = 0;
+        ent = readdir(root);
+        if (!ent) { failed = errno != 0; break; }
+        const char *name = ent->d_name;
+        if (strlen(name) != 8 || strcmp(name, out) <= 0) continue;
+        bool digits = true;
+        for (int i = 0; i < 8; i++)
+            if (name[i] < '0' || name[i] > '9') digits = false;
+        if (!digits) continue;
+        char path[300];
+        snprintf(path, sizeof(path), "%s/%.8s", SD_STREAMS_DIR, name);
+        DIR *day = opendir(path);
+        if (!day) { failed = true; break; }
+        struct dirent *item;
+        bool have_manifest = false, day_failed = false;
+        for (;;) {
+            errno = 0;
+            item = readdir(day);
+            if (!item) { day_failed = errno != 0; break; }
+            size_t n = strlen(item->d_name);
+            const char suffix[] = "_session.json";
+            if (n > sizeof(suffix) - 1 &&
+                !strcmp(item->d_name + n - (sizeof(suffix) - 1), suffix)) {
+                have_manifest = true;
+                break;
+            }
+        }
+        closedir(day);
+        if (day_failed) { failed = true; break; }
+        if (have_manifest) memcpy(out, name, 9);
+    }
+    closedir(root);
+    if (failed) return ESP_FAIL;
+    return out[0] ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+/* Use the same newest-session fallback drift as a normal day rebuild, but
+ * refresh only the cumulative STR; native settings do not change DATALOG. */
+static esp_err_t rebuild_native_from_latest_session(bool *has_session)
+{
+    *has_session = false;
+    char day[9], day_path[300];
+    esp_err_t found_day = newest_manifest_day(day);
+    if (found_day == ESP_ERR_NOT_FOUND) return ESP_OK;
+    if (found_day != ESP_OK) return found_day;
+    *has_session = true;
+    snprintf(day_path, sizeof(day_path), "%s/%s", SD_STREAMS_DIR, day);
+    DIR *dir = opendir(day_path);
+    if (!dir) return ESP_FAIL;
+    rebuild_session_t newest = {0}, candidate;
+    bool found = false, read_error = false;
+    esp_err_t manifest_error = ESP_OK;
+    struct dirent *ent;
+    for (;;) {
+        errno = 0;
+        ent = readdir(dir);
+        if (!ent) { read_error = errno != 0; break; }
+        esp_err_t r = rebuild_read_manifest(day_path, ent->d_name, &candidate);
+        if (r != ESP_OK && r != ESP_ERR_NOT_FOUND) { manifest_error = r; break; }
+        if (r == ESP_OK &&
+            (!found || candidate.start_epoch_ms > newest.start_epoch_ms)) {
+            newest = candidate;
+            found = true;
+        }
+    }
+    closedir(dir);
+    if (manifest_error != ESP_OK) return manifest_error;
+    if (read_error || !found) {
+        ESP_LOGW(TAG, "native STR: newest streams day has no readable session");
+        return ESP_FAIL;
+    }
+    return edf_gen_generate_ex(SD_SDCARD_DIR, day_path, newest.session_id,
+                               newest.start_epoch_ms, newest.end_epoch_ms,
+                               newest.clock_drift_ms,
+                               EDF_GEN_SHARED_HISTORICAL | EDF_GEN_REQUIRE_NATIVE_ID);
+}
+
+static esp_err_t rebuild_day(const char *day_folder, bool require_native)
 {
     if (!day_folder || strlen(day_folder) != 8) return ESP_ERR_INVALID_ARG;
+    for (int i = 0; i < 8; i++)
+        if (day_folder[i] < '0' || day_folder[i] > '9') return ESP_ERR_INVALID_ARG;
     if (!sd_storage_is_ready()) return ESP_ERR_INVALID_STATE;
 
     /* Hold the lease for the entire transaction: no other export, no upload
@@ -1212,13 +1754,25 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
         return ESP_ERR_TIMEOUT;
     }
 
+    if (require_native) {
+        cJSON *native = edf_read_json_file(SD_SUMMARIES_DIR "/native.ident.json");
+        bool compatible = ident_matches_native(native) && exported_identity_compatible(native);
+        cJSON_Delete(native);
+        if (!compatible) {
+            ESP_LOGE(TAG, "rebuild %s: export identity differs from native STR", day_folder);
+            sd_storage_lease_release(SD_LEASE_EXPORT);
+            return ESP_ERR_INVALID_STATE;
+        }
+    }
+
     ESP_LOGI(TAG, "=== REBUILD DAY %s ===", day_folder);
 
     char day_path[300];
     snprintf(day_path, sizeof(day_path), "%s/%s", SD_STREAMS_DIR, day_folder);
 
-    rebuild_session_t *sessions = calloc(REBUILD_MAX_SESSIONS,
-                                         sizeof(rebuild_session_t));
+    rebuild_session_t *sessions = heap_caps_calloc(REBUILD_MAX_SESSIONS,
+                                                    sizeof(rebuild_session_t),
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!sessions) {
         sd_storage_lease_release(SD_LEASE_EXPORT);
         return ESP_ERR_NO_MEM;
@@ -1226,15 +1780,40 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
 
     int n = 0;
     bool truncated = false;
+    esp_err_t manifest_error = ESP_OK;
     DIR *d = opendir(day_path);
     if (d) {
         struct dirent *ent;
-        while ((ent = readdir(d)) != NULL) {
+        for (;;) {
+            errno = 0;
+            ent = readdir(d);
+            if (!ent) {
+                if (errno != 0) manifest_error = ESP_FAIL;
+                break;
+            }
             if (ent->d_type != DT_REG) continue;
+            size_t len = strlen(ent->d_name);
+            const char suffix[] = "_session.json";
+            if (len <= sizeof(suffix) - 1 ||
+                strcmp(ent->d_name + len - (sizeof(suffix) - 1), suffix) != 0)
+                continue;
             if (n >= REBUILD_MAX_SESSIONS) { truncated = true; break; }
-            if (rebuild_read_manifest(day_path, ent->d_name, &sessions[n])) n++;
+            esp_err_t r = rebuild_read_manifest(day_path, ent->d_name, &sessions[n]);
+            if (r == ESP_OK) n++;
+            else {
+                manifest_error = r;
+                break;
+            }
         }
         closedir(d);
+    } else if (errno != ENOENT) {
+        manifest_error = ESP_FAIL;
+    }
+
+    if (manifest_error != ESP_OK) {
+        free(sessions);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return manifest_error;
     }
 
     if (truncated) {
@@ -1280,9 +1859,10 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
                                          sessions[i].start_epoch_ms,
                                          sessions[i].end_epoch_ms,
                                          sessions[i].clock_drift_ms,
-                                         EDF_GEN_PER_SESSION);
+                                         EDF_GEN_PER_SESSION |
+                                         (require_native ? EDF_GEN_REQUIRE_NATIVE_ID : 0));
         if (r != ESP_OK) {
-            if (sessions[i].interrupted) {
+            if (sessions[i].interrupted && r != ESP_ERR_NO_MEM && r != ESP_ERR_TIMEOUT) {
                 /* A crash-recovered fragment can be damaged in ways no amount
                  * of retrying will fix.  Letting it veto the rebuild would
                  * lose the whole night — every healthy session included — which
@@ -1331,19 +1911,13 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
     mkdir(SD_SDCARD_DIR, 0775);
     mkdir(SD_SDCARD_DATALOG, 0775);
 
-    /* Mark the day as mid-publication before anything is destroyed, so an
-     * interruption from here on is detectable on the next boot. */
-    {
-        FILE *sf = fopen(REBUILD_SENTINEL, "w");
-        if (sf) {
-            fprintf(sf, "%s\n", day_folder);
-            fflush(sf);
-            fsync(fileno(sf));
-            fclose(sf);
-        } else {
-            ESP_LOGW(TAG, "rebuild %s: could not write publish sentinel — an "
-                     "interrupted publish will not self-heal", day_folder);
-        }
+    /* Never start the non-atomic day swap without a durable recovery marker. */
+    if (rebuild_write_sentinel(day_folder) != ESP_OK) {
+        ESP_LOGE(TAG, "rebuild %s: cannot create recovery marker; preserving day", day_folder);
+        rebuild_rmtree(REBUILD_STAGING_DIR);
+        free(sessions);
+        sd_storage_lease_release(SD_LEASE_EXPORT);
+        return ESP_FAIL;
     }
 
     rebuild_rmtree(live_day);
@@ -1362,14 +1936,25 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
      * STR.edf is multi-day and cumulative, and its current-day record is
      * synthesised from the session given here — so it must be the newest
      * session of the day, not an arbitrary one.  Identification and
-     * CurrentSettings likewise come from the newest session's captured data. */
+     * CurrentSettings likewise come from the newest session's captured data,
+     * but only when this is the newest day: rebuilding an older day must not
+     * replace the card's current identity/settings. */
     const rebuild_session_t *newest = &sessions[n - 1];
+    char newest_day[9] = "";
+    bool is_newest = newest_streams_day(newest_day) &&
+                     strcmp(newest_day, day_folder) == 0;
+    if (!is_newest)
+        ESP_LOGI(TAG, "rebuild %s: historical day — preserving current "
+                 "identity/settings", day_folder);
+    uint32_t shared_flags = is_newest ? EDF_GEN_SHARED
+                                      : EDF_GEN_SHARED_HISTORICAL;
+    if (require_native) shared_flags |= EDF_GEN_REQUIRE_NATIVE_ID;
     esp_err_t shared = edf_gen_generate_ex(SD_SDCARD_DIR, day_path,
                                           newest->session_id,
                                           newest->start_epoch_ms,
                                           newest->end_epoch_ms,
                                           newest->clock_drift_ms,
-                                          EDF_GEN_SHARED);
+                                          shared_flags);
     if (shared != ESP_OK) {
         /* The day's per-session files are published and correct; only the
          * cumulative/shared files are stale.  Report it without claiming the
@@ -1398,6 +1983,16 @@ esp_err_t edf_gen_rebuild_day(const char *day_folder)
     return ESP_OK;
 }
 
+esp_err_t edf_gen_rebuild_day(const char *day_folder)
+{
+    return rebuild_day(day_folder, false);
+}
+
+esp_err_t edf_gen_rebuild_day_for_native(const char *day_folder)
+{
+    return rebuild_day(day_folder, true);
+}
+
 bool edf_gen_take_interrupted_rebuild(char *out_day, size_t out_len)
 {
     if (!out_day || out_len < 9) return false;
@@ -1420,14 +2015,36 @@ bool edf_gen_take_interrupted_rebuild(char *out_day, size_t out_len)
         if (buf[i] < '0' || buf[i] > '9') valid = false;
     }
 
-    /* Consume it either way: a malformed sentinel would otherwise be reported
-     * on every boot for ever. */
-    unlink(REBUILD_SENTINEL);
     if (!valid) {
+        /* A malformed sentinel cannot identify a day to retry. */
+        unlink(REBUILD_SENTINEL);
         ESP_LOGW(TAG, "discarding malformed publish sentinel");
         return false;
     }
 
+    /* Keep the marker until a successful rebuild, including if power fails
+     * before the caller has durably queued the retry. */
     strlcpy(out_day, buf, out_len);
     return true;
+}
+
+void edf_gen_release_interrupted_rebuild(const char *day_folder)
+{
+    if (!day_folder || strlen(day_folder) != 8) return;
+
+    FILE *f = fopen(REBUILD_SENTINEL, "r");
+    if (!f) return;
+    char buf[16] = "";
+    bool match = fgets(buf, sizeof(buf), f) &&
+                 !strncmp(buf, day_folder, 8) &&
+                 (buf[8] == '\n' || buf[8] == '\0');
+    fclose(f);
+    if (!match) return;
+
+    if (unlink(REBUILD_SENTINEL) == 0)
+        ESP_LOGW(TAG, "rebuild: released publish sentinel for abandoned day "
+                 "%.8s", day_folder);
+    else
+        ESP_LOGE(TAG, "rebuild: cannot release publish sentinel for day "
+                 "%.8s", day_folder);
 }

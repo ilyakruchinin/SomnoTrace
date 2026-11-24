@@ -66,6 +66,7 @@
 
 #include "cJSON.h"
 #include "upload_stage.h"
+#include "upload_park.h"
 
 /* ── Backend registry stub (upload_index.c is not linked) ──────────── */
 
@@ -319,7 +320,7 @@ static int phase_a(const char *self)
 
     free(refs);
     int r = 0;
-    static const char *const k_phases[] = { "b", "e", "f", "g", "i" };   /* b runs c and d; g runs h */
+    static const char *const k_phases[] = { "b", "e", "f", "g", "i", "j" };   /* b runs c and d; g runs h */
     for (size_t i = 0; i < sizeof(k_phases) / sizeof(k_phases[0]); i++) {
         int pr = run_phase(self, k_phases[i]);
         if (pr) printf("  FAIL phase %s exited %d\n", k_phases[i], pr);
@@ -882,6 +883,58 @@ static int phase_i(void)
     return g_failures;
 }
 
+/* ── Phase J: one unit_id under two day folders + failure parking ──────
+ *
+ * The SleepHQ incident: the same unit id materialised under two day
+ * folders with different content.  One state node per id let each copy's
+ * reconcile pass overwrite the stored fingerprint, resetting every backend
+ * on every pass — the same file re-uploaded forever (SleepHQ hit its
+ * 100-imports/day cap).  Reconcile now keeps the newest-day copy only, and
+ * a unit failed UPLOAD_MAX_GROUP_ATTEMPTS times parks instead of retrying
+ * every pass — the rule EDF groups already had. */
+static int phase_j(void)
+{
+    reset_tree();
+    mk_stage_csv("20261107", "dup", 1);
+    mk_stage_csv("20261105", "dup", 2);
+    mk_stage_csv("20261107", "solo", 3);
+    CHECK(upload_stage_init() == ESP_OK, "upload_stage_init failed");
+
+    upload_stage_ref_t *refs = calloc(UPLOAD_STAGE_MAX_UNITS, sizeof(*refs));
+    if (!refs) return 1;
+    int kept = upload_stage_reconcile(refs, UPLOAD_STAGE_MAX_UNITS, WINDOW);
+    CHECK(kept == 2, "duplicate-id reconcile did not drop the shadow copy");
+    const upload_stage_ref_t *rd = find_ref(refs, kept, "dup");
+    CHECK(rd && !strcmp(rd->day, "20261107"),
+          "the older-day duplicate won over the newest copy");
+
+    /* The mark must stick — pre-fix the second copy's fingerprint ping-pong
+     * re-pended the unit on every pass. */
+    if (rd) upload_stage_mark(rd, SLOT_SMB, UG_OK, NULL);
+    kept = upload_stage_reconcile(refs, UPLOAD_STAGE_MAX_UNITS, WINDOW);
+    rd = find_ref(refs, kept, "dup");
+    CHECK(rd && upload_stage_status(rd, SLOT_SMB) == UG_OK,
+          "duplicate-id copy re-pended the unit — the infinite loop");
+
+    const upload_stage_ref_t *rs = find_ref(refs, kept, "solo");
+    CHECK(rs != NULL, "test unit missing");
+    if (rs) {
+        for (int i = 0; i < UPLOAD_MAX_GROUP_ATTEMPTS - 1; i++)
+            upload_stage_mark(rs, SLOT_SMB, UG_FAILED, NULL);
+        CHECK(!upload_stage_parked(rs, SLOT_SMB),
+              "unit parked before the attempt cap");
+        upload_stage_mark(rs, SLOT_SMB, UG_FAILED, NULL);
+        CHECK(upload_stage_parked(rs, SLOT_SMB),
+              "unit not parked after UPLOAD_MAX_GROUP_ATTEMPTS failures");
+        CHECK(upload_stage_pending(refs, kept, SLOT_SMB) == 0,
+              "parked unit still counts as pending");
+        CHECK(upload_stage_cached_pending(SLOT_SMB) == 0,
+              "parked unit counted in cached pending");
+    }
+    free(refs);
+    return g_failures;
+}
+
 int main(int argc, char **argv)
 {
     const char *phase = argc > 1 ? argv[1] : "a";
@@ -895,6 +948,7 @@ int main(int argc, char **argv)
     else if (!strcmp(phase, "g")) r = phase_g(argv[0]);
     else if (!strcmp(phase, "h")) r = phase_h();
     else if (!strcmp(phase, "i")) r = phase_i();
+    else if (!strcmp(phase, "j")) r = phase_j();
     else r = 1;
 
     if (r) { printf("upload_stage_test: phase %s FAILED (%d)\n", phase, r); return 1; }

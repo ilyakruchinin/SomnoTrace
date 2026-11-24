@@ -1,0 +1,465 @@
+QSocketNotifier: Can only be used with threads started with QThread
+00000: Debug:    Started logging thread
+00000: Debug:    OSCAR starting Thu Nov 5 17:22:00 2026
+00000: Debug:    APP-NAME: "OSCAR"
+00000: Debug:    APP-PATH: "/usr/bin"
+00000: Debug:    Trying "/usr/bin/Html/about.html"
+00000: Debug:    Trying "/usr/share/OSCAR/Html/about.html"
+00000: Debug:    Trying "/usr/local/share/OSCAR/Html/about.html"
+00000: Debug:    APP-RESOURCES: "/usr/bin"
+00000: Debug:    High Resolution Mode is Disabled
+00000: Debug:    OSCAR 1.5.3 (linux x86_64)
+00000: Debug:    Built with Qt 5.15.18
+00000: Debug:    system locale date format "dddd, d MMMM yyyy"
+00000: Debug:    shortened date format "ddd d MMM yyyy" dayFirst true
+00000: Debug:    number of built-in *.qm files 0
+00000: Debug:    Inbuilt Translations: en_US
+00000: Debug:    number of external *.qm files 0
+00000: Debug:    Number of external translations is 0
+00000: Debug:    Using default language en_US
+00035: Debug:    Logging UI initialized
+00036: Debug:    Using System Tray for Menu
+00083: Debug:    OSCAR 1.5.3 (linux x86_64)
+00083: Debug:    Built with Qt 5.15.18
+00083: Debug:    
+00083: Debug:    Operating system: Ubuntu 26.04.1 LTS
+00083: Debug:    Graphics Engine: 4.6 (Compatibility Profile) Mesa 26.0.8-1ubuntu0.3
+00083: Debug:    Graphics Engine type: OpenGL
+00083: Debug:    Compiler: GNU C++:15.2.0
+00083: Debug:    
+04427: Debug:    Using /home/ilya/Documents/OSCAR_Data as OSCAR data folder
+16038: Debug:    Logging to /home/ilya/Documents/OSCAR_Data/logs/debug.txt
+16038: Debug:    Opening  /home/ilya/Documents/OSCAR_Data/Preferences.xml
+16039: Warning:  Could not open preferences file for reading, error code 5 "No such file or directory"
+16039: Debug:    App font before Prefs setting QFont(Ubuntu Sans,11,-1,5,50,0,0,0,0,0)
+16039: Debug:    validateFont found 246 installed font families
+16039: Debug:    "Application" font set to "Ubuntu Sans" at size QVariant(int, 10)
+16039: Debug:    validateFont found 246 installed font families
+16039: Debug:    "Graph" font set to "Ubuntu Sans" at size QVariant(int, 10)
+16039: Debug:    validateFont found 246 installed font families
+16039: Debug:    "Title" font set to "Ubuntu Sans" at size QVariant(int, 12)
+16039: Debug:    validateFont found 246 installed font families
+16039: Debug:    "Big" font set to "Ubuntu Sans" at size QVariant(int, 35)
+16040: Debug:    Application font starts out as QFont(Ubuntu Sans,11,-1,5,50,0,0,0,0,0)
+16042: Debug:    Application font set to QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+16042: Debug:    Application font reads back as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+16042: Debug:    system font is "Ubuntu Sans"
+16042: Debug:    Opening  ":/docs/channels.xml"
+16042: Debug:    Processing xml file: "channels" "en" "1.0"
+16043: Debug:    Registering PRS1Loader
+16055: Debug:    Registering ResmedLoader
+16061: Debug:    Registering IntellipapLoader
+16065: Debug:    Registering F&P Sleepstyle Loader
+16065: Debug:    Registering F&P Icon Loader
+16065: Debug:    Registering WeinmannLoader
+16065: Debug:    Registering CMS50Loader
+16066: Debug:    Registering CMS50F37Loader
+16066: Debug:    Registering MD300W1Loader
+16066: Debug:    Registering ViatomLoader
+16066: Debug:    Registering PrismaLoader
+16066: Debug:    Registering ResventLoader
+16074: Debug:    Logging device connections to /home/ilya/Documents/OSCAR_Data/logs/connections/devices.xml
+16111: Debug:    Starting network request for "http://apneaboard.net/OSCAR/versions.xml"
+17159: Debug:    200
+17159: Debug:    "OK"
+19666: Warning:  QTextBrowser: No document for about:blank
+23895: Warning:  Wayland does not support QWindow::requestActivate()
+35488: Debug:    Opening  /home/ilya/Documents/OSCAR_Data/Profiles/111/Profile.xml
+35488: Warning:  Could not open preferences file for reading, error code 5 "No such file or directory"
+35489: Warning:  Could not open /home/ilya/Documents/OSCAR_Data/Profiles/111/machines.xml for reading, error code 5 "No such file or directory"
+35515: Debug:    Opening profile "111"
+35516: Debug:    No devices in profile
+35517: Debug:    Loading Journal record: /home/ilya/Documents/OSCAR_Data/Profiles/111/Journal_353c51af/
+35563: Debug:    No devices in Profile
+35564: Debug:    Creating new Daily object
+35575: Debug:    Daily Left Panel Width is  250
+35700: Debug:    Daily::Load called for "Thu Nov 5 2026" using "Ubuntu Sans,10,-1,5,50,0,0,0,0,0"
+35700: Debug:    Setting App font in Daily::Load
+35700: Debug:    Application font starts out as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+35701: Debug:    Application font set to QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+35701: Debug:    Application font reads back as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+35701: Debug:    system font is "Ubuntu Sans"
+35718: Warning:  Wayland does not support QWindow::requestActivate()
+35722: Debug:    Finished opening Profile
+37082: Debug:    Couldn't find device info for "111"
+39477: Debug:    Adding "" on "/boot/efi" to drivelist
+39477: Debug:    Drive list size: 1
+40538: Debug:    Adding "" on "/boot/efi" to drivelist
+40538: Debug:    Drive list size: 1
+41608: Debug:    Adding "" on "/boot/efi" to drivelist
+41608: Debug:    Drive list size: 1
+60451: Debug:    Starting ResmedLoader::Open( with  "/tmp/oscar_eval/smb" )
+60451: Debug:    Info: "AirSense11" "AirSense11AutoSet" "39532" "22251436648"
+60451: Debug:    New device or just purged
+94639: Warning:  Wayland does not support QWindow::requestActivate()
+94688: Debug:    First day to import:  "Fri Jan 1 2010"
+94689: Debug:    "Backup Path is /home/ilya/Documents/OSCAR_Data/Profiles/111/ResMed_22251436648/Backup/"
+94729: Debug:    Starting backupSTRfiles during new IMPORT
+94730: Debug:    EDFInfo::Open() Couldn't open file "/home/ilya/Documents/OSCAR_Data/Profiles/111/ResMed_22251436648/Backup/STR.edf" error 5 "No such file or directory"
+94730: Warning:  Failed to open "/home/ilya/Documents/OSCAR_Data/Profiles/111/ResMed_22251436648/Backup/STR.edf"
+94731: Debug:    Finished backupSTRfiles during new IMPORT
+94734: Debug:    "oscar_eval/smb/STR.edf" starts at QDate("2026-06-29") for 129 ends QDate("2026-11-04")
+94737: Debug:    Adding "/tmp/oscar_eval/smb/STR.edf" to STRmap as "/home/ilya/Documents/OSCAR_Data/Profiles/111/ResMed_22251436648/Backup/STR.edf"
+94737: Debug:    Add files in STR_Backup to STRmap (unless they are already there)
+94737: Debug:    Starting ProcessSTRfiles
+94752: Debug:    Skipping "Mon July 6 2026" No mask events
+94826: Debug:    Finished ProcessSTR
+94828: Debug:    Starting scan of DATALOG
+94828: Debug:    "Backup Path is /home/ilya/Documents/OSCAR_Data/Profiles/111/ResMed_22251436648/Backup/"
+94828: Debug:    Generating list of EDF files
+94828: Debug:    First Import date is  QDate("2010-01-01")
+94830: Debug:    EDFfiles list size is  45
+94830: Debug:    Scanning  45  EDF files
+94832: Debug:    Starting EDF duration scan pass
+94996: Debug:    resdayList size is  128
+94996: Debug:    Finished DATALOG scan
+94996: Debug:    About to call runTasks()
+94996: Debug:    MachineLoader::runTasks MLtasklist size is 128
+95002: Debug:    Setting session pressures for R.mode 0
+95002: Debug:    Setting session pressures for R.mode 0
+95002: Debug:    Setting session pressures for R.mode 0
+95002: Debug:    Setting session pressures for R.mode 0
+95003: Debug:    Setting session pressures for R.mode 0
+95003: Debug:    Setting session pressures for R.mode 0
+95004: Debug:    Setting session pressures for R.mode 0
+95004: Debug:    Setting session pressures for R.mode 0
+95005: Debug:    Setting session pressures for R.mode 0
+95005: Debug:    Setting session pressures for R.mode 0
+95006: Debug:    Setting session pressures for R.mode 0
+95006: Debug:    Setting session pressures for R.mode 0
+95007: Debug:    Setting session pressures for R.mode 0
+95007: Debug:    Setting session pressures for R.mode 0
+95008: Debug:    Setting session pressures for R.mode 0
+95009: Debug:    Setting session pressures for R.mode 0
+95009: Debug:    Setting session pressures for R.mode 0
+95009: Debug:    Setting session pressures for R.mode 0
+95010: Debug:    Setting session pressures for R.mode 0
+95010: Debug:    Setting session pressures for R.mode 0
+95011: Debug:    Setting session pressures for R.mode 0
+95011: Debug:    Setting session pressures for R.mode 0
+95012: Debug:    Setting session pressures for R.mode 0
+95012: Debug:    Setting session pressures for R.mode 0
+95013: Debug:    Setting session pressures for R.mode 0
+95013: Debug:    Setting session pressures for R.mode 0
+95013: Debug:    Setting session pressures for R.mode 0
+95014: Debug:    Setting session pressures for R.mode 0
+95014: Debug:    Setting session pressures for R.mode 0
+95015: Debug:    Setting session pressures for R.mode 0
+95015: Debug:    Setting session pressures for R.mode 0
+95015: Debug:    Setting session pressures for R.mode 0
+95015: Debug:    Setting session pressures for R.mode 0
+95015: Debug:    Setting session pressures for R.mode 0
+95016: Debug:    Setting session pressures for R.mode 0
+95016: Debug:    Setting session pressures for R.mode 0
+95017: Debug:    Setting session pressures for R.mode 0
+95018: Debug:    Setting session pressures for R.mode 0
+95018: Debug:    Setting session pressures for R.mode 0
+95019: Debug:    Setting session pressures for R.mode 0
+95019: Debug:    Setting session pressures for R.mode 0
+95019: Debug:    Setting session pressures for R.mode 0
+95019: Debug:    Setting session pressures for R.mode 0
+95020: Debug:    Setting session pressures for R.mode 0
+95020: Debug:    Setting session pressures for R.mode 0
+95021: Debug:    Setting session pressures for R.mode 0
+95022: Debug:    Setting session pressures for R.mode 0
+95022: Debug:    Setting session pressures for R.mode 0
+95022: Debug:    Setting session pressures for R.mode 0
+95022: Debug:    Setting session pressures for R.mode 0
+95023: Debug:    Setting session pressures for R.mode 0
+95024: Debug:    Setting session pressures for R.mode 0
+95025: Debug:    Setting session pressures for R.mode 0
+95026: Debug:    Setting session pressures for R.mode 0
+95028: Debug:    Setting session pressures for R.mode 0
+95029: Debug:    Setting session pressures for R.mode 0
+95029: Debug:    Setting session pressures for R.mode 0
+95029: Debug:    Setting session pressures for R.mode 0
+95031: Debug:    Setting session pressures for R.mode 0
+95032: Debug:    Setting session pressures for R.mode 0
+95032: Debug:    Setting session pressures for R.mode 0
+95033: Debug:    Setting session pressures for R.mode 0
+95034: Debug:    Setting session pressures for R.mode 0
+95034: Debug:    Setting session pressures for R.mode 0
+95035: Debug:    Setting session pressures for R.mode 0
+95035: Debug:    Setting session pressures for R.mode 0
+95035: Debug:    Setting session pressures for R.mode 0
+95036: Debug:    Setting session pressures for R.mode 0
+95037: Debug:    Setting session pressures for R.mode 0
+95037: Debug:    Setting session pressures for R.mode 0
+95038: Debug:    Setting session pressures for R.mode 0
+95038: Debug:    Setting session pressures for R.mode 0
+95039: Debug:    Setting session pressures for R.mode 0
+95039: Debug:    Setting session pressures for R.mode 0
+95039: Debug:    Setting session pressures for R.mode 0
+95040: Debug:    Setting session pressures for R.mode 0
+95041: Debug:    Setting session pressures for R.mode 0
+95041: Debug:    Setting session pressures for R.mode 0
+95042: Debug:    Setting session pressures for R.mode 0
+95043: Debug:    Setting session pressures for R.mode 0
+95044: Debug:    Setting session pressures for R.mode 0
+95045: Debug:    Setting session pressures for R.mode 0
+95046: Debug:    Setting session pressures for R.mode 0
+95046: Debug:    Setting session pressures for R.mode 0
+95046: Debug:    Setting session pressures for R.mode 0
+95047: Debug:    Setting session pressures for R.mode 0
+95048: Debug:    Setting session pressures for R.mode 0
+95048: Debug:    Setting session pressures for R.mode 0
+95049: Debug:    Setting session pressures for R.mode 0
+95049: Debug:    Setting session pressures for R.mode 0
+95049: Debug:    Setting session pressures for R.mode 0
+95050: Debug:    Setting session pressures for R.mode 0
+95050: Debug:    Setting session pressures for R.mode 0
+95050: Debug:    Setting session pressures for R.mode 0
+95051: Debug:    Setting session pressures for R.mode 0
+95051: Debug:    Setting session pressures for R.mode 0
+95052: Debug:    Setting session pressures for R.mode 0
+95052: Debug:    Setting session pressures for R.mode 0
+95053: Debug:    Setting session pressures for R.mode 0
+95053: Debug:    Setting session pressures for R.mode 0
+95054: Debug:    Setting session pressures for R.mode 0
+95054: Debug:    Setting session pressures for R.mode 0
+95054: Debug:    Setting session pressures for R.mode 0
+95055: Debug:    Setting session pressures for R.mode 0
+95055: Debug:    Setting session pressures for R.mode 0
+95055: Debug:    Setting session pressures for R.mode 0
+95056: Debug:    Setting session pressures for R.mode 0
+95056: Debug:    Setting session pressures for R.mode 0
+95058: Debug:    Setting session pressures for R.mode 0
+95059: Debug:    Setting session pressures for R.mode 0
+95061: Debug:    Setting session pressures for R.mode 0
+95062: Debug:    Setting session pressures for R.mode 0
+95063: Debug:    Setting session pressures for R.mode 0
+95064: Debug:    Setting session pressures for R.mode 0
+95065: Debug:    Setting session pressures for R.mode 0
+95065: Debug:    Setting session pressures for R.mode 0
+95065: Debug:    Setting session pressures for R.mode 0
+95066: Debug:    Setting session pressures for R.mode 0
+95066: Debug:    Setting session pressures for R.mode 0
+95066: Debug:    Setting session pressures for R.mode 0
+95067: Debug:    Setting session pressures for R.mode 0
+95067: Debug:    Setting session pressures for R.mode 0
+95067: Debug:    Setting session pressures for R.mode 0
+95067: Debug:    Setting session pressures for R.mode 0
+95068: Debug:    Setting session pressures for R.mode 0
+95068: Debug:    Setting session pressures for R.mode 0
+95069: Debug:    Setting session pressures for R.mode 0
+95069: Debug:    Setting session pressures for R.mode 0
+95069: Debug:    Setting session pressures for R.mode 0
+95069: Debug:    Setting session pressures for R.mode 0
+95070: Debug:    Setting session pressures for R.mode 0
+95070: Debug:    Setting session pressures for R.mode 0
+95070: Debug:    Setting session pressures for R.mode 0
+95070: Debug:    Setting session pressures for R.mode 0
+95071: Debug:    Setting session pressures for R.mode 0
+95071: Debug:    Setting session pressures for R.mode 0
+95071: Debug:    Setting session pressures for R.mode 0
+95071: Debug:    Setting session pressures for R.mode 0
+95071: Debug:    Setting session pressures for R.mode 0
+95072: Debug:    Setting session pressures for R.mode 0
+95072: Debug:    Setting session pressures for R.mode 0
+95073: Debug:    Setting session pressures for R.mode 0
+95073: Debug:    Setting session pressures for R.mode 0
+95074: Debug:    Setting session pressures for R.mode 0
+95075: Debug:    Setting session pressures for R.mode 0
+95075: Debug:    Setting session pressures for R.mode 0
+95076: Debug:    Setting session pressures for R.mode 0
+95078: Debug:    Setting session pressures for R.mode 0
+95079: Debug:    Setting session pressures for R.mode 0
+95079: Debug:    Setting session pressures for R.mode 0
+95080: Debug:    Setting session pressures for R.mode 0
+95081: Debug:    Setting session pressures for R.mode 0
+95081: Debug:    Setting session pressures for R.mode 0
+95081: Debug:    Setting session pressures for R.mode 0
+95082: Debug:    Setting session pressures for R.mode 0
+95082: Debug:    Setting session pressures for R.mode 0
+95083: Debug:    Setting session pressures for R.mode 0
+95084: Debug:    Setting session pressures for R.mode 0
+95084: Debug:    Setting session pressures for R.mode 0
+95085: Debug:    Setting session pressures for R.mode 0
+95085: Debug:    Setting session pressures for R.mode 0
+95085: Debug:    Setting session pressures for R.mode 0
+95086: Debug:    Setting session pressures for R.mode 0
+95086: Debug:    Setting session pressures for R.mode 0
+95087: Debug:    Setting session pressures for R.mode 0
+95087: Debug:    Setting session pressures for R.mode 0
+95087: Debug:    Setting session pressures for R.mode 0
+95088: Debug:    Setting session pressures for R.mode 0
+95088: Debug:    Setting session pressures for R.mode 0
+95089: Debug:    Setting session pressures for R.mode 0
+95089: Debug:    Setting session pressures for R.mode 0
+95090: Debug:    Setting session pressures for R.mode 0
+95090: Debug:    Setting session pressures for R.mode 0
+95090: Debug:    Setting session pressures for R.mode 0
+95092: Debug:    Setting session pressures for R.mode 0
+95094: Debug:    Setting session pressures for R.mode 0
+95095: Debug:    Setting session pressures for R.mode 0
+95095: Debug:    Setting session pressures for R.mode 0
+95095: Debug:    Setting session pressures for R.mode 0
+95097: Debug:    Setting session pressures for R.mode 0
+95097: Debug:    Setting session pressures for R.mode 0
+95097: Debug:    Setting session pressures for R.mode 0
+95098: Debug:    Setting session pressures for R.mode 0
+95098: Debug:    Setting session pressures for R.mode 0
+95099: Debug:    Setting session pressures for R.mode 0
+95099: Debug:    Setting session pressures for R.mode 0
+95100: Debug:    Setting session pressures for R.mode 0
+95100: Debug:    Setting session pressures for R.mode 0
+95100: Debug:    Setting session pressures for R.mode 0
+95100: Debug:    Setting session pressures for R.mode 0
+95101: Debug:    Setting session pressures for R.mode 0
+95101: Debug:    Setting session pressures for R.mode 0
+95101: Debug:    Setting session pressures for R.mode 0
+95101: Debug:    Setting session pressures for R.mode 0
+95101: Debug:    Setting session pressures for R.mode 0
+95101: Debug:    Setting session pressures for R.mode 0
+95102: Debug:    Setting session pressures for R.mode 0
+95102: Debug:    Setting session pressures for R.mode 0
+95103: Debug:    Setting session pressures for R.mode 0
+95103: Debug:    Setting session pressures for R.mode 0
+95103: Debug:    Setting session pressures for R.mode 0
+95103: Debug:    Setting session pressures for R.mode 0
+95103: Debug:    Setting session pressures for R.mode 0
+95103: Debug:    Setting session pressures for R.mode 0
+95103: Debug:    Setting session pressures for R.mode 0
+95103: Debug:    Setting session pressures for R.mode 0
+95104: Debug:    Setting session pressures for R.mode 0
+95105: Debug:    Setting session pressures for R.mode 0
+95105: Debug:    Setting session pressures for R.mode 0
+95105: Debug:    Setting session pressures for R.mode 0
+95105: Debug:    Setting session pressures for R.mode 0
+95105: Debug:    Setting session pressures for R.mode 0
+95105: Debug:    Setting session pressures for R.mode 0
+95105: Debug:    Setting session pressures for R.mode 0
+95106: Debug:    Setting session pressures for R.mode 0
+95106: Debug:    Setting session pressures for R.mode 0
+95106: Debug:    Setting session pressures for R.mode 0
+95107: Debug:    Setting session pressures for R.mode 0
+95110: Debug:    Setting session pressures for R.mode 0
+95110: Debug:    Setting session pressures for R.mode 0
+95111: Debug:    Setting session pressures for R.mode 0
+95112: Debug:    Setting session pressures for R.mode 0
+95113: Debug:    Setting session pressures for R.mode 0
+95113: Debug:    Setting session pressures for R.mode 0
+95114: Debug:    Setting session pressures for R.mode 0
+95114: Debug:    Setting session pressures for R.mode 0
+95115: Debug:    Setting session pressures for R.mode 0
+95115: Debug:    Setting session pressures for R.mode 0
+95116: Debug:    Setting session pressures for R.mode 0
+95116: Debug:    Setting session pressures for R.mode 0
+95117: Debug:    Setting session pressures for R.mode 0
+95118: Debug:    Setting session pressures for R.mode 0
+95118: Debug:    Setting session pressures for R.mode 0
+95119: Debug:    Setting session pressures for R.mode 0
+95119: Debug:    Setting session pressures for R.mode 0
+95119: Debug:    Setting session pressures for R.mode 0
+95120: Debug:    Setting session pressures for R.mode 0
+95120: Debug:    Setting session pressures for R.mode 0
+95121: Debug:    Setting session pressures for R.mode 0
+95121: Debug:    Setting session pressures for R.mode 0
+95121: Debug:    Setting session pressures for R.mode 0
+95121: Debug:    Setting session pressures for R.mode 0
+95122: Debug:    Setting session pressures for R.mode 0
+95122: Debug:    Setting session pressures for R.mode 0
+95122: Debug:    Setting session pressures for R.mode 0
+95123: Debug:    Setting session pressures for R.mode 0
+95124: Debug:    Setting session pressures for R.mode 0
+95126: Debug:    Setting session pressures for R.mode 0
+95126: Debug:    Setting session pressures for R.mode 0
+95128: Debug:    Setting session pressures for R.mode 0
+95130: Debug:    Setting session pressures for R.mode 0
+95130: Debug:    Setting session pressures for R.mode 0
+95131: Debug:    Setting session pressures for R.mode 0
+95131: Debug:    Setting session pressures for R.mode 0
+95132: Debug:    Setting session pressures for R.mode 0
+95133: Debug:    Setting session pressures for R.mode 0
+95133: Debug:    Setting session pressures for R.mode 0
+95134: Debug:    Setting session pressures for R.mode 0
+95135: Debug:    Setting session pressures for R.mode 0
+95156: Debug:    Setting session pressures for R.mode 0
+95195: Debug:    Setting session pressures for R.mode 0
+95231: Debug:    Finshed runTasks() with 300 new sessions
+95231: Debug:    About to call finishAddingSessions()
+95231: Debug:    Finshed finishedAddingSessions() with 300 new sessions
+95231: Debug:    Total Events  0
+95231: Debug:    Total new Sessions  300
+95233: Debug:    Finished Importing data 300
+95235: Debug:    Saving "ResMed" session info "ResMed"
+95235: Debug:    Done Saving "ResMed" session info
+95235: Debug:    Saving "ResMed" "AirSense11AutoSet" Summaries
+95269: Debug:    Could not open "/home/ilya/Documents/OSCAR_Data/Profiles/111/RXChanges.cache" for reading, error code 5 "No such file or directory"
+95293: Debug:    Daily::Load called for "Wed Nov 4 2026" using "Ubuntu Sans,10,-1,5,50,0,0,0,0,0"
+95293: Debug:    Setting App font in Daily::Load
+95293: Debug:    Application font starts out as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+95293: Debug:    Application font set to QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+95293: Debug:    Application font reads back as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+95293: Debug:    system font is "Ubuntu Sans"
+103061: Debug:    Daily::Load called for "Tue Nov 3 2026" using "Ubuntu Sans,10,-1,5,50,0,0,0,0,0"
+103061: Debug:    Setting App font in Daily::Load
+103061: Debug:    Application font starts out as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+103062: Debug:    Application font set to QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+103062: Debug:    Application font reads back as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+103062: Debug:    system font is "Ubuntu Sans"
+103125: Debug:    Page change time (in ms): Unload = 0 Load = 63 Other = 0
+103860: Debug:    Daily::Load called for "Mon Nov 2 2026" using "Ubuntu Sans,10,-1,5,50,0,0,0,0,0"
+103860: Debug:    Setting App font in Daily::Load
+103860: Debug:    Application font starts out as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+103861: Debug:    Application font set to QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+103861: Debug:    Application font reads back as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+103861: Debug:    system font is "Ubuntu Sans"
+103926: Debug:    Page change time (in ms): Unload = 1 Load = 65 Other = 0
+104510: Debug:    Daily::Load called for "Sun Nov 1 2026" using "Ubuntu Sans,10,-1,5,50,0,0,0,0,0"
+104510: Debug:    Setting App font in Daily::Load
+104510: Debug:    Application font starts out as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+104511: Debug:    Application font set to QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+104511: Debug:    Application font reads back as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+104511: Debug:    system font is "Ubuntu Sans"
+104578: Debug:    Page change time (in ms): Unload = 0 Load = 67 Other = 0
+104586: Debug:    gGraphView: No graphs drawn
+104586: Debug:    "gGraphView:There is no data to graph"
+108626: Debug:    gGraphView: No graphs drawn
+108626: Debug:    "gGraphView:There is no data to graph"
+112489: Debug:    Daily::Load called for "Mon Nov 2 2026" using "Ubuntu Sans,10,-1,5,50,0,0,0,0,0"
+112489: Debug:    Setting App font in Daily::Load
+112489: Debug:    Application font starts out as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+112490: Debug:    Application font set to QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+112490: Debug:    Application font reads back as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+112490: Debug:    system font is "Ubuntu Sans"
+112551: Debug:    Page change time (in ms): Unload = 0 Load = 61 Other = 0
+114260: Debug:    Daily::Load called for "Tue Nov 3 2026" using "Ubuntu Sans,10,-1,5,50,0,0,0,0,0"
+114260: Debug:    Setting App font in Daily::Load
+114260: Debug:    Application font starts out as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+114261: Debug:    Application font set to QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+114261: Debug:    Application font reads back as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+114261: Debug:    system font is "Ubuntu Sans"
+114329: Debug:    Page change time (in ms): Unload = 0 Load = 68 Other = 0
+114990: Debug:    Daily::Load called for "Wed Nov 4 2026" using "Ubuntu Sans,10,-1,5,50,0,0,0,0,0"
+114991: Debug:    Setting App font in Daily::Load
+114991: Debug:    Application font starts out as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+114991: Debug:    Application font set to QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+114992: Debug:    Application font reads back as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+114992: Debug:    system font is "Ubuntu Sans"
+115058: Debug:    Page change time (in ms): Unload = 0 Load = 67 Other = 0
+117460: Debug:    Daily::Load called for "Tue Nov 3 2026" using "Ubuntu Sans,10,-1,5,50,0,0,0,0,0"
+117460: Debug:    Setting App font in Daily::Load
+117460: Debug:    Application font starts out as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+117461: Debug:    Application font set to QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+117461: Debug:    Application font reads back as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+117461: Debug:    system font is "Ubuntu Sans"
+117522: Debug:    Page change time (in ms): Unload = 0 Load = 62 Other = 0
+118129: Debug:    Daily::Load called for "Mon Nov 2 2026" using "Ubuntu Sans,10,-1,5,50,0,0,0,0,0"
+118130: Debug:    Setting App font in Daily::Load
+118130: Debug:    Application font starts out as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+118130: Debug:    Application font set to QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+118130: Debug:    Application font reads back as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+118130: Debug:    system font is "Ubuntu Sans"
+118189: Debug:    Page change time (in ms): Unload = 0 Load = 59 Other = 0
+118821: Debug:    Daily::Load called for "Sun Nov 1 2026" using "Ubuntu Sans,10,-1,5,50,0,0,0,0,0"
+118821: Debug:    Setting App font in Daily::Load
+118821: Debug:    Application font starts out as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+118821: Debug:    Application font set to QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+118822: Debug:    Application font reads back as QFont(Ubuntu Sans,10,-1,5,50,0,0,0,0,0)
+118822: Debug:    system font is "Ubuntu Sans"
+118882: Debug:    Page change time (in ms): Unload = 0 Load = 61 Other = 0
+118936: Debug:    gGraphView: No graphs drawn
+118936: Debug:    "gGraphView:There is no data to graph"
+120259: Debug:    gGraphView: No graphs drawn
+120259: Debug:    "gGraphView:There is no data to graph"

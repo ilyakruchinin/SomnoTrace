@@ -86,6 +86,10 @@ bool sd_storage_is_ready(void);
  * a therapy recording on. */
 esp_err_t sd_storage_get_free(uint64_t *free_bytes, uint64_t *total_bytes);
 
+/* Non-destructive space gate for optional diagnostics. Unknown free space
+ * returns an error and leaves *allowed false; raw capture has its own policy. */
+esp_err_t sd_storage_diagnostics_allowed(bool *allowed);
+
 /* Space policy for raw capture.  Raw session data is the source of truth;
  * SDCARD/ is derived and regenerable, so derived output is reclaimed before
  * recording is ever refused.

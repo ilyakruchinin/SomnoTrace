@@ -35,6 +35,9 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
@@ -151,6 +154,28 @@ void ox_store_delete_paired(void)
 
 /* ── index.json ───────────────────────────────────────────────────── */
 
+/* The index ops do parse→update→atomic-save: without a lock a concurrent
+ * add and mark_converted interleave their loads and the later save drops
+ * the earlier update — the shape of "cannot update conversion state".
+ * One mutex covers every read-modify-write and the decision reads. */
+static SemaphoreHandle_t s_idx_mtx;
+static portMUX_TYPE s_idx_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void idx_lock(void)
+{
+    if (!s_idx_mtx) {
+        portENTER_CRITICAL(&s_idx_mux);
+        if (!s_idx_mtx) s_idx_mtx = xSemaphoreCreateMutex();
+        portEXIT_CRITICAL(&s_idx_mux);
+    }
+    if (s_idx_mtx) xSemaphoreTake(s_idx_mtx, portMAX_DELAY);
+}
+
+static void idx_unlock(void)
+{
+    if (s_idx_mtx) xSemaphoreGive(s_idx_mtx);
+}
+
 static FILE *open_index_read(void)
 {
     FILE *f = fopen(OXY_INDEX_JSON, "r");
@@ -164,17 +189,18 @@ static FILE *open_index_read(void)
  * Returns: 1 = finalised, 0 = present but not finalised, -1 = not found. */
 int ox_store_index_check(const char *serial, const char *name)
 {
+    idx_lock();
     FILE *f = open_index_read();
-    if (!f) return -1;
+    if (!f) { idx_unlock(); return -1; }
 
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > 65536) { fclose(f); return -1; }
+    if (sz <= 0 || sz > 65536) { fclose(f); idx_unlock(); return -1; }
 
     char *buf = heap_caps_malloc((size_t)sz + 1, MALLOC_CAP_SPIRAM);
     if (!buf) buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return -1; }
+    if (!buf) { fclose(f); idx_unlock(); return -1; }
     int n = fread(buf, 1, sz, f);
     fclose(f);
     buf[n] = '\0';
@@ -183,6 +209,7 @@ int ox_store_index_check(const char *serial, const char *name)
     free(buf);
     if (!arr || !cJSON_IsArray(arr)) {
         if (arr) cJSON_Delete(arr);
+        idx_unlock();
         return -1;
     }
 
@@ -203,6 +230,7 @@ int ox_store_index_check(const char *serial, const char *name)
         }
     }
     cJSON_Delete(arr);
+    idx_unlock();
     return result;
 }
 
@@ -212,28 +240,40 @@ static bool save_index(cJSON *arr)
     if (!json) return false;
     char tmp[160];
     snprintf(tmp, sizeof(tmp), "%s.tmp", OXY_INDEX_JSON);
+    int err = 0;
+    const char *stage = "open tmp";
     FILE *f = fopen(tmp, "w");
-    bool ok = f && fputs(json, f) >= 0 && fflush(f) == 0 && fsync(fileno(f)) == 0;
-    if (f && fclose(f) != 0) ok = false;
-    cJSON_free(json);
-    if (!ok) {
-        unlink(tmp);
-        return false;
+    bool ok = f != NULL;
+    if (ok) {
+        stage = "write tmp";
+        ok = fputs(json, f) >= 0 && fflush(f) == 0 &&
+             fsync(fileno(f)) == 0;
+        if (fclose(f) != 0) ok = false;
     }
+    if (!ok) err = errno;
+    cJSON_free(json);
+    if (!ok) { unlink(tmp); goto fail; }
+
     char backup[160];
     snprintf(backup, sizeof(backup), "%s.bak", OXY_INDEX_JSON);
-    bool had_index = access(OXY_INDEX_JSON, F_OK) == 0;
+    const bool had_index = access(OXY_INDEX_JSON, F_OK) == 0;
     if (had_index) unlink(backup);
     if (had_index && rename(OXY_INDEX_JSON, backup) != 0) {
+        stage = "backup rename";
+        err = errno;
         unlink(tmp);
-        return false;
+        goto fail;
     }
     if (rename(tmp, OXY_INDEX_JSON) == 0) {
         unlink(backup);
         return true;
     }
+    stage = "final rename";
+    err = errno;
     if (had_index) rename(backup, OXY_INDEX_JSON);
     unlink(tmp);
+fail:
+    ESP_LOGE(TAG, "index save failed at %s: %s", stage, strerror(err));
     return false;
 }
 
@@ -241,6 +281,7 @@ static bool save_index(cJSON *arr)
 void ox_store_index_add(const char *serial, const char *name,
                         uint32_t bytes, bool finalised)
 {
+    idx_lock();
     FILE *f = open_index_read();
     cJSON *arr = NULL;
     if (f) {
@@ -285,6 +326,7 @@ void ox_store_index_add(const char *serial, const char *name,
     cJSON_AddItemToArray(arr, entry);
     if (!save_index(arr)) ESP_LOGE(TAG, "cannot save oximetry index");
     cJSON_Delete(arr);
+    idx_unlock();
 }
 
 static cJSON *load_index_array(void)
@@ -316,8 +358,9 @@ static cJSON *load_index_array(void)
 
 int ox_store_index_conversion_check(const char *serial, const char *name)
 {
+    idx_lock();
     cJSON *arr = load_index_array();
-    if (!arr) return -1;
+    if (!arr) { idx_unlock(); return -1; }
     int result = -1;
     cJSON *entry;
     cJSON_ArrayForEach(entry, arr) {
@@ -331,14 +374,16 @@ int ox_store_index_conversion_check(const char *serial, const char *name)
         break;
     }
     cJSON_Delete(arr);
+    idx_unlock();
     return result;
 }
 
 void ox_store_index_mark_converted(const char *serial, const char *name,
                                    bool converted, const char *error)
 {
+    idx_lock();
     cJSON *arr = load_index_array();
-    if (!arr) return;
+    if (!arr) { idx_unlock(); return; }
     cJSON *entry;
     cJSON_ArrayForEach(entry, arr) {
         cJSON *s = cJSON_GetObjectItem(entry, "serial");
@@ -355,9 +400,11 @@ void ox_store_index_mark_converted(const char *serial, const char *name,
             cJSON_AddStringToObject(entry, "conversion_error", error);
         if (!save_index(arr)) ESP_LOGE(TAG, "cannot update oximetry conversion state");
         cJSON_Delete(arr);
+        idx_unlock();
         return;
     }
     cJSON_Delete(arr);
+    idx_unlock();
 }
 
 char *ox_store_conversion_diagnostics_json(void)

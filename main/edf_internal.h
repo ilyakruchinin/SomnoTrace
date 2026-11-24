@@ -59,10 +59,13 @@ void edf_write_field(char *buf, int width, const char *text);
 bool edf_write_all(FILE *f, const void *data, size_t len);
 
 FILE *edf_open_atomic_file(const char *path, char *tmp_path, size_t tmp_path_len);
+/* Recover an interrupted FAT replacement without creating a new file. */
+esp_err_t edf_recover_atomic_file(const char *path);
 esp_err_t edf_finalize_atomic_file(FILE *f, const char *tmp_path, const char *path);
 void edf_discard_atomic_file(FILE *f, const char *tmp_path);
 
 cJSON *edf_read_json_file(const char *path);
+esp_err_t edf_read_json_file_checked(const char *path, cJSON **out);
 esp_err_t edf_write_json_file(const char *path, const cJSON *json);
 uint8_t *edf_read_bin_file(const char *path, size_t *out_len);
 
@@ -103,7 +106,7 @@ esp_err_t edf_generate_csl_edf(const char *out_path, const char *events_snt_path
 esp_err_t edf_generate_str_edf(const char *sdcard_dir,
                                const char *patient_id, const char *recording_id,
                                const char *start_date,
-                               const cJSON *settings_json,
+                               const cJSON *settings_json, const cJSON *ident_json,
                                const char *session_dir,
                                const char *session_id,
                                int64_t start_epoch_ms, int64_t end_epoch_ms,

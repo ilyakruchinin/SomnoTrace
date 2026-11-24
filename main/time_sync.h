@@ -125,3 +125,10 @@ esp_err_t time_sync_recover_from_as11(void);
  * Must be called after time_sync_init(). Subsequent periodic re-syncs do
  * not trigger the failure path. */
 bool time_sync_wait_initial(void);
+
+/* Current time-source epoch: a persisted counter bumped at the first
+ * anchoring of each boot and again whenever a wall-clock step beyond the
+ * gate (~0.5 s) is applied (NTP step, AS11 recovery, manual set).  Peers
+ * attach it to timestamp exchanges so anchors can be segmented per
+ * unbroken timescale (SomnoBridge spec §8.1).  0 before any anchoring. */
+uint32_t time_sync_source_epoch(void);

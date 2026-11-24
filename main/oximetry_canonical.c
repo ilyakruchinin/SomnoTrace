@@ -28,7 +28,6 @@
 #include "sd_storage.h"
 #include "somno_ml.h"
 #include "time_sync.h"
-#include "as11_time.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -231,11 +230,48 @@ static bool path_join4(char *out, size_t out_size, const char *a,
            path_join2(out, out_size, tmp, d);
 }
 
+static bool valid_day_name(const char *s);
+
 static bool day_for_epoch(int64_t epoch_ms, char out[9])
 {
     if (!out) return false;
-    as11_time_noon_day(epoch_ms, out, 9);
-    return strlen(out) == 8;
+    /* Noon-day in the device's own timezone - the same domain that
+     * oximetry_civil_epoch_ms()/oximetry_filename_epoch_ms() used to turn
+     * the recording's civil timestamp into this epoch.  Labelling under the
+     * AS11 offset instead let the two domains diverge (DST boundary, a CPAP
+     * that does not track DST), so a later conversion pass filed the same
+     * immutable recording under a different day.  Evaluating (epoch - 12h)
+     * in local time makes the label a pure function of the civil digits. */
+    time_t t = (time_t)(epoch_ms / 1000 - 43200);
+    struct tm tmv;
+    if (!localtime_r(&t, &tmv)) return false;
+    return strftime(out, 9, "%Y%m%d", &tmv) == 8;
+}
+
+/* A recording's day dir is fixed once created: an existing dir wins over a
+ * freshly computed day, so migration/resume/re-conversion passes can never
+ * file the same recording_id under a second day.  When several dirs already
+ * contain the id, the newest day name wins, matching scan order. */
+static bool find_recording_day(const char *recording_id, char out[9])
+{
+    if (!recording_id || !out) return false;
+    DIR *days = opendir(OX_RECORDINGS);
+    if (!days) return false;
+    bool found = false;
+    struct dirent *de;
+    while ((de = readdir(days)) != NULL) {
+        if (!valid_day_name(de->d_name)) continue;
+        char pointer[OXIMETRY_CANONICAL_MAX_PATH];
+        if (!path_join4(pointer, sizeof(pointer), OX_RECORDINGS, de->d_name,
+                        recording_id, "recording.json") ||
+            access(pointer, F_OK) != 0)
+            continue;
+        if (!found || strcmp(de->d_name, out) > 0)
+            snprintf(out, 9, "%s", de->d_name);
+        found = true;
+    }
+    closedir(days);
+    return found;
 }
 
 /* The civil-time parsers live in oximetry_time.c, shared with the OxyII
@@ -738,6 +774,12 @@ esp_err_t oximetry_canonical_convert_vld3(const char *device_id,
 
     char day[9];
     if (!day_for_epoch(start_ms, day)) return ESP_ERR_INVALID_ARG;
+    char existing_day[9];
+    if (find_recording_day(recording_id, existing_day) && strcmp(existing_day, day) != 0) {
+        ESP_LOGW(TAG, "vld3 convert: %s already filed under %s (computed %s) — using existing dir",
+                 recording_id, existing_day, day);
+        memcpy(day, existing_day, 9);
+    }
 
     struct stat st;
     if (stat(source_path, &st) != 0 || st.st_size > OXIMETRY_CANONICAL_MAX_SOURCE_BYTES)
@@ -984,6 +1026,12 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
     if (start_utc_ms <= 0) return ESP_ERR_INVALID_ARG;
     char day[9];
     if (!day_for_epoch(start_utc_ms, day)) return ESP_ERR_INVALID_ARG;
+    char existing_day[9];
+    if (find_recording_day(recording_id, existing_day) && strcmp(existing_day, day) != 0) {
+        ESP_LOGW(TAG, "convert %s: already filed under %s (computed %s) — using existing dir",
+                 recording_id, existing_day, day);
+        memcpy(day, existing_day, 9);
+    }
 
     struct stat st;
     if (stat(source_path, &st) != 0 || st.st_size > OXIMETRY_CANONICAL_MAX_SOURCE_BYTES)

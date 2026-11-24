@@ -28,3 +28,7 @@ else()
         INCLUDE_DIRS "include")
     message(STATUS "somno_ml: no model.enc — building stub (fork-safe)")
 endif()
+
+if(SOMNOTRACE_STACK_AUDIT)
+    target_compile_options(${COMPONENT_LIB} PRIVATE -fstack-usage -Wframe-larger-than=3072)
+endif()

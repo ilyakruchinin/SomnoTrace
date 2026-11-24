@@ -47,9 +47,8 @@
  *   phase m  drift sidecar size budget: verbatim embed when small, compact
  *            projection + relocated copy when large, manifest always under
  *            the 4096 B cap of the pre-existing readers
- *   phase n  quiescence window: files modified moments ago (group, root,
- *            drift sidecar) defer instead of importing; future-dated files
- *            and window 0 never defer
+ *   phase n  quiescence window: fresh files defer; future-dated files need
+ *            a stable monotonic observation; window 0 never defers
  *   phase o  AS10 *.crc sidecars consumed with their EDF; a leftover-only
  *            or quarantined day folder is skipped, never aborting the scan
  *            for later days (issue #338)
@@ -62,6 +61,7 @@
 #include <dirent.h>
 #include <math.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -72,8 +72,10 @@
 
 #include "cJSON.h"
 #include "edf_import.h"
+#include "source_store.h"
 #include "snt_format.h"
 #include "sd_storage.h"
+#include "import_spool_marker.h"
 
 /* ── Micro test framework ──────────────────────────────────────────── */
 static int g_checks, g_fail;
@@ -271,12 +273,21 @@ static void fx_write_real_ann(const char *path, int y, int mo, int d,
 
 static bool snt_read(const char *path, snt_header_t *h, int16_t **data)
 {
+    memset(h, 0, sizeof(*h));
+    *data = NULL;
     FILE *f = fopen(path, "rb");
     if (!f) return false;
     if (fread(h, 1, sizeof(*h), f) != sizeof(*h)) { fclose(f); return false; }
     size_t n = (size_t)h->sample_count * h->n_channels;
     *data = malloc(n * 2 + 2);
-    if (n && fread(*data, 2, n, f) != n) { fclose(f); free(*data); return false; }
+    if (!*data) { fclose(f); return false; }
+    if (n && fread(*data, 2, n, f) != n) {
+        fclose(f);
+        free(*data);
+        *data = NULL;
+        memset(h, 0, sizeof(*h));
+        return false;
+    }
     fclose(f);
     return true;
 }
@@ -380,6 +391,31 @@ static void build_session_dir(const char *dir, const char *ts_wave,
     fx_write_real_ann(p, y, mo, d, eh, em, es, csl_a, csl_l, 3);
 }
 
+static void set_fixture_recording_id(const char *dir, const char *rec_id)
+{
+    DIR *d = opendir(dir);
+    struct dirent *entry;
+    CHECK(d != NULL, "open fixture directory");
+    if (!d) return;
+    while ((entry = readdir(d)) != NULL) {
+        size_t len = strlen(entry->d_name);
+        if (len < 4 || strcasecmp(entry->d_name + len - 4, ".edf")) continue;
+        char path[800], field[80];
+        snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+        FILE *f = fopen(path, "r+b");
+        CHECK(f != NULL, "open fixture EDF header");
+        if (!f) continue;
+        fx_field(field, sizeof(field), rec_id);
+        CHECK(fseek(f, 88, SEEK_SET) == 0 && fwrite(field, 1, sizeof(field), f) == sizeof(field),
+              "write fixture EDF recording identity");
+        fclose(f);
+    }
+    closedir(d);
+}
+
+static bool s_fixture_mask_2210;
+static void fixture_mask_2210(const char *serial, const char *family);
+
 static void fresh_tree(void)
 {
     rmtree(SD_MOUNT_POINT);
@@ -387,6 +423,22 @@ static void fresh_tree(void)
     mkpath(SD_STREAMS_DIR);
     mkpath(SD_SUMMARIES_DIR);
     mkpath(DATALOG_DAY);
+    if (s_fixture_mask_2210)
+        fixture_mask_2210("22199999999", "AS11");
+}
+
+static void fixture_mask_2210(const char *serial, const char *family)
+{
+    char path[600];
+    snprintf(path, sizeof(path), "%s/20240115.native.mask-intervals.json",
+             SD_SUMMARIES_DIR);
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL, "create synthetic native mask evidence");
+    if (!f) return;
+    fprintf(f, "{\"day\":\"20240115\",\"serial\":\"%s\","
+               "\"family\":\"%s\",\"complete\":true,\"pairs\":[[610,700]]}",
+            serial, family);
+    fclose(f);
 }
 
 /* Runs process_next until NOT_FOUND; returns last unit. */
@@ -398,9 +450,16 @@ static edf_import_unit_t drain(edf_import_ctx_t *c, int *units)
         tot.sessions_imported += u.sessions_imported;
         tot.sessions_skipped  += u.sessions_skipped;
         tot.sessions_failed   += u.sessions_failed;
+        tot.deferred_association += u.deferred_association;
+        tot.deferred_identity += u.deferred_identity;
+        tot.deferred_frozen += u.deferred_frozen;
+        tot.deferred_conflict += u.deferred_conflict;
+        tot.deferred_capacity += u.deferred_capacity;
+        tot.deferred_inflight += u.deferred_inflight;
         tot.files_consumed    += u.files_consumed;
         tot.files_rejected    += u.files_rejected;
         tot.spools_written    += u.spools_written;
+        tot.settings_written  += u.settings_written;
         if (u.day_label[0]) memcpy(tot.day_label, u.day_label, 9);
         if (u.day2_label[0]) memcpy(tot.day2_label, u.day2_label, 9);
         (*units)++;
@@ -409,10 +468,22 @@ static edf_import_unit_t drain(edf_import_ctx_t *c, int *units)
     return tot;
 }
 
+static bool fail_empty_flow_open;
+FILE *__real_fopen(const char *path, const char *mode);
+FILE *__wrap_fopen(const char *path, const char *mode)
+{
+    if (fail_empty_flow_open && strstr(path, "_flow.snt.part") && !strcmp(mode, "wb")) {
+        errno = EIO;
+        return NULL;
+    }
+    return __real_fopen(path, mode);
+}
+
 /* ── phase a: full session, AS11 layout ────────────────────────────── */
 static void phase_a(void)
 {
     fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
     char dir[256];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
     build_session_dir(dir, "20240115_221007", "20240115_221000", true,
@@ -427,8 +498,8 @@ static void phase_a(void)
     CHECK(units == 1, "one unit expected");
     CHECK(t.sessions_imported == 1, "1 session imported");
     CHECK(t.sessions_failed == 0, "no failures");
-    CHECK(t.files_consumed == 5, "5 sources consumed");
-    CHECK(!edf_import_pending(), "inbox drained");
+    CHECK(t.files_consumed == 5, "committed sources are consumed");
+    CHECK(!edf_import_pending(), "inbox fully drained");
 
     /* Session id = eve start (2024-01-15 22:10:00 UTC) → 1705356600000 */
     const char *id = "20240115_221000";
@@ -486,6 +557,16 @@ static void phase_a(void)
         } else {
             CHECK(false, "end_iso present");
         }
+        /* Evidence contract: the deleted cross-stem wave source survives
+         * as a recorded stem under import_sources. */
+        cJSON *srcs = cJSON_GetObjectItem(m, "import_sources");
+        CHECK(srcs && cJSON_IsObject(srcs), "import_sources recorded");
+        if (srcs) {
+            cJSON *brp = cJSON_GetObjectItem(srcs, "brp");
+            CHECK(brp && cJSON_IsString(brp) && brp->valuestring &&
+                  strstr(brp->valuestring, "20240115_221007"),
+                  "cross-stem wave recorded as evidence");
+        }
         cJSON_Delete(m);
     }
 
@@ -506,7 +587,7 @@ static void phase_a(void)
     /* press.snt — phys 0-40, dig 0-2000: dig=100 → 2.0 → 200 */
     snprintf(p, sizeof(p), "%s/%s/%s_press.snt", SD_STREAMS_DIR, DAY, id);
     CHECK(snt_read(p, &h, &d), "press.snt readable");
-    CHECK(h.sample_count == 75 && d[0] == 200 && d[1] == 202, "press values");
+    CHECK(d && h.sample_count == 75 && d[0] == 200 && d[1] == 202, "press values");
     free(d);
 
     /* flow_mm.snt — 2ch 1Hz minmax over each 25-sample second.
@@ -515,15 +596,15 @@ static void phase_a(void)
     CHECK(snt_read(p, &h, &d), "flow_mm.snt readable");
     CHECK(h.n_channels == 2 && h.sample_hz_x10 == 10 && h.sample_count == 3,
           "flow_mm header");
-    CHECK(d[0] == 0 && d[1] == 48, "flow_mm sec0");
+    CHECK(d && d[0] == 0 && d[1] == 48, "flow_mm sec0");
     free(d);
 
     /* sa2.snt — stored = phys×100; dig -1 → INT16_MIN */
     snprintf(p, sizeof(p), "%s/%s/%s_sa2.snt", SD_STREAMS_DIR, DAY, id);
     CHECK(snt_read(p, &h, &d), "sa2.snt readable");
     CHECK(h.n_channels == 2 && h.sample_count == 3, "sa2 header");
-    CHECK(d[0] == 6200 && d[1] == 9700, "sa2 frame0");
-    CHECK(d[2] == INT16_MIN && d[5] == INT16_MIN, "sa2 missing → sentinel");
+    CHECK(d && d[0] == 6200 && d[1] == 9700, "sa2 frame0");
+    CHECK(d && d[2] == INT16_MIN && d[5] == INT16_MIN, "sa2 missing → sentinel");
     free(d);
 
     /* pld.snt — 12ch, MaskPress dig 110 → phys 2.20 → 220;
@@ -533,8 +614,8 @@ static void phase_a(void)
     CHECK(snt_read(p, &h, &d), "pld.snt readable");
     CHECK(h.n_channels == 12 && h.sample_hz_x10 == 5 && h.sample_count == 3,
           "pld header");
-    CHECK(d[0] == 220 && d[3] == 40 && d[10] == 20, "pld mapped channels");
-    CHECK(d[7] == 0 && d[8] == 0 && d[11] == 0, "pld absent channels zero");
+    CHECK(d && d[0] == 220 && d[3] == 40 && d[10] == 20, "pld mapped channels");
+    CHECK(d && d[7] == 0 && d[8] == 0 && d[11] == 0, "pld absent channels zero");
     free(d);
 
     /* events.snt — synthetic therapy + mask window + 2 respiratory + 2 CSR */
@@ -553,9 +634,10 @@ static void phase_a(void)
         free(ev);
     }
 
-    /* all 5 sources deleted */
+    /* Different stems joined by native evidence are recorded in the
+     * manifest — the staged originals are consumed on commit. */
     snprintf(p, sizeof(p), "%s/%s/20240115_221007_BRP.edf", DATALOG_DAY, DAY);
-    CHECK(!file_exists(p), "BRP source deleted");
+    CHECK(!file_exists(p), "cross-stem waveform source consumed");
     edf_import_ctx_destroy(c);
     printf("phase a OK (%d checks)\n", g_checks);
 }
@@ -580,15 +662,15 @@ static void phase_b(void)
 
     build_session_dir(dir, "20240115_221007", "20240115_221000", false,
                       2024, 1, 15);
+    set_fixture_recording_id(dir, "SRN=22161122334 MID=24 VID=1");
+    fixture_mask_2210("22161122334", "AS10");
 
     edf_import_ctx_t *c = edf_import_ctx_create();
     int units;
     edf_import_unit_t t = drain(c, &units);
     CHECK(units == 2, "root pass + day unit");
     CHECK(t.sessions_imported == 1, "1 session");
-    /* BRP+PLD+EVE+CSL consumed in the day unit; the .tgt went in the
-     * root pass which does not count toward files_consumed. */
-    CHECK(t.files_consumed == 4, "4 sources consumed");
+    CHECK(t.files_consumed == 4, "committed sources consumed");
 
     const char *id = "20240115_221000";
     char p[700];
@@ -618,7 +700,7 @@ static void phase_b(void)
     snt_header_t h; int16_t *d;
     snprintf(p, sizeof(p), "%s/%s/%s_sa2.snt", SD_STREAMS_DIR, DAY, id);
     CHECK(snt_read(p, &h, &d), "sa2.snt exists despite missing SA2.edf");
-    CHECK(h.sample_count == 3 && d[0] == INT16_MIN && d[1] == INT16_MIN &&
+    CHECK(d && h.sample_count == 3 && d[0] == INT16_MIN && d[1] == INT16_MIN &&
           d[3] == INT16_MIN, "sa2 all-missing fill");
     free(d);
 
@@ -643,17 +725,25 @@ static void phase_c(void)
     };
     char p[700];
     snprintf(p, sizeof(p), "%s/20240115_221000_BRP.edf", dir);
-    /* header declares 99 records; 3 valid records + 733 junk bytes on disk.
-     * stride = 25*2+2 = 52 → disk holds 17 record slots; records 3..16
-     * fail CRC and must import as SNT_MISSING, not garbage. */
+    /* A growing file whose header promises more data must remain staged. */
     fx_write_edf(p, "SRN=22199999999 MID=46 VID=1",
                  2024, 1, 15, 22, 10, 0, "", "1", 99, 3, s, 1, 733);
 
     edf_import_ctx_t *c = edf_import_ctx_create();
     int units;
     edf_import_unit_t t = drain(c, &units);
-    CHECK(t.sessions_imported == 1, "torn session still imports");
-    CHECK(t.sessions_failed == 0, "torn tail is not a failure");
+    CHECK(t.sessions_imported == 0 && file_exists(p),
+          "incomplete source remains staged");
+    edf_import_ctx_destroy(c);
+
+    /* A complete 17-record file with bad trailing CRCs keeps their positions
+     * as missing samples rather than importing arbitrary bytes. */
+    fx_write_edf(p, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 22, 10, 0, "", "1", 17, 3, s, 1, 14 * 52);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    CHECK(t.sessions_imported == 1 && t.sessions_failed == 0,
+          "complete source imports");
 
     snprintf(p, sizeof(p), "%s/%s/20240115_221000_flow.snt",
              SD_STREAMS_DIR, DAY);
@@ -661,8 +751,8 @@ static void phase_c(void)
     CHECK(snt_read(p, &h, &d), "flow.snt readable");
     CHECK(h.sample_count == 17 * 25, "17 record slots kept positional");
     /* dig 74 → phys = -2 + (74+1000)·5/2500 = 0.148 → stored 15 */
-    CHECK(d[74] == 15, "last good sample");
-    CHECK(d[75] == INT16_MIN && d[424] == INT16_MIN, "CRC junk → missing");
+    CHECK(d && d[74] == 15, "last good sample");
+    CHECK(d && d[75] == INT16_MIN && d[424] == INT16_MIN, "CRC junk → missing");
     free(d);
     edf_import_ctx_destroy(c);
     printf("phase c OK (%d checks)\n", g_checks);
@@ -726,12 +816,12 @@ static void phase_d(void)
 /* ── phase e: SomnoBridge drift sidecar ────────────────────────────── */
 static void phase_e(void)
 {
+    s_fixture_mask_2210 = true;
     fresh_tree();
     char dir[256];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
     build_session_dir(dir, "20240115_221007", "20240115_221000", true,
                       2024, 1, 15);
-
     /* drift = +214000 ms measured by the bridge */
     char dp[700];
     snprintf(dp, sizeof(dp), "%s/_bridge_drift.json", dir);
@@ -774,7 +864,7 @@ static void phase_e(void)
               "drifted start");
         cJSON_Delete(m);
     }
-    CHECK(!file_exists(dp), "sidecar consumed");
+    CHECK(!file_exists(dp), "sidecar consumed with fully-drained group");
     edf_import_ctx_destroy(c);
 
     /* estimate-only sidecar → valid=false, usable iff half_ms ≤ 5000 */
@@ -832,6 +922,318 @@ static void phase_e(void)
         cJSON_Delete(m3);
     }
     edf_import_ctx_destroy(c);
+
+    /* ── schema-5 envelope shapes (SomnoBridge update6) ── */
+
+    /* sot as interval_ms (no scalar clock_drift_ms) → midpoint used */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"source_of_truth\":{\"selected_view\":\"current_session_estimate\","
+          "\"quality\":\"qualified\",\"interval_ms\":[213500,214500],"
+          "\"accuracy_half_ms\":500,\"reference_at_ms\":1705357000000}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_221334_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m4 = parse_json_file(p);
+    CHECK(m4 != NULL, "schema-5 sot manifest parses");
+    if (m4) {
+        cJSON *v = cJSON_GetObjectItem(m4, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == 214000,
+              "interval midpoint drift");
+        v = cJSON_GetObjectItem(m4, "clock_drift_half_ms");
+        CHECK(v && (int64_t)v->valuedouble == 500, "sot half recorded");
+        v = cJSON_GetObjectItem(m4, "clock_drift_measured_at_ms");
+        CHECK(v && (int64_t)v->valuedouble == 1705357000000LL,
+              "sot reference_at");
+        CHECK(cJSON_IsTrue(cJSON_GetObjectItem(m4, "clock_drift_valid")),
+              "sot valid");
+        v = cJSON_GetObjectItem(m4, "clock_drift_source");
+        CHECK(v && !strcmp(v->valuestring, "somnobridge_qualified"),
+              "sot source = qualified");
+        cJSON_Delete(m4);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* best_available_offset previous-session fallback → -480000 ms */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"best_available_offset\":{\"selected_view\":"
+          "\"previous_session_fallback\",\"quality\":\"provisional\","
+          "\"interval_ms\":[-480500,-479500],\"accuracy_half_ms\":500,"
+          "\"reference_at_ms\":1705356400000}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_220200_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m5 = parse_json_file(p);
+    CHECK(m5 != NULL, "best-available manifest parses");
+    if (m5) {
+        cJSON *v = cJSON_GetObjectItem(m5, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == -480000,
+              "best_available drift -480s");
+        CHECK(cJSON_IsTrue(cJSON_GetObjectItem(m5, "clock_drift_valid")),
+              "best_available valid");
+        CHECK(cJSON_IsTrue(cJSON_GetObjectItem(m5, "clock_drift_usable")),
+              "best_available usable");
+        v = cJSON_GetObjectItem(m5, "clock_drift_source");
+        CHECK(v && !strcmp(v->valuestring, "somnobridge_fallback"),
+              "fallback view → fallback source");
+        cJSON_Delete(m5);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* completed_session_fallback eligible record → -481000 ms */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"completed_session_fallback\":{\"fallback_eligible\":true,"
+          "\"adjusted_half_ms\":2300,\"record\":{\"clock_drift_ms\":"
+          "\"-481000\",\"accuracy_half_ms\":1300,"
+          "\"reference_at_ms\":1705356000000}}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_220159_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m6 = parse_json_file(p);
+    CHECK(m6 != NULL, "completed-fallback manifest parses");
+    if (m6) {
+        cJSON *v = cJSON_GetObjectItem(m6, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == -481000,
+              "completed fallback drift");
+        v = cJSON_GetObjectItem(m6, "clock_drift_half_ms");
+        CHECK(v && (int64_t)v->valuedouble == 2300,
+              "adjusted half used");
+        CHECK(cJSON_IsTrue(cJSON_GetObjectItem(m6, "clock_drift_valid")),
+              "completed fallback valid");
+        cJSON_Delete(m6);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* estimate-only + confirmed device zone UTC-10 under a UTC host:
+     * applied shift = -480000 + (0 - 36000)*1000 = -36480000 */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"estimate\":{\"estimate_state\":\"provisional\","
+          "\"clock_drift_ms\":\"-480000\",\"accuracy_half_ms\":1191,"
+          "\"timezone_rule\":\"UTC-10\",\"timezone_confirmed\":true}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_120200_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m7 = parse_json_file(p);
+    CHECK(m7 != NULL, "device-zone manifest parses");
+    if (m7) {
+        cJSON *v = cJSON_GetObjectItem(m7, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == -36480000,
+              "drift+zone applied");
+        v = cJSON_GetObjectItem(m7, "device_tz_offset_s");
+        CHECK(v && (int64_t)v->valuedouble == 36000,
+              "device offset +10h");
+        v = cJSON_GetObjectItem(m7, "device_tz_delta_ms");
+        CHECK(v && (int64_t)v->valuedouble == -36000000,
+              "zone delta -10h");
+        v = cJSON_GetObjectItem(m7, "device_tz_rule");
+        CHECK(v && !strcmp(v->valuestring, "UTC-10"),
+              "device rule recorded");
+        CHECK(cJSON_IsFalse(cJSON_GetObjectItem(m7, "clock_drift_valid")),
+              "estimate not valid");
+        CHECK(cJSON_IsTrue(cJSON_GetObjectItem(m7, "clock_drift_usable")),
+              "estimate usable");
+        cJSON_Delete(m7);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* unconfirmed device zone → zone delta NOT applied */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"estimate\":{\"estimate_state\":\"provisional\","
+          "\"clock_drift_ms\":\"-480000\",\"accuracy_half_ms\":1191,"
+          "\"timezone_rule\":\"UTC-10\",\"timezone_confirmed\":false}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_220200_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m8 = parse_json_file(p);
+    CHECK(m8 != NULL, "unconfirmed-zone manifest parses");
+    if (m8) {
+        cJSON *v = cJSON_GetObjectItem(m8, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == -480000,
+              "unconfirmed zone → drift only");
+        CHECK(cJSON_GetObjectItem(m8, "device_tz_offset_s") == NULL,
+              "no device offset field");
+        CHECK(cJSON_GetObjectItem(m8, "device_tz_delta_ms") == NULL,
+              "no zone delta field");
+        cJSON_Delete(m8);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* unusable estimate (half 15000) but confirmed zone → zone delta
+     * still applied, drift stays 0 */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"estimate\":{\"estimate_state\":\"provisional\","
+          "\"clock_drift_ms\":\"-480000\",\"accuracy_half_ms\":15000,"
+          "\"timezone_rule\":\"UTC-10\",\"timezone_confirmed\":true}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_121000_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m9 = parse_json_file(p);
+    CHECK(m9 != NULL, "zone-only manifest parses");
+    if (m9) {
+        cJSON *v = cJSON_GetObjectItem(m9, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == -36000000,
+              "zone-only shift");
+        CHECK(cJSON_IsFalse(cJSON_GetObjectItem(m9, "clock_drift_usable")),
+              "estimate not usable");
+        cJSON_Delete(m9);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* poisoned drift magnitude (>24 h) → ignored entirely (RC1 bug) */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"estimate\":{\"estimate_state\":\"provisional\","
+          "\"clock_drift_ms\":\"-1793194135596\",\"accuracy_half_ms\":1191}}",
+          f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_221000_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m10 = parse_json_file(p);
+    CHECK(m10 != NULL, "garbage-drift manifest parses");
+    if (m10) {
+        cJSON *v = cJSON_GetObjectItem(m10, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == 0,
+              "garbage drift → 0");
+        CHECK(cJSON_IsFalse(cJSON_GetObjectItem(m10, "clock_drift_valid")),
+              "garbage → not valid");
+        CHECK(cJSON_IsFalse(cJSON_GetObjectItem(m10, "clock_drift_usable")),
+              "garbage → not usable");
+        v = cJSON_GetObjectItem(m10, "clock_drift_source");
+        CHECK(v && !strcmp(v->valuestring, "somnobridge_none"),
+              "garbage → none source");
+        v = cJSON_GetObjectItem(m10, "start_epoch_ms");
+        CHECK(v && (int64_t)v->valuedouble == 1705356600000LL,
+              "garbage → unshifted start");
+        cJSON_Delete(m10);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* garbage sot must not shadow a valid lower tier (fallthrough) */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"source_of_truth\":{\"quality\":\"qualified\",\"interval_ms\":"
+          "[-1793194135596,-1793194135000],\"accuracy_half_ms\":500},"
+          "\"completed_session_fallback\":{\"fallback_eligible\":true,"
+          "\"adjusted_half_ms\":1300,\"record\":{\"clock_drift_ms\":"
+          "\"-480500\",\"accuracy_half_ms\":1300,"
+          "\"reference_at_ms\":1705356000000}}}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    snprintf(p, sizeof(p), "%s/%s/20240115_220159_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *m11 = parse_json_file(p);
+    CHECK(m11 != NULL, "fallthrough manifest parses");
+    if (m11) {
+        cJSON *v = cJSON_GetObjectItem(m11, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == -480500,
+              "garbage sot → fallback tier");
+        v = cJSON_GetObjectItem(m11, "clock_drift_source");
+        CHECK(v && !strcmp(v->valuestring, "somnobridge_fallback"),
+              "fallback source");
+        cJSON_Delete(m11);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* pending transport-error placeholder → the group defers instead of
+     * committing drift=0; the settled record then imports with the real
+     * drift applied.  (Regression: a one-shot GET_DRIFT timeout used to
+     * bake a ~51-minute shift into every session of that day.) */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"schema\":5,\"pending\":true,\"reason\":\"transport_error\"}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    edf_import_unit_t pu;
+    CHECK(edf_import_process_next(c, &pu) == ESP_OK && pu.deferred,
+          "pending drift → unit deferred");
+    CHECK(pu.sessions_imported == 0 && pu.sessions_failed == 0,
+          "pending drift → nothing committed");
+    CHECK(file_exists(dp), "pending sidecar kept staged");
+    /* The real record lands — the same day now imports with drift. */
+    f = fopen(dp, "w");
+    fputs("{\"source_of_truth\":{\"clock_drift_ms\":\"214000\",\"half_ms\":300,"
+          "\"quality\":\"qualified\",\"basis\":\"anchor\",\"generation\":4}}", f);
+    fclose(f);
+    edf_import_unit_t ru;
+    CHECK(edf_import_process_next(c, &ru) == ESP_OK &&
+          ru.sessions_imported == 1,
+          "settled drift → session imported");
+    snprintf(p, sizeof(p), "%s/%s/20240115_221334_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *mp = parse_json_file(p);
+    CHECK(mp != NULL, "post-pending manifest parses");
+    if (mp) {
+        cJSON *v = cJSON_GetObjectItem(mp, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == 214000,
+              "settled drift applied after pending");
+        cJSON_Delete(mp);
+    }
+    edf_import_ctx_destroy(c);
+
+    /* A settled placeholder (bridge answered "nothing for this day")
+     * imports immediately — drift 0 is the honest outcome. */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    f = fopen(dp, "w");
+    fputs("{\"schema\":5,\"pending\":true,"
+          "\"reason\":\"metadata_unavailable\"}", f);
+    fclose(f);
+    c = edf_import_ctx_create();
+    edf_import_unit_t st = drain(c, &units);
+    CHECK(st.sessions_imported == 1, "settled placeholder imports");
+    snprintf(p, sizeof(p), "%s/%s/20240115_221000_session.json",
+             SD_STREAMS_DIR, DAY);
+    cJSON *ms = parse_json_file(p);
+    CHECK(ms != NULL, "settled-placeholder manifest parses");
+    if (ms) {
+        cJSON *v = cJSON_GetObjectItem(ms, "clock_drift_ms");
+        CHECK(v && (int64_t)v->valuedouble == 0, "settled → drift 0");
+        v = cJSON_GetObjectItem(ms, "clock_drift_source");
+        CHECK(v && !strcmp(v->valuestring, "somnobridge_none"),
+              "settled → none source");
+        cJSON_Delete(ms);
+    }
+    edf_import_ctx_destroy(c);
+    s_fixture_mask_2210 = false;
     printf("phase e OK (%d checks)\n", g_checks);
 }
 
@@ -841,7 +1243,7 @@ static void phase_f(void)
     fresh_tree();
     char dir[256];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
-    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true,
                       2024, 1, 15);
 
     edf_import_ctx_t *c = edf_import_ctx_create();
@@ -850,7 +1252,7 @@ static void phase_f(void)
     edf_import_ctx_destroy(c);
 
     /* Re-drop identical files → duplicate detection consumes them */
-    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true,
                       2024, 1, 15);
     c = edf_import_ctx_create();
     edf_import_unit_t t = drain(c, &units);
@@ -860,7 +1262,7 @@ static void phase_f(void)
     edf_import_ctx_destroy(c);
 
     /* Same anchor, slightly different content → still the same session */
-    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+    build_session_dir(dir, "20240115_221000", "20240115_221000", false,
                       2024, 1, 15);
     c = edf_import_ctx_create();
     t = drain(c, &units);
@@ -879,10 +1281,11 @@ static void phase_f(void)
     FILE *f = fopen(mpath, "w");
     /* existing session at 22:06:40 — 200 s away → not a dup */
     fputs("{\"id\":\"20240115_221000\",\"start_epoch_ms\":1705356400000,"
-          "\"end_epoch_ms\":1705356410000}", f);
+          "\"end_epoch_ms\":1705356410000,\"clock_drift_ms\":0,"
+          "\"clock_drift_valid\":true}", f);
     fclose(f);
 
-    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true,
                       2024, 1, 15);
     c = edf_import_ctx_create();
     t = drain(c, &units);
@@ -973,6 +1376,11 @@ static uint8_t *read_bin(const char *path, size_t *n)
 static void phase_g(void)
 {
     fresh_tree();
+    char legacy_path[700];
+    snprintf(legacy_path, sizeof(legacy_path), "%s/20240115.settings.json", SD_SUMMARIES_DIR);
+    FILE *legacy = fopen(legacy_path, "w");
+    CHECK(legacy != NULL, "create legacy settings");
+    if (legacy) { fputs("{\"legacy_marker\":true}", legacy); fclose(legacy); }
     /* AS11 Identification.json */
     char ip[700];
     snprintf(ip, sizeof(ip), "%s/Identification.json", IMPORT_DIR);
@@ -984,22 +1392,21 @@ static void phase_g(void)
           "\"Software\":{\"SoftwareVersion\":\"SX566-0302\"}}}}", f);
     fclose(f);
 
-    /* STR.edf — two day records.  "Date" carries days-since-epoch:
-     * 2024-01-15 = 19737, 2024-01-14 = 19736. */
-    static int16_t str_date[2]  = { 19737, 19736 };
-    static int16_t str_on[40]   = { 630, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    /* STR.edf — two consecutive day records in header/index order. */
+    static int16_t str_date[2]  = { 19736, 19737 };
+    static int16_t str_on[40]   = { 620, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                                     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-                                    620, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                    630, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                                     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
-    static int16_t str_off[40]  = { 1050, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    static int16_t str_off[40]  = { 1040, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                                     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-                                    1040, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                                    1050, -1, -1, -1, -1, -1, -1, -1, -1, -1,
                                     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
     static int16_t str_dur[2]   = { 420, 420 };
     static int16_t str_mode[2]  = { 1, 1 };     /* AutoSetProfile */
-    static int16_t str_ahi[2]   = { 23, 18 };   /* spool raw = dig*10 */
-    static int16_t str_oai[2]   = { 11, 9 };
-    static int16_t str_mp[2]    = { 1080, 1100 };
+    static int16_t str_ahi[2]   = { 18, 23 };   /* spool raw = dig*10 */
+    static int16_t str_oai[2]   = { 9, 11 };
+    static int16_t str_mp[2]    = { 1100, 1080 };
     const fx_sig_t str_s[] = {
         { "Date",    "d",   0, 40000,   0, 40000, 1, str_date, NULL, 0 },
         { "MaskOn",  "min", -1, 1440,  -1, 1440, 20, str_on,   NULL, 0 },
@@ -1014,19 +1421,24 @@ static void phase_g(void)
     snprintf(sp, sizeof(sp), "%s/STR.edf", IMPORT_DIR);
     /* real STR files use record_duration=86400 s (one day per record) */
     fx_write_edf(sp, "SRN=22199876543 MID=46 VID=1",
-                 2024, 1, 16, 0, 0, 5, "", "86400", 2, 2, str_s, 8, 0);
+                 2024, 1, 14, 12, 0, 0, "", "86400", 2, 2, str_s, 8, 0);
 
     /* session on 2024-01-15 so the resolved AS11 ident gets attached */
     char dir[256];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
-    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true,
                       2024, 1, 15);
+    set_fixture_recording_id(dir, "SRN=22199876543 MID=46 VID=1");
 
     edf_import_ctx_t *c = edf_import_ctx_create();
     int units;
     edf_import_unit_t t = drain(c, &units);
     CHECK(t.spools_written == 2, "two spools from STR");
     CHECK(t.sessions_imported == 1, "session imported");
+    cJSON *legacy_json = parse_json_file(legacy_path);
+    CHECK(legacy_json && cJSON_IsTrue(cJSON_GetObjectItem(legacy_json, "legacy_marker")),
+          "existing unmarked settings must remain intact");
+    cJSON_Delete(legacy_json);
 
     /* 20240115.spool — field walk: f2 noon_ms(0115), f3 +24h, f5=420,
      * f7 AHI raw=230, f10 OAI raw=110, f39 session count=1. */
@@ -1051,15 +1463,15 @@ static void phase_g(void)
         free(blob);
     }
 
-    /* <day>.settings.json — TherapyProfile from Mode dig=1 → AutoSet */
-    snprintf(sp, sizeof(sp), "%s/20240115.settings.json", SD_SUMMARIES_DIR);
+    /* Native daily settings contain only fields from the STR record. */
+    CHECK(t.settings_written == 2, "two native settings snapshots");
+    snprintf(sp, sizeof(sp), "%s/20240115.native.settings.json", SD_SUMMARIES_DIR);
     cJSON *sj = parse_json_file(sp);
     CHECK(sj != NULL, "day settings written");
     if (sj) {
         cJSON *v = cJSON_GetObjectItem(
-            cJSON_GetObjectItem(cJSON_GetObjectItem(sj, "SettingProfiles"),
-                                "ActiveProfiles"), "TherapyProfile");
-        CHECK(v && !strcmp(v->valuestring, "AutoSetProfile"), "AutoSet profile");
+            cJSON_GetObjectItem(sj, "_as11_edf_settings"), "Mode");
+        CHECK(cJSON_IsNumber(v) && v->valueint == 1, "AutoSet mode");
         cJSON_Delete(sj);
     }
     CHECK(!file_exists(ip), "Identification.json consumed");
@@ -1089,15 +1501,16 @@ static void phase_g(void)
      * reason) */
     snprintf(sp, sizeof(sp), "%s/STR.edf", IMPORT_DIR);
     fx_write_edf(sp, "SRN=22199876543 MID=46 VID=1",
-                 2024, 1, 16, 0, 0, 5, "", "86400", 2, 2, str_s, 8, 0);
+                 2024, 1, 14, 12, 0, 0, "", "86400", 2, 2, str_s, 8, 0);
     c = edf_import_ctx_create();
     t = drain(c, &units);
     CHECK(t.spools_written == 0, "re-imported STR creates no new spools");
+    CHECK(t.settings_written == 0, "unchanged STR creates no new settings");
     edf_import_ctx_destroy(c);
 
     /* A fresh ctx with no root ident falls back to EDF recording_id */
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, "20240116");
-    build_session_dir(dir, "20240116_221007", "20240116_221000", true,
+    build_session_dir(dir, "20240116_221000", "20240116_221000", true,
                       2024, 1, 16);
     c = edf_import_ctx_create();
     drain(c, &units);
@@ -1130,19 +1543,24 @@ static void phase_h(void)
      * renamed stream, NO manifest. */
     char p[700];
     snprintf(p, sizeof(p), "%s/20240115_221000_session.json.importing", dir);
-    FILE *f = fopen(p, "w"); fclose(f);
+    FILE *f = fopen(p, "w"); fputs("SomnoTrace import grouping v2\n", f); fclose(f);
     snprintf(p, sizeof(p), "%s/20240115_221000_flow.snt.part", dir);
     f = fopen(p, "wb"); fwrite("0123456789", 1, 10, f); fclose(f);
     snprintf(p, sizeof(p), "%s/20240115_221000_events.snt", dir);
     f = fopen(p, "wb"); fwrite("0123456789", 1, 10, f); fclose(f);
     /* A committed marker (manifest exists) must survive: */
     snprintf(p, sizeof(p), "%s/20240115_230000_session.json.importing", dir);
-    f = fopen(p, "w"); fclose(f);
+    f = fopen(p, "w"); fputs("SomnoTrace import grouping v2\n", f); fclose(f);
     snprintf(p, sizeof(p), "%s/20240115_230000_session.json", dir);
     f = fopen(p, "w");
-    fputs("{\"start_epoch_ms\":1705360200000}", f); fclose(f);
+    fputs("{\"start_epoch_ms\":1705360200000,\"state\":\"completed\","
+          "\"import_grouping_version\":2}", f); fclose(f);
     snprintf(p, sizeof(p), "%s/20240115_230000_flow.snt", dir);
     f = fopen(p, "wb"); fwrite("0123456789", 1, 10, f); fclose(f);
+    snprintf(p, sizeof(p), "%s/20240115_200000_session.json.importing", dir);
+    f = fopen(p, "w"); fclose(f); /* pre-cohort marker */
+    snprintf(p, sizeof(p), "%s/20240115_200000_flow.snt.part", dir);
+    f = fopen(p, "wb"); fwrite("legacy", 1, 6, f); fclose(f);
 
     edf_import_ctx_t *c = edf_import_ctx_create();
     int units;
@@ -1161,6 +1579,10 @@ static void phase_h(void)
     CHECK(file_exists(p), "committed flow kept");
     snprintf(p, sizeof(p), "%s/20240115_230000_session.json.importing", dir);
     CHECK(!file_exists(p), "committed marker removed");
+    snprintf(p, sizeof(p), "%s/20240115_200000_session.json.importing", dir);
+    CHECK(file_exists(p), "pre-cohort marker preserved");
+    snprintf(p, sizeof(p), "%s/20240115_200000_flow.snt.part", dir);
+    CHECK(file_exists(p), "pre-cohort staged artifact preserved");
     printf("phase h OK (%d checks)\n", g_checks);
 }
 
@@ -1209,9 +1631,9 @@ static void phase_j(void)
     char dir[256];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);   /* .../20240115 */
     /* 01:00 belongs to the previous noon-day; 22:00 stays on 0115. */
-    build_session_dir(dir, "20240115_010007", "20240115_010000", false,
+    build_session_dir(dir, "20240115_010000", "20240115_010000", false,
                       2024, 1, 15);
-    build_session_dir(dir, "20240115_220007", "20240115_220000", false,
+    build_session_dir(dir, "20240115_220000", "20240115_220000", false,
                       2024, 1, 15);
 
     edf_import_ctx_t *c = edf_import_ctx_create();
@@ -1242,8 +1664,9 @@ static void phase_k(void)
     fresh_tree();
     char dir[256], p[700];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
-    build_session_dir(dir, "20240115_221007", "20240115_221000", false,
+    build_session_dir(dir, "20240115_221000", "20240115_221000", false,
                       2024, 1, 15);
+    set_fixture_recording_id(dir, "SRN=22199876543 MID=46 VID=1");
 
     /* Overwrite PLD.edf with the AS10 short-label variant — every channel
      * carries a distinct dig so a misrouted probe cannot pass silently.
@@ -1268,9 +1691,9 @@ static void phase_k(void)
         {"FL.2s","",0,100,0,1000,1,s_fl,NULL,0},     /* AS10 FlowLim  */
         {"Ti.2s","",0,100,0,1000,1,s_ti,NULL,0},
     };
-    snprintf(p, sizeof(p), "%s/20240115_221007_PLD.edf", dir);
-    fx_write_edf(p, "SRN=22199876543 MID=38 VID=1",
-                 2024, 1, 15, 22, 10, 7, "", "1", 3, 3, pld_s, 12, 0);
+    snprintf(p, sizeof(p), "%s/20240115_221000_PLD.edf", dir);
+    fx_write_edf(p, "SRN=22199876543 MID=46 VID=1",
+                 2024, 1, 15, 22, 10, 0, "", "1", 3, 3, pld_s, 12, 0);
 
     /* CurrentSettings.json — carries a marker field the STR does not
      * cover; the S.* overlay must preserve it (not stub the tree). */
@@ -1350,43 +1773,27 @@ static void phase_k(void)
         free(blob);
     }
 
-    /* <day>.settings.json = CurrentSettings overlaid with S.* channels:
-     * SetPressure 10.0 (dig 500/50) replaces the stub's 4.0; PatientView
-     * "Basic" survives because no S.* channel covers it. */
-    snprintf(p, sizeof(p), "%s/20240115.settings.json", SD_SUMMARIES_DIR);
+    /* Native daily settings do not inherit fields absent from STR. */
+    snprintf(p, sizeof(p), "%s/20240115.native.settings.json", SD_SUMMARIES_DIR);
     cJSON *sj = parse_json_file(p);
     CHECK(sj != NULL, "day settings written");
     if (sj) {
-        cJSON *sp = cJSON_GetObjectItem(sj, "SettingProfiles");
-        cJSON *ap = cJSON_GetObjectItem(sp, "ActiveProfiles");
-        cJSON *v = cJSON_GetObjectItem(ap, "TherapyProfile");
-        CHECK(v && !strcmp(v->valuestring, "CpapProfile"),
-              "Mode 3 → CpapProfile");
-        cJSON *tp = cJSON_GetObjectItem(sp, "TherapyProfiles");
-        cJSON *cpap = cJSON_GetObjectItem(tp, "CpapProfile");
-        v = cJSON_GetObjectItem(cpap, "SetPressure");
-        CHECK(v && cJSON_IsNumber(v) && v->valuedouble == 10.0,
-              "S.C.Press 500 → SetPressure 10.0");
-        cJSON *fp = cJSON_GetObjectItem(sp, "FeatureProfiles");
-        v = cJSON_GetObjectItem(cJSON_GetObjectItem(fp, "AutoRampFeature"),
-                                "RampEnable");
-        CHECK(v && !strcmp(v->valuestring, "On"), "S.RampEnable 2 → On");
-        v = cJSON_GetObjectItem(cJSON_GetObjectItem(fp, "ClimateFeature"),
-                                "HumidifierLevel");
-        CHECK(v && cJSON_IsNumber(v) && v->valuedouble == 6.0,
-              "S.HumLevel 6 → 6.0");
-        v = cJSON_GetObjectItem(cJSON_GetObjectItem(fp, "ClimateFeature"),
-                                "ClimateControl");
-        CHECK(v && !strcmp(v->valuestring, "Auto"),
-              "S.ClimateControl 1 → Auto");
-        v = cJSON_GetObjectItem(cJSON_GetObjectItem(fp, "CircuitFeature"),
-                                "MaskType");
-        CHECK(v && !strcmp(v->valuestring, "FullFace"),
-              "S.Mask 3 → FullFace (1-idx)");
-        v = cJSON_GetObjectItem(cJSON_GetObjectItem(fp, "PatientViewFeature"),
-                                "PatientView");
-        CHECK(v && !strcmp(v->valuestring, "Basic"),
-              "unmapped CurrentSettings field preserved");
+        cJSON *fields = cJSON_GetObjectItem(sj, "_as11_edf_settings");
+        cJSON *v = cJSON_GetObjectItem(fields, "Mode");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 3, "Mode 3 retained");
+        v = cJSON_GetObjectItem(fields, "S.C.Press");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 10.0,
+              "S.C.Press 500 → 10.0 cmH2O");
+        v = cJSON_GetObjectItem(fields, "S.RampEnable");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 2, "S.RampEnable 2 retained");
+        v = cJSON_GetObjectItem(fields, "S.HumLevel");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 6, "S.HumLevel 6 retained");
+        v = cJSON_GetObjectItem(fields, "S.ClimateControl");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 1, "S.ClimateControl 1 retained");
+        v = cJSON_GetObjectItem(fields, "S.Mask");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 3, "S.Mask 3 retained");
+        v = cJSON_GetObjectItem(fields, "S.PtAccess");
+        CHECK(v == NULL, "unmapped CurrentSettings field must remain unknown");
         cJSON_Delete(sj);
     }
     edf_import_ctx_destroy(c);
@@ -1586,7 +1993,7 @@ static drift_case_t run_sidecar_case(const char *label, int n_files, int flags_l
     char msg[120];
     snprintf(msg, sizeof(msg), "%s: session imported", label);
     CHECK(t.sessions_imported == 1 && t.sessions_failed == 0, msg);
-    CHECK(!file_exists(dp), "sidecar consumed");
+    CHECK(!file_exists(dp), "sidecar consumed with fully-drained group");
 
     /* id is in the drifted domain: 22:10:00 + 214 s */
     snprintf(p, sizeof(p), "%s/%s/20240115_221334_session.json", SD_STREAMS_DIR, DAY);
@@ -1631,6 +2038,7 @@ static drift_case_t run_sidecar_case(const char *label, int n_files, int flags_l
 
 static void phase_m(void)
 {
+    s_fixture_mask_2210 = true;
     /* m1: small sidecar — embedded verbatim, nothing relocated (unchanged) */
     drift_case_t a = run_sidecar_case("small", 1, 0);
     CHECK(a.compact_present && !a.truncated && !a.file_ref, "small: verbatim embed");
@@ -1653,6 +2061,7 @@ static void phase_m(void)
     a = run_sidecar_case("giant-scalar", 1, 6000);
     CHECK(!a.compact_present && a.truncated, "giant-scalar: embed dropped, flagged");
     CHECK(a.file_ref, "giant-scalar: verbatim copy still relocated");
+    s_fixture_mask_2210 = false;
     printf("phase m OK (%d checks)\n", g_checks);
 }
 
@@ -1661,14 +2070,17 @@ static void phase_m(void)
 /* Stamp every file under `root` with mtime = now + delta_s. */
 static void touch_tree(const char *root, long delta_s)
 {
+    /* Dirs as well as files — a finished copy leaves an aged directory
+     * stamp, and the importer's dir-level quiescence keys on it. */
     char cmd[900];
-    snprintf(cmd, sizeof(cmd), "find '%s' -type f -exec touch -d @%ld {} +",
+    snprintf(cmd, sizeof(cmd), "find '%s' -exec touch -d @%ld {} +",
              root, (long)time(NULL) + delta_s);
     if (system(cmd) != 0) printf("  warn: touch_tree %s failed\n", root);
 }
 
 static void phase_n(void)
 {
+    s_fixture_mask_2210 = true;
     char dir[256], p[700];
     snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
     int units;
@@ -1689,7 +2101,7 @@ static void phase_n(void)
     touch_tree(IMPORT_DIR, -120);
     CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.deferred &&
           u.sessions_imported == 1, "n1: quiet files import");
-    CHECK(!file_exists(p), "n1: sources consumed after import");
+    CHECK(!file_exists(p), "n1: committed source consumed after import");
     edf_import_ctx_destroy(c);
 
     /* n2: a root copy in flight (Identification.json just written) holds
@@ -1731,16 +2143,49 @@ static void phase_n(void)
     CHECK(t.sessions_imported == 1, "n3: imports once the sidecar is quiet");
     edf_import_ctx_destroy(c);
 
-    /* n4: files dated in the future (unset device clock / fast PC clock)
-     * carry no recency information and must not defer forever */
+    /* n4: future-dated sources and .part files must first remain unchanged
+     * for a monotonic window, even when the wall clock is wrong. */
     fresh_tree();
     build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
+    snprintf(p, sizeof(p), "%s/upload.part", dir);
+    f = fopen(p, "w"); CHECK(f != NULL, "n4: create future transfer marker");
+    if (f) { fputs("first", f); fclose(f); }
     touch_tree(IMPORT_DIR, 3600);
     c = edf_import_ctx_create();
     edf_import_ctx_set_quiesce(c, 60);
-    t = drain(c, &units);
-    CHECK(t.sessions_imported == 1, "n4: future-dated files import");
+    edf_import_test_set_monotonic_us(0);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.deferred,
+          "n4: future-dated group is not assumed quiet");
+    edf_import_test_set_monotonic_us(30000000);
+    f = fopen(p, "a");
+    if (f) { fputs("still transferring", f); fclose(f); }
+    touch_tree(IMPORT_DIR, 3600);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.deferred,
+          "n4: changing future transfer restarts quiet window");
+    edf_import_test_set_monotonic_us(91000000);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.deferred &&
+          u.sessions_imported == 1, "n4: stable future group eventually imports");
     edf_import_ctx_destroy(c);
+
+    fresh_tree();
+    snprintf(p, sizeof(p), "%s/Identification.json", IMPORT_DIR);
+    f = fopen(p, "w");
+    if (f) {
+        fputs("{\"FlowGenerator\":{\"IdentificationProfiles\":{\"Product\":"
+              "{\"SerialNumber\":\"22199999999\",\"PlatformIdentifier\":46}}}}", f);
+        fclose(f);
+    }
+    touch_tree(IMPORT_DIR, 3600);
+    c = edf_import_ctx_create();
+    edf_import_ctx_set_quiesce(c, 60);
+    edf_import_test_set_monotonic_us(0);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.deferred && u.root_pass,
+          "n4: future-dated root is initially deferred");
+    edf_import_test_set_monotonic_us(61000000);
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.deferred && u.root_pass,
+          "n4: stable future root eventually imports");
+    edf_import_ctx_destroy(c);
+    edf_import_test_set_monotonic_us(-1);
 
     /* n5: window 0 (explicit "import now") ignores recency */
     fresh_tree();
@@ -1751,6 +2196,7 @@ static void phase_n(void)
     CHECK(t.sessions_imported == 1, "n5: quiesce 0 imports fresh files");
     edf_import_ctx_destroy(c);
 
+    s_fixture_mask_2210 = false;
     printf("phase n OK (%d checks)\n", g_checks);
 }
 
@@ -1788,10 +2234,10 @@ static void phase_o(void)
      * later day, so each reboot imported exactly one folder. */
     fresh_tree();
     snprintf(dir, sizeof(dir), "%s/20240115", IMPORT_DIR);
-    build_session_dir(dir, "20240115_221007", "20240115_221000", true, 2024, 1, 15);
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true, 2024, 1, 15);
     CHECK(crc_siblings(dir) == 5, "o1: 5 .crc siblings written");
     snprintf(dir, sizeof(dir), "%s/20240116", IMPORT_DIR);
-    build_session_dir(dir, "20240116_221007", "20240116_221000", true, 2024, 1, 16);
+    build_session_dir(dir, "20240116_221000", "20240116_221000", true, 2024, 1, 16);
     CHECK(crc_siblings(dir) == 5, "o1: second day's .crc siblings written");
     edf_import_ctx_t *c = edf_import_ctx_create();
     edf_import_unit_t t = drain(c, &units);
@@ -1814,7 +2260,7 @@ static void phase_o(void)
     FILE *f = fopen(p, "w");
     if (f) { fputs("keep me\n", f); fclose(f); }
     snprintf(dir, sizeof(dir), "%s/20240115", IMPORT_DIR);
-    build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
+    build_session_dir(dir, "20240115_221000", "20240115_221000", false, 2024, 1, 15);
     c = edf_import_ctx_create();
     t = drain(c, &units);
     CHECK(t.sessions_imported == 1, "o2: day after a leftover-only folder imports");
@@ -1823,24 +2269,1735 @@ static void phase_o(void)
     CHECK(file_exists(notes), "o2: the user's own file is left alone");
     edf_import_ctx_destroy(c);
 
-    /* o3: a corrupt EDF is quarantined *.bad and must not pin the inbox */
+    /* o3: an unreadable candidate must not pin other days. */
     fresh_tree();
     snprintf(dir, sizeof(dir), "%s/20240115", IMPORT_DIR);
-    build_session_dir(dir, "20240115_221007", "20240115_221000", false, 2024, 1, 15);
-    snprintf(p, sizeof(p), "%s/20240115_221007_BRP.edf", dir);
+    build_session_dir(dir, "20240115_221000", "20240115_221000", false, 2024, 1, 15);
+    snprintf(p, sizeof(p), "%s/20240115_221000_BRP.edf", dir);
     f = fopen(p, "wb");
     if (f) { fputs("garbage", f); fclose(f); }
+    char old_bad[760], new_bad[760], drift_path[760], crc_path[760];
+    snprintf(old_bad, sizeof(old_bad), "%s.bad", p);
+    snprintf(new_bad, sizeof(new_bad), "%s.bad.1", p);
+    f = fopen(old_bad, "w");
+    if (f) { fputs("prior quarantine", f); fclose(f); }
+    snprintf(crc_path, sizeof(crc_path), "%s/20240115_221000_BRP.crc", dir);
+    f = fopen(crc_path, "w");
+    if (f) { fputs("checksum", f); fclose(f); }
+    snprintf(drift_path, sizeof(drift_path), "%s/_bridge_drift.json", dir);
+    f = fopen(drift_path, "w");
+    if (f) { fputs("{\"source_of_truth\":{\"clock_drift_ms\":\"1000\"}}", f); fclose(f); }
     snprintf(dir, sizeof(dir), "%s/20240116", IMPORT_DIR);
-    build_session_dir(dir, "20240116_221007", "20240116_221000", false, 2024, 1, 16);
+    build_session_dir(dir, "20240116_221000", "20240116_221000", false, 2024, 1, 16);
     c = edf_import_ctx_create();
     t = drain(c, &units);
-    CHECK(t.files_rejected >= 1, "o3: corrupt EDF quarantined");
+    CHECK(file_exists(p), "o3: short source remains staged for retry");
     CHECK(t.sessions_imported == 1, "o3: the healthy day still imports");
+    f = fopen(old_bad, "r");
+    CHECK(f && fgetc(f) == 'p', "o3: previous quarantine is not overwritten");
+    if (f) fclose(f);
+    CHECK(!file_exists(new_bad), "o3: ambiguous short source is not renamed");
+    CHECK(file_exists(crc_path) && file_exists(drift_path),
+          "o3: quarantined sources keep checksum and drift sidecars");
     snprintf(h2, sizeof(h2), "%s/20240116", IMPORT_DIR);
     CHECK(!file_exists(h2), "o3: healthy day's husk removed");
     edf_import_ctx_destroy(c);
 
     printf("phase o OK (%d checks)\n", g_checks);
+}
+
+static void phase_p(void)
+{
+    fresh_tree();
+    char source[700], blocked[700];
+    FILE *meta = fopen(SD_DEVICE_METADATA_PATH, "w");
+    CHECK(meta != NULL, "create other-machine metadata");
+    if (meta) {
+        fputs("{\"ident\":{\"SerialNumber\":\"fixture-old\"},\"settings\":{\"old\":true}}", meta);
+        fclose(meta);
+    }
+    static int16_t date[] = {19737}, mode[] = {3}, pressure[] = {400};
+    const fx_sig_t sig[] = {
+        {"Date", "d", 0, 40000, 0, 40000, 1, date, NULL, 0},
+        {"Mode", "", 0, 32, 0, 32, 1, mode, NULL, 0},
+        {"S.C.Press", "cmH2O", 0, 40, 0, 2000, 1, pressure, NULL, 0},
+    };
+    snprintf(source, sizeof(source), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, sig, 3, 0);
+    snprintf(blocked, sizeof(blocked), "%s/20240115.native.settings.json.tmp",
+             SD_SUMMARIES_DIR);
+    CHECK(mkdir(blocked, 0775) == 0, "create blocked temporary path");
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t u;
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "failed snapshot retains root for a later scan");
+    CHECK(file_exists(source), "failed root pass must retain source STR");
+    CHECK(rmdir(blocked) == 0, "remove test-created blocker");
+    edf_import_ctx_destroy(c);
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.settings_written == 1,
+          "retry writes imported settings");
+    CHECK(!file_exists(source), "successful retry consumes source STR");
+    cJSON *kept = parse_json_file(SD_DEVICE_METADATA_PATH);
+    cJSON *kept_ident = cJSON_GetObjectItem(kept, "ident");
+    cJSON *kept_serial = cJSON_GetObjectItem(kept_ident, "SerialNumber");
+    CHECK(cJSON_IsString(kept_serial) && !strcmp(kept_serial->valuestring, "fixture-old"),
+          "different machine must not replace cached identity");
+    cJSON_Delete(kept);
+    edf_import_ctx_destroy(c);
+    mode[0] = -1;
+    pressure[0] = -1;
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, sig, 3, 0);
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.settings_written == 1,
+          "new unknown STR record invalidates earlier settings");
+    char settings_path[700];
+    snprintf(settings_path, sizeof(settings_path), "%s/20240115.native.settings.json",
+             SD_SUMMARIES_DIR);
+    cJSON *unknown = parse_json_file(settings_path);
+    cJSON *profiles = cJSON_GetObjectItem(unknown, "_as11_edf_settings");
+    CHECK(cJSON_IsObject(profiles) && cJSON_GetArraySize(profiles) == 0,
+          "unknown record must not retain previous settings");
+    cJSON_Delete(unknown);
+    edf_import_ctx_destroy(c);
+    printf("phase p OK (%d checks)\n", g_checks);
+}
+
+static void phase_q(void)
+{
+    fresh_tree();
+    char source[700], ident[700], snapshot[700];
+    static int16_t date[] = {19737}, mode[] = {3}, pressure[] = {400};
+    const fx_sig_t sig[] = {
+        {"Date", "d", 0, 40000, 0, 40000, 1, date, NULL, 0},
+        {"Mode", "", 0, 32, 0, 32, 1, mode, NULL, 0},
+        {"S.C.Press", "cmH2O", 0, 40, 0, 2000, 1, pressure, NULL, 0},
+    };
+    snprintf(source, sizeof(source), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, sig, 3, 0);
+    snprintf(ident, sizeof(ident), "%s/Identification.json", IMPORT_DIR);
+    FILE *f = fopen(ident, "w");
+    CHECK(f != NULL, "create conflicting identification");
+    if (f) {
+        fputs("{\"FlowGenerator\":{\"IdentificationProfiles\":{\"Product\":"
+              "{\"SerialNumber\":\"22188888888\",\"PlatformIdentifier\":46}}}}", f);
+        fclose(f);
+    }
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t u;
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "retain mismatched root identity");
+    CHECK(file_exists(source) && file_exists(ident), "retain mismatched root files");
+    edf_import_ctx_destroy(c);
+
+    f = fopen(ident, "w");
+    CHECK(f != NULL, "correct fixture identity");
+    if (f) {
+        fputs("{\"FlowGenerator\":{\"IdentificationProfiles\":{\"Product\":"
+              "{\"SerialNumber\":\"22199999999\",\"PlatformIdentifier\":46}}}}", f);
+        fclose(f);
+    }
+    snprintf(snapshot, sizeof(snapshot), "%s/20240115.native.settings.json", SD_SUMMARIES_DIR);
+    f = fopen(snapshot, "w");
+    CHECK(f != NULL, "create existing other-machine snapshot");
+    if (f) {
+        fputs("{\"marker\":\"preserve\",\"_somnotrace_provenance\":"
+              "{\"version\":1,\"source\":\"imported_str\",\"day\":\"20240115\","
+              "\"serial\":\"22188888888\",\"local_sessions\":[]}}", f);
+        fclose(f);
+    }
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "reject other-machine snapshot overwrite");
+    cJSON *old = parse_json_file(snapshot);
+    CHECK(old && cJSON_GetObjectItem(old, "marker"), "preserve existing snapshot");
+    cJSON_Delete(old);
+    CHECK(file_exists(source), "retain STR after snapshot conflict");
+    edf_import_ctx_destroy(c);
+    f = fopen(snapshot, "w");
+    CHECK(f != NULL, "create same-machine snapshot");
+    if (f) {
+        fputs("{\"marker\":\"preserve\",\"_as11_edf_settings\":{},\"_somnotrace_provenance\":"
+              "{\"version\":1,\"source\":\"native_str_day\",\"day\":\"20240115\","
+              "\"family\":\"AS11\",\"serial\":\"22199999999\",\"local_sessions\":[]}}", f);
+        fclose(f);
+    }
+    char day_dir[700], session_path[800], ident_path[800];
+    snprintf(day_dir, sizeof(day_dir), "%s/20240115", SD_STREAMS_DIR);
+    mkpath(day_dir);
+    snprintf(session_path, sizeof(session_path), "%s/20240115_220000_session.json", day_dir);
+    snprintf(ident_path, sizeof(ident_path), "%s/20240115_220000_ident.json", day_dir);
+    f = fopen(session_path, "w");
+    CHECK(f != NULL, "create local session");
+    if (f) {
+        fputs("{\"source_serial\":\"22188888888\",\"source_device_family\":\"AS11\"}", f);
+        fclose(f);
+    }
+    f = fopen(ident_path, "w");
+    CHECK(f != NULL, "create local other-machine identity");
+    if (f) { fputs("{\"SerialNumber\":\"22188888888\"}", f); fclose(f); }
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "reject day with another machine's session");
+    old = parse_json_file(snapshot);
+    CHECK(old && !cJSON_GetObjectItem(old, "marker"), "preserve native evidence despite session conflict");
+    cJSON_Delete(old);
+    CHECK(file_exists(source), "retain STR after session conflict");
+    edf_import_ctx_destroy(c);
+    printf("phase q OK (%d checks)\n", g_checks);
+}
+
+static void phase_r(void)
+{
+    static int16_t dates[] = {19737, 19738}, modes[] = {3, 3}, pressures[] = {400, 450};
+    const fx_sig_t signals[] = {
+        {"Date", "d", 0, 40000, 0, 40000, 1, dates, NULL, 0},
+        {"Mode", "", 0, 32, 0, 32, 1, modes, NULL, 0},
+        {"S.C.Press", "cmH2O", 0, 40, 0, 2000, 1, pressures, NULL, 0},
+    };
+    char source[700], dir[700], path[800];
+    fresh_tree();
+    snprintf(source, sizeof(source), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 2, 2, signals, 3, 0);
+    snprintf(dir, sizeof(dir), "%s/20240115", SD_STREAMS_DIR);
+    mkpath(dir);
+    snprintf(path, sizeof(path), "%s/20240115_220000_session.json", dir);
+    FILE *f = fopen(path, "w");
+    CHECK(f != NULL, "create unverified local session");
+    if (f) { fputs("{}", f); fclose(f); }
+    snprintf(dir, sizeof(dir), "%s/20240117", DATALOG_DAY);
+    build_session_dir(dir, "20240117_221000", "20240117_221000", false, 2024, 1, 17);
+
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t u;
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.root_retained &&
+          u.settings_written == 2, "unverified session does not block native daily evidence");
+    CHECK(!file_exists(source), "consume successfully retained STR");
+    snprintf(path, sizeof(path), "%s/20240115.native.settings.json", SD_SUMMARIES_DIR);
+    CHECK(file_exists(path), "store native settings independently of session coverage");
+    snprintf(path, sizeof(path), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    CHECK(file_exists(path), "write missing native summary day");
+    snprintf(path, sizeof(path), "%s/20240116.native.settings.json", SD_SUMMARIES_DIR);
+    CHECK(file_exists(path), "import independent day settings");
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_imported == 1,
+          "retained root does not starve queued sessions");
+    CHECK(!file_exists(source), "root remains consumed after session import");
+    edf_import_ctx_destroy(c);
+
+    for (int kind = 0; kind < 5; kind++) {
+        fresh_tree();
+        snprintf(source, sizeof(source), "%s/STR.edf", IMPORT_DIR);
+        if (kind == 0) {
+            f = fopen(source, "w");
+            if (f) { fputs("not EDF", f); fclose(f); }
+        } else if (kind == 1) {
+            fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                         2024, 1, 15, 0, 0, 0, "", "86400", 2, 1, signals, 3, 0);
+        } else if (kind == 2) {
+            const fx_sig_t other[] = {
+                {"Flow.40ms", "", 0, 100, 0, 100, 1, pressures, NULL, 0},
+            };
+            fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                         2024, 1, 15, 0, 0, 0, "", "60", 1, 1, other, 1, 0);
+        } else if (kind == 3) {
+            fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                         2024, 1, 15, 0, 0, 0, "", "60", 1, 1, signals, 3, 0);
+        } else {
+            fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                         2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, signals, 1, 0);
+        }
+        snprintf(dir, sizeof(dir), "%s/20240117", DATALOG_DAY);
+        build_session_dir(dir, "20240117_221000", "20240117_221000", false, 2024, 1, 17);
+        c = edf_import_ctx_create();
+        CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+              "malformed, truncated or non-STR root retained");
+        CHECK(file_exists(source), "invalid STR not consumed");
+        CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_imported == 1,
+              "invalid root does not starve queued sessions");
+        edf_import_ctx_destroy(c);
+    }
+
+    fresh_tree();
+    f = fopen(SD_DEVICE_METADATA_PATH, "w");
+    if (f) { fputs("{\"ident\":{\"SerialNumber\":\"old\"},\"settings\":{\"old\":true}}", f); fclose(f); }
+    snprintf(dir, sizeof(dir), "%s/SETTINGS", IMPORT_DIR);
+    mkpath(dir);
+    snprintf(path, sizeof(path), "%s/CurrentSettings.json", dir);
+    f = fopen(path, "w");
+    if (f) { fputs("{\"FlowGenerator\":{\"new\":true}}", f); fclose(f); }
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "retain identity-less settings import");
+    CHECK(file_exists(path), "identity-less settings source is retained");
+    cJSON *metadata = parse_json_file(SD_DEVICE_METADATA_PATH);
+    cJSON *settings = cJSON_GetObjectItem(metadata, "settings");
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(settings, "old")) &&
+          !cJSON_GetObjectItem(settings, "new"), "do not pair unknown settings with old identity");
+    cJSON_Delete(metadata);
+    edf_import_ctx_destroy(c);
+    printf("phase r OK (%d checks)\n", g_checks);
+}
+
+static void phase_store_budget(void)
+{
+    fresh_tree();
+    static int16_t date[] = {19737}, mode[] = {3}, pressure[] = {400};
+    const fx_sig_t signals[] = {
+        {"Date", "d", 0, 40000, 0, 40000, 1, date, NULL, 0},
+        {"Mode", "", 0, 32, 0, 32, 1, mode, NULL, 0},
+        {"S.C.Press", "cmH2O", 0, 40, 0, 2000, 1, pressure, NULL, 0},
+    };
+    char source[700];
+    snprintf(source, sizeof(source), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, signals, 3, 0);
+    CHECK(source_store_set_budget(1) == ESP_OK, "limit source store for test");
+    edf_import_ctx_t *ctx = edf_import_ctx_create();
+    edf_import_unit_t unit;
+    CHECK(ctx && edf_import_process_next(ctx, &unit) == ESP_OK &&
+          unit.root_retained && unit.settings_written == 1 && unit.spools_written == 1,
+          "source-store failure retains input without blocking valid daily import");
+    CHECK(file_exists(source), "source remains staged without archival storage");
+    edf_import_ctx_destroy(ctx);
+    edf_import_test_mark_root_retry(1000000);
+    CHECK(edf_import_test_defer_root_retry(2000000, false),
+          "unchanged retained root is backed off");
+    CHECK(!edf_import_test_defer_root_retry(2000000, true),
+          "pending session groups bypass root backoff");
+    CHECK(!edf_import_test_defer_root_retry(3601000000LL, false),
+          "retained root is retried after one hour");
+    char added_ident[700];
+    snprintf(added_ident, sizeof(added_ident), "%s/Identification.json", IMPORT_DIR);
+    FILE *change = fopen(added_ident, "w");
+    CHECK(change != NULL, "create changed root dependency");
+    if (change) { fputs("{}", change); fclose(change); }
+    CHECK(!edf_import_test_defer_root_retry(2000000, false),
+          "changed root dependency bypasses backoff");
+    CHECK(unlink(added_ident) == 0, "remove test-owned dependency");
+    CHECK(source_store_set_budget(SOURCE_STORE_DEFAULT_BUDGET) == ESP_OK, "restore store budget");
+    char day_file[700], backup[740];
+    snprintf(day_file, sizeof(day_file), "%s/20240115.native.settings.json", SD_SUMMARIES_DIR);
+    snprintf(backup, sizeof(backup), "%s.replace-backup", day_file);
+    CHECK(rename(day_file, backup) == 0, "stage prior day as interrupted FAT backup");
+    change = fopen(day_file, "w");
+    CHECK(change != NULL, "create incomplete replacement");
+    if (change) { fputs("{}", change); fclose(change); }
+    ctx = edf_import_ctx_create();
+    CHECK(ctx && edf_import_process_next(ctx, &unit) == ESP_OK &&
+          !unit.root_retained && unit.settings_written == 0 && unit.spools_written == 0,
+          "retry archives source without rewriting unchanged days");
+    CHECK(!file_exists(source), "archived source consumed after retry");
+    CHECK(!file_exists(backup), "retry restored prior daily record before validation");
+    edf_import_ctx_destroy(ctx);
+}
+
+static void phase_s(void)
+{
+    char ident[800], settings[800], temp[700], dir[512];
+    fresh_tree();
+    snprintf(ident, sizeof(ident), "%s/Identification.json", IMPORT_DIR);
+    FILE *f = fopen(ident, "w");
+    CHECK(f != NULL, "s1: create identification");
+    if (f) {
+        fputs("{\"FlowGenerator\":{\"IdentificationProfiles\":{\"Product\":"
+              "{\"SerialNumber\":\"22199999999\",\"PlatformIdentifier\":46}}}}", f);
+        fclose(f);
+    }
+    snprintf(dir, sizeof(dir), "%s/SETTINGS", IMPORT_DIR);
+    mkpath(dir);
+    snprintf(settings, sizeof(settings), "%s/CurrentSettings.json", dir);
+    f = fopen(settings, "w");
+    CHECK(f != NULL, "s1: create settings");
+    if (f) { fputs("{\"FlowGenerator\":{\"fixture\":true}}", f); fclose(f); }
+    snprintf(temp, sizeof(temp), "%s.tmp", SD_DEVICE_METADATA_PATH);
+    CHECK(mkdir(temp, 0775) == 0, "s1: block metadata write");
+    char queued[800];
+    snprintf(queued, sizeof(queued), "%s/20240117", DATALOG_DAY);
+    build_session_dir(queued, "20240117_221000", "20240117_221000", false, 2024, 1, 17);
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t u;
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "s1: metadata failure retains root");
+    CHECK(file_exists(ident) && file_exists(settings), "s1: failed root sources retained");
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_imported == 1,
+          "s1: failed root does not block independent day");
+    CHECK(rmdir(temp) == 0, "s1: remove fixture blocker");
+    edf_import_ctx_destroy(c);
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.root_retained,
+          "s1: retry commits root metadata");
+    CHECK(!file_exists(ident) && !file_exists(settings), "s1: committed sources consumed");
+    cJSON *metadata = parse_json_file(SD_DEVICE_METADATA_PATH);
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(cJSON_GetObjectItem(metadata, "settings"), "fixture")),
+          "s1: source settings durably saved");
+    cJSON_Delete(metadata);
+    edf_import_ctx_destroy(c);
+
+    fresh_tree();
+    f = fopen(SD_DEVICE_METADATA_PATH, "w");
+    if (f) {
+        fputs("{\"ident\":{\"SerialNumber\":\"old\",\"PlatformIdentifier\":46},"
+              "\"settings\":{\"old\":true}}", f);
+        fclose(f);
+    }
+    f = fopen(ident, "w");
+    if (f) {
+        fputs("{\"FlowGenerator\":{\"IdentificationProfiles\":{\"Product\":"
+              "{\"SerialNumber\":\"22199999999\",\"PlatformIdentifier\":46}}}}", f);
+        fclose(f);
+    }
+    mkpath(dir);
+    f = fopen(settings, "w");
+    if (f) { fputs("{\"FlowGenerator\":{\"new\":true}}", f); fclose(f); }
+    snprintf(dir, sizeof(dir), "%s/20240117", DATALOG_DAY);
+    build_session_dir(dir, "20240117_221000", "20240117_221000", false, 2024, 1, 17);
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained,
+          "s2: foreign current settings retained rather than lost");
+    CHECK(file_exists(ident) && file_exists(settings), "s2: root files preserved");
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_imported == 1,
+          "s2: unrelated queued session still imports");
+    metadata = parse_json_file(SD_DEVICE_METADATA_PATH);
+    CHECK(cJSON_IsTrue(cJSON_GetObjectItem(cJSON_GetObjectItem(metadata, "settings"), "old")),
+          "s2: existing cache preserved");
+    cJSON_Delete(metadata);
+    edf_import_ctx_destroy(c);
+
+    fresh_tree();
+    snprintf(dir, sizeof(dir), "%s/20240115", DATALOG_DAY);
+    build_session_dir(dir, "20240115_221000", "20240115_221000", false, 2024, 1, 15);
+    snprintf(queued, sizeof(queued), "%s/20240116", DATALOG_DAY);
+    build_session_dir(queued, "20240116_221000", "20240116_221000", false, 2024, 1, 16);
+    snprintf(temp, sizeof(temp), "%s/20240115", SD_STREAMS_DIR);
+    mkpath(temp);
+    snprintf(temp, sizeof(temp), "%s/20240115/20240115_221000_ident.json.tmp", SD_STREAMS_DIR);
+    CHECK(mkdir(temp, 0775) == 0, "s3: block session identity write");
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_skipped == 1,
+          "s3: unowned identity artifact defers publication");
+    snprintf(ident, sizeof(ident), "%s/20240115_221000_BRP.edf", dir);
+    CHECK(file_exists(ident), "s3: valid input retained under its original name");
+    snprintf(queued, sizeof(queued), "%s/20240115_221000_BRP.edf.bad", dir);
+    CHECK(!file_exists(queued), "s3: I/O failure is not mislabeled corrupt");
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_imported == 1,
+          "s3: failed group does not starve later day");
+    CHECK(rmdir(temp) == 0, "s3: remove fixture blocker");
+    edf_import_ctx_destroy(c);
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.sessions_imported == 1,
+          "s3: retained session succeeds on later retry");
+    edf_import_ctx_destroy(c);
+    printf("phase s OK (%d checks)\n", g_checks);
+}
+
+static void phase_native_corruption(void)
+{
+    static int16_t dates[] = {19737, 19738}, modes[] = {3, 3}, pressures[] = {400, 450};
+    const fx_sig_t signals[] = {
+        {"Date", "d", 0, 40000, 0, 40000, 1, dates, NULL, 0},
+        {"Mode", "", 0, 32, 0, 32, 1, modes, NULL, 0},
+        {"S.C.Press", "cmH2O", 0, 40, 0, 2000, 1, pressures, NULL, 0},
+    };
+    char source[700], snapshot[700], bad[750], previous[750], next_day[700], temp[750];
+    snprintf(source, sizeof(source), "%s/STR.edf", IMPORT_DIR);
+    snprintf(snapshot, sizeof(snapshot), "%s/20240115.native.settings.json", SD_SUMMARIES_DIR);
+    snprintf(bad, sizeof(bad), "%s.bad.1", snapshot);
+    snprintf(previous, sizeof(previous), "%s.bad", snapshot);
+    snprintf(next_day, sizeof(next_day), "%s/20240116.native.settings.json", SD_SUMMARIES_DIR);
+    snprintf(temp, sizeof(temp), "%s.tmp", snapshot);
+
+    fresh_tree();
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 2, 2, signals, 3, 0);
+    FILE *f = fopen(snapshot, "wb");
+    CHECK(f != NULL, "create zeroed native snapshot");
+    if (f) {
+        for (int i = 0; i < 512; i++) fputc(0, f);
+        fputs("damaged tail", f);
+        fclose(f);
+    }
+    f = fopen(previous, "wb");
+    if (f) { fputs("previous quarantine", f); fclose(f); }
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t u;
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.root_retained &&
+          u.settings_written == 2, "recover damaged day and continue to later day");
+    CHECK(!file_exists(source) && file_exists(next_day),
+          "successful recovery consumes source and imports later day");
+    cJSON *recovered = parse_json_file(snapshot);
+    cJSON *fields = cJSON_GetObjectItem(recovered, "_as11_edf_settings");
+    CHECK(cJSON_IsObject(fields) && cJSON_IsNumber(cJSON_GetObjectItem(fields, "Mode")),
+          "recovered snapshot contains native settings");
+    cJSON_Delete(recovered);
+    f = fopen(bad, "rb");
+    CHECK(f && fgetc(f) == 0, "corrupt bytes preserved in a distinct quarantine");
+    if (f) fclose(f);
+    char *old = read_text(previous);
+    CHECK(old && !strcmp(old, "previous quarantine"), "earlier quarantine is preserved");
+    free(old);
+    edf_import_ctx_destroy(c);
+
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 2, 2, signals, 3, 0);
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.root_retained &&
+          u.settings_written == 0, "reimport after recovery is idempotent");
+    edf_import_ctx_destroy(c);
+
+    fresh_tree();
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 2, 2, signals, 3, 0);
+    f = fopen(snapshot, "wb");
+    if (f) { fputc(0, f); fclose(f); }
+    CHECK(mkdir(temp, 0775) == 0, "block recovery temporary file");
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained &&
+          file_exists(source) && file_exists(previous),
+          "failed recovery preserves source and quarantined bytes");
+    edf_import_ctx_destroy(c);
+    CHECK(rmdir(temp) == 0, "remove test-created write blocker");
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && !u.root_retained &&
+          file_exists(snapshot) && file_exists(previous),
+          "retry after interrupted recovery reconstructs snapshot");
+    edf_import_ctx_destroy(c);
+
+    fresh_tree();
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 2, 2, signals, 3, 0);
+    f = fopen(snapshot, "wb");
+    if (f) { fputs("{\"incomplete\":", f); fclose(f); }
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained &&
+          file_exists(snapshot) && !file_exists(previous),
+          "uncertain parse failure is retained rather than misclassified");
+    edf_import_ctx_destroy(c);
+
+    fresh_tree();
+    fx_write_edf(source, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 2, 2, signals, 3, 0);
+    f = fopen(source, "r+b");
+    CHECK(f != NULL, "open synthetic STR for checksum failure");
+    if (f) {
+        fseek(f, 256 + 256 * 4, SEEK_SET);
+        int ch = fgetc(f);
+        fseek(f, -1, SEEK_CUR);
+        fputc(ch ^ 1, f);
+        fclose(f);
+    }
+    f = fopen(snapshot, "wb");
+    if (f) { fputc(0, f); fclose(f); }
+    c = edf_import_ctx_create();
+    CHECK(edf_import_process_next(c, &u) == ESP_OK && u.root_retained &&
+          file_exists(snapshot) && !file_exists(previous),
+          "bad STR record cannot repair or quarantine existing snapshot");
+    edf_import_ctx_destroy(c);
+    printf("native corruption recovery OK (%d checks)\n", g_checks);
+}
+
+static void remove_fixture_kind(const char *dir, const char *prefix, const char *kind)
+{
+    char path[640];
+    snprintf(path, sizeof(path), "%s/%s_%s.edf", dir, prefix, kind);
+    CHECK(unlink(path) == 0, "remove synthetic fixture");
+}
+
+static void write_growing_brp(const char *dir, int records, bool changed_prefix)
+{
+    char path[640];
+    int16_t flow[25 * 180] = {0}, press[25 * 180] = {0};
+    if (changed_prefix) flow[0] = 100;
+    const fx_sig_t sig[] = {
+        { "Flow.40ms", "L/s", -2.0, 3.0, -1000, 1500, 25, flow, NULL, 0 },
+        { "Press.40ms", "cmH2O", 0, 40, 0, 2000, 25, press, NULL, 0 },
+    };
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    fx_write_edf(path, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 22, 10, 7, "", "1",
+                 records, records, sig, 2, 0);
+}
+
+static void write_brp_with_extra(const char *dir, int records, bool changed_prefix)
+{
+    char path[640];
+    int16_t flow[150] = {0}, press[150] = {0}, extra[6] = {0};
+    if (changed_prefix) extra[0] = 100;
+    const fx_sig_t sig[] = {
+        { "Flow.40ms", "L/s", -2.0, 3.0, -1000, 1500, 25, flow, NULL, 0 },
+        { "Press.40ms", "cmH2O", 0, 40, 0, 2000, 25, press, NULL, 0 },
+        { "ExtraSignal", "", 0, 100, 0, 100, 1, extra, NULL, 0 },
+    };
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    fx_write_edf(path, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 22, 10, 7, "", "1",
+                 records, records, sig, 3, 0);
+}
+
+static void write_mask_str(bool split, bool incomplete)
+{
+    static int16_t date[] = {19737}, mode[] = {3};
+    int16_t on[] = {610, split ? 637 : -1};
+    int16_t off[] = {incomplete ? -1 : (split ? 620 : 700), split ? 700 : -1};
+    const fx_sig_t sig[] = {
+        { "Date", "d", 0, 32767, 0, 32767, 1, date, NULL, 0 },
+        { "Mode", "", 0, 32, 0, 32, 1, mode, NULL, 0 },
+        { "MaskOn", "min", 0, 1440, 0, 1440, 2, on, NULL, 0 },
+        { "MaskOff", "min", 0, 1440, 0, 1440, 2, off, NULL, 0 },
+    };
+    char path[640];
+    snprintf(path, sizeof(path), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(path, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, sig, 4, 0);
+}
+
+static void write_near_mask_str(void)
+{
+    int16_t date[] = {19737}, mode[] = {3};
+    int16_t on[] = {609, 610}, off[] = {610, 700};
+    const fx_sig_t sig[] = {
+        { "Date", "d", 0, 32767, 0, 32767, 1, date, NULL, 0 },
+        { "Mode", "", 0, 32, 0, 32, 1, mode, NULL, 0 },
+        { "MaskOn", "min", 0, 1440, 0, 1440, 2, on, NULL, 0 },
+        { "MaskOff", "min", 0, 1440, 0, 1440, 2, off, NULL, 0 },
+    };
+    char path[640];
+    snprintf(path, sizeof(path), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(path, "SRN=22199999999 MID=46 VID=1",
+                 2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, sig, 4, 0);
+}
+
+/* Machine-side STR.edf grows the current day's MaskOn/MaskOff vectors in
+ * place — same name, same record shape, more pairs. */
+static void write_mask_str_pairs(const int16_t *on, const int16_t *off,
+                                 int n, const char *rec_id)
+{
+    int16_t date[] = {19737}, mode[] = {3};
+    const fx_sig_t sig[] = {
+        { "Date", "d", 0, 32767, 0, 32767, 1, date, NULL, 0 },
+        { "Mode", "", 0, 32, 0, 32, 1, mode, NULL, 0 },
+        { "MaskOn", "min", 0, 1440, 0, 1440, n, on, NULL, 0 },
+        { "MaskOff", "min", 0, 1440, 0, 1440, n, off, NULL, 0 },
+    };
+    char path[640];
+    snprintf(path, sizeof(path), "%s/STR.edf", IMPORT_DIR);
+    fx_write_edf(path, rec_id,
+                 2024, 1, 15, 0, 0, 0, "", "86400", 1, 1, sig, 4, 0);
+}
+
+static char *file_snapshot(const char *path, long *n)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); *n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *b = malloc(*n ? *n : 1);
+    if (b && fread(b, 1, (size_t)*n, f) != (size_t)*n) { free(b); b = NULL; }
+    fclose(f);
+    return b;
+}
+
+static void phase_incremental_sources(void)
+{
+    char dir[300], path[700], mp[700];
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+    snprintf(mp, sizeof(mp), "%s/%s/20240115_221000_session.json",
+             SD_STREAMS_DIR, DAY);
+    fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    int units;
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t t = drain(c, &units);
+    CHECK(t.sessions_imported == 1 && file_exists(mp),
+          "annotation-only session created with source anchors");
+    edf_import_ctx_destroy(c);
+
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    snprintf(path, sizeof(path), "%s/_bridge_drift.json", dir);
+    FILE *f = fopen(path, "w");
+    CHECK(f != NULL, "open synthetic drift sidecar");
+    if (f) {
+        fputs("{\"source_of_truth\":{\"clock_drift_ms\":\"14400000\","
+              "\"half_ms\":300,\"valid\":true}}", f);
+        fclose(f);
+    }
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    CHECK(t.sessions_imported == 1 && t.sessions_failed == 0,
+          "late waveforms augment the annotation session");
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240116_021007_session.json",
+             SD_STREAMS_DIR, DAY);
+    CHECK(!file_exists(path), "changed drift does not create another session");
+    cJSON *m = parse_json_file(mp);
+    CHECK(m != NULL, "augmented manifest parses");
+    if (m) {
+        cJSON *v = cJSON_GetObjectItem(m, "brp_samples");
+        CHECK(cJSON_IsNumber(v) && v->valueint == 75, "late flow retained");
+        v = cJSON_GetObjectItem(m, "clock_drift_ms");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 0,
+              "existing session clock domain stays consistent");
+        v = cJSON_GetObjectItem(m, "waveform_offset_ms");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 7000,
+              "late waveform offset retained");
+    }
+    cJSON_Delete(m);
+    snprintf(path, sizeof(path), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    CHECK(import_spool_is_synthetic(path), "synthetic spool carries its provenance");
+    snprintf(path, sizeof(path), "%s/20240115.imported.spool", SD_SUMMARIES_DIR);
+    CHECK(file_exists(path), "late waveforms refresh a separate imported summary");
+    write_mask_str(false, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115.native.spool", SD_SUMMARIES_DIR);
+    CHECK(file_exists(path), "late native STR gets a separate authoritative summary");
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "EVE-only session imports");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240115_221000_events.snt",
+             SD_STREAMS_DIR, DAY);
+    char *late_csl_events = read_text(path);
+    CHECK(t.sessions_imported == 1 && late_csl_events &&
+          strstr(late_csl_events, "ObstructiveApneaEnd") &&
+          strstr(late_csl_events, "CsrStart"),
+          "late CSL augments EVE without discarding earlier events");
+    free(late_csl_events);
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    set_fixture_recording_id(dir, "Unknown machine");
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 0,
+          "unidentified annotation group remains staged");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    set_fixture_recording_id(dir, "Unknown machine");
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    char late_manifest[700];
+    snprintf(late_manifest, sizeof(late_manifest), "%s/%s/20240115_221007_session.json",
+             SD_STREAMS_DIR, DAY);
+    CHECK(t.sessions_imported == 0 && file_exists(path) && !file_exists(late_manifest),
+          "unverified late waveforms stay staged instead of creating a duplicate");
+
+    fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "waveform-first session imports");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240115_221007_session.json",
+             SD_STREAMS_DIR, DAY);
+    m = parse_json_file(path);
+    CHECK(t.sessions_imported == 1 && m && !file_exists(mp),
+          "earlier annotation augments waveform-first session");
+    if (m) {
+        cJSON *v = cJSON_GetObjectItem(m, "start_epoch_ms");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 1705356600000.0,
+              "session start follows annotation anchor");
+        v = cJSON_GetObjectItem(m, "waveform_offset_ms");
+        CHECK(cJSON_IsNumber(v) && v->valuedouble == 7000,
+              "waveform remains at its original timestamp");
+    }
+    cJSON_Delete(m);
+
+    fresh_tree();
+    mkpath(dir);
+    write_growing_brp(dir, 60, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    size_t spool_len = 0;
+    uint8_t *spool = read_bin(path, &spool_len);
+    CHECK(spool && pb_find_varint(spool, spool_len, 5) == 1,
+          "initial derived summary records one minute");
+    free(spool);
+    mkpath(dir);
+    write_growing_brp(dir, 120, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115.imported.spool", SD_SUMMARIES_DIR);
+    spool = read_bin(path, &spool_len);
+    CHECK(spool && pb_find_varint(spool, spool_len, 5) == 2,
+          "growing waveform refreshes derived summary duration");
+    free(spool);
+    snprintf(path, sizeof(path), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    spool = read_bin(path, &spool_len);
+    CHECK(spool && pb_find_varint(spool, spool_len, 5) == 1,
+          "summary refresh leaves the original spool untouched");
+    free(spool);
+
+    fresh_tree();
+    mkpath(dir);
+    write_brp_with_extra(dir, 3, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "source with extra signal imports");
+    mkpath(dir);
+    write_brp_with_extra(dir, 6, true);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    CHECK(file_exists(path) && t.sessions_imported == 0,
+          "growing source with changed unconverted prefix stays staged");
+    snprintf(path, sizeof(path), "%s/%s/20240115_221007_session.json",
+             SD_STREAMS_DIR, DAY);
+    m = parse_json_file(path);
+    CHECK(m && cJSON_GetObjectItem(m, "brp_samples")->valueint == 75,
+          "unconverted conflict leaves previous waveform intact");
+    cJSON_Delete(m);
+    write_brp_with_extra(dir, 6, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(path);
+    CHECK(t.sessions_imported == 1 && m &&
+          cJSON_GetObjectItem(m, "brp_samples")->valueint == 150,
+          "verified original EDF prefix permits an append");
+    cJSON_Delete(m);
+    mkpath(dir);
+    write_brp_with_extra(dir, 6, true);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    CHECK(t.sessions_imported == 0 && file_exists(path),
+          "same-length unconverted source change stays staged");
+
+    fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    snprintf(path, sizeof(path), "%s/_bridge_drift.json", dir);
+    f = fopen(path, "w");
+    CHECK(f != NULL, "create synthetic embedded drift evidence");
+    if (f) {
+        fputs("{\"padding\":\"", f);
+        for (int i = 0; i < 1000; i++) fputc('x', f);
+        fputs("\"}", f);
+        fclose(f);
+    }
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(mp);
+    CHECK(t.sessions_imported == 1 && m &&
+          cJSON_IsObject(cJSON_GetObjectItem(m, "somnobridge_drift")),
+          "initial manifest contains embedded drift evidence");
+    if (m) {
+        char *text = cJSON_PrintUnformatted(m);
+        size_t used = text ? strlen(text) : 0;
+        free(text);
+        size_t pad_len = used < 3400 ? 3400 - used : 0;
+        char *pad = malloc(pad_len + 1);
+        CHECK(pad != NULL && pad_len > 0, "reserve synthetic manifest padding");
+        if (pad) {
+            memset(pad, 'y', pad_len);
+            pad[pad_len] = '\0';
+            cJSON_AddStringToObject(m, "test_padding", pad);
+            free(pad);
+            text = cJSON_PrintUnformatted(m);
+            f = fopen(mp, "w");
+            CHECK(text && f && fputs(text, f) >= 0, "write synthetic near-cap manifest");
+            if (f) fclose(f);
+            free(text);
+        }
+    }
+    cJSON_Delete(m);
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(mp);
+    cJSON *ref = cJSON_GetObjectItem(m, "somnobridge_drift_file");
+    snprintf(path, sizeof(path), "%s/%s/20240115_221000_bridge_drift.json",
+             SD_STREAMS_DIR, DAY);
+    CHECK(t.sessions_imported == 1 && cJSON_IsString(ref) && file_exists(path),
+          "growing manifest relocates rather than discards embedded drift");
+    cJSON *saved_drift = parse_json_file(path);
+    cJSON *padding = cJSON_GetObjectItem(saved_drift, "padding");
+    CHECK(cJSON_IsString(padding) && strlen(padding->valuestring) == 1000,
+          "relocated drift retains original evidence");
+    cJSON_Delete(saved_drift);
+    cJSON_Delete(m);
+
+    fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    write_growing_brp(dir, 3, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "initial synthetic recording imported");
+    mkpath(dir);
+    write_growing_brp(dir, 6, false);
+    char blocker[720], pending[720];
+    snprintf(blocker, sizeof(blocker), "%s.tmp", mp);
+    snprintf(pending, sizeof(pending), "%s/%s/20240115_221000_augment.pending",
+             SD_STREAMS_DIR, DAY);
+    CHECK(mkdir(blocker, 0775) == 0, "block manifest commit for fault injection");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    CHECK(t.sessions_failed > 0 && file_exists(path) && file_exists(pending),
+          "failed manifest commit retains source and recovery marker");
+    CHECK(rmdir(blocker) == 0, "remove synthetic write blocker");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(mp);
+    CHECK(t.sessions_imported == 1 && m, "growing waveform updates existing session");
+    CHECK(!file_exists(pending), "successful retry clears recovery marker");
+    if (m) {
+        cJSON *v = cJSON_GetObjectItem(m, "brp_samples");
+        CHECK(cJSON_IsNumber(v) && v->valueint == 150, "extended samples preserved");
+    }
+    cJSON_Delete(m);
+    mkpath(dir);
+    write_growing_brp(dir, 6, true);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_221007_BRP.edf", dir);
+    CHECK(file_exists(path) && t.sessions_imported == 0,
+          "conflicting rewrite remains staged without replacing samples");
+    m = parse_json_file(mp);
+    if (m) {
+        cJSON *v = cJSON_GetObjectItem(m, "brp_samples");
+        CHECK(cJSON_IsNumber(v) && v->valueint == 150, "conflict leaves session intact");
+    }
+    cJSON_Delete(m);
+
+    fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    mkpath(dir);
+    static const char e0[] = "+0\x15" "0\x14" "Recording starts\x14\x00";
+    static const char e1[] = "+2.1\x15" "9.4\x14" "Obstructive Apnea\x14\x00";
+    static const char e2[] = "+5.0\x15" "10\x14" "Hypopnea\x14\x00";
+    static const char e3[] = "+25\x15" "10\x14" "Central Apnea\x14\x00";
+    const char *const anns[] = {e0, e1, e2, e3};
+    const int lens[] = {sizeof(e0)-1, sizeof(e1)-1, sizeof(e2)-1, sizeof(e3)-1};
+    snprintf(path, sizeof(path), "%s/20240115_221000_EVE.edf", dir);
+    fx_write_real_ann(path, 2024, 1, 15, 22, 10, 0, anns, lens, 4);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240115_221000_events.snt",
+             SD_STREAMS_DIR, DAY);
+    char *events = read_text(path);
+    CHECK(t.sessions_imported == 1 && events &&
+          strstr(events, "CentralApneaEnd") && strstr(events, "CsrStart"),
+          "updated EVE adds events without losing existing CSL");
+    free(events);
+    mkpath(dir);
+    const char *const changed_anns[] = {e0, e2, e3};
+    const int changed_lens[] = {sizeof(e0)-1, sizeof(e2)-1, sizeof(e3)-1};
+    snprintf(path, sizeof(path), "%s/20240115_221000_EVE.edf", dir);
+    fx_write_real_ann(path, 2024, 1, 15, 22, 10, 0, changed_anns, changed_lens, 3);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 0 && file_exists(path),
+          "annotation rewrite removing an existing event is retained");
+    snprintf(path, sizeof(path), "%s/%s/20240115_221000_events.snt",
+             SD_STREAMS_DIR, DAY);
+    events = read_text(path);
+    CHECK(events && strstr(events, "ObstructiveApneaEnd") &&
+          strstr(events, "CentralApneaEnd") && strstr(events, "CsrStart"),
+          "conflicting annotation rewrite leaves previous events intact");
+    free(events);
+
+    fresh_tree();
+    fixture_mask_2210("22199999999", "AS11");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    snprintf(path, sizeof(path), "%s/20240115_221000_EVE.edf", dir);
+    f = fopen(path, "r+b");
+    CHECK(f != NULL, "open annotation for synthetic CRC failure");
+    if (f) {
+        CHECK(fseek(f, 768, SEEK_SET) == 0, "seek to annotation record");
+        int ch = fgetc(f);
+        CHECK(ch != EOF && fseek(f, -1, SEEK_CUR) == 0 &&
+              fputc(ch ^ 1, f) != EOF, "corrupt annotation record");
+        fclose(f);
+    }
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_failed > 0 && file_exists(path),
+          "bad annotation CRC retains all source files for retry");
+    CHECK(!file_exists(mp), "bad annotation does not publish a session");
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    build_session_dir(dir, "20240115_221020", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240115_221020_session.json",
+             SD_STREAMS_DIR, DAY);
+    CHECK(t.sessions_imported == 1 && file_exists(path),
+          "distinct nearby waveform anchors stay separate");
+    build_session_dir(dir, "20240115_221007", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221007", "BRP");
+    remove_fixture_kind(dir, "20240115_221007", "PLD");
+    remove_fixture_kind(dir, "20240115_221007", "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_221000_EVE.edf", dir);
+    CHECK(t.sessions_imported == 0 && file_exists(path),
+          "ambiguous annotation stays staged rather than merging two sessions");
+
+    fresh_tree();
+    mkpath(dir);
+    static const char long_event[] = "+1800\x15" "10\x14" "Hypopnea\x14\x00";
+    const char *const long_anns[] = {e0, long_event};
+    const int long_lens[] = {sizeof(e0)-1, sizeof(long_event)-1};
+    snprintf(path, sizeof(path), "%s/20240115_221000_EVE.edf", dir);
+    fx_write_real_ann(path, 2024, 1, 15, 22, 10, 0, long_anns, long_lens, 2);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    build_session_dir(dir, "20240115_223715", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "EVE");
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_223715_BRP.edf", dir);
+    CHECK(t.sessions_imported == 0 && file_exists(path),
+          "ambiguous long-gap overlap is retained instead of split");
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_223715", "20240115_221000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "CSL");
+    const char *const start_only[] = {e0};
+    const int start_len[] = {sizeof(e0)-1};
+    snprintf(path, sizeof(path), "%s/20240115_221000_EVE.edf", dir);
+    fx_write_real_ann(path, 2024, 1, 15, 22, 10, 0, start_only, start_len, 1);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_223715_BRP.edf", dir);
+    CHECK(t.sessions_imported == 1 && file_exists(mp) && file_exists(path),
+          "27-minute gap without STR evidence remains staged");
+
+    fresh_tree();
+    write_mask_str(false, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115.native.mask-intervals.json",
+             SD_SUMMARIES_DIR);
+    m = parse_json_file(path);
+    CHECK(m && cJSON_IsTrue(cJSON_GetObjectItem(m, "complete")),
+          "native STR interval retained as machine-specific evidence");
+    cJSON_Delete(m);
+    build_session_dir(dir, "20240115_223715", "20240115_221000", true,
+                      2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240115_223715_session.json",
+             SD_STREAMS_DIR, DAY);
+    m = parse_json_file(mp);
+    CHECK(t.sessions_imported == 1 && m && !file_exists(path),
+          "native mask evidence reconciles 27-minute staggered anchors");
+    if (m) {
+        cJSON *v = cJSON_GetObjectItem(m, "waveform_offset_ms");
+        CHECK(cJSON_IsNumber(v) && v->valueint == 1635000,
+              "long-gap reconciliation preserves original waveform time");
+    }
+    cJSON_Delete(m);
+    build_session_dir(dir, "20240115_223715", "20240115_221000", true,
+                      2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 0 && t.sessions_skipped > 0,
+          "long-gap source replay is idempotent");
+
+    fresh_tree();
+    write_mask_str(true, false);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    build_session_dir(dir, "20240115_223715", "20240115_221000", true,
+                      2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 2 && file_exists(mp) && file_exists(path),
+          "distinct native mask intervals stay separate");
+
+    fresh_tree();
+    write_near_mask_str();
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    build_session_dir(dir, "20240115_221030", "20240115_220950", true,
+                      2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/%s/20240115_221030_session.json",
+             SD_STREAMS_DIR, DAY);
+    snprintf(pending, sizeof(pending), "%s/%s/20240115_220950_session.json",
+             SD_STREAMS_DIR, DAY);
+    CHECK(t.sessions_imported == 2 && file_exists(path) && file_exists(pending),
+          "separate mask intervals override a 40-second filename match");
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_120007", "20240115_115950", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_120007", "BRP");
+    remove_fixture_kind(dir, "20240115_120007", "PLD");
+    remove_fixture_kind(dir, "20240115_120007", "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240114/20240115_115950_session.json",
+             SD_STREAMS_DIR);
+    CHECK(t.sessions_imported == 1 && file_exists(path),
+          "pre-noon annotation lands in the previous reporting day");
+    build_session_dir(dir, "20240115_120007", "20240115_115950", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_115950", "EVE");
+    remove_fixture_kind(dir, "20240115_115950", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_120007_BRP.edf", dir);
+    snprintf(pending, sizeof(pending), "%s/20240115/20240115_120007_session.json",
+             SD_STREAMS_DIR);
+    CHECK(t.sessions_imported == 0 && file_exists(path) && !file_exists(pending),
+          "cross-noon possible match remains staged without a duplicate");
+
+    fresh_tree();
+    build_session_dir(dir, "20240115_140000", "20240115_110000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_140000", "BRP");
+    remove_fixture_kind(dir, "20240115_140000", "PLD");
+    remove_fixture_kind(dir, "20240115_140000", "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "long-gap pre-noon annotation imports");
+    build_session_dir(dir, "20240115_140000", "20240115_110000", true,
+                      2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_110000", "EVE");
+    remove_fixture_kind(dir, "20240115_110000", "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115_140000_BRP.edf", dir);
+    CHECK(t.sessions_imported == 0 && file_exists(path),
+          "long-gap cross-noon possible match remains staged");
+
+    fresh_tree();
+    write_mask_str(false, true);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115.native.mask-intervals.json",
+             SD_SUMMARIES_DIR);
+    m = parse_json_file(path);
+    CHECK(!m || cJSON_IsFalse(cJSON_GetObjectItem(m, "complete")),
+          "incomplete mask interval is not treated as evidence");
+    cJSON_Delete(m);
+
+    fresh_tree();
+    write_mask_str(false, false);
+    f = fopen(path, "wb");
+    CHECK(f != NULL, "create corrupt synthetic mask evidence");
+    if (f) {
+        for (int i = 0; i < 512; i++) fputc(0, f);
+        fclose(f);
+    }
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(path);
+    snprintf(pending, sizeof(pending), "%s.bad", path);
+    CHECK(m && cJSON_IsTrue(cJSON_GetObjectItem(m, "complete")) &&
+          file_exists(pending), "corrupt derived masks are quarantined and recovered");
+    cJSON_Delete(m);
+    printf("incremental source reconciliation OK (%d checks)\n", g_checks);
+}
+
+/* A re-pulled STR.edf carries a grown MaskOn/MaskOff table under the same
+ * filename (the machine rewrites today's record in place). Re-import must
+ * refresh the STR-sourced base spool; an unmarked AS11 spool (live pull, or
+ * a pre-marker STR write) stays authoritative and is never rewritten. */
+static void phase_str_regrowth(void)
+{
+    char path[700];
+    snprintf(path, sizeof(path), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    int16_t on3[] = {610, 640, 660}, off3[] = {620, 650, 700};
+    int16_t on5[] = {610, 640, 660, 690, 710};
+    int16_t off5[] = {620, 650, 670, 700, 720};
+
+    fresh_tree();
+    write_mask_str_pairs(on3, off3, 3, "SRN=22199999999 MID=46 VID=1");
+    int units;
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(file_exists(path), "STR-sourced day summary written");
+    CHECK(!import_spool_is_synthetic(path), "STR summary is not synthetic");
+    CHECK(import_spool_is_native_str(path), "STR summary carries provenance");
+    long n1 = 0;
+    char *v1 = file_snapshot(path, &n1);
+    CHECK(v1 != NULL, "first STR summary readable");
+
+    write_mask_str_pairs(on5, off5, 5, "SRN=22199999999 MID=46 VID=1");
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    edf_import_ctx_destroy(c);
+    long n2 = 0;
+    char *v2 = file_snapshot(path, &n2);
+    CHECK(v2 != NULL, "refreshed STR summary readable");
+    if (v1 && v2) {
+        long head = n1 < n2 ? n1 : n2;
+        CHECK(n1 != n2 || memcmp(v1, v2, (size_t)head) != 0,
+              "regrown STR refreshes the day summary");
+    }
+    snprintf(path, sizeof(path), "%s/20240115.native.spool",
+             SD_SUMMARIES_DIR);
+    CHECK(!file_exists(path), "base spool refresh leaves no overlay");
+    snprintf(path, sizeof(path),
+             "%s/20240115.native.mask-intervals.json", SD_SUMMARIES_DIR);
+    cJSON *m = parse_json_file(path);
+    CHECK(m != NULL, "regrown mask evidence parses");
+    if (m) {
+        cJSON *pairs = cJSON_GetObjectItem(m, "pairs");
+        CHECK(cJSON_IsArray(pairs) && cJSON_GetArraySize(pairs) == 5,
+              "mask evidence tracks all five sessions");
+    }
+    cJSON_Delete(m);
+
+    /* The identical record re-staged must not rewrite the summary. */
+    write_mask_str_pairs(on5, off5, 5, "SRN=22199999999 MID=46 VID=1");
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(path, sizeof(path), "%s/20240115.spool", SD_SUMMARIES_DIR);
+    long n3 = 0;
+    char *v3 = file_snapshot(path, &n3);
+    if (v2 && v3)
+        CHECK(n2 == n3 && !memcmp(v2, v3, (size_t)n2),
+              "unchanged STR does not rewrite the summary");
+    free(v1); free(v2); free(v3);
+
+    fresh_tree();
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL, "create stand-in live summary");
+    if (f) { fputs("LIVE", f); fclose(f); }
+    write_mask_str_pairs(on5, off5, 5, "SRN=22199999999 MID=46 VID=1");
+    c = edf_import_ctx_create();
+    drain(c, &units);
+    edf_import_ctx_destroy(c);
+    long n4 = 0;
+    char *v4 = file_snapshot(path, &n4);
+    if (v4)
+        CHECK(n4 == 4 && !memcmp(v4, "LIVE", 4),
+              "unmarked AS11 summary is never rewritten");
+    free(v4);
+    snprintf(path, sizeof(path), "%s/20240115.native.spool",
+             SD_SUMMARIES_DIR);
+    CHECK(!file_exists(path),
+          "unmarked AS11 summary keeps STR out of the overlay slot");
+    printf("STR regrowth OK (%d checks)\n", g_checks);
+}
+
+/* Arrival order must not turn a timing guess into durable source ownership. */
+static void phase_grouping_arrival_safety(void)
+{
+    const char *a0 = "20240115_221000";
+    const char *a1 = "20240115_221014";
+    const char *wave = "20240115_221019";
+    char dir[300], source[700], manifest[700];
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+    snprintf(manifest, sizeof(manifest), "%s/%s/%s_session.json",
+             SD_STREAMS_DIR, DAY, a0);
+    int units;
+    edf_import_ctx_t *c;
+    edf_import_unit_t t;
+
+    fresh_tree();
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    build_session_dir(dir, wave, a1, true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, wave);
+    CHECK(t.sessions_imported == 0 && file_exists(source) && !file_exists(manifest),
+          "competing annotation stems and wave remain staged");
+
+    fresh_tree();
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, wave, "BRP");
+    remove_fixture_kind(dir, wave, "PLD");
+    remove_fixture_kind(dir, wave, "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1 && file_exists(manifest),
+          "annotation-only cohort may be published independently");
+    char *before = read_text(manifest);
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "EVE");
+    remove_fixture_kind(dir, a0, "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    char *after = read_text(manifest);
+    CHECK(t.sessions_imported == 0 && file_exists(source) && before && after &&
+          !strcmp(before, after),
+          "later waveform is not timing-joined to earlier annotation");
+    free(after);
+    build_session_dir(dir, wave, a1, true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    after = read_text(manifest);
+    CHECK(t.sessions_imported == 0 && file_exists(source) && before && after &&
+          !strcmp(before, after),
+          "later competing annotation leaves existing ownership unchanged");
+    free(before);
+    free(after);
+
+    fresh_tree();
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "EVE");
+    remove_fixture_kind(dir, a0, "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    char wave_manifest[700];
+    snprintf(wave_manifest, sizeof(wave_manifest), "%s/%s/%s_session.json",
+             SD_STREAMS_DIR, DAY, wave);
+    CHECK(t.sessions_imported == 1 && file_exists(wave_manifest),
+          "waveform-only cohort may be published independently");
+    before = read_text(wave_manifest);
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, wave, "BRP");
+    remove_fixture_kind(dir, wave, "PLD");
+    remove_fixture_kind(dir, wave, "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_EVE.edf", dir, a0);
+    after = read_text(wave_manifest);
+    CHECK(t.sessions_imported == 0 && file_exists(source) && before && after &&
+          !strcmp(before, after),
+          "waveform-first arrival does not accept a timing-only annotation");
+    free(before);
+    free(after);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    cJSON *m = parse_json_file(manifest);
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(m, "import_grouping_version");
+    CHECK(t.sessions_imported == 1 && cJSON_IsNumber(v) && v->valueint == 2,
+          "verified same-stem sources publish a versioned cohort");
+    cJSON_Delete(m);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "BRP");
+    remove_fixture_kind(dir, a0, "PLD");
+    remove_fixture_kind(dir, a0, "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "same-stem annotation-only cohort imports");
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "EVE");
+    remove_fixture_kind(dir, a0, "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(manifest);
+    v = cJSON_GetObjectItemCaseSensitive(m, "brp_samples");
+    CHECK(t.sessions_imported == 1 && cJSON_IsNumber(v) && v->valueint == 75,
+          "verified same-stem late waveform augments the new cohort");
+    cJSON_Delete(m);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "BRP");
+    remove_fixture_kind(dir, a0, "PLD");
+    remove_fixture_kind(dir, a0, "SA2");
+    remove_fixture_kind(dir, a0, "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1, "EVE can arrive before CSL");
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "BRP");
+    remove_fixture_kind(dir, a0, "PLD");
+    remove_fixture_kind(dir, a0, "SA2");
+    remove_fixture_kind(dir, a0, "EVE");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    char events_path[700];
+    snprintf(events_path, sizeof(events_path), "%s/%s/%s_events.snt",
+             SD_STREAMS_DIR, DAY, a0);
+    char *events = read_text(events_path);
+    m = parse_json_file(manifest);
+    const cJSON *hashes = cJSON_GetObjectItemCaseSensitive(m, "import_sha256");
+    CHECK(t.sessions_imported == 1 && events && strstr(events, "ObstructiveApneaEnd") &&
+          strstr(events, "CsrStart") &&
+          cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(hashes, "eve")) &&
+          cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(hashes, "csl")),
+          "late CSL preserves EVE events and both fingerprints");
+    free(events);
+    cJSON_Delete(m);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "BRP");
+    remove_fixture_kind(dir, a0, "PLD");
+    remove_fixture_kind(dir, a0, "SA2");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    m = parse_json_file(manifest);
+    CHECK(m != NULL, "create synthetic pre-cohort manifest");
+    if (m) {
+        cJSON_DeleteItemFromObjectCaseSensitive(m, "import_grouping_version");
+        char *text = cJSON_PrintUnformatted(m);
+        FILE *f = fopen(manifest, "w");
+        CHECK(text && f && fputs(text, f) >= 0, "write synthetic legacy manifest");
+        if (f) fclose(f);
+        free(text);
+        cJSON_Delete(m);
+    }
+    before = read_text(manifest);
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    remove_fixture_kind(dir, a0, "EVE");
+    remove_fixture_kind(dir, a0, "CSL");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, a0);
+    after = read_text(manifest);
+    CHECK(t.sessions_imported == 0 && file_exists(source) && before && after &&
+          !strcmp(before, after),
+          "late complementary source cannot mutate a pre-cohort session");
+    free(before);
+    free(after);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    char other_dir[300], old_manifest[700], other_manifest[700];
+    snprintf(other_dir, sizeof(other_dir), "%s/20240117", DATALOG_DAY);
+    build_session_dir(other_dir, "20240117_221000", "20240117_221000",
+                      true, 2024, 1, 17);
+    snprintf(old_manifest, sizeof(old_manifest), "%s/%s/legacy_session.json",
+             SD_STREAMS_DIR, DAY);
+    char day_dir[700];
+    snprintf(day_dir, sizeof(day_dir), "%s/%s", SD_STREAMS_DIR, DAY);
+    mkpath(day_dir);
+    FILE *broken = fopen(old_manifest, "w");
+    CHECK(broken && fputs("{truncated", broken) >= 0, "create unreadable manifest");
+    if (broken) fclose(broken);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, a0);
+    snprintf(other_manifest, sizeof(other_manifest),
+             "%s/20240117/20240117_221000_session.json", SD_STREAMS_DIR);
+    after = read_text(old_manifest);
+    CHECK(t.sessions_failed > 0 && t.sessions_imported == 1 && file_exists(source) &&
+          !file_exists(manifest) && file_exists(other_manifest) &&
+          after && !strcmp(after, "{truncated"),
+          "unreadable local manifest blocks only its cohort and preserves all evidence");
+    free(after);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    build_session_dir(dir, "20240115_200000", "20240115_200000",
+                      true, 2024, 1, 15);
+    mkpath(day_dir);
+    snprintf(old_manifest, sizeof(old_manifest), "%s/%s/20240115_220955_session.json",
+             SD_STREAMS_DIR, DAY);
+    broken = fopen(old_manifest, "w");
+    CHECK(broken && fputs("{\"state\":\"completed\",\"start_epoch_ms\":1705356595000,"
+                          "\"end_epoch_ms\":1705357200000,\"clock_drift_ms\":0,"
+                          "\"clock_drift_valid\":true}", broken) >= 0,
+          "create source-unattested historical session");
+    if (broken) fclose(broken);
+    before = read_text(old_manifest);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, a0);
+    snprintf(other_manifest, sizeof(other_manifest),
+             "%s/%s/20240115_200000_session.json", SD_STREAMS_DIR, DAY);
+    after = read_text(old_manifest);
+    CHECK(t.deferred_frozen > 0 && t.sessions_imported == 1 &&
+          file_exists(source) && !file_exists(manifest) && file_exists(other_manifest) &&
+          before && after && !strcmp(before, after),
+          "possible source for frozen session is staged; independent session imports");
+    free(before);
+    free(after);
+
+    fresh_tree();
+    build_session_dir(dir, a0, a0, true, 2024, 1, 15);
+    mkpath(day_dir);
+    broken = fopen(old_manifest, "w");
+    CHECK(broken && fputs("{\"state\":\"completed\",\"start_epoch_ms\":1705348800000,"
+                          "\"end_epoch_ms\":1705349400000,\"clock_drift_ms\":0,"
+                          "\"clock_drift_valid\":false}", broken) >= 0,
+          "create historical session without usable drift evidence");
+    if (broken) fclose(broken);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.deferred_frozen > 0 && t.sessions_imported == 0 &&
+          file_exists(source) && !file_exists(manifest),
+          "unknown historical drift cannot prove nearby-day independence");
+
+    /* Verified machine, MaskOn 19 s after TherapyStart, and no usable STR
+     * coverage — the normal state of a same-day bridge import, whose STR
+     * snapshot is written only after the sessions it could prove.  The
+     * legacy one-minute pairing still applies; committed sources consume. */
+    fresh_tree();
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, wave);
+    CHECK(t.sessions_imported == 1 && file_exists(manifest) && !file_exists(source) &&
+          t.files_consumed == 5,
+          "verified one-minute gap pairs without STR evidence; sources consumed");
+
+    /* The reverse order cannot be the same session — a wave cannot precede
+     * its own TherapyStart, so the pair is no longer a pairing candidate.
+     * The wave publishes independently; the orphan annotation then contests
+     * the committed nearby wave session and stays staged for evidence. */
+    fresh_tree();
+    build_session_dir(dir, a0, wave, true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, a0);
+    snprintf(wave_manifest, sizeof(wave_manifest),
+             "%s/%s/%s_session.json", SD_STREAMS_DIR, DAY, wave);
+    char ann_source[700];
+    snprintf(ann_source, sizeof(ann_source), "%s/%s_EVE.edf", dir, wave);
+    CHECK(t.sessions_imported == 1 && t.deferred_association == 0 &&
+          t.deferred_conflict > 0 && file_exists(manifest) &&
+          !file_exists(wave_manifest) && file_exists(ann_source),
+          "wave before TherapyStart is no pairing candidate — wave publishes, "
+          "contesting annotation stays staged");
+
+    /* Even a one-second backward stem is excluded: device clocks do not
+     * run backward, so it is provably another session's wave.  The wave
+     * publishes alone; the later annotation contests it and stays staged. */
+    fresh_tree();
+    build_session_dir(dir, "20240115_220959", a0, true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    char jitter_manifest[700], jitter_source[700];
+    snprintf(jitter_manifest, sizeof(jitter_manifest),
+             "%s/%s/20240115_220959_session.json", SD_STREAMS_DIR, DAY);
+    snprintf(jitter_source, sizeof(jitter_source), "%s/%s_EVE.edf", dir, a0);
+    CHECK(t.sessions_imported == 1 && t.deferred_association == 0 &&
+          t.deferred_conflict > 0 && file_exists(jitter_manifest) &&
+          !file_exists(manifest) && file_exists(jitter_source),
+          "wave one second before TherapyStart is not a candidate either");
+
+    /* AS10 mask-bounce interlock: an earlier session's wave stem sits inside
+     * the next session's one-minute window on the wrong side.  The provably
+     * impossible backward claim must not register — otherwise both clusters
+     * end multi-claimed and every involved source stages forever. */
+    fresh_tree();
+    build_session_dir(dir, "20240115_221006", "20240115_221000", true, 2024, 1, 15);
+    build_session_dir(dir, "20240115_221101", "20240115_221056", true, 2024, 1, 15);
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    char stub_manifest[700], big_manifest[700];
+    snprintf(stub_manifest, sizeof(stub_manifest),
+             "%s/%s/20240115_221000_session.json", SD_STREAMS_DIR, DAY);
+    snprintf(big_manifest, sizeof(big_manifest),
+             "%s/%s/20240115_221056_session.json", SD_STREAMS_DIR, DAY);
+    CHECK(t.sessions_imported == 2 && t.deferred_association == 0 &&
+          file_exists(stub_manifest) && file_exists(big_manifest),
+          "backward-adjacent stub cannot wedge the next session's pairing");
+
+    /* A one-minute gap earns the pairing only for a verified machine —
+     * unverifiable identity stays staged. */
+    fresh_tree();
+    build_session_dir(dir, wave, a0, true, 2024, 1, 15);
+    set_fixture_recording_id(dir, "X X X X");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    snprintf(source, sizeof(source), "%s/%s_BRP.edf", dir, wave);
+    CHECK(t.sessions_imported == 0 && file_exists(source) && !file_exists(manifest),
+          "unverifiable machine keeps a one-minute gap staged");
+}
+
+static void phase_grouping_capacity(void)
+{
+    fresh_tree();
+    char dir[300], first[700], last[700], path[700];
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+    mkpath(dir);
+    first[0] = last[0] = '\0';
+    for (int i = 0; i < 193; i++) {
+        snprintf(path, sizeof(path), "%s/20240115_22%02d%02d_EVE.edf",
+                 dir, i / 60, i % 60);
+        FILE *f = fopen(path, "wb");
+        CHECK(f != NULL, "create synthetic capacity input");
+        if (f) fclose(f);
+        if (!i) snprintf(first, sizeof(first), "%s", path);
+        if (i == 192) snprintf(last, sizeof(last), "%s", path);
+    }
+    int units;
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 0 && t.sessions_failed > 0 &&
+          t.files_consumed == 0 && file_exists(first) && file_exists(last),
+          "over-capacity group retains all offered sources");
+}
+
+static void phase_stale_part_does_not_block(void)
+{
+    fresh_tree();
+    char dir[300], stale[700];
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true,
+                      2024, 1, 15);
+    snprintf(stale, sizeof(stale), "%s/old-transfer.part", dir);
+    FILE *f = fopen(stale, "wb");
+    CHECK(f != NULL, "create synthetic stale part");
+    if (f) fclose(f);
+    int units;
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_ctx_set_quiesce(c, 0);
+    edf_import_unit_t t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1 && file_exists(stale),
+          "explicit import ignores but preserves an unrelated stale part");
+}
+
+static void phase_stub_write_failure(void)
+{
+    fresh_tree();
+    char dir[300], source[700], manifest[700];
+    snprintf(dir, sizeof(dir), "%s/%s", DATALOG_DAY, DAY);
+    build_session_dir(dir, "20240115_221000", "20240115_221000", true, 2024, 1, 15);
+    remove_fixture_kind(dir, "20240115_221000", "BRP");
+    remove_fixture_kind(dir, "20240115_221000", "PLD");
+    remove_fixture_kind(dir, "20240115_221000", "SA2");
+    snprintf(source, sizeof(source), "%s/20240115_221000_EVE.edf", dir);
+    snprintf(manifest, sizeof(manifest), "%s/%s/20240115_221000_session.json",
+             SD_STREAMS_DIR, DAY);
+    int units;
+    fail_empty_flow_open = true;
+    edf_import_ctx_t *c = edf_import_ctx_create();
+    edf_import_unit_t t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    fail_empty_flow_open = false;
+    CHECK(t.sessions_failed > 0 && file_exists(source) && !file_exists(manifest),
+          "failed empty-stream write keeps sources and publishes no manifest");
+    c = edf_import_ctx_create();
+    t = drain(c, &units);
+    edf_import_ctx_destroy(c);
+    CHECK(t.sessions_imported == 1 && file_exists(manifest),
+          "empty-stream write failure retries successfully");
 }
 
 int main(void)
@@ -1849,7 +4006,21 @@ int main(void)
     tzset();
     snprintf(DATALOG_DAY, sizeof(DATALOG_DAY), "%s/DATALOG", IMPORT_DIR);
     mkpath(DATALOG_DAY);
-
+    if (getenv("EDF_IMPORT_PHASE_A")) {
+        phase_a();
+        rmtree(SD_MOUNT_POINT);
+        printf("edf_import_test: %d checks, %d failures\n", g_checks, g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (getenv("EDF_IMPORT_GROUPING_ONLY")) {
+        phase_h();
+        phase_grouping_arrival_safety();
+        phase_grouping_capacity();
+        phase_stale_part_does_not_block();
+        rmtree(SD_MOUNT_POINT);
+        printf("edf_import_test: %d checks, %d failures\n", g_checks, g_fail);
+        return g_fail ? 1 : 0;
+    }
     phase_a();
     phase_b();
     phase_c();
@@ -1865,6 +4036,18 @@ int main(void)
     phase_m();
     phase_n();
     phase_o();
+    phase_p();
+    phase_q();
+    phase_r();
+    phase_s();
+    phase_native_corruption();
+    phase_store_budget();
+    phase_incremental_sources();
+    phase_str_regrowth();
+    phase_grouping_arrival_safety();
+    phase_grouping_capacity();
+    phase_stale_part_does_not_block();
+    phase_stub_write_failure();
 
     rmtree(SD_MOUNT_POINT);
     printf("edf_import_test: %d checks, %d failures\n", g_checks, g_fail);
