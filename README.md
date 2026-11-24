@@ -4,7 +4,7 @@
 </p>
 <br clear="right" />
 
-**SomnoTrace** is firmware for an inexpensive (~US$20) bedside device that:
+**SomnoTrace** is firmware for a small, inexpensive (~US$20) bedside device that:
 
 - 📥 Automatically pulls therapy data from your **ResMed Series 10/11 (AirSense / AirCurve)**
   - <ins>Series 11</ins> - Directly, wirelessly over Bluetooth (*<ins>no SD card required in the machine<ins>*)
