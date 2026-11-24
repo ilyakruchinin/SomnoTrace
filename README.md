@@ -29,6 +29,7 @@
 | Optional escalating buzzer alarm | ✅ | ❌ | If you miss the notification, the device will sound an escalating buzzer alarm | 💎 if not acked |
 | Send RPC commands to the machine | ✅ | ❌ | Query machine settings or start/stop therapy remotely | |
 | Smart home automations | ✅ | limited | Built-in MQTT publishes live telemetry with Home Assistant Auto-Discovery | 💎 live therapy data |
+| Midday continuous sessions | ✅ | ❌ | Therapy spanning midday is recorded as one continuous session | 💎 [no gap in data](docs/cross-noon.md)|
 
 ## Key pulse oximetry features
 | Feature | Availability | Notes | Exclusive to SomnoTrace 💎 |
@@ -206,6 +207,7 @@ Once rebooted, connect your phone or computer to the **`SomnoTrace-Setup`** Wi-F
 - 🔋 **[Battery & Power Guidelines](docs/battery.md)** — Why USB-C power is recommended, and the `--% ⚡` calibration fix.
 - 🏕️ **[Camping Mode](docs/camping.md)** — Recording offline with no Wi-Fi or internet.
 - 🕛 **[Cross-Noon Sessions](docs/cross-noon.md)** — Why midday therapy stays one continuous session.
+- 🪟 **[Windows SMB Share Setup](docs/windows_10-11_smb.md)** — Securely share a folder on Windows 10/11 for automatic EDF uploads.
 - ⚡ **[ResMed BLE RPC Bridge Guide](docs/rpc-bridge.md)** — Send direct queries and commands (`curl` examples) to the AirSense 11 over Wi-Fi.
 - 🏠 **[Smart Home & Home Assistant Guide](docs/automations.md)** — Set up bedtime automations, compliance tracking, and mask-off alerts.
 - 🛠️ **[Hardware Reference](docs/hardware/README.md)** — Pinouts, schematics, and hardware architecture.
@@ -220,36 +222,6 @@ Connect with any FTP client (e.g., FileZilla) to `ftp://somnotrace.local`.
 > **FileZilla tip:** If you experience connection errors, go to **Site Manager → Edit → Transfer Settings** and set **"Limit number of simultaneous connections"** to **1**. The ESP32-S3 FTP server processes one connection at a time.
 
 </details>
-
----
-
-## Features
-
-**Capture & Files**
-- Secure Bluetooth sync with ResMed AirSense 11 / AirCurve 11, or Series 10 via [SomnoBridge](https://github.com/ilyakruchinin/somnobridge) — live stream recording and summary data retrieval
-- Downloads stored oximetry recordings from Viatom O2 Ring (Gen1 & Gen2) over Bluetooth
-- Standard `STR.edf`, `BRP.edf`, `PLD.edf`, `EVE.edf`, and `CSL.edf` files — compatible with OSCAR and SleepHQ
-- Sub-second NTP clock sync eliminates AirSense 11 clock drift for pulse oximeter alignment
-- Therapy spanning midday is recorded as one continuous session ([details](docs/cross-noon.md))
-- SomnoStage on-device sleep staging (Wake / REM / Light / Deep) — official release builds only
-
-**Upload Destinations**
-- SMB / NAS network share — Windows, macOS, and Linux/Samba folders
-- [SleepHQ](https://sleephq.com) — direct HTTPS upload with fast retry handling
-- [Aerivue](https://aerivue.app) — CPAP sessions and oximetry recordings via upload key
-- [BreathingRoom](https://breathingroom.io) — CPAP sessions and oximetry recordings via personal access token (oximetry requires a BreathingRoom Premium account)
-
-**Alerts & Smart Home**
-- Therapy interruption alarm — push notifications via [ntfy](https://ntfy.sh) (phone/smartwatch/bed shaker) and an escalating audio buzzer
-- High-leak alert — rolling 2-minute leak average with a configurable threshold, same notification path
-- MQTT client publishes therapy events, alert state, BLE status, and device telemetry; Home Assistant Auto-Discovery provisions all entities automatically
-- Bidirectional MQTT commands for remote therapy start/stop and alarm acknowledgement
-- BLE → Wi-Fi RPC bridge — local HTTP endpoint for machine queries and smart home control
-
-**Interfaces**
-- Web dashboard — interactive sleep charts, AHI breakdown, status telemetry, easy setup
-- 1.54" color LCD — live flow graph, Wi-Fi/battery/clock status
-- Built-in FTP server — download EDF and session files directly from the MicroSD card
 
 ---
 
