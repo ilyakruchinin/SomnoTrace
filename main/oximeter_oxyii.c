@@ -280,6 +280,8 @@ static bool s_paired = false;
 static bool s_presence_served = false;
 static bool s_synced_this_idle = false;
 static bool s_ring_present = false;
+static int64_t s_ring_drift_ms = 0;
+static bool s_ring_drift_valid = false;
 static TickType_t s_served_at;
 static int s_f1_fail_count = 0;  /* consecutive F1 timeouts in this sync window */
 static int s_pull_fail_count = 0;   /* consecutive failed pulls in this presence */
@@ -725,6 +727,8 @@ static void do_disconnect(void)
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_connect_event_handle = BLE_HS_CONN_HANDLE_NONE;
     }
+    s_ring_drift_ms = 0;
+    s_ring_drift_valid = false;
     oxyii_crypto_reset();
 }
 
@@ -1026,17 +1030,37 @@ static esp_err_t oxyii_prepare_files(void)
 static esp_err_t oxyii_get_info(char *serial, size_t serial_sz,
                                  char *firmware, size_t fw_sz)
 {
+    s_ring_drift_ms = 0;
+    s_ring_drift_valid = false;
     if (oxyii_request(OP_GET_INFO, NULL, 0, true, 5000) != ESP_OK)
         return ESP_FAIL;
 
     /* Payload layout (from protocol study):
      *   bytes 9..16: firmware (8 chars, null-padded)
+     *   bytes 24..30: ring RTC (u16 LE year, mon, day, hour, min, sec)
      *   byte 37: serial length
      *   bytes 38..: serial string */
     if (s_resp_payload_len < 38) {
         ESP_LOGW(TAG, "get_info: response payload too short (%d bytes, want >= 38, enc=%d)",
                  s_resp_payload_len, s_encrypted);
         return ESP_FAIL;
+    }
+
+    if (time_is_usable()) {
+        int year = (int)((uint16_t)s_resp_payload[24] | ((uint16_t)s_resp_payload[25] << 8));
+        int mon  = s_resp_payload[26];
+        int day  = s_resp_payload[27];
+        int hour = s_resp_payload[28];
+        int min  = s_resp_payload[29];
+        int sec  = s_resp_payload[30];
+        int64_t ring_ms = oximetry_civil_epoch_ms(year, mon, day, hour, min, sec);
+        if (ring_ms > 0) {
+            int64_t host_ms = (int64_t)time(NULL) * 1000LL;
+            s_ring_drift_ms = host_ms - ring_ms;
+            s_ring_drift_valid = true;
+            ESP_LOGI(TAG, "ring_rtc=%04d-%02d-%02d %02d:%02d:%02d drift=%lldms",
+                     year, mon, day, hour, min, sec, (long long)s_ring_drift_ms);
+        }
     }
 
     if (firmware && fw_sz > 0) {
@@ -1143,8 +1167,16 @@ static esp_err_t oxyii_convert_stored(const char *name)
     char source_path[640];
     snprintf(source_path, sizeof(source_path), SD_OXIMETRY_DIR "/files/%s/%s.bin",
              s_serial, name);
+    int64_t start_ms = oximetry_filename_epoch_ms(name);
+    if (start_ms > 0 && s_ring_drift_valid &&
+        llabs(s_ring_drift_ms) >= 2000 &&
+        llabs(s_ring_drift_ms) <= 86400LL * 365 * 1000) {
+        ESP_LOGI(TAG, "applying pre-sync ring drift %lldms to '%s'",
+                 (long long)s_ring_drift_ms, name);
+        start_ms += s_ring_drift_ms;
+    }
     esp_err_t conversion = oximetry_canonical_convert_format_a(
-        s_serial, name, source_path, oximetry_filename_epoch_ms(name));
+        s_serial, name, source_path, start_ms);
     if (conversion != ESP_OK) {
         ESP_LOGW(TAG, "canonical conversion pending for '%s': %s", name,
                  esp_err_to_name(conversion));
@@ -1485,6 +1517,15 @@ static void pair_task(void *arg)
     s_pull_fail_count = 0;
     s_connect_fail_count = 0;
 
+    /* Sync the ring's clock at pairing time (when off-finger and host time
+     * is usable) so the very first night recorded uses NTP local time. */
+    if (time_is_usable() && oxyii_off_finger() == 1) {
+        uint8_t tp[8];
+        oxyii_time_payload(tp);
+        esp_err_t trc = oxyii_request(OP_SET_UTC_TIME, tp, 8, true, 3000);
+        ESP_LOGI(TAG, "pair: ring clock sync %s", trc == ESP_OK ? "ok" : "no ack");
+    }
+
     do_disconnect();
     set_state(OX_STATUS_PAIRED);
     ESP_LOGI(TAG, "paired: serial=%s fw=%s name=%s", serial, firmware, display_name);
@@ -1710,17 +1751,18 @@ static esp_err_t live_rec_open_or_resume(oxyii_live_rec_t *rec)
     }
 
     memset(rec, 0, sizeof(*rec));
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    if (tv.tv_sec < 1577836800) { /* < 2020-01-01: clock not synced yet */
+    if (!time_is_usable()) {
         static TickType_t s_last_clk_warn = 0;
         TickType_t now_t = xTaskGetTickCount();
         if (s_last_clk_warn == 0 || (now_t - s_last_clk_warn) > pdMS_TO_TICKS(30000)) {
-            ESP_LOGW(TAG, "live PPG waiting for clock sync before opening files");
+            ESP_LOGW(TAG, "live PPG waiting for usable clock sync before opening files");
             s_last_clk_warn = now_t;
         }
         return ESP_ERR_INVALID_STATE;
     }
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
 
     uint64_t free_bytes = 0;
     if (sd_storage_get_free(&free_bytes, NULL) == ESP_OK && free_bytes < OX_LIVE_MIN_FREE_BYTES) {
@@ -2396,6 +2438,8 @@ static esp_err_t oxyii_pair(const char *addr_str)
 static void oxyii_forget(void)
 {
     s_paired = false;
+    s_ring_drift_ms = 0;
+    s_ring_drift_valid = false;
     live_rec_reset(&s_live_rec);
     s_presence_served = false;
     s_synced_this_idle = false;
