@@ -43,7 +43,7 @@
 |---------|-----------|-----------|-------|
 | OTA firmware updates| ✅ | Simple update via web interface | |
 | Support for SleepHQ, Aerivue and BreathingRoom | ✅ | Automatic uploads to cloud services | 💎 widest endpoint support |
-| 3-click installation (only takes 1 minute) | ✅ | Anyone can do it, no technical knowledge required | 💎 install from a web page |
+| 3-click installation ([only takes 1 minute](#3-click-install)) | ✅ | Anyone can do it, no technical knowledge required | 💎 install from a web page |
 
 
 ---
@@ -181,7 +181,8 @@ Access the built-in web portal from any device on your Wi-Fi network without ins
 
 ## Installation
 
-### 1-Click Web Installer at somnotrace.com (Recommended — Under 1 Minute)
+<a id="3-click-install"></a>
+### 3-Click Web Installer at somnotrace.com (Recommended — Under 1 Minute)
 
 No software, drivers, command line, or file downloads required. Install SomnoTrace directly from your browser (**Google Chrome**, **Microsoft Edge**, **Brave**, or **Opera**):
 
