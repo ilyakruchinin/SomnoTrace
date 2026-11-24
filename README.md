@@ -9,7 +9,7 @@
   - <ins>Series 10</ins> - Through [SomnoBridge](https://github.com/ilyakruchinin/somnobridge) and an EZShare WiFi SD card in the machine (Series 10 doesn't have Bluetooth support)
 - 💓 Downloads your O2 Ring pulse-oximetry recordings over Bluetooth (wirelessly).
 - ⏱️ <ins>Corrects the machine's clock drift</ins> so therapy records align to real internet time — <ins>your CPAP and oximeter graphs line up properly</ins>.
-- 📤 Writes standard EDF files and uploads them automatically to your NAS/PC share (SMB) for <ins>[OSCAR](https://www.sleepfiles.com/OSCAR/), [SleepHQ](https://sleephq.com), [Aerivue](https://aerivue.app), or [BreathingRoom](https://breathingroom.io)</ins> — no SD card swapping.
+- 📤 Writes standard EDF files and uploads them automatically to your NAS/PC share (SMB) for [OSCAR](https://www.sleepfiles.com/OSCAR/), [SleepHQ](https://sleephq.com), [Aerivue](https://aerivue.app), or [BreathingRoom](https://breathingroom.io) — no SD card swapping.
 
 ---
 
