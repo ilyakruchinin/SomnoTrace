@@ -322,6 +322,14 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 /* Summary breakdown + stats */
 .dash-summary-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:600px){.dash-summary-grid{grid-template-columns:1fr}}
+.dash-sq-card{padding:12px 16px;font-size:.8rem;color:var(--text-muted);line-height:1.5;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px 20px}
+.dash-sq-item{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 6px;min-width:0}
+.dash-sq-label{font-weight:600;color:var(--text);white-space:nowrap}
+.dash-sq-issue{color:var(--danger);font-weight:600}
+.dash-sq-pill-err{display:inline-block;padding:1px 7px;border-radius:999px;background:var(--log-error-bg);color:var(--danger);border:1px solid var(--danger);font-weight:600;font-size:.75rem}
+.dash-sq-pill-ok{display:inline-block;padding:1px 7px;border-radius:999px;background:rgba(52,211,153,.12);color:var(--success);font-weight:600;font-size:.75rem}
+.dash-sq-muted{color:var(--text-muted);font-size:.75rem}
+@media(max-width:600px){.dash-sq-card{flex-direction:column;align-items:stretch;gap:8px;padding:12px 14px}.dash-sq-item+.dash-sq-item{border-top:1px solid var(--card-border);padding-top:8px}}
 .dash-brk-row{display:flex;align-items:center;gap:8px;font-size:.85rem;margin:3px 0}
 .dash-brk-row .sw{width:10px;height:10px;border-radius:2px;flex:none}
 .dash-brk-row .lbl{flex:1;color:var(--text-muted)}
@@ -1385,7 +1393,7 @@ Save &amp; Reboot
 <div id="oximetry-status" style="font-size:.75rem;color:var(--text-muted);margin-top:6px"></div>
 <div id="dash-status" style="font-size:.75rem;color:var(--text-muted);margin-top:4px"></div>
 </div>
-<div id="dash-stream-quality" class="card" style="display:none;padding:12px 16px;font-size:.8rem;color:var(--text-muted);line-height:1.6"></div>
+<div id="dash-stream-quality" class="card dash-sq-card"></div>
 <div class="dash-options-bar" style="margin-top:12px;display:flex;flex-wrap:wrap;gap:16px">
 <label id="dash-clamp-row" class="dash-toggle-row" style="display:none" title="When enabled, the time axis and oximetry data are clamped to CPAP therapy start/end times only">
 <input type="checkbox" id="dash-clamp-cpap" onchange="onDashClampCpapChange()">
@@ -6346,42 +6354,99 @@ function renderSummary() {
   var panel = document.getElementById('dash-summary'); if (panel) panel.style.display = '';
 }
 
-/* ── Stream quality (v2 sessions only) ───────────────────────────────
- * Aggregates BLE notification reception stats across all v2 sessions in
- * the current noon-day.  v1 sessions don't have these fields, so the block
- * is hidden when no v2 sessions are present.  Only sessions that passed
- * the ≥60s duration filter (dashSessions) are counted. */
+/* ── Stream quality & time drift ────────────────────────────────────────
+ * Always visible at the bottom of the Dashboard.  Aggregates BLE reception
+ * stats across v2 sessions (highlighting packet loss in red) and reports the
+ * clock drift of the last CPAP session of the selected day when present. */
+function fmtDriftMs(ms) {
+  var sign = ms < 0 ? '-' : (ms > 0 ? '+' : '');
+  var abs = Math.abs(ms);
+  if (abs < 1000) return sign + Math.round(abs) + ' ms';
+  var sec = abs / 1000;
+  if (sec < 60) return sign + sec.toFixed(1) + 's';
+  var min = Math.floor(sec / 60);
+  var remS = sec - min * 60;
+  if (min < 60) return sign + min + 'm ' + remS.toFixed(1) + 's';
+  var hr = Math.floor(min / 60);
+  var remM = min % 60;
+  return sign + hr + 'h ' + remM + 'm ' + Math.round(remS) + 's';
+}
+
 function renderStreamQuality() {
   var el = document.getElementById('dash-stream-quality');
-  if (!el || !dashSessions || !dashSessions.length) {
-    if (el) el.style.display = 'none';
+  if (!el) return;
+  el.style.display = '';
+  el.classList.remove('card-danger');
+
+  if (!dashSessions || !dashSessions.length) {
+    el.innerHTML =
+      '<div class="dash-sq-item">' +
+        '<span class="dash-sq-label">Stream quality:</span> ' +
+        '<span>No CPAP sessions</span>' +
+      '</div>';
     return;
   }
+
   var notif = 0, gaps = 0, missing = 0, durMs = 0;
+  var anyImported = false, anyV1 = false;
   for (var i = 0; i < dashSessions.length; i++) {
     var s = dashSessions[i];
-    if (!s || s.fmt < 2) continue;
-    notif  += (s.stream_notifications || 0);
-    gaps   += (s.gap_events || 0);
+    if (!s) continue;
+    if (s.imported) anyImported = true;
+    if ((s.fmt || 1) < 2) { anyV1 = true; continue; }
+    notif   += (s.stream_notifications || 0);
+    gaps    += (s.gap_events || 0);
     missing += (s.gap_missing || 0);
-    durMs  += (s.end_epoch_ms || 0) - (s.start_epoch_ms || 0);
+    durMs   += (s.end_epoch_ms || 0) - (s.start_epoch_ms || 0);
   }
-  if (notif === 0 && missing === 0) {
-    el.style.display = 'none';
-    return;
+
+  var sqHtml = '<div class="dash-sq-item"><span class="dash-sq-label">Stream quality:</span> ';
+  if (notif > 0 || missing > 0) {
+    var expected = notif + missing;
+    var lossPct = expected > 0 ? (missing / expected * 100) : 0;
+    var durMin = durMs / 60000;
+    var per10 = (durMin > 0 && missing > 0) ? (missing / durMin * 10) : 0;
+    var hasIssues = (missing > 0 || gaps > 0);
+    if (hasIssues) el.classList.add('card-danger');
+    var detailText =
+      notif.toLocaleString() + ' notifications received, ' +
+      gaps + ' gap event' + (gaps !== 1 ? 's' : '') + ', ' +
+      missing + ' missing compensated';
+    var rateText = lossPct.toFixed(2) + '% loss' + (per10 > 0 ? ' (' + per10.toFixed(1) + '/10m)' : '');
+    if (hasIssues) {
+      sqHtml += '<span class="dash-sq-issue">' + detailText + '</span> ' +
+                '<span class="dash-sq-pill-err">' + rateText + '</span>';
+    } else {
+      sqHtml += '<span>' + detailText + '</span> ' +
+                '<span class="dash-sq-pill-ok">' + rateText + '</span>';
+    }
+  } else if (anyImported) {
+    sqHtml += '<span>SD card import (no BLE stream)</span>';
+  } else if (anyV1) {
+    sqHtml += '<span>Legacy v1 session (no stream stats)</span>';
+  } else {
+    sqHtml += '<span>No BLE stream data</span>';
   }
-  var expected = notif + missing;
-  var lossPct = expected > 0 ? (missing / expected * 100) : 0;
-  var durMin = durMs / 60000;
-  var per10 = (durMin > 0 && missing > 0) ? (missing / durMin * 10) : 0;
-  el.innerHTML =
-    '<span style="font-weight:600;color:var(--text)">Stream quality:</span> ' +
-    notif.toLocaleString() + ' notifications received, ' +
-    gaps + ' gap event' + (gaps !== 1 ? 's' : '') + ', ' +
-    missing + ' missing compensated, ' +
-    'loss rate ' + lossPct.toFixed(2) + '%' +
-    (per10 > 0 ? ', ' + per10.toFixed(1) + ' missing per 10 min' : '');
-  el.style.display = '';
+  sqHtml += '</div>';
+
+  var last = dashSessions[dashSessions.length - 1];
+  var driftHtml = '<div class="dash-sq-item"><span class="dash-sq-label">Last session time drift:</span> ';
+  if (last && last.clock_drift_valid) {
+    var tzDelta = last.device_tz_delta_ms || 0;
+    var rtcDrift = (last.clock_drift_ms || 0) - tzDelta;
+    var tzNote = '';
+    if (tzDelta !== 0) {
+      var tzHrs = tzDelta / 3600000;
+      var tzStr = (tzHrs > 0 ? '+' : '') + (Math.abs(tzHrs % 1) < 1e-6 ? tzHrs.toFixed(0) : tzHrs.toFixed(1)) + 'h';
+      tzNote = ' <span class="dash-sq-muted">(device TZ ' + tzStr + ')</span>';
+    }
+    driftHtml += '<span style="color:var(--text);font-weight:500">' + fmtDriftMs(rtcDrift) + '</span>' + tzNote;
+  } else {
+    driftHtml += '<span>Unavailable</span>';
+  }
+  driftHtml += '</div>';
+
+  el.innerHTML = sqHtml + driftHtml;
 }
 
 /* ── Respiratory events overlay (Feature 4) ──────────────────────────
