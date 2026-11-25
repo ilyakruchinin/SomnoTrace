@@ -778,8 +778,9 @@ int upload_ox_status(const upload_ox_ref_t *ref, int backend_slot)
     return s;
 }
 
-void upload_ox_mark(const upload_ox_ref_t *ref, int backend_slot,
-                   upload_unit_status_t status, const char *remote_id)
+static void ox_record_outcome(const upload_ox_ref_t *ref, int backend_slot,
+                              upload_unit_status_t status, const char *remote_id,
+                              bool park)
 {
     if (!ref || backend_slot < 0 || backend_slot >= OX_MAX_BACKENDS_LOCAL ||
         !ox_lock_init()) return;
@@ -796,7 +797,15 @@ void upload_ox_mark(const upload_ox_ref_t *ref, int backend_slot,
     }
     u->backend[backend_slot].status = status;
     u->backend[backend_slot].last_try_s = (uint32_t)time(NULL);
-    if (status != UG_OK) u->backend[backend_slot].attempts++;
+    if (park) {
+        if (u->backend[backend_slot].attempts < UPLOAD_MAX_GROUP_ATTEMPTS)
+            u->backend[backend_slot].attempts = UPLOAD_MAX_GROUP_ATTEMPTS;
+        else if (u->backend[backend_slot].attempts < UINT8_MAX)
+            u->backend[backend_slot].attempts++;
+    } else if (status != UG_OK) {
+        if (u->backend[backend_slot].attempts < UINT8_MAX)
+            u->backend[backend_slot].attempts++;
+    }
     if (remote_id) strlcpy(u->remote[backend_slot], remote_id,
                            sizeof(u->remote[backend_slot]));
     /* The mark is the durability-critical write: persist immediately rather
@@ -806,6 +815,17 @@ void upload_ox_mark(const upload_ox_ref_t *ref, int backend_slot,
     else
         u->dirty = false;
     ox_unlock();
+}
+
+void upload_ox_mark(const upload_ox_ref_t *ref, int backend_slot,
+                   upload_unit_status_t status, const char *remote_id)
+{
+    ox_record_outcome(ref, backend_slot, status, remote_id, false);
+}
+
+void upload_ox_park(const upload_ox_ref_t *ref, int backend_slot)
+{
+    ox_record_outcome(ref, backend_slot, UG_FAILED, NULL, true);
 }
 
 /* Same park semantics as EDF groups (upload_park.h): a unit that has failed

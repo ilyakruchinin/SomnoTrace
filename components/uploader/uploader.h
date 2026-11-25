@@ -62,7 +62,8 @@ typedef enum {
     UPLOAD_OK = 0,          /* transferred, or deliberately skipped         */
     UPLOAD_NOT_CONFIGURED,  /* backend has no valid config — skipped        */
     UPLOAD_ERR_TRANSIENT,   /* timeout / unreachable / 5xx — retry later    */
-    UPLOAD_ERR_PERMANENT,   /* auth rejected / 4xx — retry, but surface it  */
+    UPLOAD_ERR_PERMANENT,   /* auth rejected / account gate — retry, surface it */
+    UPLOAD_ERR_UNIT_REJECTED, /* single unit permanently rejected — park unit */
 } upload_result_t;
 
 /* Kept as an alias so existing backend code reads naturally; any error maps

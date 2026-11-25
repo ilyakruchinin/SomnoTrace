@@ -359,6 +359,7 @@ static bool run_backend(backend_rt_t *r, int max_days,
 
     int fails = 0;
     bool any_ok = false;
+    bool any_parked = false;
     bool deferred_busy = false;
     /* Recorded here rather than inside the day loop: a `continue` in that loop
      * used to skip the fingerprint update, leaving the bundle permanently
@@ -542,14 +543,19 @@ static bool run_backend(backend_rt_t *r, int max_days,
             }
             res = be->put_oximetry(&ox_refs[oi]);
             uploader_lease_give();
-            upload_ox_mark(&ox_refs[oi], r->slot,
-                           res == UPLOAD_OK ? UG_OK : UG_FAILED, NULL);
             if (res == UPLOAD_OK) {
+                upload_ox_mark(&ox_refs[oi], r->slot, UG_OK, NULL);
                 ox_day_any = true;
                 any_ok = true;
                 r->cur_unit++;
                 r->last_ok_s = now_s();
+            } else if (res == UPLOAD_ERR_UNIT_REJECTED) {
+                upload_ox_park(&ox_refs[oi], r->slot);
+                any_parked = true;
+                ESP_LOGW(TAG, "%s: oximetry %s rejected — parked", be->id,
+                         ox_refs[oi].recording_id);
             } else {
+                upload_ox_mark(&ox_refs[oi], r->slot, UG_FAILED, NULL);
                 fails++;
                 ESP_LOGW(TAG, "%s: oximetry %s failed", be->id,
                          ox_refs[oi].recording_id);
@@ -610,14 +616,19 @@ static bool run_backend(backend_rt_t *r, int max_days,
             }
             res = be->put_stage(&st_refs[i]);
             uploader_lease_give();
-            upload_stage_mark(&st_refs[i], r->slot,
-                              res == UPLOAD_OK ? UG_OK : UG_FAILED, NULL);
             if (res == UPLOAD_OK) {
+                upload_stage_mark(&st_refs[i], r->slot, UG_OK, NULL);
                 st_day_any = true;
                 any_ok = true;
                 r->cur_unit++;
                 r->last_ok_s = now_s();
+            } else if (res == UPLOAD_ERR_UNIT_REJECTED) {
+                upload_stage_park(&st_refs[i], r->slot);
+                any_parked = true;
+                ESP_LOGW(TAG, "%s: stage %s rejected — parked", be->id,
+                         st_refs[i].unit_id);
             } else {
+                upload_stage_mark(&st_refs[i], r->slot, UG_FAILED, NULL);
                 fails++;
                 ESP_LOGW(TAG, "%s: stage %s failed", be->id,
                          st_refs[i].unit_id);
@@ -650,6 +661,9 @@ static bool run_backend(backend_rt_t *r, int max_days,
     } else if (!any_ok && !bundle_committed) {
         if (deferred_busy) {
             ESP_LOGI(TAG, "%s: storage busy during upload, deferring without cooldown", be->id);
+            set_be_state(r, SB_IDLE);
+        } else if (any_parked) {
+            ESP_LOGI(TAG, "%s: rejected unit(s) parked", be->id);
             set_be_state(r, SB_IDLE);
         } else {
             /* We connected and transferred nothing.  That is not success — it means

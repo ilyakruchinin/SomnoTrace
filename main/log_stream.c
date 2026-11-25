@@ -765,14 +765,20 @@ static esp_err_t logs_ws_handler(httpd_req_t *req)
      * consume path must be correct for any size. */
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(ws_pkt));
-    if (httpd_ws_recv_frame(req, &ws_pkt, 0) != ESP_OK) {
-        ESP_LOGW(TAG, "ws: frame header read failed (fd=%d)",
-                 httpd_req_to_sockfd(req));
+    esp_err_t recv_err = httpd_ws_recv_frame(req, &ws_pkt, 0);
+    if (recv_err != ESP_OK) {
+        ESP_LOGD(TAG, "ws: frame header read failed (%s, fd=%d)",
+                 esp_err_to_name(recv_err), httpd_req_to_sockfd(req));
         ws_forget(client);
         return ESP_FAIL;
     }
     if (ws_pkt.len == 0) {
-        if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
+        if (ws_pkt.type == HTTPD_WS_TYPE_PING) {
+            httpd_ws_frame_t pong = { .final = true, .type = HTTPD_WS_TYPE_PONG };
+            httpd_ws_send_frame(req, &pong);
+        } else if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
+            httpd_ws_frame_t close_resp = { .final = true, .type = HTTPD_WS_TYPE_CLOSE };
+            httpd_ws_send_frame(req, &close_resp);
             ws_forget(client);
             ESP_LOGI(TAG, "ws: client closed connection (fd=%d)", client->fd);
         }
@@ -794,7 +800,7 @@ static esp_err_t logs_ws_handler(httpd_req_t *req)
     }
     ws_pkt.payload = buf;
     if (httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len) != ESP_OK) {
-        ESP_LOGW(TAG, "ws: frame payload read failed (%u bytes, fd=%d)",
+        ESP_LOGD(TAG, "ws: frame payload read failed (%u bytes, fd=%d)",
                  (unsigned)ws_pkt.len, httpd_req_to_sockfd(req));
         if (buf != stack_buf) free(buf);
         ws_forget(client);
@@ -816,8 +822,19 @@ static esp_err_t logs_ws_handler(httpd_req_t *req)
             /* Defer the status push to the forwarder task (single-writer model). */
             s_push_status_now = true;
         }
+    } else if (ws_pkt.type == HTTPD_WS_TYPE_PING) {
+        httpd_ws_frame_t pong = {
+            .final = true,
+            .type = HTTPD_WS_TYPE_PONG,
+            .payload = buf,
+            .len = ws_pkt.len,
+        };
+        httpd_ws_send_frame(req, &pong);
     } else if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
+        httpd_ws_frame_t close_resp = { .final = true, .type = HTTPD_WS_TYPE_CLOSE };
+        httpd_ws_send_frame(req, &close_resp);
         ws_forget(client);
+        ESP_LOGI(TAG, "ws: client closed connection (fd=%d)", client->fd);
     }
     if (buf != stack_buf) free(buf);
     return ESP_OK;
@@ -1204,6 +1221,7 @@ void log_stream_register_handlers(httpd_handle_t server)
         .method     = HTTP_GET,
         .handler    = logs_ws_handler,
         .is_websocket = true,
+        .handle_ws_control_frames = true,
     };
     web_auth_register(server, &ws);
 

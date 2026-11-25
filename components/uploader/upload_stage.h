@@ -87,6 +87,9 @@ int       upload_stage_reconcile(upload_stage_ref_t *out, int max_out,
 int       upload_stage_status(const upload_stage_ref_t *ref, int backend_slot);
 void      upload_stage_mark(const upload_stage_ref_t *ref, int backend_slot,
                             upload_unit_status_t status, const char *remote_id);
+/* Immediately park a permanently rejected stage unit (status=UG_FAILED and
+ * attempts >= UPLOAD_MAX_GROUP_ATTEMPTS) without burning retry cooldowns. */
+void      upload_stage_park(const upload_stage_ref_t *ref, int backend_slot);
 /* Same park rule as EDF groups (upload_park.h): a unit failed
  * UPLOAD_MAX_GROUP_ATTEMPTS times is skipped by dispatch and excluded from
  * pending until the parking goes stale. */

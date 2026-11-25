@@ -612,7 +612,7 @@ static upload_result_t smb_put_oximetry(const upload_ox_ref_t *ref)
                  ref->day, ref->recording_id, ext);
         return smb_upload_file(s_smb, ref->local_paths[i], path);
     }
-    return UPLOAD_ERR_PERMANENT;
+    return UPLOAD_ERR_UNIT_REJECTED;
 }
 
 static upload_result_t smb_stage_day_begin(const char *day)

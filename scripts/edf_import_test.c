@@ -71,6 +71,7 @@
 #include <unistd.h>
 
 #include "cJSON.h"
+#include "esp_timer.h"
 #include "edf_import.h"
 #include "source_store.h"
 #include "snt_format.h"
@@ -2061,6 +2062,13 @@ static void phase_m(void)
     a = run_sidecar_case("giant-scalar", 1, 6000);
     CHECK(!a.compact_present && a.truncated, "giant-scalar: embed dropped, flagged");
     CHECK(a.file_ref, "giant-scalar: verbatim copy still relocated");
+
+    /* m5: sidecar < 2048 B whose verbatim embed overflows the 3584 B manifest
+     * cap is compacted + relocated rather than dropped */
+    a = run_sidecar_case("embed-overflow", 9, 750);
+    CHECK(a.compact_present && a.truncated, "embed-overflow: compacted instead of dropped");
+    CHECK(a.files_in_manifest == -1, "embed-overflow: files[] stripped on compact");
+    CHECK(a.file_ref && a.files_in_copy == 9, "embed-overflow: verbatim copy relocated");
     s_fixture_mask_2210 = false;
     printf("phase m OK (%d checks)\n", g_checks);
 }
@@ -2570,6 +2578,19 @@ static void phase_store_budget(void)
           "pending session groups bypass root backoff");
     CHECK(!edf_import_test_defer_root_retry(3601000000LL, false),
           "retained root is retried after one hour");
+
+    /* edf_import_work_due() uses live esp_timer_get_time(): IMP_NATIVE_DIRTY still
+     * demands a wakeup even while root retry is backed off; once that marker is
+     * cleared, an unchanged retained root suppresses background wakeups. */
+    char dirty_marker[700];
+    snprintf(dirty_marker, sizeof(dirty_marker), "%s/native-str.needs_rebuild", SD_SUMMARIES_DIR);
+    edf_import_test_mark_root_retry(esp_timer_get_time());
+    CHECK(edf_import_work_due(), "native rebuild marker keeps sync wakeup active");
+    CHECK(unlink(dirty_marker) == 0, "clear native rebuild marker");
+    edf_import_test_mark_root_retry(esp_timer_get_time());
+    CHECK(edf_import_pending(), "pending stays true during retained-root backoff");
+    CHECK(!edf_import_work_due(), "sync wakeup suppressed during retained-root backoff");
+
     char added_ident[700];
     snprintf(added_ident, sizeof(added_ident), "%s/Identification.json", IMPORT_DIR);
     FILE *change = fopen(added_ident, "w");
@@ -2577,7 +2598,10 @@ static void phase_store_budget(void)
     if (change) { fputs("{}", change); fclose(change); }
     CHECK(!edf_import_test_defer_root_retry(2000000, false),
           "changed root dependency bypasses backoff");
+    CHECK(edf_import_work_due(), "changed root dependency triggers sync wakeup");
     CHECK(unlink(added_ident) == 0, "remove test-owned dependency");
+    edf_import_test_mark_root_retry(0);
+    CHECK(edf_import_work_due(), "expired backoff triggers sync wakeup");
     CHECK(source_store_set_budget(SOURCE_STORE_DEFAULT_BUDGET) == ESP_OK, "restore store budget");
     char day_file[700], backup[740];
     snprintf(day_file, sizeof(day_file), "%s/20240115.native.settings.json", SD_SUMMARIES_DIR);

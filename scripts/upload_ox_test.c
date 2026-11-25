@@ -504,6 +504,22 @@ static int phase_e(void)
         CHECK(upload_ox_cached_pending(SLOT_SHQ) == N_RECS - 3,
               "parked unit counted in cached pending");
     }
+
+    char id2[16], day2[12];
+    rec_id(2, id2, day2);
+    const upload_ox_ref_t *r2 = find_ref(refs, kept, id2);
+    CHECK(r2 != NULL, "second test unit missing");
+    if (r2) {
+        upload_ox_park(r2, SLOT_SHQ);
+        CHECK(upload_ox_status(r2, SLOT_SHQ) == UG_FAILED,
+              "immediate park marks status UG_FAILED");
+        CHECK(upload_ox_parked(r2, SLOT_SHQ),
+              "upload_ox_park parks immediately on one permanent rejection");
+        CHECK(upload_ox_pending(refs, kept, SLOT_SHQ) == N_RECS - 4,
+              "immediately parked unit still counts as pending");
+        CHECK(upload_ox_cached_pending(SLOT_SHQ) == N_RECS - 4,
+              "immediately parked unit counted in cached pending");
+    }
     free(refs);
     return g_failures;
 }

@@ -555,7 +555,7 @@ static upload_result_t shq_put_oximetry(const upload_ox_ref_t *ref)
         s_day_files++;
         return UPLOAD_OK;
     }
-    return UPLOAD_ERR_PERMANENT;
+    return UPLOAD_ERR_UNIT_REJECTED;
 }
 
 static upload_result_t shq_put_group(const char *day, const upload_group_ref_t *g)

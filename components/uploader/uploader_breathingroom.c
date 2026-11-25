@@ -482,7 +482,7 @@ static upload_result_t br_put_oximetry(const upload_ox_ref_t *ref)
     if (n == 0) {
         ESP_LOGW(TAG, "  oximetry %s: no source file in ref",
                  ref->recording_id);
-        return UPLOAD_ERR_PERMANENT;
+        return UPLOAD_ERR_UNIT_REJECTED;
     }
 
     char *body = NULL;
@@ -516,7 +516,7 @@ static upload_result_t br_put_oximetry(const upload_ox_ref_t *ref)
             if (res.first_reason[0] &&
                 strstr(res.first_reason, "storage error"))
                 return UPLOAD_ERR_TRANSIENT;
-            return UPLOAD_ERR_PERMANENT;
+            return UPLOAD_ERR_UNIT_REJECTED;
         }
         ESP_LOGI(TAG, "  oximetry %s: %d file(s) imported (id %s)",
                  ref->recording_id, res.n_imported,
@@ -609,12 +609,12 @@ static upload_result_t br_put_stage(const upload_stage_ref_t *ref)
 {
     if (!s_tls || !ref) return UPLOAD_ERR_TRANSIENT;
     if (!upload_stage_ref_has_fmt(ref, UPLOAD_STAGE_FMT_SST))
-        return UPLOAD_ERR_PERMANENT;
+        return UPLOAD_ERR_UNIT_REJECTED;
     if (s_stage_blocked) return UPLOAD_ERR_PERMANENT;
 
     char filename[UPLOAD_STAGE_ID_LEN + 16];
     upload_stage_sst_filename(ref, filename, sizeof(filename));
-    if (!filename[0] || !ref->sst_path[0]) return UPLOAD_ERR_PERMANENT;
+    if (!filename[0] || !ref->sst_path[0]) return UPLOAD_ERR_UNIT_REJECTED;
 
     const char *tz_field = NULL, *tz_value = NULL;
     char tz[40];
@@ -658,7 +658,7 @@ static upload_result_t br_put_stage(const upload_stage_ref_t *ref)
              * range, partial run, unknown source type, …). */
             if (res.first_reason[0] && strstr(res.first_reason, "storage error"))
                 return UPLOAD_ERR_TRANSIENT;
-            return UPLOAD_ERR_PERMANENT;
+            return UPLOAD_ERR_UNIT_REJECTED;
         }
         ESP_LOGI(TAG, "  stages %s: uploaded (id %s)", ref->unit_id,
                  res.first_id[0] ? res.first_id : "-");

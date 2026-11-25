@@ -2422,9 +2422,9 @@ static void sync_run(bool full)
         ESP_LOGW(TAG, "sync: pass incomplete (%d issue(s)); last-success unchanged",
                  pass_fail);
 
-    /* Hand staged files to the importer.  The pending check covers files
-     * staged by an earlier pass that this pass did not re-download. */
-    if (s_import_kick && (s_sync_files_done > 0 || edf_import_pending()))
+    /* Hand staged files to the importer.  The work-due check covers files
+     * staged by an earlier pass while respecting retained-root backoff. */
+    if (s_import_kick && (s_sync_files_done > 0 || edf_import_work_due()))
         s_import_kick();
 }
 

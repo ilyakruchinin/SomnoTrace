@@ -55,6 +55,7 @@
 #include <sys/stat.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "cJSON.h"
 #include "sd_storage.h"
 #include "snt_format.h"
@@ -71,7 +72,6 @@
 #include "esp_heap_caps.h"
 #include "mbedtls/sha256.h"
 #include "psram_task.h"
-#include "esp_timer.h"
 #include "edf_gen.h"
 #include "somno_ml.h"
 #include "uploader.h"
@@ -2193,6 +2193,7 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
     if (!rec || !d) { free(rec); free(d); fclose(f); free(e); return STR_IMPORT_RETRY; }
 
     int written = 0, settings_written = 0, conflicting_days = 0, unsupported = 0;
+    char first_conflict_day[9] = "";
     bool retry = false, retain = false, ambiguous_any = false, identity_saved = false;
     for (int64_t r = 0; r < e->n_records; r++) {
         if (!imp_edf_read_rec(e, f, r, rec)) { retry = true; break; }
@@ -2251,7 +2252,10 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
                 if (old && (!settings_provenance_is(old, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) ||
                             !old_serial || strcmp(old_serial, ctx->src_serial) != 0 ||
                             !settings_provenance_is_family(old, as10 ? SETTINGS_FAMILY_AS10 : SETTINGS_FAMILY_AS11))) {
-                    ESP_LOGE(TAG, "import: daily settings belong to another or unknown machine");
+                    ESP_LOGE(TAG, "import: daily settings for %s belong to another or unknown machine",
+                             day);
+                    if (!first_conflict_day[0])
+                        snprintf(first_conflict_day, sizeof(first_conflict_day), "%s", day);
                     ambiguous_any = ambiguous = true;
                 } else if (!settings_provenance_set(native, SETTINGS_SOURCE_NATIVE_DAY, day, NULL) ||
                            !settings_provenance_set_serial(native, ctx->src_serial) ||
@@ -2280,12 +2284,16 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
         if (!retry && settings_provenance_day_conflicts(
                 day, ctx->src_serial, as10 ? SETTINGS_FAMILY_AS10 : SETTINGS_FAMILY_AS11)) {
             conflicting_days++;
+            if (!first_conflict_day[0])
+                snprintf(first_conflict_day, sizeof(first_conflict_day), "%s", day);
             ambiguous_any = ambiguous = true;
         }
         if (!retry && !ambiguous) {
             esp_err_t masks = save_native_mask_intervals(e, rec, ctx, day);
             if (masks == ESP_ERR_INVALID_STATE) {
                 conflicting_days++;
+                if (!first_conflict_day[0])
+                    snprintf(first_conflict_day, sizeof(first_conflict_day), "%s", day);
                 ambiguous_any = ambiguous = true;
             } else if (masks != ESP_OK) {
                 retry = true;
@@ -2315,8 +2323,8 @@ static str_import_result_t import_str_edf(const char *path, edf_import_ctx_t *ct
     if (conflicting_days != s_last_conflicting_days) {
         s_last_conflicting_days = conflicting_days;
         if (conflicting_days)
-            ESP_LOGW(TAG, "import: %d day(s) have conflicting or unreadable session identity",
-                     conflicting_days);
+            ESP_LOGW(TAG, "import: %d day(s) have conflicting or unreadable session identity (first: %s)",
+                     conflicting_days, first_conflict_day[0] ? first_conflict_day : "?");
     }
     if (unsupported)
         ESP_LOGW(TAG, "import: %d native settings samples have unsupported units or ranges; "
@@ -3578,7 +3586,26 @@ static void manifest_enforce_cap(cJSON *r)
     char *txt = cJSON_PrintUnformatted(r);
     bool over = txt && strlen(txt) + 1 > IMP_MANIFEST_MAX;
     free(txt);
-    if (!over || !cJSON_GetObjectItem(r, "somnobridge_drift")) return;
+    cJSON *drift = cJSON_GetObjectItemCaseSensitive(r, "somnobridge_drift");
+    if (!over || !drift) return;
+
+    /* If verbatim drift fits once compacted, downgrade in place rather than
+     * dropping the summary fields altogether (verbatim copy is already staged
+     * or preserved in <id>_bridge_drift.json). */
+    if (cJSON_IsObject(drift) &&
+        !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "somnobridge_drift_truncated"))) {
+        cJSON *compact = drift_compact(drift);
+        if (compact) {
+            cJSON_ReplaceItemInObjectCaseSensitive(r, "somnobridge_drift", compact);
+            if (!cJSON_GetObjectItemCaseSensitive(r, "somnobridge_drift_truncated"))
+                cJSON_AddBoolToObject(r, "somnobridge_drift_truncated", true);
+            txt = cJSON_PrintUnformatted(r);
+            over = txt && strlen(txt) + 1 > IMP_MANIFEST_MAX;
+            free(txt);
+            if (!over) return;
+        }
+    }
+
     ESP_LOGW(TAG, "import: manifest over %d B — dropping embedded drift record",
              IMP_MANIFEST_MAX);
     cJSON_DeleteItemFromObject(r, "somnobridge_drift");
@@ -6015,6 +6042,17 @@ bool edf_import_pending(void)
     return needs_spool_pending();
 }
 
+bool edf_import_work_due(void)
+{
+    struct stat st;
+    if (stat(IMP_NATIVE_DIRTY, &st) == 0) return true;
+    if (dir_has_pending(IMP_IMPORT_DIR, 2, true)) return true;
+    if (needs_spool_pending()) return true;
+    if (root_files_pending())
+        return !root_retry_defer(esp_timer_get_time(), false);
+    return false;
+}
+
 /* Final sweep: days the run imported but whose spool synthesis never
  * landed (e.g. interrupted mid-unit) are flagged <day>.needs_spool in
  * summaries/ so this stays O(flags), not O(all days). */
@@ -6348,12 +6386,20 @@ static void edf_import_task(void *arg)
                 bool native_pending = stat(IMP_NATIVE_DIRTY, &native_dirty) == 0;
                 esp_err_t rebuilt = native_pending ? edf_gen_rebuild_day_for_native(u.day_label)
                                                    : edf_gen_rebuild_day(u.day_label);
-                if (rebuilt == ESP_OK)
+                if (rebuilt == ESP_OK) {
+                    if (native_pending && unlink(IMP_NATIVE_DIRTY) != 0 && errno != ENOENT)
+                        ESP_LOGW(TAG, "import: cannot clear native STR rebuild marker");
                     uploader_on_export_complete(u.day_label);
+                }
                 if (u.day2_label[0]) {
-                    rebuilt = native_pending ? edf_gen_rebuild_day_for_native(u.day2_label)
-                                             : edf_gen_rebuild_day(u.day2_label);
-                    if (rebuilt == ESP_OK) uploader_on_export_complete(u.day2_label);
+                    bool native_pending2 = stat(IMP_NATIVE_DIRTY, &native_dirty) == 0;
+                    rebuilt = native_pending2 ? edf_gen_rebuild_day_for_native(u.day2_label)
+                                              : edf_gen_rebuild_day(u.day2_label);
+                    if (rebuilt == ESP_OK) {
+                        if (native_pending2 && unlink(IMP_NATIVE_DIRTY) != 0 && errno != ENOENT)
+                            ESP_LOGW(TAG, "import: cannot clear native STR rebuild marker");
+                        uploader_on_export_complete(u.day2_label);
+                    }
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(200));   /* yield between units */

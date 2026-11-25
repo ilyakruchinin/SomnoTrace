@@ -1051,8 +1051,9 @@ int upload_stage_status(const upload_stage_ref_t *ref, int backend_slot)
     return s;
 }
 
-void upload_stage_mark(const upload_stage_ref_t *ref, int backend_slot,
-                       upload_unit_status_t status, const char *remote_id)
+static void stage_record_outcome(const upload_stage_ref_t *ref, int backend_slot,
+                                 upload_unit_status_t status, const char *remote_id,
+                                 bool park)
 {
     if (!ref || backend_slot < 0 || backend_slot >= STAGE_MAX_BACKENDS ||
         !st_lock_init()) return;
@@ -1071,7 +1072,15 @@ void upload_stage_mark(const upload_stage_ref_t *ref, int backend_slot,
     }
     u->backend[backend_slot].status = status;
     u->backend[backend_slot].last_try_s = (uint32_t)time(NULL);
-    if (status != UG_OK) u->backend[backend_slot].attempts++;
+    if (park) {
+        if (u->backend[backend_slot].attempts < UPLOAD_MAX_GROUP_ATTEMPTS)
+            u->backend[backend_slot].attempts = UPLOAD_MAX_GROUP_ATTEMPTS;
+        else if (u->backend[backend_slot].attempts < UINT8_MAX)
+            u->backend[backend_slot].attempts++;
+    } else if (status != UG_OK) {
+        if (u->backend[backend_slot].attempts < UINT8_MAX)
+            u->backend[backend_slot].attempts++;
+    }
     if (remote_id) strlcpy(u->remote[backend_slot], remote_id,
                            sizeof(u->remote[backend_slot]));
     /* The mark is the durability-critical write: persist immediately. */
@@ -1080,6 +1089,17 @@ void upload_stage_mark(const upload_stage_ref_t *ref, int backend_slot,
     else
         u->dirty = false;
     st_unlock();
+}
+
+void upload_stage_mark(const upload_stage_ref_t *ref, int backend_slot,
+                       upload_unit_status_t status, const char *remote_id)
+{
+    stage_record_outcome(ref, backend_slot, status, remote_id, false);
+}
+
+void upload_stage_park(const upload_stage_ref_t *ref, int backend_slot)
+{
+    stage_record_outcome(ref, backend_slot, UG_FAILED, NULL, true);
 }
 
 /* Same park semantics as EDF groups (upload_park.h): a unit that has failed

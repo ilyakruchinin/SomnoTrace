@@ -898,12 +898,13 @@ static int phase_j(void)
     mk_stage_csv("20261107", "dup", 1);
     mk_stage_csv("20261105", "dup", 2);
     mk_stage_csv("20261107", "solo", 3);
+    mk_stage_csv("20261107", "solo2", 4);
     CHECK(upload_stage_init() == ESP_OK, "upload_stage_init failed");
 
     upload_stage_ref_t *refs = calloc(UPLOAD_STAGE_MAX_UNITS, sizeof(*refs));
     if (!refs) return 1;
     int kept = upload_stage_reconcile(refs, UPLOAD_STAGE_MAX_UNITS, WINDOW);
-    CHECK(kept == 2, "duplicate-id reconcile did not drop the shadow copy");
+    CHECK(kept == 3, "duplicate-id reconcile did not keep expected units");
     const upload_stage_ref_t *rd = find_ref(refs, kept, "dup");
     CHECK(rd && !strcmp(rd->day, "20261107"),
           "the older-day duplicate won over the newest copy");
@@ -926,10 +927,24 @@ static int phase_j(void)
         upload_stage_mark(rs, SLOT_SMB, UG_FAILED, NULL);
         CHECK(upload_stage_parked(rs, SLOT_SMB),
               "unit not parked after UPLOAD_MAX_GROUP_ATTEMPTS failures");
-        CHECK(upload_stage_pending(refs, kept, SLOT_SMB) == 0,
+        CHECK(upload_stage_pending(refs, kept, SLOT_SMB) == 1,
               "parked unit still counts as pending");
-        CHECK(upload_stage_cached_pending(SLOT_SMB) == 0,
+        CHECK(upload_stage_cached_pending(SLOT_SMB) == 1,
               "parked unit counted in cached pending");
+    }
+
+    const upload_stage_ref_t *rs2 = find_ref(refs, kept, "solo2");
+    CHECK(rs2 != NULL, "solo2 unit missing");
+    if (rs2) {
+        upload_stage_park(rs2, SLOT_SMB);
+        CHECK(upload_stage_status(rs2, SLOT_SMB) == UG_FAILED,
+              "immediate stage park marks status UG_FAILED");
+        CHECK(upload_stage_parked(rs2, SLOT_SMB),
+              "upload_stage_park parks immediately on one permanent rejection");
+        CHECK(upload_stage_pending(refs, kept, SLOT_SMB) == 0,
+              "immediately parked stage unit still counts as pending");
+        CHECK(upload_stage_cached_pending(SLOT_SMB) == 0,
+              "immediately parked stage unit counted in cached pending");
     }
     free(refs);
     return g_failures;

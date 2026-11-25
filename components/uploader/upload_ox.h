@@ -56,6 +56,9 @@ int upload_ox_reconcile(upload_ox_ref_t *out, int max_out, int max_days);
 int upload_ox_status(const upload_ox_ref_t *ref, int backend_slot);
 void upload_ox_mark(const upload_ox_ref_t *ref, int backend_slot,
                     upload_unit_status_t status, const char *remote_id);
+/* Immediately park a permanently rejected recording (status=UG_FAILED and
+ * attempts >= UPLOAD_MAX_GROUP_ATTEMPTS) without burning retry cooldowns. */
+void upload_ox_park(const upload_ox_ref_t *ref, int backend_slot);
 esp_err_t upload_ox_save(void);
 /* Same park rule as EDF groups (upload_park.h): a unit failed
  * UPLOAD_MAX_GROUP_ATTEMPTS times is skipped by dispatch and excluded from

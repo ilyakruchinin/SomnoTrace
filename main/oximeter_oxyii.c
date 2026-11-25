@@ -747,6 +747,7 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target, bool do_mtu)
     s_write_handle = s_notify_handle = s_cccd_handle = 0;
     s_svc_start = s_svc_end = 0;
     s_resp_len = 0;
+    s_negotiated_mtu = 23;
 
     /* Drain any stale s_conn_sem token left by a previous remote
      * disconnect.  Without this, xSemaphoreTake below returns
@@ -1942,8 +1943,41 @@ static int live_rec_step(oxyii_live_rec_t *rec)
     return 0;
 }
 
+static bool oxyii_try_off_finger_pull(const char *cand_addr, bool *pulled_any)
+{
+    char serial[32] = {0}, firmware[16] = {0};
+    esp_err_t info_rc = oxyii_get_info(serial, sizeof(serial), firmware, sizeof(firmware));
+    if (info_rc != ESP_OK) {
+        ESP_LOGW(TAG, "watch: get_info failed after off-finger (%s, conn=%d)",
+                 esp_err_to_name(info_rc),
+                 s_conn_handle == BLE_HS_CONN_HANDLE_NONE ? -1 : (int)s_conn_handle);
+        return false;
+    }
+    if (serial[0] == '\0' || strcmp(serial, s_serial) != 0) {
+        ESP_LOGW(TAG, "watch: serial mismatch (got '%s', want '%s')", serial, s_serial);
+        return false;
+    }
+    strlcpy(s_paired_addr, cand_addr, sizeof(s_paired_addr));
+    if (oxyii_prepare_files() != ESP_OK) {
+        ESP_LOGW(TAG, "watch: file prep failed");
+        return false;
+    }
+    ESP_LOGI(TAG, "watch: off-finger — waiting 3s for ring to finalize recording");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return false;
+    bool pull_ok = do_pull_and_mark(pulled_any);
+    if (pull_ok && !*pulled_any && s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        ESP_LOGI(TAG, "watch: no new files yet — waiting 5s for ring to finalize");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
+            pull_ok = do_pull_and_mark(pulled_any);
+    }
+    return pull_ok;
+}
+
 /* Shared off-finger pull tail for OX_PROBE_PERSISTENT and OX_PROBE_LIVE_PPG. */
 static void oxyii_handle_off_finger_sync(const char *cand_addr,
+                                         const ble_addr_t *target,
                                          bool session_already_open,
                                          const oxyii_live_rec_t *live_rec)
 {
@@ -1956,37 +1990,28 @@ static void oxyii_handle_off_finger_sync(const char *cand_addr,
     }
 
     ESP_LOGI(TAG, "watch: off-finger detected — upgrading to full session");
-    clear_op_sem();
-    ble_gattc_exchange_mtu(s_conn_handle, on_mtu, NULL);
-    wait_op(2000);
+    if (!session_already_open && s_negotiated_mtu <= 23) {
+        clear_op_sem();
+        ble_gattc_exchange_mtu(s_conn_handle, on_mtu, NULL);
+        wait_op(2000);
+    }
 
     bool pulled_any = false;
     bool pull_ok = false;
     if (session_already_open || oxyii_session_open() == ESP_OK) {
-        char serial[32] = {0}, firmware[16] = {0};
-        if (oxyii_get_info(serial, sizeof(serial), firmware, sizeof(firmware)) == ESP_OK
-            && serial[0] != '\0' && strcmp(serial, s_serial) == 0) {
-            strlcpy(s_paired_addr, cand_addr, sizeof(s_paired_addr));
-            if (oxyii_prepare_files() == ESP_OK) {
-                ESP_LOGI(TAG, "watch: off-finger — waiting 3s for ring to finalize recording");
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-                    pull_ok = do_pull_and_mark(&pulled_any);
-                    if (pull_ok && !pulled_any && s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-                        ESP_LOGI(TAG, "watch: no new files yet — waiting 5s for ring to finalize");
-                        vTaskDelay(pdMS_TO_TICKS(5000));
-                        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE)
-                            pull_ok = do_pull_and_mark(&pulled_any);
-                    }
-                }
-            } else {
-                ESP_LOGW(TAG, "watch: file prep failed");
-            }
-        } else {
-            ESP_LOGW(TAG, "watch: serial mismatch (got '%s', want '%s')", serial, s_serial);
-        }
+        pull_ok = oxyii_try_off_finger_pull(cand_addr, &pulled_any);
     } else {
         ESP_LOGW(TAG, "watch: session open failed after off-finger");
+    }
+
+    if (!pull_ok && session_already_open && target != NULL) {
+        ESP_LOGI(TAG, "watch: off-finger link lost — reconnecting once to pull ring file");
+        do_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        if (do_connect_and_discover((ble_addr_t *)target, true) == ESP_OK &&
+            oxyii_session_open() == ESP_OK) {
+            pull_ok = oxyii_try_off_finger_pull(cand_addr, &pulled_any);
+        }
     }
 
     do_disconnect();
@@ -2156,7 +2181,8 @@ static void pull_task(void *arg)
                 int off = mode_live ? live_rec_step(&s_live_rec) : oxyii_off_finger();
                 if (off == 1) {
                     live_rec_pause(&s_live_rec);
-                    oxyii_handle_off_finger_sync(cand_addr, session_opened,
+                    oxyii_handle_off_finger_sync(cand_addr, &s_scan[idx].addr,
+                                                 session_opened,
                                                  mode_live ? &s_live_rec : NULL);
                     live_rec_reset(&s_live_rec);
                     pulled = true;
@@ -2232,8 +2258,17 @@ static void pull_task(void *arg)
         }
 
         char serial[32] = {0}, firmware[16] = {0};
-        if (oxyii_get_info(serial, sizeof(serial), firmware, sizeof(firmware)) != ESP_OK
-            || serial[0] == '\0' || strcmp(serial, s_serial) != 0) {
+        esp_err_t info_rc = oxyii_get_info(serial, sizeof(serial), firmware, sizeof(firmware));
+        if (info_rc != ESP_OK) {
+            ESP_LOGW(TAG, "watch: get_info failed (%s, conn=%d)",
+                     esp_err_to_name(info_rc),
+                     s_conn_handle == BLE_HS_CONN_HANDLE_NONE ? -1 : (int)s_conn_handle);
+            do_disconnect();
+            set_state(OX_STATUS_PAIRED);
+            xSemaphoreGive(s_ops_mtx);
+            continue;
+        }
+        if (serial[0] == '\0' || strcmp(serial, s_serial) != 0) {
             ESP_LOGW(TAG, "watch: serial mismatch (got '%s', want '%s')",
                      serial, s_serial);
             do_disconnect();

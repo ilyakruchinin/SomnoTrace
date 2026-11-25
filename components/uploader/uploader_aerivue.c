@@ -409,7 +409,7 @@ static upload_result_t aer_put_oximetry(const upload_ox_ref_t *ref)
         s_day_files++;
         return UPLOAD_OK;
     }
-    return UPLOAD_ERR_PERMANENT;
+    return UPLOAD_ERR_UNIT_REJECTED;
 }
 
 /* Native SomnoStage (.sst v1) sidecar upload: sent as-is without resampling

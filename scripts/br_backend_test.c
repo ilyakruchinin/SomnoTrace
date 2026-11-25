@@ -332,6 +332,20 @@ int main(void)
         reset(); response = bad[i];
         assert(br_put_oximetry(&ref) == UPLOAD_ERR_TRANSIENT && marks == 0);
     }
+    /* Per-file oximetry rejection vs transient storage error vs 402 tier gate. */
+    status = 200;
+    response = "{\"results\":[{\"filename\":\"20260102015549.bin\",\"status\":\"rejected\",\"reason\":\"unrecognised format\"}]}";
+    reset();
+    assert(br_put_oximetry(&ref) == UPLOAD_ERR_UNIT_REJECTED && marks == 0);
+    response = "{\"results\":[{\"filename\":\"20260102015549.bin\",\"status\":\"rejected\",\"reason\":\"storage error\"}]}";
+    reset();
+    assert(br_put_oximetry(&ref) == UPLOAD_ERR_TRANSIENT && marks == 0);
+    status = 402;
+    response = "{\"error\":\"Premium required\"}";
+    reset();
+    assert(br_put_oximetry(&ref) == UPLOAD_ERR_PERMANENT && s_ox_blocked);
+    s_ox_blocked = false;
+    status = 200;
     clean_folder();
     for (int i = 0; i < 1000; i++) {
         int sec = 6300 + i;
@@ -378,7 +392,7 @@ int main(void)
         response = "{\"results\":[{\"filename\":\"as11_20260102_015519_stages.sst\","
                    "\"status\":\"rejected\",\"reason\":\"partial scoring run\"}]}";
         reset();
-        assert(br_put_stage(&st) == UPLOAD_ERR_PERMANENT && stage_marks == 0);
+        assert(br_put_stage(&st) == UPLOAD_ERR_UNIT_REJECTED && stage_marks == 0);
         response = "{\"results\":[{\"filename\":\"as11_20260102_015519_stages.sst\","
                    "\"status\":\"rejected\",\"reason\":\"storage error\"}]}";
         reset();
@@ -404,7 +418,7 @@ int main(void)
         assert(br_put_stage(&st) == UPLOAD_ERR_TRANSIENT);
         reset();
         st.sst_path[0] = '\0';
-        assert(br_put_stage(&st) == UPLOAD_ERR_PERMANENT);
+        assert(br_put_stage(&st) == UPLOAD_ERR_UNIT_REJECTED);
     }
 
     puts("br_backend_test: matching, collection, scan failures, names and result validation passed");
