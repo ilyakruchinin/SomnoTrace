@@ -930,6 +930,14 @@ static void write_manifest(session_writer_t *s, const char *state)
                           (s->clock_drift_source &&
                            strcmp(s->clock_drift_source, "none") != 0));
 
+    as11_offset_t as11_off = 0;
+    int64_t tz_ref_ms = s->end_epoch_ms > 0 ? s->end_epoch_ms : s->start_epoch_ms;
+    if (as11_time_get_offset(&as11_off) && tz_ref_ms >= 946684800000LL) {
+        as11_offset_t esp_off = as11_time_esp_utc_offset(tz_ref_ms / 1000);
+        cJSON_AddNumberToObject(root, "device_tz_offset_s", (double)as11_off);
+        cJSON_AddNumberToObject(root, "esp_tz_offset_s", (double)esp_off);
+    }
+
     cJSON_AddNumberToObject(root, "end_source_checkpoint_seq", (double)s->ckpt_seq);
 
     const char *src_str = "none";

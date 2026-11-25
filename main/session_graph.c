@@ -184,6 +184,9 @@ typedef struct {
     int64_t clock_drift_ms;
     bool clock_drift_valid;
     int64_t device_tz_delta_ms; /* DST / timezone delta already folded into clock_drift_ms */
+    bool has_tz_offsets;
+    int32_t device_tz_offset_s;
+    int32_t esp_tz_offset_s;
     bool imported;              /* true when imported from SD card (import_source set) */
     const char *stage_status;
     uint32_t brp_samples;
@@ -287,6 +290,8 @@ static esp_err_t sessions_list_impl(httpd_req_t *req)
         cJSON *j_drift = cJSON_GetObjectItem(j, "clock_drift_ms");
         cJSON *j_drift_valid = cJSON_GetObjectItem(j, "clock_drift_valid");
         cJSON *j_tz_delta = cJSON_GetObjectItem(j, "device_tz_delta_ms");
+        cJSON *j_dev_tz = cJSON_GetObjectItem(j, "device_tz_offset_s");
+        cJSON *j_esp_tz = cJSON_GetObjectItem(j, "esp_tz_offset_s");
         cJSON *j_imp = cJSON_GetObjectItem(j, "import_source");
         cJSON *j_fmt = cJSON_GetObjectItem(j, "fmt");
         cJSON *j_notif = cJSON_GetObjectItem(j, "stream_notifications");
@@ -344,6 +349,11 @@ static esp_err_t sessions_list_impl(httpd_req_t *req)
         s->clock_drift_ms = j_drift ? (int64_t)j_drift->valuedouble : 0;
         s->clock_drift_valid = j_drift_valid ? cJSON_IsTrue(j_drift_valid) : (j_drift != NULL);
         s->device_tz_delta_ms = (j_tz_delta && cJSON_IsNumber(j_tz_delta)) ? (int64_t)j_tz_delta->valuedouble : 0;
+        if (j_dev_tz && cJSON_IsNumber(j_dev_tz) && j_esp_tz && cJSON_IsNumber(j_esp_tz)) {
+            s->has_tz_offsets = true;
+            s->device_tz_offset_s = (int32_t)j_dev_tz->valuedouble;
+            s->esp_tz_offset_s = (int32_t)j_esp_tz->valuedouble;
+        }
         s->imported = (j_imp && cJSON_IsString(j_imp) && j_imp->valuestring[0] != '\0');
         s->fmt = j_fmt ? (int)j_fmt->valuedouble : 1;  /* default v1 if absent */
         s->stream_notifications = j_notif ? (uint32_t)j_notif->valuedouble : 0;
@@ -429,7 +439,7 @@ static esp_err_t sessions_list_impl(httpd_req_t *req)
             "\"device_tz_delta_ms\":%lld,\"imported\":%s,"
             "\"brp_samples\":%u,\"brp_mm_samples\":%u,\"pld_samples\":%u,\"sa2_samples\":%u,"
             "\"brp_bytes\":%ld,\"brp_mm_bytes\":%ld,\"has_stages\":%s,\"stage_status\":\"%s\","
-            "\"fmt\":%d,\"stream_notifications\":%u,\"gap_events\":%u,\"gap_missing\":%u}",
+            "\"fmt\":%d,\"stream_notifications\":%u,\"gap_events\":%u,\"gap_missing\":%u",
             s->id, s->state, s->partial ? "true" : "false",
             (long long)s->start_epoch_ms, (long long)s->end_epoch_ms,
             (long long)s->clock_drift_ms, s->clock_drift_valid ? "true" : "false",
@@ -438,6 +448,12 @@ static esp_err_t sessions_list_impl(httpd_req_t *req)
             s->brp_bytes, s->brp_mm_bytes,
             !strcmp(s->stage_status, "ready") ? "true" : "false", s->stage_status,
             s->fmt, (unsigned)s->stream_notifications, (unsigned)s->gap_events, (unsigned)s->gap_missing);
+        if (s->has_tz_offsets) {
+            pos += snprintf(json + pos, json_cap - pos,
+                ",\"device_tz_offset_s\":%d,\"esp_tz_offset_s\":%d",
+                (int)s->device_tz_offset_s, (int)s->esp_tz_offset_s);
+        }
+        pos += snprintf(json + pos, json_cap - pos, "}");
     }
 
     pos += snprintf(json + pos, json_cap - pos, "]");

@@ -375,6 +375,25 @@ int main(void)
                parse_tz_node(cJSON_String, NULL, &off) ? 1 : 0, 0);
     expect_int("...and *out left untouched", off, 777);
     reset_offset();
+
+    printf("\n=== Scenario 14: ESP Local UTC Offset ===\n");
+    const char *saved_tz = getenv("TZ");
+    char saved_tz_buf[64] = {0};
+    if (saved_tz) snprintf(saved_tz_buf, sizeof(saved_tz_buf), "%s", saved_tz);
+    /* 2026-11-25 16:36:06Z (standard time in North America EST, DST in Sydney AEDT). */
+    set_tz("EST5EDT,M3.2.0,M11.1.0");
+    expect_int("EST5EDT in Nov is -18000 s (-05:00)",
+               as11_time_esp_utc_offset(1795624566LL), -18000);
+    set_tz("AEST-10AEDT,M10.1.0,M4.1.0/3");
+    expect_int("AEST/AEDT in Nov is +39600 s (+11:00)",
+               as11_time_esp_utc_offset(1795624566LL), 39600);
+    if (saved_tz_buf[0]) {
+        set_tz(saved_tz_buf);
+    } else {
+        unsetenv("TZ");
+        tzset();
+    }
+
     printf("\n%s (%d failure%s)\n", fails ? "FAILURES" : "ALL PASS",
            fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;

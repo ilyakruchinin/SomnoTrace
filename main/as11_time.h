@@ -62,6 +62,9 @@ void as11_time_set_offset(as11_offset_t offset_s, const char *src);
 /* Returns true and fills *out if an AS11 offset is known. */
 bool as11_time_get_offset(as11_offset_t *out);
 
+/* Return the ESP's own local UTC offset (seconds east of UTC) at epoch_s. */
+as11_offset_t as11_time_esp_utc_offset(int64_t epoch_s);
+
 /* Parse the AS11's TimeZoneOffset ("-05:00") out of a settings JSON tree, as
  * returned by the Get RPC and stored in <session>_settings.json.  Accepts
  * either the bare {"SettingProfiles":...} form or the {"FlowGenerator":...}

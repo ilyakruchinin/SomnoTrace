@@ -6372,6 +6372,14 @@ function fmtDriftMs(ms) {
   return sign + hr + 'h ' + remM + 'm ' + Math.round(remS) + 's';
 }
 
+function fmtTzOffset(sec) {
+  var sign = sec < 0 ? '-' : '+';
+  var abs = Math.abs(Math.round(sec));
+  var hh = Math.floor(abs / 3600);
+  var mm = Math.floor((abs % 3600) / 60);
+  return 'UTC' + sign + (hh < 10 ? '0' : '') + hh + ':' + (mm < 10 ? '0' : '') + mm;
+}
+
 function renderStreamQuality() {
   var el = document.getElementById('dash-stream-quality');
   if (!el) return;
@@ -6439,6 +6447,17 @@ function renderStreamQuality() {
       var tzHrs = tzDelta / 3600000;
       var tzStr = (tzHrs > 0 ? '+' : '') + (Math.abs(tzHrs % 1) < 1e-6 ? tzHrs.toFixed(0) : tzHrs.toFixed(1)) + 'h';
       tzNote = ' <span class="dash-sq-muted">(device TZ ' + tzStr + ')</span>';
+    } else if (typeof last.device_tz_offset_s === 'number' &&
+               typeof last.esp_tz_offset_s === 'number' &&
+               last.device_tz_offset_s !== last.esp_tz_offset_s) {
+      var tzDiffMs = (last.device_tz_offset_s - last.esp_tz_offset_s) * 1000;
+      var localDrift = rtcDrift - tzDiffMs;
+      var detail = 'CPAP TZ ' + fmtTzOffset(last.device_tz_offset_s) +
+                   ' vs SomnoTrace ' + fmtTzOffset(last.esp_tz_offset_s);
+      if (Math.abs(localDrift) < Math.abs(rtcDrift)) {
+        detail += '; local ' + fmtDriftMs(localDrift);
+      }
+      tzNote = ' <span class="dash-sq-muted">(' + detail + ')</span>';
     }
     driftHtml += '<span style="color:var(--text);font-weight:500">' + fmtDriftMs(rtcDrift) + '</span>' + tzNote;
   } else {

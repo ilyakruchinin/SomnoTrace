@@ -127,6 +127,11 @@ bool as11_time_get_offset(as11_offset_t *out)
     return true;
 }
 
+as11_offset_t as11_time_esp_utc_offset(int64_t epoch_s)
+{
+    return esp_utc_offset((time_t)epoch_s);
+}
+
 /* ── Offset discovery ─────────────────────────────────────────────── */
 
 bool as11_time_offset_from_settings(const cJSON *settings, as11_offset_t *out)

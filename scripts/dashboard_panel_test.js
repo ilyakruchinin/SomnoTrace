@@ -161,7 +161,67 @@ async function testStageRefresh() {
 }
 
 testStageRefresh().then(() => {
-  console.log('dashboard missing-data panels and stage refresh: passed');
+  for (const name of ['fmtDriftMs', 'fmtTzOffset', 'renderStreamQuality']) {
+    vm.runInContext(getFunction(name), context);
+  }
+  const sqEl = {
+    style: {display: 'none'},
+    classes: new Set(),
+    classList: {
+      add: c => sqEl.classes.add(c),
+      remove: c => sqEl.classes.delete(c),
+    },
+    innerHTML: '',
+  };
+  context.document = {getElementById: id => (id === 'dash-stream-quality' ? sqEl : null)};
+
+  // 1. Live session with large TZ mismatch (Squid case: +2h41m19s UTC, -18m41.2s local)
+  context.dashSessions = [{
+    fmt: 2, stream_notifications: 100, gap_events: 0, gap_missing: 0,
+    start_epoch_ms: 1795616917000, end_epoch_ms: 1795624566000,
+    clock_drift_valid: true, clock_drift_ms: 9678816,
+    device_tz_offset_s: -7200, esp_tz_offset_s: -18000,
+  }];
+  context.renderStreamQuality();
+  assert(sqEl.innerHTML.includes('+2h 41m 19s'), 'shows raw UTC drift');
+  assert(sqEl.innerHTML.includes('CPAP TZ UTC-02:00 vs SomnoTrace UTC-05:00; local -18m 41.2s'),
+         'annotates TZ mismatch and smaller local drift');
+
+  // 2. Live session with small UTC drift and missed DST (1h TZ mismatch)
+  context.dashSessions = [{
+    fmt: 2, stream_notifications: 100, gap_events: 0, gap_missing: 0,
+    start_epoch_ms: 1795616917000, end_epoch_ms: 1795624566000,
+    clock_drift_valid: true, clock_drift_ms: 5000,
+    device_tz_offset_s: 36000, esp_tz_offset_s: 39600,
+  }];
+  context.renderStreamQuality();
+  assert(sqEl.innerHTML.includes('+5.0s'), 'keeps pure UTC drift');
+  assert(sqEl.innerHTML.includes('CPAP TZ UTC+10:00 vs SomnoTrace UTC+11:00)'),
+         'shows TZ mismatch without bogus local drift when local is larger');
+  assert(!sqEl.innerHTML.includes('local '), 'omits local drift when |localDrift| >= |rtcDrift|');
+
+  // 3. Live session with matching timezones
+  context.dashSessions = [{
+    fmt: 2, stream_notifications: 100, gap_events: 0, gap_missing: 0,
+    start_epoch_ms: 1795616917000, end_epoch_ms: 1795624566000,
+    clock_drift_valid: true, clock_drift_ms: 5000,
+    device_tz_offset_s: -18000, esp_tz_offset_s: -18000,
+  }];
+  context.renderStreamQuality();
+  assert(sqEl.innerHTML.includes('+5.0s'), 'shows matching TZ drift cleanly');
+  assert(!sqEl.innerHTML.includes('CPAP TZ'), 'no TZ note when offsets match');
+
+  // 4. SD-imported session preserves device_tz_delta_ms behaviour
+  context.dashSessions = [{
+    imported: true, fmt: 2, stream_notifications: 0, gap_events: 0, gap_missing: 0,
+    clock_drift_valid: true, clock_drift_ms: 3605000, device_tz_delta_ms: 3600000,
+    device_tz_offset_s: 36000, esp_tz_offset_s: 39600,
+  }];
+  context.renderStreamQuality();
+  assert(sqEl.innerHTML.includes('+5.0s') && sqEl.innerHTML.includes('(device TZ +1h)'),
+         'preserves existing SD import device_tz_delta_ms display');
+
+  console.log('dashboard missing-data panels, stage refresh, and stream quality: passed');
 }).catch(err => {
   console.error(err);
   process.exitCode = 1;
