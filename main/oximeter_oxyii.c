@@ -36,6 +36,7 @@
 #include "upload_sched.h"
 #include "log_stream.h"
 #include "oxyii_codec.h"
+#include "oxyii_trailer.h"
 #include "oximetry_time.h"
 
 #include <ctype.h>
@@ -276,19 +277,20 @@ static char s_firmware[16];
 static char s_name_prefix[16];
 static char s_ble_name[40];      /* BLE advertised name (e.g. "SHQO2Pro 0897") */
 static char s_paired_addr[18];
-static bool s_paired = false;
+static volatile bool s_paired = false;
 static bool s_presence_served = false;
 static bool s_synced_this_idle = false;
 static bool s_ring_present = false;
 static int64_t s_ring_drift_ms = 0;
 static bool s_ring_drift_valid = false;
+static bool s_ring_rtc_reset = false;
 static TickType_t s_served_at;
 static int s_f1_fail_count = 0;  /* consecutive F1 timeouts in this sync window */
 static int s_pull_fail_count = 0;   /* consecutive failed pulls in this presence */
 static int s_connect_fail_count = 0; /* consecutive connect failures in this presence */
 #define OX_PULL_MAX_FAST_RETRIES 3  /* quick retries before applying curfew */
 #define OX_CONNECT_MAX_RETRIES 3   /* connect failures before cooldown curfew */
-static ox_probe_mode_t s_probe_mode = OX_PROBE_PERSISTENT;
+static volatile ox_probe_mode_t s_probe_mode = OX_PROBE_PERSISTENT;
 
 /* Measured: END powers off ~120s after take-off IF no one connects.
  * Any GATT connection resets that timer. Pull happens inside the
@@ -313,10 +315,12 @@ static bool s_f1_reset_pending = false; /* reset sent, no file list served since
 
 /* Persistent-mode polling: one held connection, unauthenticated LIVE_B.
  * See .ai/OXIMETRY2.md for the experiment that established this value. */
-#define OX_PERSISTENT_POLL_MS    30000
-#define OX_LIVE_PPG_POLL_MS      1000
-#define OX_LIVE_RESUME_WINDOW_MS (30 * 60 * 1000)
-#define OX_LIVE_MIN_FREE_BYTES   (10ULL * 1024ULL * 1024ULL)
+#define OX_PERSISTENT_POLL_MS       30000
+#define OX_LIVE_PPG_POLL_MS         1000
+#define OX_LIVE_OFF_FINGER_DEBOUNCE 12
+#define OX_LIVE_RESUME_WINDOW_MS    (30 * 60 * 1000)
+#define OX_LIVE_MIN_FREE_BYTES      (10ULL * 1024ULL * 1024ULL)
+#define OX_LIVE_ACTIVE_MARKER       SD_PPG_DIR "/.active.json"
 
 /* BLE connection state */
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -333,12 +337,14 @@ static uint8_t s_seq = 0;
 static struct ox_scan_result *s_scan;
 static int s_scan_count;
 
-/* Notification accumulation buffer — PSRAM-allocated at init */
+/* Notification/TX buffers — PSRAM-allocated at init (shared under s_ops_mtx) */
 static uint8_t *s_resp_buf;
 static int s_resp_len;
 static uint8_t s_resp_opcode;
 static uint8_t *s_resp_payload;
 static int s_resp_payload_len;
+static uint8_t *s_tx_enc_buf;
+static uint8_t *s_tx_frame_buf;
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
 static void set_state(const char *st)
@@ -729,6 +735,7 @@ static void do_disconnect(void)
     }
     s_ring_drift_ms = 0;
     s_ring_drift_valid = false;
+    s_ring_rtc_reset = false;
     oxyii_crypto_reset();
 }
 
@@ -893,23 +900,22 @@ static esp_err_t do_connect_and_discover(ble_addr_t *target, bool do_mtu)
 static esp_err_t oxyii_request(uint8_t op, const uint8_t *payload, int plen,
                                 bool expect_reply, int timeout_ms)
 {
-    uint8_t enc_buf[OXYII_MAX_FRAME];
+    if (!s_tx_enc_buf || !s_tx_frame_buf) return ESP_ERR_NO_MEM;
     const uint8_t *tx_payload = payload;
     int tx_plen = plen;
 
     if (s_encrypted && op != OP_AUTH) {
         int enc_len = oxyii_aes_encrypt(payload ? payload : (const uint8_t *)"",
-                                        plen, enc_buf, sizeof(enc_buf));
+                                        plen, s_tx_enc_buf, OXYII_MAX_FRAME);
         if (enc_len < 0) {
             ESP_LOGE(TAG, "payload encrypt failed op=0x%02x", op);
             return ESP_FAIL;
         }
-        tx_payload = enc_buf;
+        tx_payload = s_tx_enc_buf;
         tx_plen = enc_len;
     }
 
-    uint8_t frame[OXYII_MAX_FRAME];
-    int flen = oxyii_encode(frame, sizeof(frame), op, 0, s_seq++,
+    int flen = oxyii_encode(s_tx_frame_buf, OXYII_MAX_FRAME, op, 0, s_seq++,
                              tx_payload, tx_plen);
     if (flen < 0) return ESP_FAIL;
 
@@ -921,7 +927,7 @@ static esp_err_t oxyii_request(uint8_t op, const uint8_t *payload, int plen,
     /* Use write-without-response (OxyII protocol uses WRITE_CMD, not WRITE_REQ).
      * This eliminates one BLE round-trip per request, roughly doubling throughput. */
     int rc = ble_gattc_write_no_rsp_flat(s_conn_handle, s_write_handle,
-                                          frame, flen);
+                                          s_tx_frame_buf, flen);
     if (rc != 0) {
         ESP_LOGE(TAG, "write failed op=0x%02x rc=%d", op, rc);
         return ESP_FAIL;
@@ -1010,13 +1016,13 @@ static esp_err_t oxyii_session_open(void)
 static esp_err_t oxyii_prepare_files(void)
 {
     if (!time_is_usable()) {
-        ESP_LOGW(TAG, "not setting ring clock: host time is unusable");
-        return ESP_ERR_INVALID_STATE;
+        ESP_LOGW(TAG, "host time unusable — skipping ring clock sync, continuing pull");
+    } else {
+        uint8_t tp[8];
+        oxyii_time_payload(tp);
+        if (oxyii_request(OP_SET_UTC_TIME, tp, 8, true, 5000) != ESP_OK)
+            return ESP_FAIL;
     }
-    uint8_t tp[8];
-    oxyii_time_payload(tp);
-    if (oxyii_request(OP_SET_UTC_TIME, tp, 8, true, 5000) != ESP_OK)
-        return ESP_FAIL;
 
     if (oxyii_request(OP_GET_CONFIG, NULL, 0, true, 5000) != ESP_OK)
         return ESP_FAIL;
@@ -1033,6 +1039,7 @@ static esp_err_t oxyii_get_info(char *serial, size_t serial_sz,
 {
     s_ring_drift_ms = 0;
     s_ring_drift_valid = false;
+    s_ring_rtc_reset = false;
     if (oxyii_request(OP_GET_INFO, NULL, 0, true, 5000) != ESP_OK)
         return ESP_FAIL;
 
@@ -1054,6 +1061,11 @@ static esp_err_t oxyii_get_info(char *serial, size_t serial_sz,
         int hour = s_resp_payload[28];
         int min  = s_resp_payload[29];
         int sec  = s_resp_payload[30];
+        if (year < 2015) {
+            s_ring_rtc_reset = true;
+            ESP_LOGW(TAG, "ring_rtc=%04d-%02d-%02d %02d:%02d:%02d — RTC reset detected",
+                     year, mon, day, hour, min, sec);
+        }
         int64_t ring_ms = oximetry_civil_epoch_ms(year, mon, day, hour, min, sec);
         if (ring_ms > 0) {
             int64_t host_ms = (int64_t)time(NULL) * 1000LL;
@@ -1162,8 +1174,34 @@ static int oxyii_get_file_list(char names[][17], int max_count)
     return count;
 }
 
+static int64_t format_a_duration_ms(const char *source_path)
+{
+    struct stat st;
+    if (!source_path || stat(source_path, &st) != 0 ||
+        st.st_size <= 10 + OXYII_TRAILER_BYTES)
+        return 0;
+    uint32_t body_count = (uint32_t)(((uint64_t)st.st_size - 10 - OXYII_TRAILER_BYTES) / 3);
+    uint32_t sample_count = body_count;
+    uint32_t period_us = 1000000;
+    FILE *f = fopen(source_path, "rb");
+    if (f) {
+        uint8_t raw[OXYII_TRAILER_BYTES];
+        if (fseek(f, st.st_size - OXYII_TRAILER_BYTES, SEEK_SET) == 0 &&
+            fread(raw, 1, sizeof(raw), f) == sizeof(raw)) {
+            oxyii_trailer_t tr;
+            if (oxyii_trailer_parse(raw, sizeof(raw), &tr)) {
+                if (tr.interval_valid) period_us = tr.period_us;
+                if (tr.sample_count > 0 && tr.sample_count <= body_count)
+                    sample_count = tr.sample_count;
+            }
+        }
+        fclose(f);
+    }
+    return (int64_t)sample_count * (int64_t)(period_us / 1000);
+}
+
 /* ── Pull a single file ────────────────────────────────────────────── */
-static esp_err_t oxyii_convert_stored(const char *name)
+static esp_err_t oxyii_convert_stored(const char *name, bool is_newest)
 {
     char source_path[640];
     snprintf(source_path, sizeof(source_path), SD_OXIMETRY_DIR "/files/%s/%s.bin",
@@ -1175,6 +1213,24 @@ static esp_err_t oxyii_convert_stored(const char *name)
         ESP_LOGI(TAG, "applying pre-sync ring drift %lldms to '%s'",
                  (long long)s_ring_drift_ms, name);
         start_ms += s_ring_drift_ms;
+    } else if (is_newest && time_is_usable()) {
+        int64_t host_ms = (int64_t)time(NULL) * 1000LL;
+        if (start_ms > 0 && s_ring_drift_valid &&
+            llabs(s_ring_drift_ms) > 86400LL * 365 * 1000) {
+            int64_t cand = start_ms + s_ring_drift_ms;
+            if (cand >= host_ms - 7LL * 86400 * 1000 && cand <= host_ms + 300000LL) {
+                ESP_LOGW(TAG, "ring RTC reset recovery: shifted '%s' by %lld ms",
+                         name, (long long)s_ring_drift_ms);
+                start_ms = cand;
+            }
+        } else if (start_ms == 0 && s_ring_rtc_reset) {
+            int64_t dur_ms = format_a_duration_ms(source_path);
+            if (dur_ms > 0 && dur_ms <= 24LL * 3600 * 1000) {
+                start_ms = host_ms - dur_ms;
+                ESP_LOGW(TAG, "ring RTC reset recovery: reconstructed start for '%s' (host - %lus)",
+                         name, (unsigned long)(dur_ms / 1000));
+            }
+        }
     }
     esp_err_t conversion = oximetry_canonical_convert_format_a(
         s_serial, name, source_path, start_ms);
@@ -1189,7 +1245,7 @@ static esp_err_t oxyii_convert_stored(const char *name)
     return ESP_OK;
 }
 
-static esp_err_t oxyii_pull_file(const char *name)
+static esp_err_t oxyii_pull_file(const char *name, bool is_newest)
 {
     /* READ_FILE_START */
     uint8_t start_pl[20];
@@ -1260,7 +1316,7 @@ static esp_err_t oxyii_pull_file(const char *name)
              name, (unsigned long)offset, finalised);
     if (!finalised) return ESP_FAIL;
 
-    return oxyii_convert_stored(name);
+    return oxyii_convert_stored(name, is_newest);
 }
 
 /* ── NVS persistence ───────────────────────────────────────────────── */
@@ -1566,6 +1622,8 @@ static esp_err_t do_scan(int timeout_sec)
     return ESP_OK;
 }
 
+static void live_rec_recover_orphan_on_boot(void);
+
 static void canonical_migration_task(void *arg)
 {
     (void)arg;
@@ -1576,6 +1634,7 @@ static void canonical_migration_task(void *arg)
     if (sd_storage_is_ready()) {
         oximetry_canonical_reconcile();
         oximetry_canonical_migrate_all_legacy();
+        live_rec_recover_orphan_on_boot();
     }
     vTaskDelete(NULL);
 }
@@ -1647,9 +1706,10 @@ static bool do_pull_and_mark(bool *pulled_any)
         if (names[i][0] == '\0') continue;
 
         int idx = ox_store_index_check(s_serial, names[i]);
+        bool is_newest = (i == count - 1);
         if (idx == 1) {
             if (ox_store_index_conversion_check(s_serial, names[i]) != 1 &&
-                oxyii_convert_stored(names[i]) != ESP_OK) {
+                oxyii_convert_stored(names[i], is_newest) != ESP_OK) {
                 ESP_LOGW(TAG, "conversion still pending for '%s'", names[i]);
                 pull_ok = false;
             } else {
@@ -1659,7 +1719,7 @@ static bool do_pull_and_mark(bool *pulled_any)
         }
 
         ESP_LOGI(TAG, "pulling file %d/%d: '%s'", i + 1, count, names[i]);
-        esp_err_t result = oxyii_pull_file(names[i]);
+        esp_err_t result = oxyii_pull_file(names[i], is_newest);
         if (result != ESP_OK) {
             pull_ok = false;
             if (result == ESP_ERR_INVALID_STATE) {
@@ -1723,7 +1783,129 @@ static void live_rec_reset(oxyii_live_rec_t *rec)
 {
     if (!rec) return;
     live_rec_pause(rec);
+    unlink(OX_LIVE_ACTIVE_MARKER);
     memset(rec, 0, sizeof(*rec));
+}
+
+static bool live_rec_finalize_fallback(const oxyii_live_rec_t *rec)
+{
+    if (!rec || rec->metrics_rows < 10 || !rec->metrics_path[0] ||
+        !rec->recording_id[0] || !s_serial[0])
+        return false;
+    if (oximetry_canonical_convert_live_metrics(s_serial, rec->recording_id,
+                                                rec->metrics_path,
+                                                rec->start_utc_ms) == ESP_OK) {
+        ESP_LOGI(TAG, "live PPG fallback converted %lu samples to SNTv3 (%s)",
+                 (unsigned long)rec->metrics_rows, rec->recording_id);
+        upload_sched_request_scan();
+        return true;
+    }
+    return false;
+}
+
+static void live_rec_write_active_marker(const oxyii_live_rec_t *rec)
+{
+    if (!rec || !rec->recording_id[0] || !rec->metrics_path[0] ||
+        rec->start_utc_ms <= 0 || !s_serial[0])
+        return;
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) return;
+    cJSON_AddStringToObject(obj, "device_id", s_serial);
+    cJSON_AddStringToObject(obj, "recording_id", rec->recording_id);
+    cJSON_AddStringToObject(obj, "metrics_path", rec->metrics_path);
+    cJSON_AddNumberToObject(obj, "start_utc_ms", (double)rec->start_utc_ms);
+    char *txt = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+    if (!txt) return;
+    char tmp[128];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", OX_LIVE_ACTIVE_MARKER);
+    FILE *f = fopen(tmp, "w");
+    if (f) {
+        size_t len = strlen(txt);
+        bool ok = fwrite(txt, 1, len, f) == len && fflush(f) == 0 &&
+                  fsync(fileno(f)) == 0;
+        if (fclose(f) != 0) ok = false;
+        if (ok) {
+            unlink(OX_LIVE_ACTIVE_MARKER);
+            if (rename(tmp, OX_LIVE_ACTIVE_MARKER) != 0) unlink(tmp);
+        } else {
+            unlink(tmp);
+        }
+    }
+    cJSON_free(txt);
+}
+
+static void live_rec_recover_orphan_on_boot(void)
+{
+    if (!sd_storage_is_ready() || !s_ops_mtx) return;
+    if (xSemaphoreTake(s_ops_mtx, pdMS_TO_TICKS(5000)) != pdTRUE) return;
+    if (s_live_rec.active || s_live_rec.resumable) {
+        xSemaphoreGive(s_ops_mtx);
+        return;
+    }
+    struct stat st;
+    if (stat(OX_LIVE_ACTIVE_MARKER, &st) != 0 || st.st_size <= 0 || st.st_size > 1024) {
+        xSemaphoreGive(s_ops_mtx);
+        return;
+    }
+    FILE *f = fopen(OX_LIVE_ACTIVE_MARKER, "r");
+    if (!f) {
+        xSemaphoreGive(s_ops_mtx);
+        return;
+    }
+    char *buf = malloc((size_t)st.st_size + 1);
+    if (!buf) {
+        fclose(f);
+        xSemaphoreGive(s_ops_mtx);
+        return;
+    }
+    size_t rd = fread(buf, 1, (size_t)st.st_size, f);
+    fclose(f);
+    buf[rd] = '\0';
+    cJSON *obj = cJSON_Parse(buf);
+    free(buf);
+    if (obj) {
+        cJSON *dev = cJSON_GetObjectItemCaseSensitive(obj, "device_id");
+        cJSON *rid = cJSON_GetObjectItemCaseSensitive(obj, "recording_id");
+        cJSON *mpath = cJSON_GetObjectItemCaseSensitive(obj, "metrics_path");
+        cJSON *stms = cJSON_GetObjectItemCaseSensitive(obj, "start_utc_ms");
+        if (cJSON_IsString(dev) && dev->valuestring[0] &&
+            cJSON_IsString(rid) && rid->valuestring[0] &&
+            cJSON_IsString(mpath) && mpath->valuestring[0] &&
+            cJSON_IsNumber(stms) && stms->valuedouble > 0) {
+            FILE *mf = fopen(mpath->valuestring, "r");
+            uint32_t rows = 0;
+            if (mf) {
+                char line[128];
+                bool first = true;
+                while (fgets(line, sizeof(line), mf)) {
+                    if (first) {
+                        first = false;
+                        if (strncmp(line, "unix_ts", 7) == 0) continue;
+                    }
+                    if (line[0] && line[0] != '\n') rows++;
+                }
+                fclose(mf);
+            }
+            int64_t start_ms = (int64_t)stms->valuedouble;
+            int64_t end_ms = start_ms + (int64_t)rows * 1000LL;
+            if (rows >= 10 &&
+                !oximetry_canonical_has_overlapping_recording(dev->valuestring,
+                                                              start_ms, end_ms)) {
+                if (oximetry_canonical_convert_live_metrics(dev->valuestring,
+                                                            rid->valuestring,
+                                                            mpath->valuestring,
+                                                            start_ms) == ESP_OK) {
+                    ESP_LOGI(TAG, "live PPG boot recovery converted %lu samples (%s)",
+                             (unsigned long)rows, rid->valuestring);
+                    upload_sched_request_scan();
+                }
+            }
+        }
+        cJSON_Delete(obj);
+    }
+    unlink(OX_LIVE_ACTIVE_MARKER);
+    xSemaphoreGive(s_ops_mtx);
 }
 
 /* Open or resume a live PPG recording session.
@@ -1751,6 +1933,12 @@ static esp_err_t live_rec_open_or_resume(oxyii_live_rec_t *rec)
         live_rec_reset(rec);
     }
 
+    if (rec->resumable && rec->metrics_rows >= 10 && rec->metrics_path[0]) {
+        ESP_LOGI(TAG, "live PPG: expired paused session %s — running fallback conversion",
+                 rec->recording_id);
+        live_rec_finalize_fallback(rec);
+    }
+    unlink(OX_LIVE_ACTIVE_MARKER);
     memset(rec, 0, sizeof(*rec));
     if (!time_is_usable()) {
         static TickType_t s_last_clk_warn = 0;
@@ -1810,6 +1998,7 @@ static esp_err_t live_rec_open_or_resume(oxyii_live_rec_t *rec)
     rec->active = true;
     rec->resumable = true;
     rec->last_sample_tick = xTaskGetTickCount();
+    live_rec_write_active_marker(rec);
     ESP_LOGI(TAG, "live PPG recording started: %s", rec->raw_path);
     return ESP_OK;
 }
@@ -2018,16 +2207,9 @@ static void oxyii_handle_off_finger_sync(const char *cand_addr,
 
     /* If live PPG mode recorded >=10s of vitals and no ring file was pulled
      * (e.g. short session or ring didn't flush), synthesize SNTv3 from metrics CSV. */
-    if (!pulled_any && live_rec && live_rec->metrics_rows >= 10 && live_rec->metrics_path[0]) {
-        if (oximetry_canonical_convert_live_metrics(s_serial, live_rec->recording_id,
-                                                    live_rec->metrics_path,
-                                                    live_rec->start_utc_ms) == ESP_OK) {
-            ESP_LOGI(TAG, "live PPG fallback converted %lu samples to SNTv3 (%s)",
-                     (unsigned long)live_rec->metrics_rows, live_rec->recording_id);
-            upload_sched_request_scan();
-            pulled_any = true;
-            pull_ok = true;
-        }
+    if (!pulled_any && live_rec_finalize_fallback(live_rec)) {
+        pulled_any = true;
+        pull_ok = true;
     }
 
     if (pull_ok) {
@@ -2098,6 +2280,13 @@ static void pull_task(void *arg)
             }
             if (s_ring_present)
                 ESP_LOGI(TAG, "ring gone — next appearance is a new sync window");
+            if (s_probe_mode == OX_PROBE_LIVE_PPG && s_live_rec.resumable &&
+                (xTaskGetTickCount() - s_live_rec.last_sample_tick) >= pdMS_TO_TICKS(OX_LIVE_RESUME_WINDOW_MS)) {
+                ESP_LOGI(TAG, "live PPG: ring absent past resume window (%ds) — finalizing %s",
+                         OX_LIVE_RESUME_WINDOW_MS / 1000, s_live_rec.recording_id);
+                live_rec_finalize_fallback(&s_live_rec);
+                live_rec_reset(&s_live_rec);
+            }
             s_ring_present = false;
             if (s_presence_served)
                 s_presence_served = false;
@@ -2150,10 +2339,15 @@ static void pull_task(void *arg)
                 ESP_LOGW(TAG, "watch: connect failed: %s", s_error);
                 do_disconnect();
                 if (++s_connect_fail_count >= OX_CONNECT_MAX_RETRIES) {
-                    ESP_LOGW(TAG, "connect failed %d times — curfew %ds (let ring reset)",
-                             s_connect_fail_count, OX_END_WINDOW_MS / 1000);
-                    s_presence_served = true;
-                    s_served_at = xTaskGetTickCount();
+                    if (s_probe_mode == OX_PROBE_LIVE_PPG && s_live_rec.resumable) {
+                        ESP_LOGW(TAG, "live PPG: connect failed %d times while resuming — continuing retries",
+                                 s_connect_fail_count);
+                    } else {
+                        ESP_LOGW(TAG, "connect failed %d times — curfew %ds (let ring reset)",
+                                 s_connect_fail_count, OX_END_WINDOW_MS / 1000);
+                        s_presence_served = true;
+                        s_served_at = xTaskGetTickCount();
+                    }
                     s_connect_fail_count = 0;
                 }
                 set_state(OX_STATUS_PAIRED);
@@ -2165,8 +2359,13 @@ static void pull_task(void *arg)
             bool session_opened = false;
             bool pulled = false;
             int consec_err = 0;
+            int off_finger_streak = 0;
             while (s_paired && (s_probe_mode == OX_PROBE_PERSISTENT || s_probe_mode == OX_PROBE_LIVE_PPG) && !pulled) {
                 bool mode_live = (s_probe_mode == OX_PROBE_LIVE_PPG);
+                if (!mode_live && s_live_rec.active) {
+                    live_rec_pause(&s_live_rec);
+                    break;
+                }
                 if (mode_live && !session_opened) {
                     clear_op_sem();
                     ble_gattc_exchange_mtu(s_conn_handle, on_mtu, NULL);
@@ -2180,6 +2379,22 @@ static void pull_task(void *arg)
                 TickType_t tick_start = xTaskGetTickCount();
                 int off = mode_live ? live_rec_step(&s_live_rec) : oxyii_off_finger();
                 if (off == 1) {
+                    if (mode_live && s_live_rec.metrics_rows > 0 &&
+                        ++off_finger_streak < OX_LIVE_OFF_FINGER_DEBOUNCE) {
+                        if (off_finger_streak == 1) {
+                            ESP_LOGI(TAG, "live PPG: off-finger detected — debouncing %ds before finalizing",
+                                     OX_LIVE_OFF_FINGER_DEBOUNCE);
+                        }
+                        TickType_t elapsed = xTaskGetTickCount() - tick_start;
+                        TickType_t target = pdMS_TO_TICKS(OX_LIVE_PPG_POLL_MS);
+                        TickType_t wait_ticks = (elapsed < target) ? (target - elapsed) : pdMS_TO_TICKS(100);
+                        vTaskDelay(wait_ticks);
+                        if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+                            ESP_LOGI(TAG, "watch: connection dropped during off-finger debounce — pausing");
+                            break;
+                        }
+                        continue;
+                    }
                     live_rec_pause(&s_live_rec);
                     oxyii_handle_off_finger_sync(cand_addr, &s_scan[idx].addr,
                                                  session_opened,
@@ -2189,6 +2404,7 @@ static void pull_task(void *arg)
                     break;
                 } else if (off == 0 || off == -2) {
                     consec_err = 0;
+                    off_finger_streak = 0;
                     s_synced_this_idle = false;
                     set_state(mode_live ? OX_STATUS_RECORDING_PPG : OX_STATUS_MONITORING);
                     if (mode_live) {
@@ -2197,7 +2413,13 @@ static void pull_task(void *arg)
                         TickType_t wait_ticks = (elapsed < target) ? (target - elapsed) : pdMS_TO_TICKS(100);
                         vTaskDelay(wait_ticks);
                     } else {
-                        vTaskDelay(pdMS_TO_TICKS(OX_PERSISTENT_POLL_MS));
+                        for (int w = 0;
+                             w < OX_PERSISTENT_POLL_MS && s_paired &&
+                             s_probe_mode == OX_PROBE_PERSISTENT &&
+                             s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
+                             w += 500) {
+                            vTaskDelay(pdMS_TO_TICKS(500));
+                        }
                     }
                     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
                         ESP_LOGI(TAG, "watch: persistent connection dropped — will reconnect");
@@ -2220,8 +2442,12 @@ static void pull_task(void *arg)
 
             if (!pulled) {
                 /* Pause (flush+fsync+close) without discarding s_live_rec.resumable,
-                 * so a toilet break or BLE drop seamlessly appends to the same night's CSVs. */
-                live_rec_pause(&s_live_rec);
+                 * so a toilet break or BLE drop seamlessly appends to the same night's CSVs.
+                 * If unpairing requested this exit, discard the live session too. */
+                if (!s_paired)
+                    live_rec_reset(&s_live_rec);
+                else
+                    live_rec_pause(&s_live_rec);
                 do_disconnect();
             }
             set_state(OX_STATUS_PAIRED);
@@ -2362,7 +2588,10 @@ static void oxyii_init(void)
                               MALLOC_CAP_SPIRAM);
     s_resp_buf = heap_caps_malloc(OXYII_MAX_FRAME, MALLOC_CAP_SPIRAM);
     s_resp_payload = heap_caps_malloc(OXYII_MAX_FRAME, MALLOC_CAP_SPIRAM);
-    if (!s_scan || !s_resp_buf || !s_resp_payload) {
+    s_tx_enc_buf = heap_caps_malloc(OXYII_MAX_FRAME, MALLOC_CAP_SPIRAM);
+    s_tx_frame_buf = heap_caps_malloc(OXYII_MAX_FRAME, MALLOC_CAP_SPIRAM);
+    if (!s_scan || !s_resp_buf || !s_resp_payload ||
+        !s_tx_enc_buf || !s_tx_frame_buf) {
         ESP_LOGE(TAG, "init: failed to allocate PSRAM buffers");
         return;
     }
@@ -2473,9 +2702,16 @@ static esp_err_t oxyii_pair(const char *addr_str)
 static void oxyii_forget(void)
 {
     s_paired = false;
+    bool locked = s_ops_mtx && xSemaphoreTake(s_ops_mtx, pdMS_TO_TICKS(5000)) == pdTRUE;
+    if (locked) {
+        do_disconnect();
+        live_rec_reset(&s_live_rec);
+    } else {
+        ESP_LOGW(TAG, "forget: ops mutex busy — clearing paired state without live reset");
+    }
     s_ring_drift_ms = 0;
     s_ring_drift_valid = false;
-    live_rec_reset(&s_live_rec);
+    s_ring_rtc_reset = false;
     s_presence_served = false;
     s_synced_this_idle = false;
     s_pull_fail_count = 0;
@@ -2489,6 +2725,7 @@ static void oxyii_forget(void)
     nvs_writer_run(do_erase_nvs, NULL);
     ox_store_delete_paired();
 
+    if (locked) xSemaphoreGive(s_ops_mtx);
     set_state(OX_STATUS_IDLE);
 }
 

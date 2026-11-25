@@ -214,6 +214,32 @@ static bool path_join2(char *out, size_t out_size, const char *a, const char *b)
     return true;
 }
 
+static void rm_tree(const char *path, int max_depth)
+{
+    if (!path || !path[0] || max_depth < 0) return;
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    if (!S_ISDIR(st.st_mode)) {
+        unlink(path);
+        return;
+    }
+    DIR *d = opendir(path);
+    if (!d) return;
+    char *child = malloc(OXIMETRY_CANONICAL_MAX_PATH);
+    if (child) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+                continue;
+            if (path_join2(child, OXIMETRY_CANONICAL_MAX_PATH, path, e->d_name))
+                rm_tree(child, max_depth - 1);
+        }
+        free(child);
+    }
+    closedir(d);
+    rmdir(path);
+}
+
 static bool path_join3(char *out, size_t out_size, const char *a,
                        const char *b, const char *c)
 {
@@ -1020,6 +1046,8 @@ static esp_err_t publish_format_a_package(convert_ctx_t *p,
                                           const char *source_name,
                                           const char *source_path,
                                           bool source_is_staged,
+                                          bool is_live_fallback,
+                                          bool replace_existing,
                                           int64_t start_utc_ms,
                                           uint32_t period_us,
                                           uint32_t expected_source_size)
@@ -1068,6 +1096,8 @@ static esp_err_t publish_format_a_package(convert_ctx_t *p,
     cJSON_AddStringToObject(pointer, "recording_id", recording_id);
     cJSON_AddNumberToObject(pointer, "active_generation", 1);
     cJSON_AddStringToObject(pointer, "state", "ready");
+    cJSON_AddStringToObject(pointer, "source_kind",
+                            is_live_fallback ? "live_metrics_fallback" : "device_file");
     cJSON_AddStringToObject(pointer, "device_key", device_id);
     cJSON_AddStringToObject(pointer, "noon_day", day);
     cJSON_AddNumberToObject(pointer, "start_epoch_ms", (double)start_utc_ms);
@@ -1076,11 +1106,29 @@ static esp_err_t publish_format_a_package(convert_ctx_t *p,
     cJSON_Delete(pointer);
     if (pe != ESP_OK) return pe;
 
+    char replaced_path[OXIMETRY_CANONICAL_MAX_PATH] = {0};
+    if (replace_existing) {
+        if (snprintf(replaced_path, sizeof(replaced_path), "%s/%s-live-fallback",
+                     OX_QUARANTINE, recording_id) >= (int)sizeof(replaced_path)) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        rm_tree(replaced_path, 5);
+        if (rename(p->final_dir, replaced_path) != 0) {
+            ESP_LOGW(TAG, "preserve fallback %s failed: %s", p->final_dir, strerror(errno));
+            return ESP_FAIL;
+        }
+    }
+
     /* The stage and final directory are on the same FAT volume.  The root
      * pointer is written before publication and is the final readiness gate. */
     if (rename(p->stage_dir, p->final_dir) != 0) {
         ESP_LOGW(TAG, "publish %s -> %s failed: %s", p->stage_dir, p->final_dir, strerror(errno));
+        if (replaced_path[0]) rename(replaced_path, p->final_dir);
         return ESP_FAIL;
+    }
+    if (replaced_path[0]) {
+        rm_tree(replaced_path, 5);
+        ESP_LOGI(TAG, "real ring recording %s replaced live fallback", recording_id);
     }
     /* Recording published: queue post-session sleep staging (no-op on stub
      * builds or when the queue is full). */
@@ -1090,12 +1138,16 @@ static esp_err_t publish_format_a_package(convert_ctx_t *p,
 
 static esp_err_t prepare_format_a_stage(const char *recording_id,
                                         int64_t start_utc_ms,
+                                        int64_t incoming_dur_ms,
+                                        bool allow_replace_fallback,
                                         char out_day[9],
                                         convert_ctx_t **out_ctx,
-                                        bool *out_already_ready)
+                                        bool *out_already_ready,
+                                        bool *out_replace_existing)
 {
     *out_ctx = NULL;
     *out_already_ready = false;
+    *out_replace_existing = false;
     if (!day_for_epoch(start_utc_ms, out_day)) return ESP_ERR_INVALID_ARG;
     char existing_day[9];
     if (find_recording_day(recording_id, existing_day) && strcmp(existing_day, out_day) != 0) {
@@ -1116,10 +1168,28 @@ static esp_err_t prepare_format_a_stage(const char *recording_id,
 
     cJSON *existing = read_json_file(p->final_pointer);
     if (existing) {
+        bool can_replace = false;
+        if (allow_replace_fallback) {
+            cJSON *sk = cJSON_GetObjectItemCaseSensitive(existing, "source_kind");
+            cJSON *js = cJSON_GetObjectItemCaseSensitive(existing, "start_epoch_ms");
+            cJSON *je = cJSON_GetObjectItemCaseSensitive(existing, "end_epoch_ms");
+            if (cJSON_IsString(sk) && sk->valuestring &&
+                strcmp(sk->valuestring, "live_metrics_fallback") == 0) {
+                int64_t ex_dur = (cJSON_IsNumber(js) && cJSON_IsNumber(je))
+                    ? (int64_t)(je->valuedouble - js->valuedouble) : 0;
+                if (ex_dur <= 0 || incoming_dur_ms * 10 >= ex_dur * 8 ||
+                    ex_dur - incoming_dur_ms <= 60000) {
+                    can_replace = true;
+                }
+            }
+        }
         cJSON_Delete(existing);
-        free(p);
-        *out_already_ready = true;
-        return ESP_OK;
+        if (!can_replace) {
+            free(p);
+            *out_already_ready = true;
+            return ESP_OK;
+        }
+        *out_replace_existing = true;
     }
 
     if (!path_join2(p->day_dir, sizeof(p->day_dir), OX_RECORDINGS, out_day) ||
@@ -1136,6 +1206,7 @@ static esp_err_t prepare_format_a_stage(const char *recording_id,
         return ESP_ERR_INVALID_SIZE;
     }
 
+    if (*out_replace_existing) rm_tree(p->stage_dir, 5);
     mkdir_one(p->day_dir);
     mkdir_one(p->stage_dir);
     mkdir_one(p->stage_source_dir);
@@ -1144,6 +1215,109 @@ static esp_err_t prepare_format_a_stage(const char *recording_id,
     mkdir_one(p->stage_data_dir);
     *out_ctx = p;
     return ESP_OK;
+}
+
+static bool recording_overlaps_window(cJSON *ptr, const char *device_id,
+                                      int64_t start_ms, int64_t end_ms,
+                                      bool require_live_fallback,
+                                      int min_pct)
+{
+    if (!ptr || !device_id) return false;
+    cJSON *st_j = cJSON_GetObjectItemCaseSensitive(ptr, "state");
+    cJSON *dk = cJSON_GetObjectItemCaseSensitive(ptr, "device_key");
+    if (!cJSON_IsString(st_j) || strcmp(st_j->valuestring, "ready") != 0 ||
+        !cJSON_IsString(dk) || strcmp(dk->valuestring, device_id) != 0)
+        return false;
+    if (require_live_fallback) {
+        cJSON *sk = cJSON_GetObjectItemCaseSensitive(ptr, "source_kind");
+        if (!cJSON_IsString(sk) || strcmp(sk->valuestring, "live_metrics_fallback") != 0)
+            return false;
+    }
+    cJSON *js = cJSON_GetObjectItemCaseSensitive(ptr, "start_epoch_ms");
+    cJSON *je = cJSON_GetObjectItemCaseSensitive(ptr, "end_epoch_ms");
+    if (!cJSON_IsNumber(js) || !cJSON_IsNumber(je)) return false;
+    int64_t cs = (int64_t)js->valuedouble;
+    int64_t ce = (int64_t)je->valuedouble;
+    if (ce < cs) ce = cs;
+    int64_t ov_start = cs > start_ms ? cs : start_ms;
+    int64_t ov_end = ce < end_ms ? ce : end_ms;
+    int64_t overlap = ov_end - ov_start;
+    if (overlap <= 0) return false;
+    int64_t ref_dur = require_live_fallback ? (ce - cs) : (end_ms - start_ms);
+    if (ref_dur <= 0) return true;
+    return overlap * 100 >= ref_dur * min_pct || ref_dur - overlap <= 60000;
+}
+
+static void retire_overlapping_live_fallbacks(const char *device_id, const char *day,
+                                              const char *new_id,
+                                              int64_t new_start_ms, int64_t new_end_ms)
+{
+    char day_path[OXIMETRY_CANONICAL_MAX_PATH];
+    if (!path_join2(day_path, sizeof(day_path), OX_RECORDINGS, day)) return;
+    DIR *d = opendir(day_path);
+    if (!d) return;
+    char *cand_dir = malloc(OXIMETRY_CANONICAL_MAX_PATH);
+    char *ptr_path = malloc(OXIMETRY_CANONICAL_MAX_PATH);
+    if (cand_dir && ptr_path) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (!safe_component(e->d_name, OXIMETRY_CANONICAL_MAX_COMPONENT)) continue;
+            if (strcmp(e->d_name, new_id) == 0) continue;
+            if (!path_join2(cand_dir, OXIMETRY_CANONICAL_MAX_PATH, day_path, e->d_name) ||
+                !path_join2(ptr_path, OXIMETRY_CANONICAL_MAX_PATH, cand_dir, "recording.json"))
+                continue;
+            cJSON *ptr = read_json_file(ptr_path);
+            bool drop = recording_overlaps_window(ptr, device_id,
+                                                  new_start_ms, new_end_ms,
+                                                  true, 80);
+            cJSON_Delete(ptr);
+            if (drop) {
+                ESP_LOGI(TAG, "real ring recording %s supersedes live fallback %s — removing fallback",
+                         new_id, e->d_name);
+                rm_tree(cand_dir, 5);
+            }
+        }
+    }
+    free(cand_dir);
+    free(ptr_path);
+    closedir(d);
+}
+
+bool oximetry_canonical_has_overlapping_recording(const char *device_id,
+                                                  int64_t start_utc_ms,
+                                                  int64_t end_utc_ms)
+{
+    if (!sd_storage_is_ready() || !device_id || !device_id[0] || start_utc_ms <= 0)
+        return false;
+    if (end_utc_ms < start_utc_ms) end_utc_ms = start_utc_ms;
+    char day[9];
+    if (!day_for_epoch(start_utc_ms, day)) return false;
+    char day_path[OXIMETRY_CANONICAL_MAX_PATH];
+    if (!path_join2(day_path, sizeof(day_path), OX_RECORDINGS, day)) return false;
+    DIR *d = opendir(day_path);
+    if (!d) return false;
+    bool found = false;
+    char *cand_dir = malloc(OXIMETRY_CANONICAL_MAX_PATH);
+    char *ptr_path = malloc(OXIMETRY_CANONICAL_MAX_PATH);
+    if (cand_dir && ptr_path) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (!safe_component(e->d_name, OXIMETRY_CANONICAL_MAX_COMPONENT)) continue;
+            if (!path_join2(cand_dir, OXIMETRY_CANONICAL_MAX_PATH, day_path, e->d_name) ||
+                !path_join2(ptr_path, OXIMETRY_CANONICAL_MAX_PATH, cand_dir, "recording.json"))
+                continue;
+            cJSON *ptr = read_json_file(ptr_path);
+            found = recording_overlaps_window(ptr, device_id,
+                                              start_utc_ms, end_utc_ms,
+                                              false, 50);
+            cJSON_Delete(ptr);
+            if (found) break;
+        }
+    }
+    free(cand_dir);
+    free(ptr_path);
+    closedir(d);
+    return found;
 }
 
 esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
@@ -1186,17 +1360,26 @@ esp_err_t oximetry_canonical_convert_format_a(const char *device_id,
         ESP_LOGW(TAG, "convert %s: trailer unreadable, assuming 1 Hz", recording_id);
     }
 
+    int64_t dur_ms = count > 1 ? (int64_t)(count - 1) * (int64_t)(period_us / 1000) : 0;
     char day[9];
     convert_ctx_t *p = NULL;
     bool already_ready = false;
-    esp_err_t prep = prepare_format_a_stage(recording_id, start_utc_ms, day, &p, &already_ready);
+    bool replace_existing = false;
+    esp_err_t prep = prepare_format_a_stage(recording_id, start_utc_ms, dur_ms,
+                                            true, day, &p, &already_ready,
+                                            &replace_existing);
     if (prep != ESP_OK || already_ready) return prep;
 
     esp_err_t ret = publish_format_a_package(p, device_id, recording_id, day,
                                              basename_safe(source_path), source_path,
-                                             false, start_utc_ms, period_us,
+                                             false, false, replace_existing,
+                                             start_utc_ms, period_us,
                                              (uint32_t)st.st_size);
     free(p);
+    if (ret == ESP_OK) {
+        retire_overlapping_live_fallbacks(device_id, day, recording_id,
+                                          start_utc_ms, start_utc_ms + dur_ms);
+    }
     return ret;
 }
 
@@ -1213,7 +1396,10 @@ esp_err_t oximetry_canonical_convert_live_metrics(const char *device_id,
     char day[9];
     convert_ctx_t *p = NULL;
     bool already_ready = false;
-    esp_err_t prep = prepare_format_a_stage(recording_id, start_utc_ms, day, &p, &already_ready);
+    bool replace_existing = false;
+    esp_err_t prep = prepare_format_a_stage(recording_id, start_utc_ms, 0,
+                                            false, day, &p, &already_ready,
+                                            &replace_existing);
     if (prep != ESP_OK || already_ready) return prep;
 
     FILE *csv = fopen(metrics_csv_path, "r");
@@ -1298,7 +1484,8 @@ esp_err_t oximetry_canonical_convert_live_metrics(const char *device_id,
     uint32_t expected_size = OX_SOURCE_HEADER + count * 3u + OX_SOURCE_TRAILER;
     esp_err_t ret = publish_format_a_package(p, device_id, recording_id, day,
                                              recording_id, metrics_csv_path,
-                                             true, start_utc_ms, 1000000u,
+                                             true, true, replace_existing,
+                                             start_utc_ms, 1000000u,
                                              expected_size);
     free(p);
     return ret;

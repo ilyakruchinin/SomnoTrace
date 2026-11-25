@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -76,6 +77,12 @@ esp_err_t oximetry_canonical_convert_live_metrics(const char *device_id,
                                                   const char *recording_id,
                                                   const char *metrics_csv_path,
                                                   int64_t start_utc_ms);
+
+/* True when a ready canonical recording for `device_id` already covers the
+ * given [start_utc_ms, end_utc_ms] window (used by Live PPG boot recovery). */
+bool oximetry_canonical_has_overlapping_recording(const char *device_id,
+                                                  int64_t start_utc_ms,
+                                                  int64_t end_utc_ms);
 
 /* Convert one completed O2 Ring (Gen1) VLD3 file into a durable recording
  * package.  Vendor-layout metadata provides cadence; header and filename
