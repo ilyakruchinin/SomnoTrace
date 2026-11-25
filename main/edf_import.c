@@ -55,7 +55,6 @@
 #include <sys/stat.h>
 
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "cJSON.h"
 #include "sd_storage.h"
 #include "snt_format.h"
@@ -72,6 +71,7 @@
 #include "esp_heap_caps.h"
 #include "mbedtls/sha256.h"
 #include "psram_task.h"
+#include "esp_timer.h"
 #include "edf_gen.h"
 #include "somno_ml.h"
 #include "uploader.h"
@@ -6042,6 +6042,8 @@ bool edf_import_pending(void)
     return needs_spool_pending();
 }
 
+static int64_t imp_monotonic_us(void);
+
 bool edf_import_work_due(void)
 {
     struct stat st;
@@ -6049,7 +6051,7 @@ bool edf_import_work_due(void)
     if (dir_has_pending(IMP_IMPORT_DIR, 2, true)) return true;
     if (needs_spool_pending()) return true;
     if (root_files_pending())
-        return !root_retry_defer(esp_timer_get_time(), false);
+        return !root_retry_defer(imp_monotonic_us(), false);
     return false;
 }
 

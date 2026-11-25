@@ -71,7 +71,6 @@
 #include <unistd.h>
 
 #include "cJSON.h"
-#include "esp_timer.h"
 #include "edf_import.h"
 #include "source_store.h"
 #include "snt_format.h"
@@ -2579,15 +2578,17 @@ static void phase_store_budget(void)
     CHECK(!edf_import_test_defer_root_retry(3601000000LL, false),
           "retained root is retried after one hour");
 
-    /* edf_import_work_due() uses live esp_timer_get_time(): IMP_NATIVE_DIRTY still
+    /* edf_import_work_due() uses imp_monotonic_us(): IMP_NATIVE_DIRTY still
      * demands a wakeup even while root retry is backed off; once that marker is
      * cleared, an unchanged retained root suppresses background wakeups. */
     char dirty_marker[700];
     snprintf(dirty_marker, sizeof(dirty_marker), "%s/native-str.needs_rebuild", SD_SUMMARIES_DIR);
-    edf_import_test_mark_root_retry(esp_timer_get_time());
+    edf_import_test_set_monotonic_us(1000000);
+    edf_import_test_mark_root_retry(1000000);
     CHECK(edf_import_work_due(), "native rebuild marker keeps sync wakeup active");
     CHECK(unlink(dirty_marker) == 0, "clear native rebuild marker");
-    edf_import_test_mark_root_retry(esp_timer_get_time());
+    edf_import_test_mark_root_retry(1000000);
+    edf_import_test_set_monotonic_us(2000000);
     CHECK(edf_import_pending(), "pending stays true during retained-root backoff");
     CHECK(!edf_import_work_due(), "sync wakeup suppressed during retained-root backoff");
 
@@ -2600,8 +2601,12 @@ static void phase_store_budget(void)
           "changed root dependency bypasses backoff");
     CHECK(edf_import_work_due(), "changed root dependency triggers sync wakeup");
     CHECK(unlink(added_ident) == 0, "remove test-owned dependency");
-    edf_import_test_mark_root_retry(0);
+    edf_import_test_mark_root_retry(1000000);
+    edf_import_test_set_monotonic_us(2000000);
+    CHECK(!edf_import_work_due(), "backoff re-engages after dependency removed");
+    edf_import_test_set_monotonic_us(3601000000LL);
     CHECK(edf_import_work_due(), "expired backoff triggers sync wakeup");
+    edf_import_test_set_monotonic_us(-1);
     CHECK(source_store_set_budget(SOURCE_STORE_DEFAULT_BUDGET) == ESP_OK, "restore store budget");
     char day_file[700], backup[740];
     snprintf(day_file, sizeof(day_file), "%s/20240115.native.settings.json", SD_SUMMARIES_DIR);
