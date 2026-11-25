@@ -183,6 +183,8 @@ typedef struct {
     int64_t end_epoch_ms;
     int64_t clock_drift_ms;
     bool clock_drift_valid;
+    int64_t device_tz_delta_ms; /* DST / timezone delta already folded into clock_drift_ms */
+    bool imported;              /* true when imported from SD card (import_source set) */
     const char *stage_status;
     uint32_t brp_samples;
     uint32_t brp_mm_samples;
@@ -284,6 +286,8 @@ static esp_err_t sessions_list_impl(httpd_req_t *req)
         cJSON *j_sa2 = cJSON_GetObjectItem(j, "sa2_samples");
         cJSON *j_drift = cJSON_GetObjectItem(j, "clock_drift_ms");
         cJSON *j_drift_valid = cJSON_GetObjectItem(j, "clock_drift_valid");
+        cJSON *j_tz_delta = cJSON_GetObjectItem(j, "device_tz_delta_ms");
+        cJSON *j_imp = cJSON_GetObjectItem(j, "import_source");
         cJSON *j_fmt = cJSON_GetObjectItem(j, "fmt");
         cJSON *j_notif = cJSON_GetObjectItem(j, "stream_notifications");
         cJSON *j_gaps = cJSON_GetObjectItem(j, "gap_events");
@@ -339,6 +343,8 @@ static esp_err_t sessions_list_impl(httpd_req_t *req)
         s->sa2_samples = j_sa2 ? (uint32_t)j_sa2->valuedouble : 0;
         s->clock_drift_ms = j_drift ? (int64_t)j_drift->valuedouble : 0;
         s->clock_drift_valid = j_drift_valid ? cJSON_IsTrue(j_drift_valid) : (j_drift != NULL);
+        s->device_tz_delta_ms = (j_tz_delta && cJSON_IsNumber(j_tz_delta)) ? (int64_t)j_tz_delta->valuedouble : 0;
+        s->imported = (j_imp && cJSON_IsString(j_imp) && j_imp->valuestring[0] != '\0');
         s->fmt = j_fmt ? (int)j_fmt->valuedouble : 1;  /* default v1 if absent */
         s->stream_notifications = j_notif ? (uint32_t)j_notif->valuedouble : 0;
         s->gap_events = j_gaps ? (uint32_t)j_gaps->valuedouble : 0;
@@ -420,12 +426,14 @@ static esp_err_t sessions_list_impl(httpd_req_t *req)
             "{\"id\":\"%s\",\"state\":\"%s\",\"partial\":%s,"
             "\"start_epoch_ms\":%lld,\"end_epoch_ms\":%lld,"
             "\"clock_drift_ms\":%lld,\"clock_drift_valid\":%s,"
+            "\"device_tz_delta_ms\":%lld,\"imported\":%s,"
             "\"brp_samples\":%u,\"brp_mm_samples\":%u,\"pld_samples\":%u,\"sa2_samples\":%u,"
             "\"brp_bytes\":%ld,\"brp_mm_bytes\":%ld,\"has_stages\":%s,\"stage_status\":\"%s\","
             "\"fmt\":%d,\"stream_notifications\":%u,\"gap_events\":%u,\"gap_missing\":%u}",
             s->id, s->state, s->partial ? "true" : "false",
             (long long)s->start_epoch_ms, (long long)s->end_epoch_ms,
             (long long)s->clock_drift_ms, s->clock_drift_valid ? "true" : "false",
+            (long long)s->device_tz_delta_ms, s->imported ? "true" : "false",
             (unsigned)s->brp_samples, (unsigned)s->brp_mm_samples, (unsigned)s->pld_samples, (unsigned)s->sa2_samples,
             s->brp_bytes, s->brp_mm_bytes,
             !strcmp(s->stage_status, "ready") ? "true" : "false", s->stage_status,

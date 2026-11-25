@@ -1115,7 +1115,8 @@ static void trigger_sd_refresh(void)
 {
     if (s_sd_refreshing || !sd_storage_is_ready()) return;
     s_sd_refreshing = true;
-    if (xTaskCreate(sd_refresh_task, "sd_refresh", 3072, NULL, 1, NULL) != pdPASS) {
+    if (psram_task_create(sd_refresh_task, "sd_refresh", 3072, NULL, 1,
+                          tskNO_AFFINITY, NULL, NULL) == NULL) {
         s_sd_refreshing = false;
     }
 }
@@ -1274,9 +1275,10 @@ cJSON *netprov_build_status_json(void)
         cJSON_AddStringToObject(ox, "state", oximeter_get_status());
         cJSON_AddStringToObject(ox, "error", oximeter_get_error());
         cJSON_AddBoolToObject(ox, "paired", oximeter_is_paired());
-        cJSON_AddStringToObject(ox, "probe_mode",
-                oximeter_get_probe_mode() == OX_PROBE_PERSISTENT
-                    ? "persistent" : "legacy");
+        ox_probe_mode_t pm = oximeter_get_probe_mode();
+        const char *pm_str = pm == OX_PROBE_LIVE_PPG ? "live_ppg"
+                             : (pm == OX_PROBE_PERSISTENT ? "persistent" : "legacy");
+        cJSON_AddStringToObject(ox, "probe_mode", pm_str);
         if (oximeter_is_paired()) {
             cJSON *oinfo = oximeter_get_paired_info();
             if (oinfo) {
@@ -1669,6 +1671,15 @@ static esp_err_t ox_pair_handler(httpd_req_t *req)
         else if (strcmp(type->valuestring, "auto") == 0)
             driver = OX_DRIVER_AUTO;
     }
+    cJSON *pm_j = j ? cJSON_GetObjectItem(j, "probe_mode") : NULL;
+    if (cJSON_IsString(pm_j) && driver != OX_DRIVER_LEGACY) {
+        if (strcmp(pm_j->valuestring, "live_ppg") == 0)
+            oximeter_set_probe_mode(OX_PROBE_LIVE_PPG);
+        else if (strcmp(pm_j->valuestring, "persistent") == 0)
+            oximeter_set_probe_mode(OX_PROBE_PERSISTENT);
+        else if (strcmp(pm_j->valuestring, "legacy") == 0)
+            oximeter_set_probe_mode(OX_PROBE_LEGACY);
+    }
     esp_err_t e = oximeter_pair(addr->valuestring, driver);
     cJSON_Delete(j);
     if (e != ESP_OK) {
@@ -1703,7 +1714,9 @@ static esp_err_t ox_probe_mode_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     ox_probe_mode_t pm;
-    if (strcmp(mode->valuestring, "persistent") == 0)
+    if (strcmp(mode->valuestring, "live_ppg") == 0)
+        pm = OX_PROBE_LIVE_PPG;
+    else if (strcmp(mode->valuestring, "persistent") == 0)
         pm = OX_PROBE_PERSISTENT;
     else if (strcmp(mode->valuestring, "legacy") == 0)
         pm = OX_PROBE_LEGACY;
@@ -3235,15 +3248,26 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
         ESP_LOGI(TAG, "OTA: receiving %d bytes", total);
     }
 
-    /* Set up stream buffer and context for the flash task. */
+    /* Set up stream buffer in PSRAM and context for the flash task. */
+    uint8_t *sbuf_storage = heap_caps_malloc(OTA_BUF_SIZE + 1, MALLOC_CAP_SPIRAM);
+    StaticStreamBuffer_t *sbuf_struct = heap_caps_malloc(sizeof(StaticStreamBuffer_t),
+                                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!sbuf_storage || !sbuf_struct) {
+        free(sbuf_storage);
+        free(sbuf_struct);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom (stream buffer)");
+        return ESP_FAIL;
+    }
     ota_ctx_t ctx = {
-        .sbuf = xStreamBufferCreate(OTA_BUF_SIZE, 1),
+        .sbuf = xStreamBufferCreateStatic(OTA_BUF_SIZE, 1, sbuf_storage, sbuf_struct),
         .total_size = total,
         .eof = false,
         .result = ESP_FAIL,
         .done = false,
     };
     if (!ctx.sbuf) {
+        free(sbuf_storage);
+        free(sbuf_struct);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom (stream buffer)");
         return ESP_FAIL;
     }
@@ -3251,9 +3275,11 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     /* Launch flash task on an INTERNAL RAM stack (not PSRAM) — required for
      * cache-freeze safety during esp_ota_write. */
     TaskHandle_t flash_task = NULL;
-    BaseType_t tr = xTaskCreate(ota_flash_task, "ota_flash", 8192, &ctx, 5, &flash_task);
+    BaseType_t tr = xTaskCreate(ota_flash_task, "ota_flash", 5120, &ctx, 5, &flash_task);
     if (tr != pdPASS) {
         vStreamBufferDelete(ctx.sbuf);
+        free(sbuf_storage);
+        free(sbuf_struct);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom (flash task)");
         return ESP_FAIL;
     }
@@ -3262,7 +3288,14 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     uint8_t *recv_buf = heap_caps_malloc(OTA_CHUNK_SIZE, MALLOC_CAP_SPIRAM);
     if (!recv_buf) {
         ctx.eof = true;
+        int abort_ms = 0;
+        while (!ctx.done && abort_ms < 5000) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            abort_ms += 50;
+        }
         vStreamBufferDelete(ctx.sbuf);
+        free(sbuf_storage);
+        free(sbuf_struct);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_FAIL;
     }
@@ -3306,11 +3339,15 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     if (!ctx.done) {
         ESP_LOGE(TAG, "OTA: flash task timed out");
         vStreamBufferDelete(ctx.sbuf);
+        free(sbuf_storage);
+        free(sbuf_struct);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "flash task timeout");
         return ESP_FAIL;
     }
 
     vStreamBufferDelete(ctx.sbuf);
+    free(sbuf_storage);
+    free(sbuf_struct);
 
     if (ctx.result != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(ctx.result));

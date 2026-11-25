@@ -32,8 +32,9 @@
 static const char *TAG = "nvs_writer";
 
 /* Internal-RAM stack: this task performs the actual flash writes, so its own
- * stack must not be in PSRAM. NVS commits fit comfortably in 4 KB. */
-#define NVS_WRITER_STACK   8192
+ * stack must not be in PSRAM. Observed HWM peak is ~2.8 KB; 4608 B leaves
+ * ~1.8 KB headroom while reclaiming 3.5 KB of permanent internal RAM. */
+#define NVS_WRITER_STACK   4608
 #define NVS_WRITER_PRIO    6      /* >= httpd worker so a submitted write runs promptly */
 
 typedef struct {

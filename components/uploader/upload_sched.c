@@ -91,7 +91,7 @@ typedef struct {
     int      n_units;
 } backend_rt_t;
 
-static backend_rt_t s_rt[UPLOAD_MAX_BACKENDS];
+static EXT_RAM_BSS_ATTR backend_rt_t s_rt[UPLOAD_MAX_BACKENDS];
 static int s_n_rt = 0;
 
 /* ── Module state ─────────────────────────────────────────────────── */

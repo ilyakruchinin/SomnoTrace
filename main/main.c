@@ -58,6 +58,13 @@
 #include "somno_ml.h"
 #include "oximetry_canonical.h"
 #include "edf_import.h"
+#include "cJSON.h"
+
+static void *cjson_psram_malloc(size_t sz)
+{
+    void *p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p ? p : malloc(sz);
+}
 
 
 static const char *TAG = "somnotrace";
@@ -97,6 +104,14 @@ static void enter_softap(const struct netprov_config *cfg)
 
 void app_main(void)
 {
+    /* Route all cJSON node/string allocations to PSRAM before any subsystem
+     * parses or builds JSON, keeping small allocations off internal SRAM. */
+    cJSON_Hooks cjson_hooks = {
+        .malloc_fn = cjson_psram_malloc,
+        .free_fn   = free,
+    };
+    cJSON_InitHooks(&cjson_hooks);
+
     const esp_app_desc_t *app_desc = esp_app_get_description();
     ESP_LOGI(TAG, "SomnoTrace %s (IDF %s) starting up",
              app_desc ? app_desc->version : "unknown",

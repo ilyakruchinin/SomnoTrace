@@ -29,7 +29,8 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # CONFIG_ESP_WIFI_RX_IRAM_OPT is not set
 
 # Fewer always-resident Wi-Fi buffers.  SoftAP portal + STA uploads do not
-# need the IDF defaults (32 cache TX, static RX mgmt).
+# need the IDF defaults (16 static TX, 32 cache TX, static RX mgmt).
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
 CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUFFER=y
 # CONFIG_ESP_WIFI_STATIC_RX_MGMT_BUFFER is not set
@@ -67,16 +68,16 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 # Threshold below which malloc() prefers internal RAM; at/above it, PSRAM is
 # preferred (with automatic fallback either way, so malloc never fails on this
-# alone).  Lowered 16384 -> 4096 -> 1024 to push the 1-4 KB allocation band
-# (HTTP header/body buffers, cJSON aggregates, misc driver/lib buffers) into
-# PSRAM and free internal RAM.  Only tiny (<1 KB) allocations stay internal.
+# alone).  Lowered 16384 -> 4096 -> 1024 -> 512 to push the 512B-1KB
+# allocation band (cJSON, FATFS, BLE notify copies, misc driver buffers) into
+# PSRAM and free internal RAM.  Only tiny (<512 B) allocations stay internal.
 # NOTE: CONFIG_SPI_FLASH_AUTO_SUSPEND does NOT make it safe for tasks that
 # do flash erase/write (NVS commit) to have PSRAM stacks —
 # esp_ota_get_running_partition() → spi_flash_cache2phys() still freezes
 # caches.  Such work is funnelled through the internal-stack nvs_writer task
 # so the httpd worker (PSRAM stack) never calls flash-write directly.
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=49152
 
 # Allow zero-initialized BSS to be placed in PSRAM.  This moves large static
 # arrays (e.g. s_evt_q_storage, s_cfg_mtx_buf) out of internal RAM.  Variables
@@ -151,10 +152,9 @@ CONFIG_HTTPD_WS_SUPPORT=y
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
-# Use default memory allocation (allows PSRAM) instead of internal-only.
-# Internal RAM is exhausted by Wi-Fi + libsmb2 + certificate bundle,
-# causing ble_buf_alloc() to fail with "hci inits failed".
-CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_DEFAULT=y
+# Use external (PSRAM) memory allocation for NimBLE host pools to preserve
+# internal SRAM when Wi-Fi + libsmb2 + certificate bundle are active.
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
 CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
