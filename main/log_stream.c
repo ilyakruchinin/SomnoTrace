@@ -80,6 +80,7 @@ static size_t   s_writebuf_tail;     /* read position (from flush task) */
 static SemaphoreHandle_t s_writebuf_mutex;
 static TaskHandle_t s_flush_task;
 static bool s_sd_ready;              /* SD card is mounted and log dir created */
+static volatile uint32_t s_flush_done_seq;
 
 /* ── WebSocket Live Tail ──────────────────────────────────────────── */
 #define MAX_WS_CLIENTS WS_CLIENT_LIMIT
@@ -271,6 +272,7 @@ static void log_flush_task(void *arg)
         }
 
         if (f) fclose(f);
+        __atomic_add_fetch(&s_flush_done_seq, 1, __ATOMIC_SEQ_CST);
 
         /* One-shot high-water mark after the first flush to verify the
          * 4 KB PSRAM stack is sufficient for the FATFS write path. */
@@ -281,6 +283,34 @@ static void log_flush_task(void *arg)
             ESP_LOGI(TAG, "log_flush: stack high-water = %u bytes",
                      (unsigned)(hwm * sizeof(StackType_t)));
         }
+    }
+}
+
+void log_stream_flush(uint32_t timeout_ms)
+{
+    if (!s_flush_task || !s_writebuf || !s_writebuf_mutex ||
+        !sd_storage_is_ready()) {
+        return;
+    }
+
+    size_t pending = 0;
+    xSemaphoreTake(s_writebuf_mutex, portMAX_DELAY);
+    pending = s_writebuf_head - s_writebuf_tail;
+    xSemaphoreGive(s_writebuf_mutex);
+    if (pending == 0) return;
+
+    uint32_t seq_before = __atomic_load_n(&s_flush_done_seq, __ATOMIC_SEQ_CST);
+    xTaskNotifyGive(s_flush_task);
+
+    uint32_t waited = 0;
+    while (waited < timeout_ms) {
+        xSemaphoreTake(s_writebuf_mutex, portMAX_DELAY);
+        pending = s_writebuf_head - s_writebuf_tail;
+        xSemaphoreGive(s_writebuf_mutex);
+        uint32_t seq_now = __atomic_load_n(&s_flush_done_seq, __ATOMIC_SEQ_CST);
+        if (pending == 0 && seq_now != seq_before) break;
+        vTaskDelay(pdMS_TO_TICKS(20));
+        waited += 20;
     }
 }
 

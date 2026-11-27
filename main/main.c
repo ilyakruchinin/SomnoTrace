@@ -429,6 +429,7 @@ void app_main(void)
                 }
 
                 vTaskDelay(pdMS_TO_TICKS(500));
+                log_stream_flush(500);
                 esp_restart();
             }
         }
@@ -531,6 +532,7 @@ void app_main(void)
             if ((xTaskGetTickCount() - softap_start_ticks) * portTICK_PERIOD_MS
                  > 10 * 60 * 1000) {
                 ESP_LOGW(TAG, "SoftAP 10-minute idle timeout: rebooting to retry connection");
+                log_stream_flush(500);
                 esp_restart();
             }
             /* Update battery indicator in SoftAP mode */

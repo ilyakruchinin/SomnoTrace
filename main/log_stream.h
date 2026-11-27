@@ -42,6 +42,12 @@ extern "C" {
 void log_stream_init(void);
 
 /**
+ * Flush any buffered log output to SD card storage (up to timeout_ms).
+ * Used before intentional reboots so shutdown log lines survive reset.
+ */
+void log_stream_flush(uint32_t timeout_ms);
+
+/**
  * Register the system WebSocket & log HTTP endpoints on the given server:
  *
  *   GET  /api/ws            — Unified WebSocket real-time channel (JSON envelopes)

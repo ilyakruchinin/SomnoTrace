@@ -321,7 +321,7 @@ static void resolve_session_roots(const char *session_dir,
         streams_root[plen] = '\0';
 
         const char *prev = strrchr(streams_root, '/');
-        if (prev && prev > streams_root) {
+        if (prev && prev >= streams_root) {
             size_t gplen = (size_t)(prev - streams_root);
             if (gplen >= ssr_len) gplen = ssr_len - 1;
             memcpy(sessions_root, streams_root, gplen);
@@ -483,6 +483,54 @@ read_pre_gate_info(const char *session_dir, const char *session_id,
             cJSON_IsNumber(c) && c->valuedouble <= 0) out->emit_pld = false;
     }
     cJSON_Delete(mani);
+}
+
+/* Empty / standby sessions captured without _ZLE or MaskOn contain ~0.1 cmH2O
+ * flat pressure.  Require at least 10 s (250 samples @ 25 Hz) at >= 2.00 cmH2O
+ * before exporting an ungated capture so false triggers never reach SDCARD/. */
+#define EDF_NO_THERAPY_PRESS_MIN      200
+#define EDF_NO_THERAPY_PRESS_SAMPLES  250
+
+static __attribute__((noinline)) bool
+snt_has_therapy_pressure(const char *session_dir, const char *session_id)
+{
+    char path[300];
+    int stride = 1;
+    int offset = 0;
+
+    snprintf(path, sizeof(path), "%s/%s_press.snt", session_dir, session_id);
+    FILE *pf = fopen(path, "rb");
+    if (!pf) {
+        snprintf(path, sizeof(path), "%s/%s_brp.snt", session_dir, session_id);
+        pf = fopen(path, "rb");
+        if (!pf) return true;
+        stride = 2;
+        offset = 1;
+    }
+
+    snt_header_t hdr;
+    if (snt_read_header(pf, &hdr) != 0) {
+        fclose(pf);
+        return true;
+    }
+
+    int16_t buf[512];
+    uint32_t high = 0;
+    for (;;) {
+        size_t n = fread(buf, sizeof(int16_t), 512, pf);
+        if (n == 0) break;
+        for (size_t i = (size_t)offset; i < n; i += (size_t)stride) {
+            if (buf[i] >= EDF_NO_THERAPY_PRESS_MIN) {
+                high++;
+                if (high >= EDF_NO_THERAPY_PRESS_SAMPLES) {
+                    fclose(pf);
+                    return true;
+                }
+            }
+        }
+    }
+    fclose(pf);
+    return false;
 }
 
 typedef struct {
@@ -999,12 +1047,11 @@ esp_err_t edf_gen_generate_ex(const char *out_root,
                 brp_samples = bhdr.sample_count;
             fclose(bf);
         }
-        if (brp_samples < 1500) {       /* < one 60 s record at 25 Hz */
+        if (brp_samples < 1500 || !snt_has_therapy_pressure(session_dir, session_id)) {
             no_therapy = true;
-            ESP_LOGI(TAG, "session %s: no _ZLE/MaskOn and only %u BRP samples "
-                          "(<1500) — no therapy delivered, skipping all "
-                          "per-session EDF files", session_id,
-                     (unsigned)brp_samples);
+            ESP_LOGI(TAG, "session %s: no _ZLE/MaskOn and no therapeutic flow/pressure "
+                          "(samples=%u) — skipping all per-session EDF files",
+                     session_id, (unsigned)brp_samples);
 
             /* The day folder was created before we knew there would be nothing
              * to put in it.  Leaving it behind makes the card look as though a
@@ -1590,6 +1637,14 @@ static esp_err_t rebuild_read_manifest(const char *day_path, const char *fname,
             /* Sessions rebuilt from a crash have partially damaged raw data by
              * definition; the day rebuild treats their failures differently. */
             cJSON *jst = cJSON_GetObjectItem(j, "state");
+            if (cJSON_IsString(jst) &&
+                (strncmp(jst->valuestring, "aborted_", 8) == 0 ||
+                 strcmp(jst->valuestring, "storage_failed") == 0)) {
+                ESP_LOGI(TAG, "rebuild: skipping %s (state=%s)",
+                         out->session_id, jst->valuestring);
+                cJSON_Delete(j);
+                return ESP_ERR_NOT_FOUND;
+            }
             out->interrupted = (jst && cJSON_IsString(jst) &&
                                 strcmp(jst->valuestring, "interrupted") == 0);
 
@@ -1800,7 +1855,7 @@ static esp_err_t rebuild_day(const char *day_folder, bool require_native)
             if (n >= REBUILD_MAX_SESSIONS) { truncated = true; break; }
             esp_err_t r = rebuild_read_manifest(day_path, ent->d_name, &sessions[n]);
             if (r == ESP_OK) n++;
-            else {
+            else if (r != ESP_ERR_NOT_FOUND) {
                 manifest_error = r;
                 break;
             }

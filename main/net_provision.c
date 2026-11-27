@@ -1866,9 +1866,10 @@ static esp_err_t sb_op_handler(httpd_req_t *req)
 
 static void reboot_task(void *arg)
 {
-    (void)arg;
+    const char *reason = arg ? (const char *)arg : "requested";
     vTaskDelay(pdMS_TO_TICKS(1500));
-    ESP_LOGI(TAG, "rebooting to apply credentials");
+    ESP_LOGI(TAG, "rebooting (%s)", reason);
+    log_stream_flush(500);
     esp_restart();
 }
 
@@ -2002,9 +2003,11 @@ static esp_err_t heap_stats_handler(httpd_req_t *req)
 
 static esp_err_t reboot_post_handler(httpd_req_t *req)
 {
+    ESP_LOGI(TAG, "reboot requested via /api/reboot");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-    psram_task_create(reboot_task, "reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    psram_task_create(reboot_task, "reboot", 4096, (void *)"api/reboot", 5,
+                      tskNO_AFFINITY, NULL, NULL);
     return ESP_OK;
 }
 
@@ -2112,7 +2115,8 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     httpd_resp_sendstr(req,
         "<html><body style=\"font-family:sans-serif\">Saved. Rebooting to connect...</body></html>");
 
-    psram_task_create(reboot_task, "reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    psram_task_create(reboot_task, "reboot", 4096, (void *)"settings saved", 5,
+                      tskNO_AFFINITY, NULL, NULL);
     return ESP_OK;
 }
 
@@ -3359,7 +3363,8 @@ static esp_err_t ota_upload_handler(httpd_req_t *req)
     httpd_resp_sendstr(req, "{\"ok\":true}");
 
     /* Reboot after a short delay so the response is sent. */
-    psram_task_create(reboot_task, "ota_reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    psram_task_create(reboot_task, "ota_reboot", 4096, (void *)"ota upload", 5,
+                      tskNO_AFFINITY, NULL, NULL);
     return ESP_OK;
 }
 
@@ -3453,7 +3458,8 @@ static void ota_url_task(void *arg)
     s_ota_progress.active = false;
     s_ota_progress.done = true;
     free(url);
-    psram_task_create(reboot_task, "ota_reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+    psram_task_create(reboot_task, "ota_reboot", 4096, (void *)"ota url", 5,
+                      tskNO_AFFINITY, NULL, NULL);
     vTaskDelete(NULL);
     return;
 

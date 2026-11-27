@@ -3118,6 +3118,208 @@ static void test_resolver_gates_daily_settings(void)
     }
 }
 
+static void build_ungated_session_with_press(const char *root, int version,
+                                             int16_t flow_val,
+                                             int n_high, int16_t high_p,
+                                             int16_t low_p,
+                                             char *session_dir, size_t sd_len)
+{
+    mk("%s", root);
+    mk("%s/streams", root);
+    snprintf(session_dir, sd_len, "%s/streams/20260301", root);
+    mk("%s", session_dir);
+    char p[400];
+
+    int16_t sent = (version >= 2) ? INT16_MIN : -1;
+    static int16_t sa2[SA2_N * 2];
+    for (int i = 0; i < SA2_N * 2; i++) sa2[i] = sent;
+    snprintf(p, sizeof(p), "%s/%s_sa2.snt", session_dir, SID);
+    write_snt(p, (uint8_t)version, 2, 10, START_MS, SA2_N, sa2, SA2_N);
+
+    static int16_t flow[BRP_N], press[BRP_N], brp[BRP_N * 2];
+    for (int i = 0; i < BRP_N; i++) {
+        flow[i] = flow_val;
+        /* Place high samples near index 1000 so chunked reading across >512 is exercised */
+        press[i] = (i >= 600 && i < 600 + n_high) ? high_p : low_p;
+        brp[2 * i] = flow[i];
+        brp[2 * i + 1] = press[i];
+    }
+    if (version >= 2) {
+        snprintf(p, sizeof(p), "%s/%s_flow.snt", session_dir, SID);
+        write_snt(p, 2, 1, 250, START_MS, BRP_N, flow, BRP_N);
+        snprintf(p, sizeof(p), "%s/%s_press.snt", session_dir, SID);
+        write_snt(p, 2, 1, 250, START_MS, BRP_N, press, BRP_N);
+    } else {
+        snprintf(p, sizeof(p), "%s/%s_brp.snt", session_dir, SID);
+        write_snt(p, 1, 2, 250, START_MS, BRP_N, brp, BRP_N);
+    }
+
+    static int16_t pld[PLD_N * 12];
+    memset(pld, 0, sizeof(pld));
+    snprintf(p, sizeof(p), "%s/%s_pld.snt", session_dir, SID);
+    write_snt(p, (uint8_t)version, 12, 5, START_MS, PLD_N, pld, PLD_N);
+
+    snprintf(p, sizeof(p), "%s/%s_ident.json", session_dir, SID);
+    write_text(p, "{}\n");
+    snprintf(p, sizeof(p), "%s/%s_settings.json", session_dir, SID);
+    write_text(p, "{}\n");
+}
+
+static int count_day_files(const char *day_dir)
+{
+    DIR *d = opendir(day_dir);
+    if (!d) return 0;
+    int count = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        count++;
+    }
+    closedir(d);
+    return count;
+}
+
+static void test_ungated_flat_standby_suppressed(void)
+{
+    /* 1. v2 standby session (4500 samples @ 0.1 cmH2O, no _ZLE/MaskOn) -> 0 EDFs */
+    {
+        char root[300], out[300], sdir[360], day_dir[360];
+        snprintf(root, sizeof(root), "%s/flat_v2", g_root);
+        snprintf(out, sizeof(out), "%s/flat_v2_out", g_root);
+        build_ungated_session_with_press(root, 2, 63, 0, 0, 10, sdir, sizeof(sdir));
+        CHECK(edf_gen_generate_ex(out, sdir, SID, START_MS, START_MS + 180000, 0,
+                                  EDF_GEN_PER_SESSION) == ESP_OK,
+              "v2 flat standby export returns ESP_OK");
+        snprintf(day_dir, sizeof(day_dir), "%s/DATALOG/20260301", out);
+        CHECK(count_day_files(day_dir) == 0,
+              "v2 flat standby session emits no per-session EDFs");
+    }
+
+    /* 2. v1 brp.snt with high ch0 flow (500 >= 200) but standby ch1 pressure (10) -> 0 EDFs */
+    {
+        char root[300], out[300], sdir[360], day_dir[360];
+        snprintf(root, sizeof(root), "%s/flat_v1", g_root);
+        snprintf(out, sizeof(out), "%s/flat_v1_out", g_root);
+        build_ungated_session_with_press(root, 1, 500, 0, 0, 10, sdir, sizeof(sdir));
+        CHECK(edf_gen_generate_ex(out, sdir, SID, START_MS, START_MS + 180000, 0,
+                                  EDF_GEN_PER_SESSION) == ESP_OK,
+              "v1 flat standby export returns ESP_OK");
+        snprintf(day_dir, sizeof(day_dir), "%s/DATALOG/20260301", out);
+        CHECK(count_day_files(day_dir) == 0,
+              "v1 flat standby reads pressure channel (ch1), not flow (ch0)");
+    }
+
+    /* 3. Boundary: 249 samples at 200 -> suppressed */
+    {
+        char root[300], out[300], sdir[360], day_dir[360];
+        snprintf(root, sizeof(root), "%s/flat_249", g_root);
+        snprintf(out, sizeof(out), "%s/flat_249_out", g_root);
+        build_ungated_session_with_press(root, 2, 63, 249, 200, 10, sdir, sizeof(sdir));
+        CHECK(edf_gen_generate_ex(out, sdir, SID, START_MS, START_MS + 180000, 0,
+                                  EDF_GEN_PER_SESSION) == ESP_OK,
+              "249-sample pressure blip returns ESP_OK");
+        snprintf(day_dir, sizeof(day_dir), "%s/DATALOG/20260301", out);
+        CHECK(count_day_files(day_dir) == 0,
+              "249 samples at 2.00 cmH2O (< 250) stays suppressed");
+    }
+
+    /* 4. Boundary: 250 samples at 199 -> suppressed */
+    {
+        char root[300], out[300], sdir[360], day_dir[360];
+        snprintf(root, sizeof(root), "%s/flat_p199", g_root);
+        snprintf(out, sizeof(out), "%s/flat_p199_out", g_root);
+        build_ungated_session_with_press(root, 2, 63, 250, 199, 10, sdir, sizeof(sdir));
+        CHECK(edf_gen_generate_ex(out, sdir, SID, START_MS, START_MS + 180000, 0,
+                                  EDF_GEN_PER_SESSION) == ESP_OK,
+              "250 samples below 2.00 cmH2O returns ESP_OK");
+        snprintf(day_dir, sizeof(day_dir), "%s/DATALOG/20260301", out);
+        CHECK(count_day_files(day_dir) == 0,
+              "250 samples at 1.99 cmH2O (< 200) stays suppressed");
+    }
+
+    /* 5. Boundary: 250 samples at 200 in v1 -> exported */
+    {
+        char root[300], out[300], sdir[360], day_dir[360];
+        snprintf(root, sizeof(root), "%s/real_250", g_root);
+        snprintf(out, sizeof(out), "%s/real_250_out", g_root);
+        build_ungated_session_with_press(root, 1, 0, 250, 200, 10, sdir, sizeof(sdir));
+        CHECK(edf_gen_generate_ex(out, sdir, SID, START_MS, START_MS + 180000, 0,
+                                  EDF_GEN_PER_SESSION) == ESP_OK,
+              "250 samples at 2.00 cmH2O returns ESP_OK");
+        snprintf(day_dir, sizeof(day_dir), "%s/DATALOG/20260301", out);
+        CHECK(count_day_files(day_dir) >= 3,
+              "250 samples at 2.00 cmH2O exports ungated session");
+    }
+}
+
+static void test_rebuild_skips_aborted_and_failed_manifests(void)
+{
+    set_tz("UTC");
+    const char *day = "20260311";
+    const int64_t t0 = START_MS + 10 * 86400000LL; /* 2026-03-11T22:00:00Z -> noon-day 20260311 */
+    char dir[400], p[500], m_good[500], m_abort[500], m_fail[500];
+    mk("%s", SD_STREAMS_DIR);
+    mk("%s", SD_SDCARD_DIR);
+    reset_day_state(day);
+    snprintf(dir, sizeof(dir), "%s/%s", SD_STREAMS_DIR, day);
+
+    /* Write one real completed session directly into SD_STREAMS_DIR/<day> */
+    static int16_t sa2[SA2_N * 2], flow[BRP_N], press[BRP_N], pld[PLD_N * 12];
+    for (int i = 0; i < SA2_N; i++) {
+        sa2[2 * i] = 6500;
+        sa2[2 * i + 1] = 9700;
+    }
+    for (int i = 0; i < BRP_N; i++) {
+        flow[i] = (int16_t)((i % 200) - 100);
+        press[i] = (int16_t)(800 + (i % 300));
+    }
+    memset(pld, 0, sizeof(pld));
+    snprintf(p, sizeof(p), "%s/20260311_220000_sa2.snt", dir);
+    write_snt(p, 2, 2, 10, t0, SA2_N, sa2, SA2_N);
+    snprintf(p, sizeof(p), "%s/20260311_220000_flow.snt", dir);
+    write_snt(p, 2, 1, 250, t0, BRP_N, flow, BRP_N);
+    snprintf(p, sizeof(p), "%s/20260311_220000_press.snt", dir);
+    write_snt(p, 2, 1, 250, t0, BRP_N, press, BRP_N);
+    snprintf(p, sizeof(p), "%s/20260311_220000_pld.snt", dir);
+    write_snt(p, 2, 12, 5, t0, PLD_N, pld, PLD_N);
+    snprintf(p, sizeof(p), "%s/20260311_220000_settings.json", dir);
+    write_text(p, "{}\n");
+    snprintf(p, sizeof(p), "%s/20260311_220000_ident.json", dir);
+    write_live_ident(p, day, "20260311_220000");
+
+    snprintf(m_good, sizeof(m_good), "%s/20260311_220000_session.json", dir);
+    char jbuf[256];
+    snprintf(jbuf, sizeof(jbuf),
+             "{\"state\":\"completed\",\"start_epoch_ms\":%lld,\"end_epoch_ms\":%lld,\"clock_drift_ms\":0}",
+             (long long)t0, (long long)(t0 + 180000));
+    write_text(m_good, jbuf);
+
+    /* Add an aborted_no_therapy manifest and a storage_failed manifest */
+    snprintf(m_abort, sizeof(m_abort), "%s/20260311_230000_session.json", dir);
+    snprintf(jbuf, sizeof(jbuf),
+             "{\"state\":\"aborted_no_therapy\",\"start_epoch_ms\":%lld,\"end_epoch_ms\":%lld,\"clock_drift_ms\":0}",
+             (long long)(t0 + 3600000), (long long)(t0 + 3780000));
+    write_text(m_abort, jbuf);
+
+    snprintf(m_fail, sizeof(m_fail), "%s/20260311_235000_session.json", dir);
+    snprintf(jbuf, sizeof(jbuf),
+             "{\"state\":\"storage_failed\",\"start_epoch_ms\":%lld,\"end_epoch_ms\":%lld,\"clock_drift_ms\":0}",
+             (long long)(t0 + 6600000), (long long)(t0 + 6780000));
+    write_text(m_fail, jbuf);
+
+    CHECK(edf_gen_rebuild_day(day) == ESP_OK,
+          "rebuild_day succeeds when aborted/failed manifests are present");
+
+    char day_out[400];
+    snprintf(day_out, sizeof(day_out), "%s/%s", SD_SDCARD_DATALOG, day);
+    /* Completed session produces BRP/SA2/PLD/EVE/CSL = 5 files; none for aborted/failed */
+    CHECK(count_day_files(day_out) == 5,
+          "rebuild exports only the completed session (skips aborted/failed manifests)");
+
+    rmtree(day_out);
+    reset_day_state(day);
+}
+
 int main(void)
 {
     snprintf(g_root, sizeof(g_root), "%s/snt_edf_test_XXXXXX",
@@ -3239,6 +3441,10 @@ int main(void)
         test_zle_multi_window_splits_waveforms, NULL);
     run("_ZLE open final window is not truncated to prior falling edge",
         test_zle_open_final_window_not_truncated, NULL);
+    run("ungated flat standby sessions are suppressed (exact pressure boundaries)",
+        test_ungated_flat_standby_suppressed, NULL);
+    run("day rebuild skips aborted_* and storage_failed manifests",
+        test_rebuild_skips_aborted_and_failed_manifests, NULL);
 
     if (!getenv("KEEP_TEST_TREE")) rmtree(g_root);
     else printf("test tree kept at %s\n", g_root);

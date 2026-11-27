@@ -277,7 +277,7 @@ assert "if (!cJSON_GetObjectItem(cfg, \"availability\"))" in mqtt
 assert "if (!duplicate) bsp_display_set_therapy_start_time(now_us);" in writer
 assert "bsp_display_push_pressure(pld_vals[0] / 100.0f)" in writer
 assert "for (int j = 0; j < leak_n; j++)" in writer
-assert writer.index("bsp_display_push_leak(leak_vals[j]") > writer.index("THERAPY detected via non-zero flow")
+assert writer.index("bsp_display_push_leak(leak_vals[j]") > writer.index("THERAPY detected via")
 assert "s_leak_updated_us = 0;" in function(display, "bsp_display_set_as11_paired")
 
 cjson_dir = os.environ.get("CJSON_DIR")

@@ -59,6 +59,7 @@
 
 #include "session_writer.h"
 #include "session_gap.h"
+#include "session_detect.h"
 #include "sd_storage.h"
 #include "as11_ble.h"
 #include "bsp_display.h"
@@ -311,18 +312,9 @@ static TaskHandle_t      s_storage_task = NULL;
 static TaskHandle_t      s_post_task = NULL;
 static bool              s_ready = false;
 
-/* Set on TherapyStop/Cooldown, cleared on TherapyStart.  RAM-only, so it is false
- * after any reset — which is what arms mid-therapy auto-start.  The stale
- * watchdog deliberately does NOT set it (that would block auto-start on
- * reconnect). */
-static bool s_therapy_stopped = false;
-
-/* Non-therapy mode flags: Mask Fit and Cooldown/Drying mode blow air but
- * are NOT therapy sessions.  These flags suppress the mid-therapy flow-detection
- * auto-start so non-therapeutic airflow is never logged as therapy (issue #149). */
-static bool s_in_mask_fit = false;
-static bool s_in_cooldown = false;
-static bool s_started_from_event = false;
+/* Therapy / standby / mode detection state (RAM-only; see session_detect.h).
+ * therapy_stopped starts false after reset to arm mid-therapy recovery. */
+static sw_detect_t s_detect = {0};
 
 /* TherapyStart de-duplication: an echoed start must not rotate a healthy
  * session, but a genuine one must (a missed TherapyStop otherwise glues
@@ -1565,11 +1557,18 @@ static void sw_post_task(void *arg)
         free(s);
         s = NULL;
 
-        if (storage_failed) {
+        bool aborted = (job.state && strncmp(job.state, "aborted_", 8) == 0);
+        if (storage_failed || aborted) {
             __atomic_sub_fetch(&s_post_in_flight, 1, __ATOMIC_SEQ_CST);
-            psram_work_end("post-storage-failed", 24 * 1024);
-            ESP_LOGE(TAG, "post: storage failed for %s — skipping export",
-                     session_id);
+            psram_work_end(storage_failed ? "post-storage-failed" : "post-aborted",
+                           24 * 1024);
+            if (storage_failed) {
+                ESP_LOGE(TAG, "post: storage failed for %s — skipping export",
+                         session_id);
+            } else {
+                ESP_LOGI(TAG, "post: %s (%s) — skipping export/upload",
+                         session_id, job.state);
+            }
             if (!bsp_display_is_therapy_active()) uploader_request_scan();
             continue;
         }
@@ -2123,32 +2122,27 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         }
     }
 
-    /* PatientFlow: push to display, detect active flow */
-    bool has_active_flow = false;
+    /* PatientFlow: push to display */
     for (int j = 0; j < flow_n; j++) {
         bsp_display_push_flow(flow_vals[j] / 100.0f);
-        if (abs(flow_vals[j]) > 50) has_active_flow = true;
     }
 
-    bool has_therapy_pressure = false;
-    for (int j = 0; j < press_n; j++) {
-        if (press_vals[j] > 200) has_therapy_pressure = true;
-    }
+    int64_t now_mono_ms = esp_timer_get_time() / 1000;
 
-    /* Edge case: auto-start session if flow and pressure indicate active
-     * therapy (reboot mid-therapy, or ESP powered on after the AS11).
-     * Gated against Mask Fit and Cooldown/Drying mode so non-therapeutic
-     * blower air never opens a phantom therapy session (issue #149). */
-    if ((!s || !session_writer_is_active(s)) && !s_therapy_stopped
-        && !s_in_mask_fit && !s_in_cooldown
-        && has_active_flow && has_therapy_pressure) {
-        ESP_LOGI(TAG, ">>> THERAPY detected via non-zero flow (reboot mid-therapy?)");
+    /* Auto-start only on sustained therapy pressure + flow variation (blocks
+     * standby baselines and post-cooldown pressure blips). */
+    if (sw_detect_should_autostart(&s_detect,
+                                   (s && session_writer_is_active(s)),
+                                   flow_vals, flow_n,
+                                   press_vals, press_n,
+                                   now_mono_ms)) {
+        ESP_LOGI(TAG, ">>> THERAPY detected via sustained flow+pressure (reboot mid-therapy?)");
         bsp_display_set_therapy_active(true);
         bsp_display_set_therapy_start_time(esp_timer_get_time());
         mqtt_manager_on_therapy_start();
         s = session_writer_start();
         if (s) {
-            s_started_from_event = false;
+            sw_detect_on_session_open(&s_detect, false, now_mono_ms);
         } else {
             ESP_LOGW(TAG, "session_writer_start() failed — "
                      "graph active but NOT recording to SD");
@@ -2166,6 +2160,21 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         bsp_display_push_pressure(pld_vals[0] / 100.0f);
 
     if (!s || !session_writer_is_active(s)) return;
+
+    /* Close false/stuck sessions when MaskPressure stays in standby. */
+    sw_watchdog_action_t wd = sw_detect_check_active_stream(
+        &s_detect, press_vals, press_n, now_mono_ms);
+    if (wd != SW_WATCHDOG_OK) {
+        bool abort_no_therapy = (wd == SW_WATCHDOG_ABORT_NO_THERAPY);
+        const char *wd_state = abort_no_therapy ? "aborted_no_therapy" : "timed_out";
+        ESP_LOGW(TAG, "standby pressure timeout — closing session (%s)", wd_state);
+        bsp_display_set_therapy_active(false);
+        therapy_alert_on_therapy_stop();
+        mqtt_manager_on_therapy_stop();
+        sw_request_finalize(s, wd_state, (int64_t)time(NULL) * 1000,
+                            !abort_no_therapy);
+        return;
+    }
 
     s->last_stream_us = esp_timer_get_time();
 
@@ -2280,6 +2289,8 @@ void session_writer_on_stream_data_raw(const char *json, int len)
         sw_request_finalize(s, "split", end_epoch_ms, true);
         s = session_writer_start();
         if (!s) return;
+        sw_detect_on_session_open(&s_detect, s_detect.started_from_event,
+                                  now_mono_ms);
         xSemaphoreTake(s->fill_mutex, portMAX_DELAY);
         b = s->fill;
         s->prev_stream_ms = cur_stream_ms;
@@ -2377,8 +2388,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         if (ev_type == AS11_EV_THERAPY_STOP) {
             ESP_LOGI(TAG, ">>> THERAPY STOP detected");
             crash_diag_note_activity("therapy_stop");
-            s_therapy_stopped = true;
-            s_in_mask_fit = false;
+            sw_detect_on_therapy_stop(&s_detect);
             bsp_display_set_therapy_active(false);
             therapy_alert_on_therapy_stop();
             mqtt_manager_on_therapy_stop();
@@ -2393,9 +2403,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         if (ev_type == AS11_EV_THERAPY_START) {
             ESP_LOGI(TAG, ">>> THERAPY START detected");
             crash_diag_note_activity("therapy_start");
-            s_therapy_stopped = false;
-            s_in_mask_fit = false;
-            s_in_cooldown = false;
+            sw_detect_on_therapy_start(&s_detect);
             therapy_alert_on_therapy_start();
             bsp_display_set_therapy_active(true);
 
@@ -2427,11 +2435,16 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                 ESP_LOGI(TAG, "duplicate TherapyStart ignored (echo)");
             }
 
-            if (!s || !s->active) {
+            bool opened_new = (!s || !s->active);
+            if (opened_new) {
                 s = session_writer_start();
             }
             if (s) {
-                s_started_from_event = true;
+                if (opened_new) {
+                    sw_detect_on_session_open(&s_detect, true, now_us / 1000);
+                } else {
+                    s_detect.started_from_event = true;
+                }
                 write_event(s, msg);
             } else {
                 ESP_LOGW(TAG, "session_writer_start() failed — "
@@ -2441,12 +2454,12 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         }
         if (ev_type == AS11_EV_MASK_FIT_START) {
             ESP_LOGI(TAG, ">>> MASK FIT / DIAGNOSTIC START detected (suppressing therapy)");
-            s_in_mask_fit = true;
+            sw_detect_on_mask_fit_start(&s_detect);
             bsp_display_set_therapy_active(false);
             mqtt_manager_on_therapy_stop();
             /* If a session was started by flow heuristic within the last 15 seconds
              * before the MaskFit event arrived, abort the false session. */
-            if (s && s->active && !s_started_from_event) {
+            if (s && s->active && !s_detect.started_from_event) {
                 int64_t dur_ms = (esp_timer_get_time() - s->start_time_us) / 1000;
                 if (dur_ms < 15000) {
                     ESP_LOGW(TAG, "aborting false session opened by Mask Fit airflow (%lld ms)",
@@ -2460,13 +2473,12 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         }
         if (ev_type == AS11_EV_MASK_FIT_STOP) {
             ESP_LOGI(TAG, ">>> MASK FIT / DIAGNOSTIC STOP detected");
-            s_in_mask_fit = false;
+            sw_detect_on_mask_fit_stop(&s_detect);
             return;
         }
         if (ev_type == AS11_EV_COOLDOWN_START) {
             ESP_LOGI(TAG, ">>> COOLDOWN (tube drying) STARTED");
-            s_in_cooldown = true;
-            s_therapy_stopped = true;
+            sw_detect_on_cooldown_start(&s_detect);
             bsp_display_set_therapy_active(false);
             therapy_alert_on_therapy_stop();
             mqtt_manager_on_therapy_stop();
@@ -2481,14 +2493,14 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
         }
         if (ev_type == AS11_EV_COOLDOWN_STOP) {
             ESP_LOGI(TAG, ">>> COOLDOWN (tube drying) STOPPED");
-            s_in_cooldown = false;
+            sw_detect_on_cooldown_stop(&s_detect);
             return;
         }
         if (ev_type == AS11_EV_STANDBY_START) {
             ESP_LOGD(TAG, ">>> STANDBY STARTED");
+            sw_detect_on_standby_start(&s_detect);
             if (s && s->active) {
                 ESP_LOGI(TAG, "finalizing therapy session on StandbyStarted");
-                s_therapy_stopped = true;
                 bsp_display_set_therapy_active(false);
                 therapy_alert_on_therapy_stop();
                 mqtt_manager_on_therapy_stop();
@@ -2556,6 +2568,7 @@ void session_writer_on_notification(session_writer_t *s, const cJSON *msg)
                         cJSON_Delete(zle_copy);
                     }
                 }
+                sw_detect_on_zle(&s_detect, zle_val, (s && s->active));
                 ESP_LOGI(TAG, ">>> _ZLE ValueChange: %d (%s)",
                          zle_val, zle_val == 1 ? "rising edge" : "falling edge");
                 return;
@@ -2784,7 +2797,8 @@ static bool manifest_is_final(const char *path)
         const char *v = state->valuestring;
         final = (strcmp(v, "completed") == 0 || strcmp(v, "interrupted") == 0 ||
                  strcmp(v, "timed_out") == 0 || strcmp(v, "rotated") == 0 ||
-                 strcmp(v, "split") == 0 || strcmp(v, "storage_failed") == 0);
+                 strcmp(v, "split") == 0 || strcmp(v, "storage_failed") == 0 ||
+                 strncmp(v, "aborted_", 8) == 0);
     }
     cJSON_Delete(root);
     return final;
