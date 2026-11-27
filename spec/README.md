@@ -39,6 +39,7 @@ code.
 - `0013-mqtt-home-assistant-integration.md` — lightweight pub/sub state telemetry, Home Assistant Auto-Discovery, and remote controls. _(Proposed)_
 - `0014-web-interface-password.md` — optional password for the web interface and its API: sessions, Basic auth, rate limiting. _(Implemented)_
 - `0015-somnostage-sst-format.md` — SST1 binary sleep-stage sidecar format: header layout, stage/confidence payload, flags, epoch grid. _(Implemented)_
+- `0016-browser-sdcard-export-bridge.md` — read-only `/api/sdcard/*` export endpoints and universal `window.postMessage` (`?connect=<origin>`) browser transfer bridge. _(Implemented)_
 
 > Draft stubs are placeholders to guide structure; flesh them out as the design
 > firms up.

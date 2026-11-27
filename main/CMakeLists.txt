@@ -5,7 +5,7 @@ idf_component_register(SRCS "main.c" "bsp_power.c" "bsp_display.c" "net_provisio
                            "as11_time.c" "as11_events.c" "leak_roll.c" "bridge_indicator.c"
                            "crash_diag.c"
                            "sb_ble.c" "sb_proto.c" "sb_root.c" "sb_root_ledger.c" "oximeter.c" "oximeter_oxyii.c" "oximeter_legacy.c" "legacy_file_list.c" "oximeter_store.c" "oximetry_vld3.c" "oxyii_trailer.c" "oxyii_codec.c" "oximetry_time.c" "oximetry_canonical.c" "oximetry_http.c" "web_auth.c" "web_auth_core.c"
-                           "mqtt_manager.c" "http_query.c" "httpd_defer.c" "update_check.c" "update_check_core.c" "ws_clients.c"
+                           "mqtt_manager.c" "http_query.c" "httpd_defer.c" "sdcard_api.c" "sdcard_api_core.c" "update_check.c" "update_check_core.c" "ws_clients.c"
                        INCLUDE_DIRS "."
                        REQUIRES esp_lcd driver esp_wifi esp_netif esp_event nvs_flash esp_http_server json esp_app_format
                                 bt mbedtls esp_rom fatfs sdmmc esp-idf-ftpServer uploader esp_http_client mqtt

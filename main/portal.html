@@ -199,6 +199,13 @@ select.form-control{cursor:pointer;appearance:none;background-image:url("data:im
 .auth-box{width:100%;max-width:360px;background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;padding:24px;box-shadow:0 4px 20px rgba(0,0,0,0.35)}
 .auth-box img{display:block;height:36px;margin:0 auto 18px}
 .auth-box .btn{width:100%;margin-top:12px}
+.connect-overlay{z-index:950}
+.connect-origin{margin:10px 0;padding:10px 12px;border-radius:8px;background:var(--bg);border:1px solid var(--card-border);font-family:monospace;font-size:.9rem;font-weight:600;color:var(--primary);word-break:break-all;text-align:center}
+.connect-desc{font-size:.86rem;color:var(--text-muted);line-height:1.45;margin:6px 0}
+.connect-actions{display:flex;gap:10px;margin-top:14px}
+.connect-actions .btn{margin-top:0;flex:1}
+.connect-prog{height:8px;border-radius:999px;background:var(--bg);border:1px solid var(--card-border);overflow:hidden;margin-top:10px}
+.connect-prog-fill{height:100%;width:0;background:var(--primary);transition:width .15s linear}
 .sb-box{position:relative;max-height:92vh;overflow-y:auto}
 .sb-x{position:absolute;top:8px;right:10px;background:none;border:0;color:var(--text-muted);font-size:1.35rem;cursor:pointer;line-height:1;padding:6px;width:auto!important;margin-top:0!important}
 .sb-x:hover{color:var(--text)}
@@ -511,6 +518,32 @@ body.fixed-height .logs-container{flex:0 0 auto;height:calc(100dvh - 145px);min-
 <button type="submit" class="btn btn-primary" id="auth-login-btn">Sign in</button>
 <p id="auth-login-msg" class="status-msg error" role="alert"></p>
 </form>
+</div>
+
+<!-- Browser bridge consent modal, shown only for ?connect=<origin> -->
+<div id="connect-overlay" class="auth-overlay connect-overlay" role="dialog" aria-modal="true" aria-labelledby="connect-title">
+<div class="auth-box" style="max-width:420px">
+<img src="/logo.svg" alt="SomnoTrace">
+<div class="card-title" id="connect-title" style="text-align:center;margin-bottom:6px">Share CPAP Data</div>
+<p id="connect-err" class="status-msg error" role="alert" style="display:none"></p>
+<div id="connect-consent" style="display:none">
+<p class="connect-desc">This site is requesting <strong>read-only</strong> access to your CPAP files (<code>SDCARD/</code>):</p>
+<div id="connect-origin" class="connect-origin"></div>
+<p class="connect-desc">Only exported therapy files under <code>SDCARD/</code> are shared. Settings, logs, and passwords are never accessible.</p>
+<div class="connect-actions">
+<button type="button" class="btn" id="connect-cancel-btn">Cancel</button>
+<button type="button" class="btn btn-primary" id="connect-allow-btn">Allow &amp; Sync</button>
+</div>
+</div>
+<div id="connect-progress" style="display:none">
+<p id="connect-prog-text" class="connect-desc" style="text-align:center">Preparing files...</p>
+<div class="connect-prog"><div id="connect-prog-fill" class="connect-prog-fill"></div></div>
+<div class="connect-actions">
+<button type="button" class="btn" id="connect-abort-btn">Cancel</button>
+</div>
+</div>
+<button type="button" class="btn" id="connect-close-btn" style="display:none">Close window</button>
+</div>
 </div>
 
 <!-- SomnoBridge network setup — offered automatically right after pairing -->
@@ -1629,6 +1662,8 @@ var PW_SENTINEL_UPLOAD = '***';
 /* ── Web password ──────────────────────────────────────────────── */
 var authEnabled = false;
 var authLocked = false;   /* login screen is up: stop background traffic */
+var connectMode = false;
+var connectOnAuthed = null;
 
 /* Any same-origin 401 means the session is gone (expired, signed out
  * elsewhere, password changed): bring up the login screen.  The auth
@@ -1668,7 +1703,18 @@ function doLogin() {
   fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
                              body: JSON.stringify({ password: pw.value }) })
     .then(function(r) {
-      if (r.ok) { location.reload(); return; }
+      if (r.ok) {
+        if (connectMode && connectOnAuthed) {
+          authLocked = false;
+          btn.disabled = false;
+          pw.value = '';
+          document.getElementById('auth-overlay').classList.remove('show');
+          connectOnAuthed();
+          return;
+        }
+        location.reload();
+        return;
+      }
       btn.disabled = false;
       pw.value = '';
       pw.focus();
@@ -7887,9 +7933,211 @@ function loadSomnostageCredit() {
     .catch(function() { el.style.display = 'none'; });
 }
 
+function parseConnectOrigin(raw) {
+  if (!raw || typeof raw !== 'string') return { ok: false, reason: 'Missing target origin.' };
+  var u;
+  try {
+    u = new URL(raw);
+  } catch (e) {
+    return { ok: false, reason: 'Invalid origin URL.' };
+  }
+  if (u.protocol === 'https:') {
+    return { ok: true, origin: u.origin };
+  }
+  if (u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1')) {
+    return { ok: true, origin: u.origin };
+  }
+  return { ok: false, reason: 'Only https:// origins (or http://localhost for local dev) are allowed.' };
+}
+
+function connectRunTransfer(opener, targetOrigin, fetchFn, addListener, removeListener, onProgress, isCancelled) {
+  return fetchFn('/api/sdcard/files', { cache: 'no-store' }).then(function(r) {
+    if (!r.ok) throw new Error('manifest_http_' + r.status);
+    return r.json();
+  }).then(function(files) {
+    if (!Array.isArray(files)) throw new Error('bad_manifest');
+    var metaMap = {};
+    files.forEach(function(f) {
+      if (f && typeof f.path === 'string') metaMap[f.path] = f;
+    });
+
+    return new Promise(function(resolve, reject) {
+      var settled = false;
+      var timer = setTimeout(function() {
+        finishErr('request_timeout');
+      }, 15000);
+
+      function cleanup() {
+        clearTimeout(timer);
+        removeListener('message', onMsg);
+      }
+
+      function finishErr(code) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try { opener.postMessage({ type: 'st:error', error: code }, targetOrigin); } catch (e) {}
+        reject(new Error(code));
+      }
+
+      function onMsg(event) {
+        if (event.origin !== targetOrigin || event.source !== opener) return;
+        var msg = event.data;
+        if (!msg || typeof msg !== 'object') return;
+        if (msg.type !== 'st:request' || !Array.isArray(msg.paths)) return;
+
+        clearTimeout(timer);
+        removeListener('message', onMsg);
+
+        (async function() {
+          try {
+            var paths = msg.paths;
+            var sent = 0;
+            for (var i = 0; i < paths.length; i++) {
+              if (isCancelled && isCancelled()) {
+                finishErr('user_cancelled');
+                return;
+              }
+              var p = paths[i];
+              if (typeof p !== 'string' || !Object.prototype.hasOwnProperty.call(metaMap, p)) {
+                finishErr('unknown_path');
+                return;
+              }
+              if (onProgress) onProgress(i, paths.length, p);
+              var fr = await fetchFn('/api/sdcard/file?path=' + encodeURIComponent(p), { cache: 'no-store' });
+              if (!fr.ok) throw new Error('file_http_' + fr.status);
+              var buf = await fr.arrayBuffer();
+              var meta = metaMap[p];
+              opener.postMessage(
+                { type: 'st:file', path: p, size: buf.byteLength, mtime: meta.mtime || 0, data: buf },
+                targetOrigin,
+                [buf]
+              );
+              sent++;
+              if (onProgress) onProgress(sent, paths.length, p);
+            }
+            if (!settled) {
+              settled = true;
+              opener.postMessage({ type: 'st:done', count: sent }, targetOrigin);
+              resolve(sent);
+            }
+          } catch (e) {
+            finishErr(e && e.message ? e.message : 'transfer_failed');
+          }
+        })();
+      }
+
+      addListener('message', onMsg);
+      opener.postMessage({ type: 'st:manifest', v: 1, files: files }, targetOrigin);
+    });
+  });
+}
+
+function connectInit() {
+  var params = new URLSearchParams(location.search);
+  var rawConnect = params.get('connect');
+  if (rawConnect === null) return false;
+
+  connectMode = true;
+  var overlay = document.getElementById('connect-overlay');
+  var errEl = document.getElementById('connect-err');
+  var consentEl = document.getElementById('connect-consent');
+  var progEl = document.getElementById('connect-progress');
+  var progText = document.getElementById('connect-prog-text');
+  var progFill = document.getElementById('connect-prog-fill');
+  var closeBtn = document.getElementById('connect-close-btn');
+  overlay.classList.add('show');
+
+  function showErr(msg) {
+    consentEl.style.display = 'none';
+    progEl.style.display = 'none';
+    errEl.textContent = msg;
+    errEl.style.display = '';
+    closeBtn.style.display = '';
+  }
+
+  closeBtn.onclick = function() { window.close(); };
+
+  var parsed = parseConnectOrigin(rawConnect);
+  if (!parsed.ok) {
+    showErr(parsed.reason);
+    return true;
+  }
+  if (!window.opener) {
+    showErr('No opener window found. Open this dialog from the requesting web app.');
+    return true;
+  }
+
+  var targetOrigin = parsed.origin;
+  var cancelled = false;
+  document.getElementById('connect-origin').textContent = targetOrigin;
+
+  function abortBridge() {
+    cancelled = true;
+    try { window.opener.postMessage({ type: 'st:error', error: 'user_cancelled' }, targetOrigin); } catch (e) {}
+    window.close();
+    showErr('Cancelled. You can close this window.');
+  }
+
+  document.getElementById('connect-cancel-btn').onclick = abortBridge;
+  document.getElementById('connect-abort-btn').onclick = abortBridge;
+
+  function showConsent() {
+    errEl.style.display = 'none';
+    closeBtn.style.display = 'none';
+    consentEl.style.display = '';
+  }
+
+  document.getElementById('connect-allow-btn').onclick = function() {
+    cancelled = false;
+    consentEl.style.display = 'none';
+    progEl.style.display = '';
+    progFill.style.width = '0%';
+    progText.textContent = 'Reading SD card file list...';
+    connectRunTransfer(
+      window.opener,
+      targetOrigin,
+      window.fetch.bind(window),
+      window.addEventListener.bind(window),
+      window.removeEventListener.bind(window),
+      function(done, total, path) {
+        var pct = total > 0 ? Math.round((done / total) * 100) : 100;
+        progFill.style.width = pct + '%';
+        progText.textContent = total > 0
+          ? ('Sending ' + Math.min(done + 1, total) + ' of ' + total + ': ' + path)
+          : 'No files requested.';
+      },
+      function() { return cancelled; }
+    ).then(function() {
+      progFill.style.width = '100%';
+      progText.textContent = 'Transfer complete. Closing...';
+      setTimeout(function() { window.close(); }, 100);
+    }).catch(function(e) {
+      if (!cancelled) {
+        showErr('Transfer failed: ' + (e && e.message ? e.message : 'error'));
+      }
+    });
+  };
+
+  fetch('/api/auth/status', { cache: 'no-store' }).then(function(r) { return r.json(); })
+    .then(function(a) {
+      authEnabled = !!a.enabled;
+      if (a.enabled && !a.authenticated) {
+        connectOnAuthed = showConsent;
+        showLogin();
+      } else {
+        showConsent();
+      }
+    })
+    .catch(function() { showErr('Could not verify SomnoTrace authentication status.'); });
+
+  return true;
+}
+
 window.onload = function() {
   setTheme(localStorage.getItem('somnotrace_theme') || 'night');
   applyDeviceName({ mdns_name: localStorage.getItem('somnotrace_devname') || '' });
+  if (connectInit()) return;
   /* With a web password set, show nothing but the login screen until the
    * session is valid; otherwise every request below would just get 401. */
   fetch('/api/auth/status', { cache: 'no-store' }).then(function(r) { return r.json(); })

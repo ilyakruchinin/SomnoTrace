@@ -42,6 +42,7 @@
 #include "httpd_defer.h"
 #include "session_writer.h"
 #include "oximetry_http.h"
+#include "sdcard_api.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -3788,6 +3789,7 @@ static esp_err_t start_webserver(void)
     session_graph_init();
     httpd_defer_init();
     oximetry_http_register_handlers(s_httpd);
+    sdcard_api_register_handlers(s_httpd);
 
     httpd_uri_t root = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
     reg_public(s_httpd, &root);

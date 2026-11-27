@@ -158,9 +158,12 @@ run_test legacy_file_list_test -I"$SHIM" -I"$MAIN_DIR" scripts/legacy_file_list_
 run_test upload_park_test -I"$UPLOADER_DIR" scripts/upload_park_test.c
 if command -v node >/dev/null 2>&1; then
     run_check dashboard_panel_test node scripts/dashboard_panel_test.js
+    run_check connect_bridge_test node scripts/connect_bridge_test.js
 else
     skip_test dashboard_panel_test "no node"
+    skip_test connect_bridge_test "no node"
 fi
+run_test sdcard_api_test    -I"$MAIN_DIR" -Werror=frame-larger-than=3072 scripts/sdcard_api_test.c "$MAIN_DIR/sdcard_api_core.c"
 run_test as11_reconnect_test -I"$SHIM" -I"$MAIN_DIR" scripts/as11_reconnect_test.c "$MAIN_DIR/as11_reconnect.c"
 run_test leak_roll_test     -I"$SHIM" -I"$MAIN_DIR" scripts/leak_roll_test.c "$MAIN_DIR/leak_roll.c"
 run_test bridge_indicator_test -I"$MAIN_DIR" scripts/bridge_indicator_test.c "$MAIN_DIR/bridge_indicator.c"
